@@ -912,6 +912,9 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MERGE_CHUNKED_LSE_AG": False,
         "TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS": 0,
         "TPU_DCP_MERGE_RS_BF16": 0,
+        # f32 reduce-scatter wire, the reference these checks compare against
+        # (#1808 narrows it to bf16 by default; test_rs_out_precision_* below).
+        "TPU_DCP_RS_OUT_PRECISION": False,
         "TPU_DCP_MLA_MERGE_PIECES": 0,
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_WEIGHTED_HM": False,
@@ -1057,7 +1060,7 @@ def test_weighted_heads_major_is_bitwise_the_chunked_merge(
     monkeypatch.setattr(
         cp_mla,
         "_weighted_reduce_scatter_heads_major",
-        lambda o, w, g: calls.append(o.shape[0]) or real(o, w, g),
+        lambda o, *rest: calls.append(o.shape[0]) or real(o, *rest),
     )
     got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on)
     assert calls == [8] * 4 * dcp_size
@@ -1315,10 +1318,10 @@ def test_positive_control_wrong_weight_exceeds_the_bf16_bound(
     heavily (its own lse raised by log 1.25, the merged lse left alone)."""
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses, group, **kw):
+    def wrong(output, lse_f32, lses, group, *args, **kw):  # + rs_dtype, after
         if group.rank_in_group == 1:
             lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses, group, **kw)
+        return real(output, lse_f32, lses, group, *args, **kw)
 
     monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter", wrong)
     outputs, lses = _spread_partials(np.random.default_rng(59), 16, 1024, 1, 16, 4.0)
@@ -1387,7 +1390,7 @@ def test_weighted_heads_major_bf16_wire_is_bitwise_the_bf16_wire_merge(
     monkeypatch.setattr(
         cp_mla,
         "_weighted_reduce_scatter_heads_major",
-        lambda o, w, g: calls.append(o.shape[0]) or real(o, w, g),
+        lambda o, *rest: calls.append(o.shape[0]) or real(o, *rest),
     )
     got = _rs_merge_whole(
         outputs,
@@ -1429,10 +1432,11 @@ def test_positive_control_bf16_heads_major_wrong_weight_is_caught(monkeypatch):
     partial 25 % too heavily."""
     real = cp_mla._weighted_reduce_scatter_heads_major
 
-    def wrong(output, weight, group):
+    def wrong(output, lse_f32, merged_lse, group, *rest):
+        # The weight is exp(lse - merged): raise this rank's lse by log 1.25.
         if group.rank_in_group == 1:
-            weight = weight * 1.25
-        return real(output, weight, group)
+            lse_f32 = lse_f32 + math.log(1.25)
+        return real(output, lse_f32, merged_lse, group, *rest)
 
     monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter_heads_major", wrong)
     outputs, lses = _spread_partials(np.random.default_rng(59), 16, 1024, 1, 16, 4.0)
@@ -1463,7 +1467,7 @@ def test_send_layout_min_tokens_gates_small_buckets(min_tokens, want, monkeypatc
         TPU_DCP_LSE_MERGE_A2A=True,
         TPU_DCP_LSE_MERGE_A2A_PACK=True,
         TPU_DCP_LSE_MERGE_A2A_REAL_ROWS=True,
-        TPU_DCP_MLA_SPLIT_Q_LSE=True,
+        TPU_MLA_SPARSE_SPLIT_Q=True,
         TPU_DCP_MLA_MASK_IN_KERNEL=True,
         TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=64,
         TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS=min_tokens,

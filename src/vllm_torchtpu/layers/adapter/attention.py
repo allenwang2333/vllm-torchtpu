@@ -5,7 +5,6 @@ import dataclasses
 import functools
 import inspect
 import math
-import threading
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
 
@@ -62,7 +61,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
-from vllm_torchtpu.kernels.mla.absorb import HEADS_PER_BLOCK as ABSORB_HEADS_PER_BLOCK
+from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -104,31 +103,13 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 
-def _retain_buffers(out: torch.Tensor, *bufs: torch.Tensor | None) -> torch.Tensor:
-    """`out` unchanged, with each buffer lifted into the trace, inside the
-    backbone warmup only. The warmup hands a token bucket between two traces
-    of a token-count branch only if both lift the same buffers
-    (`shape_variants`); TPU_DCP_MERGE_VSPACE's chunked side reads the
-    DCP-gathered W_UV and the other side the local one, so each side lifts
-    the other's too. The buffer goes through an op that ignores it
-    (`keep_input`): no data is read, so the program computes exactly what
-    it did (an unused parameter). Reading a reshaped element instead made
-    XLA relayout the whole 64-head buffer every decode step."""
-    from vllm_torchtpu.compilation import shape_variants
+def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
+    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
 
-    if not shape_variants.in_warmup() or out.device.type != "tpu":
-        return out
-    from vllm_torchtpu.layers.adapter.dcp_weighted_hm import keep_input
 
-    for buf in bufs:
-        if buf is not None:
-            out = keep_input(out, buf)
-    return out
-    for buf in bufs:
-        if buf is not None:
-            v = buf.reshape(-1)[:1].to(out.dtype)
-            out = out - (v - v)
-    return out
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
+_absorb_q.register_fake(_fake_absorb_q)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -578,109 +559,6 @@ def _pallas_rpa_kernel_batched(
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
-# --- TPU_MLA_ABSORB_TOKEN_MAJOR: token-major W_UK absorb -------------------
-# `pallas.jax_op` infers static args from the signature (non-`jax.Array`
-# positional params), so each operand arity is its own function.
-def _mla_absorb_jax(q: jax.Array, w_uk_t: jax.Array, nope_dim: int) -> jax.Array:
-    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
-
-    return mla_absorb_token_major(q, w_uk_t, None, nope_dim=nope_dim)
-
-
-def _mla_absorb_scaled_jax(
-    q: jax.Array, w_uk_t: jax.Array, w_scale: jax.Array, nope_dim: int
-) -> jax.Array:
-    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
-
-    return mla_absorb_token_major(q, w_uk_t, w_scale, nope_dim=nope_dim)
-
-
-_MLA_ABSORB_OPS: dict[bool, Any] = {}
-_MLA_ABSORB_OPS_LOCK = threading.Lock()
-
-
-def get_mla_absorb_op(scaled: bool) -> Any:
-    """The cached torch op; build it outside Dynamo (it takes a lock)."""
-    op = _MLA_ABSORB_OPS.get(scaled)
-    if op is not None:
-        return op
-    with _MLA_ABSORB_OPS_LOCK:
-        op = _MLA_ABSORB_OPS.get(scaled)
-        if op is not None:
-            return op
-        if scaled:
-            op = pallas.jax_op("pallas::mla_absorb_token_major_s", _mla_absorb_scaled_jax)
-        else:
-            op = pallas.jax_op("pallas::mla_absorb_token_major", _mla_absorb_jax)
-
-        def _fake(q, w_uk_t, *rest):
-            return q.new_empty((q.shape[0], q.shape[1], w_uk_t.shape[-1]))
-
-        op.register_fake(_fake)
-        _MLA_ABSORB_OPS[scaled] = op
-        return op
-
-
-def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
-    """"pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
-    of `num_tokens` tokens, else None (the head-major bmm).
-
-    Only the backbone may branch on the token count: it is traced once per
-    bucket group (`_precompile_backbone` retraces where a branch needs it).
-    The MTP drafter (model_tag "eagle_head") is traced once for every bucket,
-    so the comparison below would pin its graph to the first size and the
-    other buckets fail with ShapeSpecializationError. The drafter keeps the
-    bmm, so the flag never touches its graph (checked before the comparison:
-    no guard is recorded)."""
-    mode = envs.TPU_MLA_ABSORB_TOKEN_MAJOR
-    if mode in (None, "0") or not is_backbone:
-        return None
-    if num_tokens < envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS:
-        return None
-    return "pallas" if mode == "1" else mode
-
-
-def mla_absorb_w_uk(
-    q_src: torch.Tensor,
-    nope_dim: int,
-    w_uk_t: torch.Tensor,
-    w_uk_t_scale: torch.Tensor | None,
-    out_dtype: torch.dtype,
-    mode: str | None,
-) -> torch.Tensor:
-    """``ql_nope [T, H, lora] = q_src[:, :, :nope_dim] @ w_uk_t[h]`` per head.
-
-    `q_src` is ``[T, H, qk]`` with the nope part leading (`qk >= nope_dim`);
-    passing the whole q head (not the nope slice) lets the Pallas kernel read
-    q_b's output in place. `mode` None is the reference path: head-major bmm
-    between two transposes, bit for bit what `forward` always did.
-    """
-    if mode == "pallas":
-        if (
-            q_src.dtype != torch.bfloat16
-            or w_uk_t.shape[-1] % 128
-            or q_src.shape[1] % ABSORB_HEADS_PER_BLOCK
-        ):
-            mode = "einsum"
-        else:
-            if w_uk_t_scale is None:
-                out = get_mla_absorb_op(False)(q_src, w_uk_t, nope_dim)
-            else:
-                out = get_mla_absorb_op(True)(q_src, w_uk_t, w_uk_t_scale, nope_dim)
-            return out.to(out_dtype)
-    q_nope = q_src[..., :nope_dim]
-    w = w_uk_t.to(q_nope.dtype) if w_uk_t.dtype != q_nope.dtype else w_uk_t
-    if mode == "einsum":
-        ql_nope = torch.einsum("thd,hdc->thc", q_nope, w)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale.transpose(0, 1)
-        return ql_nope.to(out_dtype)
-    ql_nope = torch.bmm(q_nope.transpose(0, 1), w)
-    if w_uk_t_scale is not None:
-        ql_nope = ql_nope * w_uk_t_scale
-    return ql_nope.transpose(0, 1).to(out_dtype)
-
-
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
         "auto",
@@ -2719,8 +2597,6 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
-        # TPU_DCP_MERGE_VSPACE: the DCP merge already applied W_UV.
-        projected = False
         # Query replication hands us the whole DCP group's heads already, so
         # the sparse DCP path below can skip its per-step q all-gather. It is
         # the only consumer, hence the `topk_indices` term.
@@ -2761,28 +2637,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        # TPU_MLA_ABSORB_TOKEN_MAJOR (mixed buckets): absorb token-major, from
-        # the whole raw q head when the decode prologue hands it over (q_pe
-        # is then q_b's [T, H, nope + rope] view), so nothing is relayouted.
-        absorb_mode = mla_absorb_mode(
-            q_nope.shape[0],
-            is_backbone=vllm_compilation_backends.model_tag == "backbone",
-        )
-        q_src = q_nope
-        if (
-            absorb_mode == "pallas"
-            and q_rope_table
-            and q_pe.shape[-1] > q_nope.shape[-1]
-        ):
-            q_src = q_pe
-        ql_nope = mla_absorb_w_uk(
-            q_src,
-            q_nope.shape[-1],
-            w_uk_t_src,
-            w_uk_t_scale,
-            input_dtype,
-            absorb_mode,
-        )
+        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+            ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+        else:
+            q_nope_t = q_nope.transpose(0, 1)
+            ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
+            if w_uk_t_scale is not None:
+                ql_nope = ql_nope * w_uk_t_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2837,6 +2699,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 if (
                     q_rope_table
                     and send_op is not None
+                    # The send buffer is the latent partial; W_UV-before-merge
+                    # (upstream #1931) needs it projected first.
+                    and not uv_first
                     and _cp_mla_attention.send_layout_applies(
                         ql_nope_dcp.shape[0],
                         ql_nope_dcp.shape[1],
@@ -2895,35 +2760,24 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # comparison would pin its graph to the first size, and the
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
-                    w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
-                    if w_uv_vspace is not None and use_qrep:
-                        # The decode buckets' trace lifts the local W_UV;
-                        # lift it here too, unread (`_retain_buffers`).
-                        w_uv_vspace = _retain_buffers(
-                            w_uv_vspace,
-                            layer.W_UV,
-                            getattr(layer, "W_UV_scale", None),
-                        )
-                        # TPU_DCP_MERGE_VSPACE: chunked buckets merge in V
-                        # space and come back through W_UV already.
-                        outputs, projected = (
-                            _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
-                                partial,
-                                lse,
-                                w_uv_vspace,
-                                getattr(layer, "W_UV_dcp_vspace_scale", None),
-                                is_backbone=is_backbone,
-                                query_start_loc=attn_metadata.query_start_loc,
-                            )
-                        )
-                    else:
-                        outputs = merge_lse_partials_scatter_heads(
+                    is_backbone = vllm_compilation_backends.model_tag == "backbone"
+                    wire_dtype = partial.dtype
+                    if uv_first:
+                        # A narrowed merge rounds to the wire dtype anyway.
+                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                        partial = project_uv_heads(
                             partial,
-                            lse,
-                            is_backbone=vllm_compilation_backends.model_tag
-                            == "backbone",
-                            query_start_loc=attn_metadata.query_start_loc,
+                            layer.W_UV_dcp_qrep,
+                            layer.W_UV_dcp_qrep_scale,
+                            out_dtype=wire_dtype if narrow else torch.float32,
                         )
+                    outputs = merge_lse_partials_scatter_heads(
+                        partial,
+                        lse,
+                        is_backbone=is_backbone,
+                        wire_dtype=wire_dtype,
+                        query_start_loc=attn_metadata.query_start_loc,
+                    )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2960,38 +2814,27 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        vspace_w = getattr(layer, "W_UV_dcp_vspace", None)
-        if projected:
+        if uv_first:
             outputs = outputs.to(input_dtype).reshape(
                 -1, layer.num_heads * layer.v_head_dim
             )
-            if output is not None and outputs is not output:
-                output.copy_(outputs)
-            return outputs
-
-        outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
-            0, 1
-        )
-        w_uv_src = layer.W_UV
-        if vspace_w is not None:
-            # TPU_DCP_MERGE_VSPACE: the chunked buckets' trace lifts the
-            # gathered W_UV; lift it here too, unread (`_retain_buffers`).
-            w_uv_src = _retain_buffers(
-                w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+        else:
+            outputs_t = outputs.reshape(
+                -1, layer.num_heads, layer.kv_lora_rank
+            ).transpose(0, 1)
+            w_uv = (
+                layer.W_UV.to(outputs_t.dtype)
+                if layer.W_UV.dtype != outputs_t.dtype
+                else layer.W_UV
             )
-        w_uv = (
-            w_uv_src.to(outputs_t.dtype)
-            if w_uv_src.dtype != outputs_t.dtype
-            else w_uv_src
-        )
-        out_proj = torch.bmm(outputs_t, w_uv)
-        if hasattr(layer, "W_UV_scale"):
-            out_proj = out_proj * layer.W_UV_scale
-        outputs = (
-            out_proj.transpose(0, 1)
-            .to(input_dtype)
-            .reshape(-1, layer.num_heads * layer.v_head_dim)
-        )
+            out_proj = torch.bmm(outputs_t, w_uv)
+            if hasattr(layer, "W_UV_scale"):
+                out_proj = out_proj * layer.W_UV_scale
+            outputs = (
+                out_proj.transpose(0, 1)
+                .to(input_dtype)
+                .reshape(-1, layer.num_heads * layer.v_head_dim)
+            )
 
         if output is not None and outputs is not output:
             output.copy_(outputs)

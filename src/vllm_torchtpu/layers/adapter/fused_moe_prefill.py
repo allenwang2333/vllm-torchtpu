@@ -23,9 +23,6 @@ from vllm_torchtpu.distributed.ep_mesh import EP_AXIS_NAME
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill as _kernel_body,
 )
-from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
-    fused_moe_prefill_kernel_v2 as _v2,
-)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -58,47 +55,15 @@ def prefill_layer(
     ti,
     start,
     routed_scale=1.0,
-    x_q=None,
-    x_scale=None,
 ):
     """Per rank, inside shard_map: the all-reduced shared + routed output.
     `start` is the rank's first global expert under EP, None under TP.
     `shared_gate_weight` is None for a shared expert without a gate, and
     `routed_scale` multiplies the routed output alone (GLM-5.2: 2.5).
-    `x_q` / `x_scale` (TPU_FUSED_ADD_RMSNORM_QUANT_MOE): x's fp8 rows and
-    scales as the preceding norm emitted them, bit for bit the kernel's own
-    _quantize_rows(x); the v2 build takes them (at v1's levers unless
-    FUSED_MOE_PREFILL_KERNEL_V2) and skips its own quantization."""
+    """
     # Trace-time, once per token bucket: the evidence that the prefill kernel
     # serves this shape.
-    logger.info(
-        "Fused MoE prefill kernel%s traced for %d tokens",
-        (" (V2, stage A)" if envs.FUSED_MOE_PREFILL_KERNEL_V2 else "")
-        + (" on the norm's fp8 rows" if x_q is not None else ""),
-        x.shape[0],
-    )
-    if envs.FUSED_MOE_PREFILL_KERNEL_V2 or x_q is not None:
-        levers = _v2.STAGE_A if envs.FUSED_MOE_PREFILL_KERNEL_V2 else {}
-        return _v2.fused_moe_prefill(
-            x,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            shared_w1,
-            shared_w1_scale,
-            shared_w2,
-            shared_w2_scale,
-            shared_gate_weight,
-            tw,
-            ti,
-            axis_name=EP_AXIS_NAME,
-            expert_start=start,
-            routed_scale=routed_scale,
-            x_q=x_q,
-            x_scale=x_scale,
-            **levers,
-        )
+    logger.info("Fused MoE prefill kernel traced for %d tokens", x.shape[0])
     return _kernel_body(
         x,
         w1,

@@ -1674,7 +1674,7 @@ def _attention_kernel(
         refs = refs[:-6]
     if lse_fill:
         # No aliased lse input: the kernel defines every row itself.
-        refs = (None, *refs)
+        refs = (cast(Any, None), *refs)
     if out_in:
         # The piece's carried output (aliased with o_hbm_ref; never read).
         assert return_lse and not lse_fill
@@ -2346,7 +2346,9 @@ def _attention_kernel(
             bkv = jnp.where(k_span < kv_len, bkv, 0)
         return bkv
 
-    def load_bkv(bkv_sem_idx, batch_idx, slice_sz=bkv_sz, levers=()):
+    def load_bkv(bkv_sem_idx, batch_idx, rows=None, levers=()):
+        # `rows` None = the whole bkv_sz tile (kv rungs / row widths narrow it).
+        slice_sz = bkv_sz if rows is None else rows
         if levers:
             return load_bkv_levers(bkv_sem_idx, batch_idx, slice_sz, levers)
         nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
@@ -2661,11 +2663,10 @@ def _attention_kernel(
             if not return_lse:
                 return
             lse_row = m + jnp.log(l_sum)  # [1, heads]
-            if lse_mask_empty:
+            if is_dcp_mode or lse_mask_empty:
+                # As `write_blse`: a token this rank owns none of weighs 0.
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                lse_row = lse_row + jnp.where(
-                    kv_len == 0, jnp.float32(-jnp.inf), jnp.float32(0.0)
-                )
+                lse_row = jnp.where(kv_len > 0, lse_row, -jnp.inf)
             if lse_lane_dense and not send:
                 blse_x2_ref.at[bo_sem_idx][pl.ds(batch_idx, 1), :] = lse_row
             else:
@@ -2702,7 +2703,7 @@ def _attention_kernel(
 
             for batch_idx in range(batch_size):
                 kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
-                bkv = load_bkv(bi_sem_idx, batch_idx, slice_sz=slice_sz, levers=levers)
+                bkv = load_bkv(bi_sem_idx, batch_idx, rows, levers)
                 bq = load_bq(bi_sem_idx, batch_idx)
 
                 if prev_out is not None and "noinf" not in levers:
@@ -2767,7 +2768,7 @@ def _attention_kernel(
                 zero_out = jnp.zeros((num_q_heads, o_dim), dtype=q_dtype)
                 neg_inf_lse = jnp.full((num_q_heads, 1), -jnp.inf, dtype=jnp.float32)
                 for batch_idx in range(batch_size):
-                    bo_x2_ref.at[bo_sem_idx, batch_idx][...] = zero_out
+                    store_out(bo_sem_idx, batch_idx, zero_out)
                     if return_lse:
                         store_blse(bo_sem_idx, batch_idx, neg_inf_lse)
 
@@ -2965,6 +2966,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "is_dcp_mode",
         "capped_live_rows",
         "lse_lane_dense",
         "lse_mask_empty",
@@ -3017,6 +3019,7 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    is_dcp_mode: bool = False,
     capped_live_rows: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
@@ -3100,6 +3103,8 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      is_dcp_mode: whether to enable DCP mode (skips gather and attention compute
+        for padding and uses dynamic KV cache slice sizing).
       capped_live_rows: With `topk_cap`, the native gather also skips each
         (window, token) row's 64-slot atoms past its live count; the kernel
         never reads those slots (`kv_len` masks), so outputs are unchanged.
@@ -4413,9 +4418,10 @@ def sparse_attention_chunk(
                     cache_kv_rope,
                     indices,
                     out_size=chunk_size * topk,
-                    atoms_per_batch=gather_atoms,
+                    atoms_per_batch=(dcp_gather_atoms if is_dcp_mode else gather_atoms),
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
+                    **({"is_dcp_mode": True} if is_dcp_mode else {}),
                     **live_kwargs,
                 )
             )
@@ -4430,6 +4436,12 @@ def sparse_attention_chunk(
                 cache_kv_rope,
                 indices.reshape(-1),
                 num_valid_indices=num_valid_indices,
+                # Non-DCP calls stay byte-identical to the pre-#1477 signature.
+                **(
+                    {"num_row_subchunks": tc_num_row_subchunks, "is_dcp_mode": True}
+                    if is_dcp_mode
+                    else {}
+                ),
             )
             gathered_nope_buffer = gathered_nope_buffer.reshape(
                 chunk_size,

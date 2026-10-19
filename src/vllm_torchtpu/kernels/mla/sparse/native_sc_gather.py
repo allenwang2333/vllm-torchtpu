@@ -115,9 +115,6 @@ def _kernel(
     write_scratch: tuple[Any, ...] | None = None,
     write_tokens: int = 0,
     write_fault: str | None = None,
-    row_atoms_hbm_ref: Any = None,
-    row_atoms: int = 0,
-    rows_per_batch: int = 1,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     late_drain = None
@@ -253,17 +250,21 @@ def _kernel(
                 rope_out_hbm_ref,
             )
 
-        run = None
+        pred = None
+        if is_dcp_mode:
+            # Skip a batch whose first index is the -1 pad.
+            pred = values(0, 0)[0] >= 0
         if live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
-            run = logical_batch < live_batches
+            tail_ok = logical_batch < live_batches
+            pred = tail_ok if pred is None else (pred & tail_ok)
         if row_atoms_ref is not None:
-            run = num_atoms > 0 if run is None else jnp.logical_and(run, num_atoms > 0)
-        if run is None:
+            pred = num_atoms > 0 if pred is None else (pred & (num_atoms > 0))
+        if pred is None:
             run_inner()
         else:
-            pl.when(run)(run_inner)
+            pl.when(pred)(run_inner)
 
     if linear_indices:
         indices_spec = pl.BlockSpec(
@@ -544,7 +545,6 @@ def dsa_gather_native_sc(
     live_vec_offset: int | None = None,
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     write_fault: str | None = None,
-    row_live_atoms: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -593,10 +593,15 @@ def dsa_gather_native_sc(
     returns the updated ``(nope_cache, rope_cache)``. Bytes identical to
     `scatter.scatter` / `tc_scatter.scatter_caches` with the same rows.
 
-    ``row_live_atoms`` (traced i32[query], optional) gathers only the first
-    ``row_live_atoms[i]`` 64-slot atoms of index row ``i``; the other atoms'
-    output rows are left unwritten. Composes with ``num_live_indices``; needs
-    the 2-D (non-linear) index operand.
+    Args:
+      nope_cache: explicit native-SC uint32[..., 128] cache.
+      rope_cache: quarter-major uint32[..., 128] cache.
+      indices: int32[query, topk] token indices.
+      out_size: total number of gathered tokens (indices.size).
+      atoms_per_batch: number of atoms per batch.
+      wait_mode: "overlap_rope" or "before_rope".
+      serve_pipelined: whether to pipeline the gather serving loop.
+      is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -691,10 +696,15 @@ def dsa_gather_native_sc(
         guard_tail = live_multiple % owner_batch_size != 0
     row_kwargs = {}
     if row_live_atoms is not None:
-        num_rows, row_len = indices.shape
-        if linear_indices:
-            raise ValueError("row_live_atoms needs the 2-D index operand")
-        if row_live_atoms.shape != (num_rows,) or row_len % OCCURRENCES_PER_ATOM:
+        # Rows of the first `out_size` indices; a `live_vec_offset` operand
+        # carries its live vector past them, so the width is not its shape.
+        num_rows = row_live_atoms.shape[0] if row_live_atoms.ndim == 1 else 0
+        row_len = out_size // num_rows if num_rows else 0
+        if (
+            not num_rows
+            or num_rows * row_len != out_size
+            or row_len % OCCURRENCES_PER_ATOM
+        ):
             raise ValueError("row_live_atoms must be i32[query] with 64-slot rows")
         row_atoms = row_len // OCCURRENCES_PER_ATOM
         vals = live_atom_lanes(row_live_atoms, num_batches, atoms_per_batch, row_atoms)
@@ -766,15 +776,13 @@ def dsa_gather_native_sc(
         nope, rope, idx = ins[:3]
         extras = list(ins[3:num_base])  # [live_vec][, row atoms]
         kw = {}
-        extra = 3
         if live_vec_offset is not None:
             # The fused prep's live vector rides in the indices operand itself.
             kw["live_hbm_ref"] = idx.at[pl.ds(live_vec_offset, 2 * NUM_LANES)]
         elif live:
-            kw["live_hbm_ref"] = ins[extra]
-            extra += 1
+            kw["live_hbm_ref"] = extras.pop(0)
         if row_kwargs:
-            kw["row_atoms_hbm_ref"] = ins[extra]
+            kw["row_atoms_hbm_ref"] = extras.pop(0)
         if kv_write is not None:
             kw["write_refs"] = tuple(ins[num_base:])
             kw["write_scratch"] = (write_dst_vmem, write_dst_sem, write_sem)
@@ -798,7 +806,6 @@ def dsa_gather_native_sc(
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
             f"{'_rowlive' if row_kwargs else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
-            f"{'_rowlive' if row_kwargs else ''}"
         ),
     )(*operands)
     if kv_write is None:

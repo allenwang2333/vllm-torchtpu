@@ -1031,6 +1031,20 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def dcp_mla_topk_cap(dcp_size: int) -> int:
+    """`TPU_DCP_MLA_TOPK_CAP` as it applies at `dcp_size`; 0 is uncapped.
+
+    The default (-1) is auto: 512 from DCP16, as #1510 shipped it for GLM-5.2
+    AgentX, and off below. A rank owns ~topk/dcp_size slots, so a cap of 512
+    rarely binds at DCP16 and overflows every row at DCP2 (~30% slower
+    prefill there). An explicit value applies at any DCP size.
+    """
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    if topk_cap < 0:
+        return 512 if dcp_size >= 16 else 0
+    return topk_cap
+
+
 def _mixed_union_gather(value: str) -> dict:
     """TPU_DCP_MLA_MIXED_UNION_GATHER -> the union-gather kwargs of
     `sparse_ragged_paged_attention` ("1" = UNION_GATHER_DEFAULT)."""
@@ -1418,7 +1432,7 @@ def sparse_mla_attention_dcp(
             envs.TPU_DCP_MLA_MERGE_PIECES
             and not decode_bucket
             and mask_in_kernel
-            and split_q_lse
+            and envs.TPU_MLA_SPARSE_SPLIT_Q
             and topk_cap
             and topk_idx.shape[0] >= envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS
         ):

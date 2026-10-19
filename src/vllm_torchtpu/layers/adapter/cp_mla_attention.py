@@ -200,71 +200,6 @@ def merge_lse_partials_scatter_heads(
     return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
-def merge_lse_partials_scatter_heads_vspace(
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    w_uv: torch.Tensor,
-    w_uv_scale: torch.Tensor | None = None,
-    is_backbone: bool = True,
-    query_start_loc: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, bool]:
-    """`merge_lse_partials_scatter_heads`, merging in V space where
-    TPU_DCP_MERGE_VSPACE applies (`vspace_merge_applies`).
-
-    `w_uv` is W_UV gathered for the whole DCP group's heads `[H, C, V]` (the
-    head order of `output`; `w_uv_scale` its gathered per-channel scale for a
-    quantized W_UV). Where V space applies, every chunk of the chunked merge
-    projects this rank's partial through W_UV for all `H` heads, weights it
-    and reduce-scatters the `V`-wide result, so the bytes on the merge's
-    binding collective scale with V (256) instead of C (kv_lora_rank, 512).
-
-    Returns `(merged, projected)`: `projected` True means `merged` is
-    `[T, H / world, V]`, this rank's heads already through W_UV (the caller
-    skips its own W_UV); False means it is the latent merge
-    `merge_lse_partials_scatter_heads` returns, `[T, H / world, C]`.
-    """
-    if not vspace_merge_applies(output.shape[0], is_backbone):
-        return (
-            merge_lse_partials_scatter_heads(
-                output, lse, is_backbone=is_backbone, query_start_loc=query_start_loc
-            ),
-            False,
-        )
-    group = get_dcp_group()
-    chunks = _merge_chunks(output.shape[0])
-    merged = _merge_chunked(output, lse, group, chunks, vspace=(w_uv, w_uv_scale))
-    return _retain_rank(merged), True
-
-
-def vspace_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
-    """Whether this step's merge runs in V space (TPU_DCP_MERGE_VSPACE): the
-    backbone's chunked reduce-scatter merge, exactly the buckets
-    `merge_lse_partials_scatter_heads` sends to `_merge_chunked`.
-
-    Fixed at trace time. Every token-count comparison here is one the merge
-    already makes for the same bucket (the a2a cap, the chunk gate), so V
-    space adds no shape guard -- except TPU_DCP_MERGE_VSPACE_MIN_TOKENS above
-    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS, which is compared only then. The MTP
-    drafter (traced once for every bucket) never compares and never takes it.
-    """
-    if not envs.TPU_DCP_MERGE_VSPACE or not is_backbone:
-        return False
-    # RS_BF16=2 exchanges the latent operand by all-to-all; not ported.
-    if envs.TPU_DCP_MERGE_RS_BF16 == 2:
-        return False
-    group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return False
-    if envs.TPU_DCP_LSE_MERGE_A2A and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS:
-        return False
-    if _merge_chunks(num_tokens) <= 1:
-        return False
-    min_tokens = envs.TPU_DCP_MERGE_VSPACE_MIN_TOKENS
-    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and num_tokens < min_tokens:
-        return False
-    return True
-
-
 def _merge_chunks(num_tokens: int) -> int:
     """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
     merge into: 1 (unsplit) unless the bucket reaches
@@ -293,7 +228,7 @@ def _merge_chunked(
     lse: torch.Tensor,
     group: Any,
     chunks: int,
-    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """The reduce-scatter merge (`cp_lse_ag_out_rs`) over `chunks`
     independent token chunks.
@@ -306,19 +241,11 @@ def _merge_chunked(
     SparseCore-offloaded async collective while the lse gather and the weight
     multiply are TensorCore work, so chunk `k`'s reduce-scatter can run under
     chunk `k + 1`'s gather and multiply instead of after all of them.
-
-    `vspace` (TPU_DCP_MERGE_VSPACE): `(W_UV, scale)` over every head; each
-    chunk is projected to V before its weighted reduce-scatter
-    (`_weighted_reduce_scatter`), and the result is `[T, H / world, V]`.
     """
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
-        return _merge_chunked_lse_gathered(output, lse, group, chunks, vspace)
-    if (
-        envs.TPU_DCP_MERGE_RS_BF16
-        or envs.TPU_DCP_MERGE_WEIGHTED_HM
-        or vspace is not None
-    ):
+        return _merge_chunked_lse_gathered(output, lse, group, chunks, rs_dtype)
+    if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
@@ -330,8 +257,8 @@ def _merge_chunked(
                     lse_f32[c * step : (c + 1) * step],
                     _gather_lse(lse_f32[c * step : (c + 1) * step], group),
                     group,
+                    rs_dtype,
                     after=_rs_lag_dep(pieces),
-                    **_vspace_kw(vspace),
                 )
             )
         return torch.cat(pieces, dim=0)
@@ -367,50 +294,37 @@ def _rs_lag_dep(done: list[torch.Tensor]) -> torch.Tensor | None:
     return done[-lag] if lag > 0 and len(done) >= lag else None
 
 
-def _vspace_kw(vspace) -> dict:
-    """`_weighted_reduce_scatter`'s `vspace` kwarg only when set, so the
-    latent path's call is unchanged (test stubs patch that signature)."""
-    return {} if vspace is None else {"vspace": vspace}
-
-
 def _weighted_reduce_scatter(
     output: torch.Tensor,
     lse_f32: torch.Tensor,
     lses: torch.Tensor,
     group: Any,
+    rs_dtype: torch.dtype | None = None,
     after: torch.Tensor | None = None,
-    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
     `[world, T, H]` for exactly `output`'s `T` rows. `after`
     (TPU_DCP_MERGE_RS_LAG, heads-major path): an earlier chunk's merged
-    result the weights are tied to by an optimization barrier -- a pure
+    result the merged lse is tied to by an optimization barrier -- a pure
     ordering edge, so that chunk's reduce-scatter is completed on the
     schedule before this one is built instead of every completion waiting
-    until the last chunk.
-
-    `vspace` (TPU_DCP_MERGE_VSPACE): `(W_UV [H, C, V], scale)`. The same
-    weights, applied to `output` projected through W_UV for every head; the
-    heads-major `[H, T, V]` operand (bf16 under RS_BF16=1, else f32) feeds
-    the same reduce-scatter. Routed around the WEIGHTED_HM kernel, whose
-    operand is the latent; RS_LAG's ordering tie is kept."""
+    until the last chunk."""
     merged_lse = torch.logsumexp(lses, dim=0)
-    if vspace is not None:
-        weight = torch.exp(lse_f32 - merged_lse)
-        if after is not None and weight.device.type == "tpu":
-            from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
-
-            weight = tie(weight, after)
-        return _weighted_reduce_scatter_vspace(output, weight, vspace, group)
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
-    if envs.TPU_DCP_MERGE_WEIGHTED_HM and envs.TPU_DCP_MERGE_RS_BF16 != 2:
-        weight = torch.exp(lse_f32 - merged_lse)
-        if after is not None and weight.device.type == "tpu":
+    if (
+        envs.TPU_DCP_MERGE_WEIGHTED_HM
+        and envs.TPU_DCP_MERGE_RS_BF16 != 2
+        and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+        >= envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS
+    ):
+        if after is not None and merged_lse.device.type == "tpu":
             from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
 
-            weight = tie(weight, after)
-        return _weighted_reduce_scatter_heads_major(output, weight, group)
+            merged_lse = tie(merged_lse, after)
+        return _weighted_reduce_scatter_heads_major(
+            output, lse_f32, merged_lse, group, rs_dtype
+        )
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -448,69 +362,36 @@ def _scatter_sum(
     return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
-def _weighted_reduce_scatter_vspace(
-    output: torch.Tensor,
-    weight: torch.Tensor,
-    vspace: tuple[torch.Tensor, torch.Tensor | None],
-    group: Any,
-) -> torch.Tensor:
-    """`[T, H, C]` partial, f32 `[T, H]` weights, `(W_UV [H, C, V], scale)`
-    -> this rank's `[T, H / world, V]`: sum over ranks of
-    `where(w > 0, (o_h @ W_UV_h) * w, 0)`, reduce-scattered over heads
-    (TPU_DCP_MERGE_VSPACE). Equal to the latent merge followed by W_UV up to
-    rounding: the weight is a per-(token, head) scalar and W_UV is linear."""
-    w_uv, w_uv_scale = vspace
-    bf16 = envs.TPU_DCP_MERGE_RS_BF16 == 1
-    if output.device.type == "tpu":
-        from vllm_torchtpu.layers.adapter.dcp_weighted_hm import (
-            vspace_weighted_heads_major,
-        )
-
-        x = vspace_weighted_heads_major(output, weight, w_uv, w_uv_scale, bf16=bf16)
-    else:
-        # The same arithmetic in torch (host tests): bf16 operands, f32
-        # accumulation, weight on the f32 product, one rounding.
-        v = torch.bmm(
-            output.transpose(0, 1).to(torch.float32),
-            w_uv.to(output.dtype).to(torch.float32),
-        )
-        if w_uv_scale is not None:
-            v = v * w_uv_scale.to(torch.float32).reshape(v.shape[0], 1, -1)
-        w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
-        x = torch.where(w > 0, v * w, torch.zeros_like(v))
-        if bf16:
-            x = x.to(torch.bfloat16)
-    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
-
-
 def _weighted_reduce_scatter_heads_major(
-    output: torch.Tensor, weight: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse_f32: torch.Tensor,
+    merged_lse: torch.Tensor,
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`_weighted_reduce_scatter`'s weight multiply and reduce-scatter with the
-    f32 operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`).
+    operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`) by the same
+    Pallas kernel `cp_lse_ag_out_rs` uses (`kernels/lse_rescale.py`), so no
+    relayout copy -- TensorCore or SparseCore data-format -- sits between the
+    weights and the reduce-scatter.
 
-    `output` [T, H, D], `weight` f32[T, H]. The reduce-scatter of the head
-    axis runs on a heads-major operand either way (XLA transposes a
-    tokens-major one first); here a TensorCore Pallas kernel writes it
-    heads-major directly, so no relayout copy -- TensorCore or SparseCore
-    data-format -- sits between the weights and the reduce-scatter. Same
-    products, same where, same reduce-scatter: the same bits.
-
-    With `TPU_DCP_MERGE_RS_BF16=1` the kernel writes the operand in bf16 (each
-    f32 product rounded once, as `_scatter_sum`'s `.to(bfloat16)`) and the
-    reduce-scatter runs in bf16 -- the RS_BF16 merge, heads-major.
+    The wire dtype is `cp_lse_ag_out_rs`'s: `rs_dtype`
+    (TPU_DCP_RS_OUT_PRECISION), else f32; `TPU_DCP_MERGE_RS_BF16=1` makes it
+    bf16 (each f32 product rounded once, as `_scatter_sum`'s
+    `.to(bfloat16)`), the RS_BF16 merge, heads-major.
     """
-    bf16 = envs.TPU_DCP_MERGE_RS_BF16 == 1
+    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
     if output.device.type == "tpu":
-        from vllm_torchtpu.layers.adapter.dcp_weighted_hm import weighted_heads_major
+        from vllm_torchtpu.distributed.dcp_comm import _lse_rescale_head_major
 
-        x = weighted_heads_major(output, weight, bf16=bf16)
+        name = str(wire or torch.float32).removeprefix("torch.")
+        x = _lse_rescale_head_major(output, lse_f32, merged_lse, name)
     else:
-        w = weight.transpose(0, 1).unsqueeze(-1)
+        w = torch.exp(lse_f32 - merged_lse).transpose(0, 1).unsqueeze(-1)
         x = output.transpose(0, 1).to(torch.float32) * w
         x = torch.where(w > 0, x, torch.zeros_like(x))
-        if bf16:
-            x = x.to(torch.bfloat16)
+        if wire is not None:
+            x = x.to(wire)
     return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
 
 
@@ -519,7 +400,7 @@ def _merge_chunked_lse_gathered(
     lse: torch.Tensor,
     group: Any,
     chunks: int,
-    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """`_merge_chunked` with one lse all-gather for every chunk
     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
@@ -558,8 +439,8 @@ def _merge_chunked_lse_gathered(
                 lse_f32[c * step : (c + 1) * step],
                 rows[c],
                 group,
+                rs_dtype,
                 after=_rs_lag_dep(pieces),
-                **_vspace_kw(vspace),
             )
         )
     return torch.cat(pieces, dim=0)
@@ -690,7 +571,7 @@ def send_layout_applies(
         and envs.TPU_DCP_LSE_MERGE_A2A
         and envs.TPU_DCP_LSE_MERGE_A2A_PACK
         and envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS
-        and envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        and envs.TPU_MLA_SPARSE_SPLIT_Q
         and envs.TPU_DCP_MLA_MASK_IN_KERNEL
         and is_backbone
         and dtype == torch.bfloat16
