@@ -29,8 +29,13 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+import os
+
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
+)
+from vllm_torchtpu.kernels.experimental.batched_rpa import (
+    decode_v2 as _decode_v2,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
@@ -77,6 +82,28 @@ def merge_attn_results(
 # ---------------------------------------------------------------------------
 
 
+def decode_v2_enabled() -> bool:
+    """TPU_RPA_DECODE_V2=1: run the DCP CACHE_ONLY pass of decode steps with
+    `batched_rpa.decode_v2` (steps with prefill/mixed sequences keep the
+    batched RPA kernel). Not bit-identical to it: f32 softmax and f32 LSE."""
+    return os.environ.get("TPU_RPA_DECODE_V2", "0") == "1"
+
+
+def _decode_v2_covers(kv_cache, query, key, sliding_window, soft_cap, kv_layout) -> bool:
+    return _decode_v2.supported(
+        kv_cache_shape=tuple(kv_cache.shape),
+        kv_dtype=kv_cache.dtype,
+        num_kv_heads=key.shape[1],
+        head_dim=query.shape[2],
+        page_size=kv_cache.shape[-1],
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        kv_layout_is_seq_along_lane=(
+            kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        ),
+    )
+
+
 def _pallas_rpa_kernel_dcp(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -100,6 +127,7 @@ def _pallas_rpa_kernel_dcp(
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
     decode_query_size: int = 1,
+    use_decode_v2: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One DCP pass (CACHE_ONLY or NEW_TOKENS_ONLY). Returns (new_kv_cache,
     output, lse). decode_query_size widens the DECODE bucket so speculative
@@ -113,29 +141,65 @@ def _pallas_rpa_kernel_dcp(
     import jax.numpy as jnp
 
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
-    output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
-        queries=query,
-        keys=key,
-        values=value,
-        kv_cache=kv_cache,
-        kv_lens=seq_lens,
-        page_indices=block_tables,
-        cu_q_lens=query_start_loc,
-        distribution=request_distribution,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        cp_group_size=cp_group_size,
-        cp_rank=cp_rank_arr,
-        attention_scope=attention_scope,
-        decode_query_size=decode_query_size,
-        return_lse=True,
-        kv_layout=kv_layout,
-    )
-    return new_kv_cache, output, lse
+
+    def batched_rpa(kv):
+        output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
+            queries=query,
+            keys=key,
+            values=value,
+            kv_cache=kv,
+            kv_lens=seq_lens,
+            page_indices=block_tables,
+            cu_q_lens=query_start_loc,
+            distribution=request_distribution,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            cp_group_size=cp_group_size,
+            cp_rank=cp_rank_arr,
+            attention_scope=attention_scope,
+            decode_query_size=decode_query_size,
+            return_lse=True,
+            kv_layout=kv_layout,
+        )
+        return new_kv_cache, output, lse
+
+    if not use_decode_v2:
+        return batched_rpa(kv_cache)
+    if not _decode_v2_covers(kv_cache, query, key, sliding_window, soft_cap, kv_layout):
+        # The op was registered with an f32 LSE.
+        new_kv_cache, output, lse = batched_rpa(kv_cache)
+        return new_kv_cache, output, lse.astype(jnp.float32)
+
+    # Decode steps (every sequence in the DECODE range) take decode_v2; a step
+    # with prefill/mixed sequences keeps the batched RPA kernel. The cache
+    # passes through both branches so XLA keeps it in place.
+    def v2_branch(kv):
+        output, lse = _decode_v2.decode_cache_pass(
+            query,
+            kv,
+            seq_lens,
+            block_tables.reshape(-1),
+            query_start_loc,
+            cp_rank_arr,
+            request_distribution[0],
+            sm_scale=float(sm_scale),
+            k_scale=None if k_scale is None else float(k_scale),
+            v_scale=None if v_scale is None else float(v_scale),
+            cp_group_size=cp_group_size,
+            decode_query_size=decode_query_size,
+        )
+        return kv, output, lse
+
+    def rpa_branch(kv):
+        new_kv_cache, output, lse = batched_rpa(kv)
+        return new_kv_cache, output, lse.astype(jnp.float32)
+
+    all_decode = request_distribution[0] >= request_distribution[2]
+    return jax.lax.cond(all_decode, v2_branch, rpa_branch, kv_cache)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +227,14 @@ def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
     return torch.empty_like(kv_cache), torch.empty_like(query), lse
 
 
-def _build_dcp_kernel_op(op_name: str, fn):
+def _fake_dcp_f32_lse(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
+    lse = torch.empty(
+        query.shape[0], query.shape[1], dtype=torch.float32, device=query.device
+    )
+    return torch.empty_like(kv_cache), torch.empty_like(query), lse
+
+
+def _build_dcp_kernel_op(op_name: str, fn, fake=_fake_dcp):
     """Wrap fn (a _pallas_rpa_kernel_dcp partial) as a callable kernel.
 
     kv_cache (arg 0) is donated: CACHE_ONLY never mutates it, so its
@@ -176,7 +247,7 @@ def _build_dcp_kernel_op(op_name: str, fn):
     op = pallas.jax_op(
         op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
     )
-    op.register_fake(_fake_dcp)
+    op.register_fake(fake)
 
     def kernel_impl(kv_cache, *args, **kwargs):
         new_kv_cache, output, lse = op(kv_cache, *args, **kwargs)
@@ -211,6 +282,16 @@ def build_dcp_kernels(
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
     # entry points bind LONGCTX's enum and share ops for the same layout.
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
+    # decode_v2 covers the CACHE_ONLY pass of the DCP decode leg's geometry:
+    # SEQ_ALONG_LANE, no sliding window or soft cap (head and dtype checks run
+    # at trace time in _decode_v2_covers).
+    use_v2 = (
+        decode_v2_enabled()
+        and kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        and sliding_window is None
+        and logits_soft_cap is None
+        and decode_query_size > 1
+    )
     base_key = (
         sliding_window,
         sm_scale,
@@ -223,7 +304,7 @@ def build_dcp_kernels(
         kv_layout,
         decode_query_size,
     )
-    cache_key = ("dcp_cache", *base_key)
+    cache_key = ("dcp_cache_v2" if use_v2 else "dcp_cache", *base_key)
     new_key = ("dcp_new", *base_key)
 
     cached_cache = _DCP_KERNEL_REGISTRY.get(cache_key)
@@ -242,9 +323,12 @@ def build_dcp_kernels(
             attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
             kv_layout=kv_layout,
             decode_query_size=decode_query_size,
+            use_decode_v2=use_v2,
         )
         cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
+            f"pallas::rpa_dcp_cache{'_v2' if use_v2 else ''}_{_alloc_instance_id()}",
+            fn,
+            fake=_fake_dcp_f32_lse if use_v2 else _fake_dcp,
         )
 
     if cached_new is None:
