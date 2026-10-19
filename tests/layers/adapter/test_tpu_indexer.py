@@ -617,3 +617,49 @@ def test_streamidx_small_bucket_tokens_default_is_64(monkeypatch):
     assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 4
     monkeypatch.setenv("TPU_STREAMIDX_MIXED_KV_PAGES", "2")
     assert envs.TPU_STREAMIDX_MIXED_KV_PAGES == 2
+
+
+@pytest.mark.parametrize(
+    "prefix, num_layers, expected",
+    [
+        ("model.layers.0.self_attn.indexer.k_cache", 78, False),
+        ("model.layers.77.self_attn.indexer.k_cache", 78, False),
+        ("model.layers.78.self_attn.indexer.k_cache", 78, True),  # GLM-5.2 MTP
+        ("model.layers.79.self_attn.indexer.k_cache", 78, True),
+        ("model.layers.3.self_attn.indexer.k_cache", 3, True),  # 3-layer twin
+        ("model.layers.78.self_attn.indexer.k_cache", None, False),
+        ("indexer.k_cache", 78, False),
+    ],
+)
+def test_is_draft_layer_prefix(prefix, num_layers, expected):
+    assert mla_attention_op._is_draft_layer_prefix(prefix, num_layers) is expected
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_streamidx_shared_meta_is_off_for_the_mtp_indexer(monkeypatch, flag):
+    """TPU_STREAMIDX_SHARED_META reaches the backbone's indexers only: the MTP
+    draft layer keeps the flag-off op (its q_len-1 DECODE schedule would
+    otherwise be built inside the skip-empty conditional)."""
+    monkeypatch.setenv("TPU_STREAMIDX_SHARED_META", "1" if flag else "0")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=78))
+    )
+    monkeypatch.setattr(
+        mla_attention_op, "get_current_vllm_config_or_none", lambda: config
+    )
+    target = mla_attention_op._streamidx_shared_meta_for(
+        "model.layers.14.self_attn.indexer.k_cache"
+    )
+    draft = mla_attention_op._streamidx_shared_meta_for(
+        "model.layers.78.self_attn.indexer.k_cache"
+    )
+    assert target is flag
+    assert draft is False
+    # No config (unit tests building a bare layer): the env alone decides.
+    monkeypatch.setattr(mla_attention_op, "get_current_vllm_config_or_none", lambda: None)
+    assert (
+        mla_attention_op._streamidx_shared_meta_for(
+            "model.layers.78.self_attn.indexer.k_cache"
+        )
+        is flag
+    )

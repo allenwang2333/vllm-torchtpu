@@ -1292,6 +1292,7 @@ def _effective_row_lengths(
         "skip_empty_decode_chunked",
         "decode_pack",
         "decode_page_major",
+        "shared_meta",
     ),
 )
 def streamindex_topk(
@@ -1325,6 +1326,7 @@ def streamindex_topk(
     final_sc_tie: tuple = (),
     decode_pack: bool = False,
     decode_page_major: bool | None = None,
+    shared_meta: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """StreamIndex Top-K retrieval.
 
@@ -1411,6 +1413,15 @@ def streamindex_topk(
         bit; SEQ_ALONG_LANE and FP8 queries only, other passes ignore it.
       decode_page_major: gather those blocks page-major (one contiguous copy
         per page). None follows `decode_pack`. Same scores.
+      shared_meta: build the per-step inputs every indexer layer derives from
+        the same step metadata so XLA keeps one copy per step instead of one
+        per layer: the MIXED pass's schedule without its empty-pass cond
+        (`compute_metadata(branchless=True)`), and its `[start, end,
+        chunk_start]` scalar operand outside the skip-empty conditional.
+        Under `skip_empty_decode` (unchunked) the DECODE passes' schedules are
+        built inside the branch that runs them, so a step with no q_len-1
+        sequence (every step under MTP) builds none. Same operands bit for
+        bit, so the same result.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1545,6 +1556,11 @@ def streamindex_topk(
         )
         return pack, page_major
 
+    def _start_end(start_seq_idx, end_seq_idx, chunk_token_start):
+        """The kernel's `[start_seq_idx, end_seq_idx, chunk_start]` operand."""
+        chunk_start = 0 if chunk_token_start is None else chunk_token_start
+        return jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32)
+
     def run_scores_kernel(
         q,
         prepared_indexer_weights,
@@ -1567,6 +1583,7 @@ def streamindex_topk(
         chunk_tokens=None,
         scheduling_group_id=None,
         chunk_idx=0,
+        start_end=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -1598,12 +1615,13 @@ def streamindex_topk(
 
         scratch_shapes = []
 
-        chunk_start = 0 if chunk_token_start is None else chunk_token_start
+        if start_end is None:
+            start_end = _start_end(start_seq_idx, end_seq_idx, chunk_token_start)
         scalar_prefetches = (
             seq_lens,
             page_indices,
             cu_q_lens,
-            jnp.array([start_seq_idx, end_seq_idx, chunk_start], jnp.int32),
+            start_end,
             pass_meta,
             jnp.asarray([cp_rank], jnp.int32),
         )
@@ -1744,6 +1762,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            branchless=shared_meta and spec["case"] == MlaCase.MIXED,
         )
 
     def _scores_for_chunk(
@@ -1759,7 +1778,11 @@ def streamindex_topk(
         # XLA would common the identical per-chunk fills into one buffer then clone
         # it back out (~370us on 1GB of scores). `row_lengths` bounds the reads.
         scores = None
-        for spec, pass_meta in passes:
+        for spec, pass_meta, start_end in passes:
+            if callable(pass_meta):
+                # TPU_STREAMIDX_SHARED_META: a DECODE schedule built here, in
+                # the branch that runs the pass.
+                pass_meta = pass_meta()
             scores = run_scores_kernel(
                 q,
                 prepared_indexer_weights,
@@ -1769,6 +1792,7 @@ def streamindex_topk(
                 page_indices,
                 cu_q_lens,
                 pass_meta=pass_meta,
+                start_end=start_end,
                 chunk_idx=chunk_idx,
                 chunk_token_start=chunk_token_start,
                 chunk_tokens=chunk_tokens,
@@ -1824,10 +1848,16 @@ def streamindex_topk(
             if num_chunks == 1
             else tuple(m * chunk_len for m in range(num_chunks))
         )
-        passes = tuple(
-            (spec, _pass_metadata(spec, chunk_starts, chunk_len))
-            for spec in _pass_specs(decode_batch_end)
-        )
+        # shared_meta: with the DECODE passes behind the skip-empty cond (the
+        # unchunked case), their schedules are built inside it, lazily.
+        lazy_decode_meta = shared_meta and skip_empty_decode and num_chunks == 1
+
+        def _meta(spec):
+            if lazy_decode_meta and spec["case"] != MlaCase.MIXED:
+                return functools.partial(_pass_metadata, spec, chunk_starts, chunk_len)
+            return _pass_metadata(spec, chunk_starts, chunk_len)
+
+        passes = tuple((spec, _meta(spec)) for spec in _pass_specs(decode_batch_end))
         topk_idxs = []
         topk_scores_list = []
         tied = ()
@@ -1839,6 +1869,21 @@ def streamindex_topk(
             sc_group = None if m == num_chunks - 1 else group_base + m
 
             start = m * chunk_len
+            # shared_meta: every eagerly built pass gets its scalar operand
+            # here, outside the skip-empty cond, where it is CSE-able across
+            # layers; a lazy (DECODE) pass builds its own inside the branch.
+            chunk_passes = tuple(
+                (
+                    spec,
+                    meta,
+                    _start_end(
+                        spec["start_seq_idx"], spec["end_seq_idx"], chunk_starts[m]
+                    )
+                    if shared_meta and not callable(meta)
+                    else None,
+                )
+                for spec, meta in passes
+            )
             scores_for = functools.partial(
                 _scores_for_chunk,
                 chunk_idx=m,
@@ -1847,7 +1892,9 @@ def streamindex_topk(
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
             )
-            mixed_only = tuple(p for p in passes if p[0]["case"] == MlaCase.MIXED)
+            mixed_only = tuple(
+                p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED
+            )
             if (
                 skip_empty_decode_chunked
                 and num_chunks > 1
@@ -1864,11 +1911,11 @@ def streamindex_topk(
                 # it would have written behind them.
                 scores = jax.lax.cond(
                     distribution[1] > 0,
-                    lambda f=scores_for: f(passes),
+                    lambda f=scores_for, p=chunk_passes: f(p),
                     lambda f=scores_for, p=mixed_only: f(p),
                 )
             else:
-                scores = scores_for(passes)
+                scores = scores_for(chunk_passes)
             scores = scores.reshape(chunk_len, -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
@@ -1987,6 +2034,7 @@ SMALL_AG_MAX_TOKENS = 8
         "flat_merge",
         "small_all_gather",
         "decode_pack",
+        "shared_meta",
     ),
 )
 def streamindex_topk_dcp(
@@ -2024,6 +2072,7 @@ def streamindex_topk_dcp(
     flat_merge: bool | None = None,
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
+    shared_meta: bool = False,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2095,6 +2144,7 @@ def streamindex_topk_dcp(
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
+      shared_meta: forwarded to `streamindex_topk`; see there. Same result.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2189,6 +2239,9 @@ def streamindex_topk_dcp(
     small_all_gather = (
         bool(small_all_gather) and flat_merge and q.shape[0] <= SMALL_AG_MAX_TOKENS
     )
+    from vllm_torchtpu import envs as _envs
+
+    small_ag_hbm = _envs.TPU_SMALL_COLL_HBM_OPERAND
     lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
     if small_all_gather and len(lane_axes) > 1:
         raise ValueError(
@@ -2271,6 +2324,7 @@ def streamindex_topk_dcp(
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
             decode_pack=decode_pack,
+            shared_meta=shared_meta,
         )
         if pin:
             idxs, scores, tied = local
@@ -2333,6 +2387,7 @@ def streamindex_topk_dcp(
                 rank=jnp.reshape(dcp_rank, (1,)),
                 lane_axis=lane_axis,
                 lane=lane,
+                hbm_operand=small_ag_hbm,
             )
         else:
             scores = lax.all_gather(

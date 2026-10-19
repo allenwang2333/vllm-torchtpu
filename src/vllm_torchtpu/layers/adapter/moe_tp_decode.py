@@ -188,6 +188,9 @@ class _OpStatics:
     prefill_min_tokens: int | None = None
     # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
     fast: bool = False
+    # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
+    # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
+    hbm_operands: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -512,6 +515,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                     topk=statics.topk,
                     n_ranks=n_ranks,
                     fast=statics.fast,
+                    hbm_operands=statics.hbm_operands,
                 )[:n]
         if kernel.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
@@ -528,6 +532,7 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 topk=statics.topk,
                 n_ranks=n_ranks,
                 fast=statics.fast,
+                hbm_operands=statics.hbm_operands,
             )
         if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
             # Prefill-sized steps: the fused MoE prefill kernel (shared +
@@ -845,7 +850,16 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         e0 = _e0_tensor(layer.w13_weight.device, adm.experts_start)
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
-        setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))
+        statics = adm.statics
+        # TPU_MOE_TP_DECODE_HBM_OPERANDS: "drafter" (MTP layer only) or "all".
+        mode = envs.TPU_MOE_TP_DECODE_HBM_OPERANDS
+        if mode not in ("", "0", "drafter", "all"):
+            raise ValueError(
+                f"TPU_MOE_TP_DECODE_HBM_OPERANDS={mode!r}: use '', 'drafter' or 'all'"
+            )
+        if mode == "all" or (mode == "drafter" and id(runner) not in known):
+            statics = dataclasses.replace(statics, hbm_operands=True)
+        setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, statics))
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0

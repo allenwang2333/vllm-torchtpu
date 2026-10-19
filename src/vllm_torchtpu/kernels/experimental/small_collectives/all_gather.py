@@ -69,6 +69,7 @@ def small_all_gather(
     lane_axis=None,
     lane=None,
     collective_id=COLLECTIVE_ID,
+    hbm_operand=False,
 ):
     """``lax.all_gather(x, axis, tiled=True)`` of a 1-D block, inside a
     shard_map over a mesh whose ``axis`` has ``num_cores`` cores.
@@ -81,6 +82,8 @@ def small_all_gather(
         this core's position on it and ``j`` on ``axis``.
       lane: int32 [1], this core's index on ``lane_axis`` as data, or None to
         read it from the axis. Ignored without ``lane_axis``.
+      hbm_operand: constrain the block to HBM (``pltpu.with_memory_space_constraint``)
+        so XLA does not stage it into VMEM right before the call.
     """
     if x.ndim != 1:
         raise ValueError(f"small_all_gather takes a flat block, got {x.shape}")
@@ -91,7 +94,10 @@ def small_all_gather(
     # The kernel moves [rows, 128] tiles: a flat 32-bit array's (1024) tiling
     # is the same bytes as [rows, 128]'s (8, 128), so both reshapes are
     # bitcasts. (XLA still copies the SparseCore top-k's output before the
-    # call, 0.8-0.9 us on the twin, with either operand shape or memory space.)
+    # call, 0.8-0.9 us on the twin, with either operand shape or in_spec memory
+    # space: that copy is XLA's memory-space assignment staging the pl.ANY
+    # operand into VMEM; only an HBM constraint on the operand aval stops it,
+    # see `hbm_operand`.)
     rows = size // LANES
     data_rank = rank is not None
     data_lane = lane_axis is not None and lane is not None
@@ -149,13 +155,16 @@ def small_all_gather(
         scalars.append(jnp.reshape(rank, (-1,))[:1].astype(jnp.int32))
     if data_lane:
         scalars.append(jnp.reshape(lane, (-1,))[:1].astype(jnp.int32))
+    block = x.reshape(rows, LANES)
+    if hbm_operand:
+        block = pltpu.with_memory_space_constraint(block, pltpu.HBM)
     out = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((n * rows, LANES), x.dtype),
-        in_specs=[smem] * len(scalars) + [any_],
+        in_specs=[smem] * len(scalars) + [hbm if hbm_operand else any_],
         out_specs=hbm,
         scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
         compiler_params=pltpu.CompilerParams(collective_id=collective_id),
         name=f"small_all_gather_n{n}_l{size}",
-    )(*scalars, x.reshape(rows, LANES))
+    )(*scalars, block)
     return out.reshape(n * size)
