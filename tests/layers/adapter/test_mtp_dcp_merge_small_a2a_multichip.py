@@ -49,7 +49,9 @@ def _compile(fn):
     from torch_tpu._internal import compile as tpu_compile
 
     torch._dynamo.reset()
-    return torch.compile(fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend())
+    return torch.compile(
+        fn, fullgraph=True, dynamic=False, backend=tpu_compile.TpuBackend()
+    )
 
 
 def _partials(world, tokens):
@@ -63,7 +65,9 @@ def _arm(cp_mla, world, small):
     cp_mla.envs.TPU_MTP_DCP_MERGE_SMALL_A2A = small
     cp_mla._SIZED_MERGE_OPS.pop(world, None)
     cp_mla.prebuild_sized_merge(world)
-    return lambda o, l: cp_mla.merge_lse_partials_scatter_heads(o, l, is_backbone=False)
+    return lambda o, lse: cp_mla.merge_lse_partials_scatter_heads(
+        o, lse, is_backbone=False
+    )
 
 
 def _check(rank, world, cp_mla):
@@ -86,10 +90,20 @@ def _check(rank, world, cp_mla):
                 y, yp = fn(o_dev, l_dev).cpu(), fn(p_dev, l_dev).cpu()
                 got[arm] = (y, yp)
                 c = {"shape": list(y.shape), **base._error_stats(y, ref)}
-                c["nan_input_bitwise"] = bool(torch.equal(yp.view(torch.int16), y.view(torch.int16)))
+                c["nan_input_bitwise"] = bool(
+                    torch.equal(yp.view(torch.int16), y.view(torch.int16))
+                )
                 if arm == "small":
-                    c["bitwise_vs_sized"] = bool(torch.equal(y.view(torch.int16), got["sized"][0].view(torch.int16)))
-                    c["nan_bitwise_vs_sized"] = bool(torch.equal(yp.view(torch.int16), got["sized"][1].view(torch.int16)))
+                    c["bitwise_vs_sized"] = bool(
+                        torch.equal(
+                            y.view(torch.int16), got["sized"][0].view(torch.int16)
+                        )
+                    )
+                    c["nan_bitwise_vs_sized"] = bool(
+                        torch.equal(
+                            yp.view(torch.int16), got["sized"][1].view(torch.int16)
+                        )
+                    )
                 report[key] = c
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
@@ -106,10 +120,16 @@ def _check(rank, world, cp_mla):
     try:
         outputs, lses = _partials(world, 4)
         ref = base._reference(outputs, lses)[:, rank * local : (rank + 1) * local]
-        sized = _compile(_arm(cp_mla, world, False))(outputs[rank].to("tpu"), lses[rank].to("tpu")).cpu()
-        y = _compile(_arm(cp_mla, world, True))(outputs[rank].to("tpu"), lses[rank].to("tpu")).cpu()
+        sized = _compile(_arm(cp_mla, world, False))(
+            outputs[rank].to("tpu"), lses[rank].to("tpu")
+        ).cpu()
+        y = _compile(_arm(cp_mla, world, True))(
+            outputs[rank].to("tpu"), lses[rank].to("tpu")
+        ).cpu()
         c = base._error_stats(y, ref)
-        c["bitwise_vs_sized"] = bool(torch.equal(y.view(torch.int16), sized.view(torch.int16)))
+        c["bitwise_vs_sized"] = bool(
+            torch.equal(y.view(torch.int16), sized.view(torch.int16))
+        )
         report["control_rotated/compiled@4"] = c
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -148,7 +168,9 @@ def _run_worker(result_dir: Path) -> None:
 
         wg = get_world_group()
         group = init_model_parallel_group(
-            [list(range(world))], wg.local_rank, dist.get_backend(wg.device_group),
+            [list(range(world))],
+            wg.local_rank,
+            dist.get_backend(wg.device_group),
             group_name="mtp_dcp_merge_small_test",
         )
         cp_mla.get_dcp_group = lambda: group
@@ -158,7 +180,9 @@ def _run_worker(result_dir: Path) -> None:
         cp_mla.envs.TPU_MTP_DCP_MERGE_SIZED = True
         cp_mla.envs.TPU_DCP_RANK_OPERAND = True
         cp_mla.envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS = SMALL_CAP
-        cp_mla.envs.TPU_SMALL_COLL_HBM_OPERAND = os.environ.get("TPU_SMALL_COLL_HBM_OPERAND", "1") == "1"
+        cp_mla.envs.TPU_SMALL_COLL_HBM_OPERAND = (
+            os.environ.get("TPU_SMALL_COLL_HBM_OPERAND", "1") == "1"
+        )
         result["check"] = _check(rank, world, cp_mla)
     except BaseException as exc:  # noqa: BLE001
         traceback.print_exc()
@@ -178,12 +202,21 @@ def assert_results(results):
         for key, c in r["check"].items():
             assert "error" not in c, (r["rank"], key, c)
             if key.startswith("control"):
-                assert not c["bitwise_vs_sized"], ("control not caught", r["rank"], key, c)
+                assert not c["bitwise_vs_sized"], (
+                    "control not caught",
+                    r["rank"],
+                    key,
+                    c,
+                )
                 assert not c["within_1ulp"], ("control not caught", r["rank"], key, c)
                 continue
             assert c["within_1ulp"] and c["nan_input_bitwise"], (r["rank"], key, c)
             if key.startswith("small"):
-                assert c["bitwise_vs_sized"] and c["nan_bitwise_vs_sized"], (r["rank"], key, c)
+                assert c["bitwise_vs_sized"] and c["nan_bitwise_vs_sized"], (
+                    r["rank"],
+                    key,
+                    c,
+                )
 
 
 def test_small_a2a_sized_merge_bitwise(tmp_path):
@@ -194,8 +227,13 @@ def test_small_a2a_sized_merge_bitwise(tmp_path):
     cmd = base._worker_command(result_dir, [])
     cmd[cmd.index(str(Path(base.__file__).resolve()))] = str(Path(__file__).resolve())
     completed = subprocess.run(
-        cmd, cwd=Path(__file__).resolve().parents[3], env=base._prepare_worker_env(),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+        cmd,
+        cwd=Path(__file__).resolve().parents[3],
+        env=base._prepare_worker_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
         timeout=base.LAUNCH_TIMEOUT_SECONDS,
     )
     results = base._results(result_dir, WORLD_SIZE)

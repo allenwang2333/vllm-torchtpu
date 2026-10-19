@@ -10,9 +10,11 @@ from vllm_torchtpu.compilation import foreach_epilogue as fe
 
 LEAF = (
     "def _apply_mutations(orig_inputs, updated_inputs):\n"
-    "    if orig_inputs[0].requires_grad: orig_inputs[0].detach().copy_(updated_inputs[0])\n"
+    "    if orig_inputs[0].requires_grad: "
+    "orig_inputs[0].detach().copy_(updated_inputs[0])\n"
     "    else: orig_inputs[0].copy_(updated_inputs[0])\n"
-    "    if orig_inputs[3].requires_grad: orig_inputs[3].detach().copy_(updated_inputs[1])\n"
+    "    if orig_inputs[3].requires_grad: "
+    "orig_inputs[3].detach().copy_(updated_inputs[1])\n"
     "    else: orig_inputs[3].copy_(updated_inputs[1])\n"
     "    orig_inputs[5].copy_(updated_inputs[2])"
 )
@@ -26,10 +28,14 @@ def test_parse_pairs_plain_and_leaf():
     "bad",
     [
         LEAF + "\n    with torch.no_grad(): orig_inputs[6].set_(updated_inputs[3])",
-        LEAF + "\n    orig_inputs[6].as_strided_(updated_inputs[3].size(), updated_inputs[3].stride(), 0)",
-        LEAF.replace("else: orig_inputs[3].copy_", "else: orig_inputs[4].copy_"),  # mismatched branch
+        LEAF + "\n    orig_inputs[6].as_strided_("
+        "updated_inputs[3].size(), updated_inputs[3].stride(), 0)",
+        LEAF.replace(
+            "else: orig_inputs[3].copy_", "else: orig_inputs[4].copy_"
+        ),  # mismatched branch
         LEAF + "\n    orig_inputs[0].copy_(updated_inputs[3])",  # same input twice
-        "def other(orig_inputs, updated_inputs):\n    orig_inputs[0].copy_(updated_inputs[0])",
+        "def other(orig_inputs, updated_inputs):\n"
+        "    orig_inputs[0].copy_(updated_inputs[0])",
     ],
 )
 def test_anything_else_is_kept(bad):
@@ -40,13 +46,21 @@ def test_rewrite_semantics_and_fallback():
     src = fe.rewrite(LEAF)
     assert src is not None and "torch._foreach_copy_" in src
     orig_calls = []
-    g = {"torch": torch, "_h5b_original_apply_mutations": lambda o, u: orig_calls.append(1), "_h5b_on": [True]}
+    g = {
+        "torch": torch,
+        "_h5b_original_apply_mutations": lambda o, u: orig_calls.append(1),
+        "_h5b_on": [True],
+    }
     exec(compile(src, "<t>", "exec"), g)
     fn = g["_apply_mutations"]
     orig = [torch.zeros(3) for _ in range(6)]
     upd = [torch.full((3,), float(i + 1)) for i in range(3)]
     fn(orig, upd)
-    assert torch.equal(orig[0], upd[0]) and torch.equal(orig[3], upd[1]) and torch.equal(orig[5], upd[2])
+    assert (
+        torch.equal(orig[0], upd[0])
+        and torch.equal(orig[3], upd[1])
+        and torch.equal(orig[5], upd[2])
+    )
     assert all(torch.equal(orig[i], torch.zeros(3)) for i in (1, 2, 4))
     assert orig_calls == []
     orig[3] = torch.zeros(3, requires_grad=True)
@@ -64,7 +78,9 @@ def test_rewrite_semantics_and_fallback():
 
 
 def _backend():
-    return aot_autograd(fw_compiler=lambda gm, ex: gm, keep_inference_input_mutations=False)
+    return aot_autograd(
+        fw_compiler=lambda gm, ex: gm, keep_inference_input_mutations=False
+    )
 
 
 def test_compiled_graph_identical_with_patch(monkeypatch):

@@ -1140,15 +1140,19 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     levers = (
         sparse_kernel.DECODE_BODY_DEFAULT
         if value == "1"
-        else tuple(v.strip() for v in (value or "").split(",") if v.strip() and v != "0")
+        else tuple(
+            v.strip() for v in (value or "").split(",") if v.strip() and v != "0"
+        )
     )
     return bool(
         "step8" in levers
         and envs.TPU_DCP_MLA_TOPK_CAP
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS <= sparse_kernel.DECODE_STEP8_TOKENS
-        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        <= sparse_kernel.DECODE_STEP8_TOKENS
+        and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+        <= envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS
     )
 
 
@@ -1182,8 +1186,9 @@ def _send_small_fake(x, rows, rank, lane):
     return _send_unpack_fake(x, rows, rank)
 
 
-def send_small_unpack_local(x, rows, rank, lane, *, world: int, axis_name: str,
-                            lane_axis: str | None):
+def send_small_unpack_local(
+    x, rows, rank, lane, *, world: int, axis_name: str, lane_axis: str | None
+):
     """One rank's `TPU_DCP_MLA_SEND_SMALL_A2A` exchange + unpack inside a
     `shard_map` over the (lane, DCP) mesh: `_build_send_unpack`'s result, bit
     for bit.
@@ -1228,7 +1233,12 @@ def _build_send_small(world: int):
 
     def body(x, rows, rank, lane):
         return send_small_unpack_local(
-            x, rows, rank, lane, world=world, axis_name=DCP_AXIS_NAME,
+            x,
+            rows,
+            rank,
+            lane,
+            world=world,
+            axis_name=DCP_AXIS_NAME,
             lane_axis=lane_axis,
         )
 
@@ -1660,10 +1670,18 @@ def prebuild_sized_merge(world: int) -> None:
     lane_t = dcp_lane_operand(torch.device("tpu"))
 
     def body_small(o, lse, rank, lane):
-        small = {"max_tokens": small_cap, "rank": rank, "lane": lane,
-                 "lane_axis": lane_axis}
+        small = {
+            "max_tokens": small_cap,
+            "rank": rank,
+            "lane": lane,
+            "lane_axis": lane_axis,
+        }
         return sized_merge_local(
-            o, lse, world=world, a2a_max_tokens=cap, axis_name=DCP_AXIS_NAME,
+            o,
+            lse,
+            world=world,
+            a2a_max_tokens=cap,
+            axis_name=DCP_AXIS_NAME,
             small=small,
         )
 

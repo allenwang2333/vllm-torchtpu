@@ -283,7 +283,9 @@ def test_onehot_all_gather_is_the_gather(monkeypatch):
     assert torch.equal(out, torch.cat(blocks, dim=-1))
 
 
-@pytest.mark.parametrize("tp,rows,lead3", [(16, 16, False), (8, 5, False), (4, 6, True)])
+@pytest.mark.parametrize(
+    "tp,rows,lead3", [(16, 16, False), (8, 5, False), (4, 6, True)]
+)
 def test_column_parallel_eh_proj_matches_replicated(monkeypatch, tp, rows, lead3):
     """TPU_MTP_EH_PROJ_TP: every rank's gathered output equals the replicated
     nn.Linear, for 2-D and 3-D inputs. Small-integer f32 values make every dot

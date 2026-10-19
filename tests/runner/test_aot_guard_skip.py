@@ -4,11 +4,10 @@ vLLM compiled them without guards."""
 
 from types import SimpleNamespace
 
-import torch
-
 import pytest
-
+import torch
 from vllm.config import CompilationMode
+
 from vllm_torchtpu.compilation import aot_guard_skip
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -45,9 +44,16 @@ def _runner(evaluate_guards=False, mode=CompilationMode.VLLM_COMPILE, drafter=Tr
     shared = target[1]
     d = None
     if drafter:
-        d = SimpleNamespace(model=torch.nn.Sequential(_Compiled()), loop=_Compiled(), same=shared, n=3)
-    cc = SimpleNamespace(mode=mode, dynamic_shapes_config=SimpleNamespace(evaluate_guards=evaluate_guards))
-    return SimpleNamespace(model=target, drafter=d, vllm_config=SimpleNamespace(compilation_config=cc))
+        d = SimpleNamespace(
+            model=torch.nn.Sequential(_Compiled()), loop=_Compiled(), same=shared, n=3
+        )
+    cc = SimpleNamespace(
+        mode=mode,
+        dynamic_shapes_config=SimpleNamespace(evaluate_guards=evaluate_guards),
+    )
+    return SimpleNamespace(
+        model=target, drafter=d, vllm_config=SimpleNamespace(compilation_config=cc)
+    )
 
 
 def _fns(r):
@@ -59,7 +65,9 @@ def _fns(r):
 
 def test_disables_every_compiled_forward_once():
     r = _runner()
-    assert TPUModelRunner._skip_aot_guard_checks(r) == 3  # the shared module counts once
+    assert (
+        TPUModelRunner._skip_aot_guard_checks(r) == 3
+    )  # the shared module counts once
     assert not any(f.enabled for f in _fns(r))
 
 
@@ -70,13 +78,17 @@ def test_no_drafter():
 
 
 def test_kept_when_guards_are_evaluated_or_stock_compile():
-    for r in (_runner(evaluate_guards=True), _runner(mode=CompilationMode.STOCK_TORCH_COMPILE)):
+    for r in (
+        _runner(evaluate_guards=True),
+        _runner(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    ):
         assert TPUModelRunner._skip_aot_guard_checks(r) == 0
         assert all(f.enabled for f in _fns(r))
 
 
 def test_real_aot_compiled_function_skips_check():
-    """The torch object honours disable_guard_check: __call__ stops calling guard_check."""
+    """The torch object honours disable_guard_check: __call__ stops calling
+    guard_check."""
     from torch._dynamo.aot_compile import AOTCompiledFunction
 
     called = []
@@ -100,7 +112,8 @@ def test_set_host_levers_toggles_each_listed_lever(monkeypatch):
     TPUModelRunner._skip_aot_guard_checks(r)
     calls = []
     r._cpu_pinner = SimpleNamespace(
-        set_active=lambda on: calls.append(("active", on)), maybe_pin=lambda: calls.append(("pin",))
+        set_active=lambda on: calls.append(("active", on)),
+        maybe_pin=lambda: calls.append(("pin",)),
     )
     r._lever_alt = {"levers": {"pin", "guard", "foreach", "h2d"}, "state": True}
     TPUModelRunner._set_host_levers(r, False)
@@ -133,11 +146,14 @@ def test_install_disables_every_fresh_aot_compile(monkeypatch):
         return w
 
     f1 = W.aot_compile(wrapper(), "args")
-    assert not f1.enabled and aot_guard_skip.FNS == [f1]
-    for w in (wrapper(evaluate_guards=True), wrapper(mode=CompilationMode.STOCK_TORCH_COMPILE)):
+    assert not f1.enabled and [f1] == aot_guard_skip.FNS
+    for w in (
+        wrapper(evaluate_guards=True),
+        wrapper(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    ):
         f = W.aot_compile(w, "args")
         assert f.enabled
-    assert aot_guard_skip.FNS == [f1]
+    assert [f1] == aot_guard_skip.FNS
     # the walk does not double-count a function the hook already switched off
     r = _runner()
     r.model[1].aot_compiled_fn = f1

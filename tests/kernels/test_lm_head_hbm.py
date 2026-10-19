@@ -39,11 +39,15 @@ def _x(m, seed=0):
 
 def _w(n, seed=1):
     rng = np.random.default_rng(seed)
-    return jnp.asarray(rng.standard_normal((n, K), dtype=np.float32) * 0.02, jnp.bfloat16)
+    return jnp.asarray(
+        rng.standard_normal((n, K), dtype=np.float32) * 0.02, jnp.bfloat16
+    )
 
 
 def _xla(x, w):
-    return jax.jit(lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))(x, w)
+    return jax.jit(lambda a, b: jax.lax.dot_general(a, b, (((1,), (1,)), ((), ()))))(
+        x, w
+    )
 
 
 def _ulps(a, b):
@@ -74,7 +78,10 @@ def _judge(y, x, w, tag=""):
         and (d > 0).mean() <= 1e-3
         and err <= 1.25 * ref_err + np.abs(f64).max() * 2.0**-8
     )
-    info = f"{tag} off={int((d > 0).sum())}/{d.size} max_ulp_floored={d_rel.max():.1f} err={err:.3g} ref_err={ref_err:.3g}"
+    info = (
+        f"{tag} off={int((d > 0).sum())}/{d.size} "
+        f"max_ulp_floored={d_rel.max():.1f} err={err:.3g} ref_err={ref_err:.3g}"
+    )
     print("LMHEAD", ok, info)
     return ok, info
 
@@ -91,7 +98,9 @@ def test_matches_xla_and_f64(m):
     assert (np.argmax(np.asarray(y, np.float32), 1) == np.argmax(ref, 1)).all()
 
 
-@pytest.mark.parametrize("n", [9728, 1040, 464])  # no tail tile; a 16-row tail; one short tile
+@pytest.mark.parametrize(
+    "n", [9728, 1040, 464]
+)  # no tail tile; a 16-row tail; one short tile
 @pytest.mark.parametrize("m", [1, 16])
 def test_other_vocab_shards(n, m):
     x, w = _x(m, seed=7 + m), _w(n, seed=n)
@@ -105,13 +114,16 @@ def test_faults_are_caught(variant, m):
     """Positive control: each injected fault fails the check the kernel passes.
     Fresh inputs per case, so a stale output buffer cannot pass for a right one."""
     x, w = _x(m, seed=100 + m + len(variant)), _w(N, seed=200 + len(variant))
-    ok, info = _judge(lh.lm_head_hbm(x, w, _variant=variant), x, w, f"fault={variant} m={m}")
+    ok, info = _judge(
+        lh.lm_head_hbm(x, w, _variant=variant), x, w, f"fault={variant} m={m}"
+    )
     assert not ok, f"fault {variant} not caught: {info}"
 
 
 @pytest.mark.parametrize("config", [(512, 2), (1024, 3), (256, 3)])
 def test_tilings_agree_bitwise(config):
-    """Row tiles are independent dots over the full k: any tiling gives the same bits."""
+    """Row tiles are independent dots over the full k: any tiling gives the same
+    bits."""
     x, w = _x(8, seed=3), _w(N)
     y = lh.lm_head_hbm(x, w, config=config)
     np.testing.assert_array_equal(
@@ -154,7 +166,15 @@ def _weight_vmem_lines(hlo: str, n: int) -> list[str]:
         result, opcode = mo.group(1), mo.group(2)
         mine = [t for t in result.strip("()").split(", ") if t.startswith(shape)]
         if mine and (
-            opcode in ("copy", "copy-start", "copy-done", "slice-start", "slice-done", "transpose")
+            opcode
+            in (
+                "copy",
+                "copy-start",
+                "copy-done",
+                "slice-start",
+                "slice-done",
+                "transpose",
+            )
             or any("S(1)" in t for t in mine)
         ):
             out.append(ln.strip())

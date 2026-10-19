@@ -103,7 +103,9 @@ def small_all_to_all(
         raise ValueError(f"{total} rows do not split into {n} blocks")
     block = total // n
     if block % 8 or row0 % 8 or not 0 <= row0 < block:
-        raise ValueError(f"block {block} / row0 {row0}: need multiples of 8, row0 < block")
+        raise ValueError(
+            f"block {block} / row0 {row0}: need multiples of 8, row0 < block"
+        )
     rows = block - row0
     data_rank = rank is not None
     data_lane = lane_axis is not None and lane is not None

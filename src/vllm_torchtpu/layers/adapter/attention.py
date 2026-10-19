@@ -2774,7 +2774,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 return (
                     torch.empty_like(kv_cache_nope),
                     torch.empty_like(kv_cache_rope),
-                    ql_nope.new_empty((tokens, heads // dcp_size, vdim), dtype=torch.bfloat16),
+                    ql_nope.new_empty(
+                        (tokens, heads // dcp_size, vdim), dtype=torch.bfloat16
+                    ),
                 )
             if fused_exchange:
                 tokens, heads, vdim = ql_nope.shape
@@ -3005,8 +3007,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     )
                 ):
                     fused_op = getattr(layer, "sparse_mla_dcp_fused_op", None)
-                    if fused_op is not None and _cp_mla_attention.fused_small_a2a_applies(
-                        ql_nope_dcp.shape[0]
+                    if (
+                        fused_op is not None
+                        and _cp_mla_attention.fused_small_a2a_applies(
+                            ql_nope_dcp.shape[0]
+                        )
                     ):
                         # TPU_MLA_FUSED_SMALL_A2A: the kernel also runs the
                         # small all-to-all and the op unpacks; only the merge.

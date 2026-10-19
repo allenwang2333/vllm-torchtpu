@@ -67,7 +67,9 @@ def test_all_mode_swaps_target_and_shared_slots():
     n = adapter.install_lm_head_hbm(target, draft, "all", op=_fake_op)
     assert n == 3
     assert isinstance(head.quant_method, adapter.HbmLmHeadMethod)
-    assert isinstance(head.quant_method, UnquantizedEmbeddingMethod)  # head_dtype checks
+    assert isinstance(
+        head.quant_method, UnquantizedEmbeddingMethod
+    )  # head_dtype checks
     for layer in draft.model.layers.values():
         assert layer.shared_head.head is head
     x = torch.randn(3, H).to(torch.bfloat16)
@@ -100,11 +102,15 @@ def test_method_falls_back_for_bias_or_non_bf16():
     m = adapter.HbmLmHeadMethod(_fake_op)
     h32 = _Head(dtype=torch.float32)
     x32 = torch.randn(2, H)
-    torch.testing.assert_close(m.apply(h32, x32), torch.nn.functional.linear(x32, h32.weight))
+    torch.testing.assert_close(
+        m.apply(h32, x32), torch.nn.functional.linear(x32, h32.weight)
+    )
     hb = _Head()
     xb = torch.randn(2, H).to(torch.bfloat16)
     b = torch.ones(V, dtype=torch.bfloat16)
-    torch.testing.assert_close(m.apply(hb, xb, b), torch.nn.functional.linear(xb, hb.weight, b))
+    torch.testing.assert_close(
+        m.apply(hb, xb, b), torch.nn.functional.linear(xb, hb.weight, b)
+    )
     # 3-D input keeps its leading dims
     x3 = torch.randn(2, 3, H).to(torch.bfloat16)
     assert m.apply(hb, x3).shape == (2, 3, V)
@@ -143,7 +149,12 @@ def test_quantized_head_refused_and_modes_validated():
 def test_drafter_mode_without_shared_slots_is_a_noop():
     head = _Head()
     other = _Head()
-    assert adapter.install_lm_head_hbm(_Target(head), _Draft(other), "drafter", op=_fake_op) == 0
+    assert (
+        adapter.install_lm_head_hbm(
+            _Target(head), _Draft(other), "drafter", op=_fake_op
+        )
+        == 0
+    )
     assert adapter.install_lm_head_hbm(_Target(head), None, "drafter", op=_fake_op) == 0
     assert type(other.quant_method) is UnquantizedEmbeddingMethod
 
@@ -206,7 +217,10 @@ def test_method_vs_flinear_on_tpu(compiled):
         r = ref[t].float()
         ulp = torch.exp2(torch.floor(torch.log2(r.abs().clamp_min(2.0**-6))) - 7)
         d_rel = float(((got.float() - r).abs() / ulp).max())
-        print(f"LMHEADPIN t={t} compiled={compiled} off={n}/{d.numel()} max_ulp_floored={d_rel:.1f}")
+        print(
+            f"LMHEADPIN t={t} compiled={compiled} off={n}/{d.numel()} "
+            f"max_ulp_floored={d_rel:.1f}"
+        )
         if t > 64:
             assert n == 0  # XLA's dot inside the op: same bits as F.linear
         else:

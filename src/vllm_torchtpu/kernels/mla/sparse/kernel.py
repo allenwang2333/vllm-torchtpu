@@ -1519,7 +1519,6 @@ SEND_EXCHANGE_FAULTS = (
 # real-token count rides the bounds prefetch after (rank, lane).
 
 
-
 def send_layout_lanes(num_tokens: int, num_heads: int, world: int) -> int:
     """Lane width of the in-kernel lse word build: hi words at lanes
     `[0, T * L)`, lo words at `[T * L, 2 * T * L)`, block-reversed source
@@ -1856,17 +1855,22 @@ def _attention_kernel(
         assert not preserve_suffix and batch_size == num_tokens, (
             "the fused exchange runs on a one-step grid"
         )
+        assert send, "the fused exchange needs the send layout"
+        assert bo_x2_ref is not None and lse_hbm_ref is not None
         xchg_axis, xchg_lane_axis = send_exchange[:2]
         # Rows each destination receives from row SEND_SLAB_ROW0 of its block.
-        xchg_rows = SEND_SLAB_ROW0 + send_rows
+        xchg_rows = SEND_SLAB_ROW0 + send_rows  # pyrefly: ignore[unbound-name]
         xchg_block = SEND_PAD_ROWS + send_rows
         assert bo_x2_ref.shape[2] == xchg_rows, bo_x2_ref.shape
         if xchg_merge:
+            assert recv_v_ref is not None
             assert recv_v_ref.shape == (send_world, xchg_rows, o_dim), recv_v_ref.shape
             assert lse_hbm_ref.shape == (send_rows, o_dim), lse_hbm_ref.shape
             assert lse_hbm_ref.dtype == jnp.int16 and send_rows % 16 == 0
         else:
-            assert lse_hbm_ref.shape == (send_world * xchg_block, o_dim), lse_hbm_ref.shape
+            assert lse_hbm_ref.shape == (send_world * xchg_block, o_dim), (
+                lse_hbm_ref.shape
+            )
 
     start_seq_idx = start_end_seq_idx_ref[0]
     end_seq_idx = start_end_seq_idx_ref[1]
@@ -2346,9 +2350,7 @@ def _attention_kernel(
                 word,
                 jnp.where(r < SEND_SLAB_ROW0 // 2, 0, old),
             )
-            bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :] = pltpu.bitcast(
-                tile, jnp.int16
-            )
+            bo_x2_ref[0, :, pl.ds(0, SEND_PAD_ROWS), :] = pltpu.bitcast(tile, jnp.int16)
             return
         tile = jnp.where(r == SEND_PAD_ROWS // 2 - 1, word, 0)
         assert send_wbuf is not None
@@ -2446,11 +2448,17 @@ def _attention_kernel(
         partial rows streamed into two f32 accumulators."""
         n = send_world
         tl = send_rows
+        assert bo_x2_ref is not None and recv_v_ref is not None
+        assert lse_hbm_ref is not None
         # Trace-time: the lse word row carries row r's hi/lo halves in lanes r
         # and tl + r of one o_dim-wide row, and the lane->sublane select reads
         # the first 128 lanes -- both need these static bounds.
         assert tl <= 128, ("in-kernel merge needs send_rows <= 128", tl)
-        assert 2 * tl <= o_dim, ("in-kernel merge needs 2*send_rows <= o_dim", tl, o_dim)
+        assert 2 * tl <= o_dim, (
+            "in-kernel merge needs 2*send_rows <= o_dim",
+            tl,
+            o_dim,
+        )
         hdr = SEND_PAD_ROWS  # the first int16 tile of a slab (word row inside)
         live = start_end_seq_idx_ref[4] * send_per  # real tokens x L
         r128 = lax.broadcasted_iota(jnp.int32, (tl, 128), 0)
@@ -2467,7 +2475,9 @@ def _attention_kernel(
             # Lanes to sublanes exactly: row r keeps only lane r (a masked max).
             l_cols.append(
                 jnp.max(
-                    jnp.where(r128 == c128, jnp.broadcast_to(l_row, (tl, 128)), -jnp.inf),
+                    jnp.where(
+                        r128 == c128, jnp.broadcast_to(l_row, (tl, 128)), -jnp.inf
+                    ),
                     axis=1,
                     keepdims=True,
                 )
@@ -3116,6 +3126,7 @@ def _attention_kernel(
         if xchg_merge and fault in ("send_peer_misorder", "send_peer_drop"):
             # Test only: a slot nobody writes reads NaN (before any peer can
             # push: they wait for this rank's barrier signal).
+            assert recv_v_ref is not None
             recv_v_ref[...] = jnp.full(recv_v_ref.shape, 0x7FC0, jnp.int16)
         # One grid step: the collective section is unconditional (every rank
         # signals, pushes and counts every block, with or without work).
@@ -3467,9 +3478,10 @@ def sparse_ragged_paged_attention(
         vmem_limit_bytes[, hbm_pin]])` of the (lane, DCP) mesh (the call's
         scoped VMEM, default SEND_EXCHANGE_VMEM_LIMIT_BYTES; which array
         operands are pinned to HBM: True = all (default), False = none, or a
-        tuple of SEND_EXCHANGE_PIN_ROLES), with `send_world` on a bucket the attention grid
-        walks in one step, inside a shard_map: the kernel also runs the DCP
-        exchange (see SEND_SLAB_ROW0) and returns the receive buffer int16
+        tuple of SEND_EXCHANGE_PIN_ROLES), with `send_world` on a bucket the
+        attention grid walks in one step, inside a shard_map: the kernel also
+        runs the DCP exchange (see SEND_SLAB_ROW0) and returns the receive
+        buffer int16
         `[send_world * block, V]` -- `small_all_to_all(send, row0=
         SEND_SLAB_ROW0)`'s, bit for bit, in every row it writes -- in place of
         the send buffer. `send_peer`: int32 [2], this rank's (DCP index,
@@ -4247,7 +4259,11 @@ def sparse_attention_chunk(
         if send_exchange is not None:
             # The fused exchange runs on a one-step grid (the whole bucket).
             assert send_world and lse_fill and batch_size == q.shape[0], (
-                send_world, lse_fill, batch_size, q.shape)
+                send_world,
+                lse_fill,
+                batch_size,
+                q.shape,
+            )
             grid = (1,)
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # q
@@ -4348,9 +4364,7 @@ def sparse_attention_chunk(
                 # Fused exchange: (send, recv, local) DMA semaphores instead.
                 pltpu.SemaphoreType.DMA((3,))
                 if send_exchange is not None
-                else pltpu.VMEM(
-                    (send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16
-                ),
+                else pltpu.VMEM((send_world, SEND_PAD_ROWS, q.shape[-1]), jnp.int16),
                 pltpu.SemaphoreType.DMA(()),
             ]
         elif lse_fill:
@@ -4394,9 +4408,7 @@ def sparse_attention_chunk(
             )
 
         xchg_merge = bool(
-            send_exchange is not None
-            and len(send_exchange) > 4
-            and send_exchange[4]
+            send_exchange is not None and len(send_exchange) > 4 and send_exchange[4]
         )
         if xchg_merge:
             # Merge mode: the receive scratch, the last scratch ref.
@@ -4529,9 +4541,16 @@ def sparse_attention_chunk(
                         else jax.ShapeDtypeStruct(
                             # Fused exchange: the receive buffer, flat.
                             shape=(
-                                int(np.prod(send_layout_shape(
-                                    q.shape[0], num_q_heads, send_world, q.shape[-1]
-                                )[:2])),
+                                int(
+                                    np.prod(
+                                        send_layout_shape(
+                                            q.shape[0],
+                                            num_q_heads,
+                                            send_world,
+                                            q.shape[-1],
+                                        )[:2]
+                                    )
+                                ),
                                 q.shape[-1],
                             ),
                             dtype=jnp.int16,

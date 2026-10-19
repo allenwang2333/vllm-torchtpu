@@ -11,6 +11,7 @@ costs tens of microseconds per line, nothing on the other steps.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 
@@ -54,27 +55,23 @@ def install_fwd_timers() -> list[str]:
     """Wrap the compiled-forward call chain with timers; returns what was
     wrapped. Idempotent. Diagnostic only (TPU_HOST_SCHED_DIAG_STEPS > 0)."""
     targets = []
-    try:
+    with contextlib.suppress(Exception):
         from torch._dynamo.aot_compile import AOTCompiledFunction
 
-        targets += [(AOTCompiledFunction, "__call__", "aot"),
-                    (AOTCompiledFunction, "guard_check", "guard")]
-    except Exception:
-        pass
-    try:
+        targets += [
+            (AOTCompiledFunction, "__call__", "aot"),
+            (AOTCompiledFunction, "guard_check", "guard"),
+        ]
+    with contextlib.suppress(Exception):
         from vllm.compilation.caching import VllmSerializableFunction
 
         targets.append((VllmSerializableFunction, "__call__", "graph"))
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):
         from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
             TorchTpuCompiledExecutable,
         )
 
         targets.append((TorchTpuCompiledExecutable, "__call__", "exe"))
-    except Exception:
-        pass
     done = []
     for cls, attr, name in targets:
         fn = cls.__dict__.get(attr)
@@ -101,7 +98,9 @@ def _proc_stat() -> dict[int, tuple[int, int]]:
 
 def _siblings(cpu: int) -> list[int]:
     try:
-        with open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list") as f:
+        with open(
+            f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ) as f:
             text = f.read().strip()
     except OSError:
         return []
@@ -148,7 +147,9 @@ def _cgroup() -> dict[str, int]:
     for path in _CGROUP_STATS:
         try:
             with open(path) as f:
-                return {k: int(v) for k, v in (line.split() for line in f if line.strip())}
+                return {
+                    k: int(v) for k, v in (line.split() for line in f if line.strip())
+                }
         except (OSError, ValueError):
             continue
     return {}
@@ -165,10 +166,17 @@ class HostSchedDiag:
         self._nvcsw0 = 0
         self._stat0: dict[int, tuple[int, int]] | None = None
         if every > 0 and fwd_timers:
-            logger.warning("HOSTDIAG rank=%d fwd timers: %s", rank, install_fwd_timers())
+            logger.warning(
+                "HOSTDIAG rank=%d fwd timers: %s", rank, install_fwd_timers()
+            )
 
     def _take(self):
-        return (time.monotonic_ns(), _schedstat("/proc/thread-self/schedstat"), _threads(), _cgroup())
+        return (
+            time.monotonic_ns(),
+            _schedstat("/proc/thread-self/schedstat"),
+            _threads(),
+            _cgroup(),
+        )
 
     def tick(self, suffix: str = "") -> str | None:
         """Count one runner step; every `every` steps log and return the line."""
@@ -194,22 +202,32 @@ class HostSchedDiag:
         top = sorted(deltas, reverse=True)[:4]
         thr = cg1.get("nr_throttled", 0) - cg0.get("nr_throttled", 0)
         per = cg1.get("nr_periods", 0) - cg0.get("nr_periods", 0)
-        thr_us = (cg1.get("throttled_usec", cg1.get("throttled_time", 0) // 1000)
-                  - cg0.get("throttled_usec", cg0.get("throttled_time", 0) // 1000))
+        thr_us = cg1.get(
+            "throttled_usec", cg1.get("throttled_time", 0) // 1000
+        ) - cg0.get("throttled_usec", cg0.get("throttled_time", 0) // 1000)
         line = (
-            f"HOSTDIAG rank={self.rank} steps={n} wall_ms/step={(t1 - t0) / 1e6 / n:.3f} "
-            f"main_run_ms/step={(mr1 - mr0) / 1e6 / n:.3f} main_wait_ms/step={(mw1 - mw0) / 1e6 / n:.3f} "
-            f"proc_run_ms/step={prun / 1e6 / n:.3f} proc_wait_ms/step={pwait / 1e6 / n:.3f} "
-            f"threads={len(th1)} cg_throttled={thr}/{per} cg_throttled_ms={thr_us / 1e3:.1f} "
+            f"HOSTDIAG rank={self.rank} steps={n} "
+            f"wall_ms/step={(t1 - t0) / 1e6 / n:.3f} "
+            f"main_run_ms/step={(mr1 - mr0) / 1e6 / n:.3f} "
+            f"main_wait_ms/step={(mw1 - mw0) / 1e6 / n:.3f} "
+            f"proc_run_ms/step={prun / 1e6 / n:.3f} "
+            f"proc_wait_ms/step={pwait / 1e6 / n:.3f} "
+            f"threads={len(th1)} cg_throttled={thr}/{per} "
+            f"cg_throttled_ms={thr_us / 1e3:.1f} "
             f"cpus={len(os.sched_getaffinity(0))} top="
-            + ",".join(f"{name}:{run / 1e6 / n:.2f}/{wait / 1e6 / n:.2f}" for run, wait, name, _ in top)
+            + ",".join(
+                f"{name}:{run / 1e6 / n:.2f}/{wait / 1e6 / n:.2f}"
+                for run, wait, name, _ in top
+            )
         )
         fwd = {k: (v[0], v[1]) for k, v in FWD_TIMERS.items()}
         parts = []
         for k in ("aot", "guard", "graph", "exe"):
             if k in fwd:
                 ns0, c0 = self._fwd0.get(k, (0, 0))
-                parts.append(f"{k}:{(fwd[k][0] - ns0) / 1e6 / n:.3f}/{(fwd[k][1] - c0) / n:.2f}")
+                parts.append(
+                    f"{k}:{(fwd[k][0] - ns0) / 1e6 / n:.3f}/{(fwd[k][1] - c0) / n:.2f}"
+                )
         self._fwd0 = fwd
         try:
             cpu, nvcsw = _thread_cpu_ctx()
@@ -226,7 +244,8 @@ class HostSchedDiag:
             stat = _proc_stat()
             if self._stat0 is not None and cpu >= 0:
                 sib = [
-                    (stat[c][0] - self._stat0[c][0]) / max(1, stat[c][1] - self._stat0[c][1])
+                    (stat[c][0] - self._stat0[c][0])
+                    / max(1, stat[c][1] - self._stat0[c][1])
                     for c in _siblings(cpu)
                     if c in stat and c in self._stat0
                 ]

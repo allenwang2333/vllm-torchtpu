@@ -39,9 +39,9 @@ def _blocks(n, block, seed, dtype=np.int16):
     """[sender, destination, block, V] distinct words per (sender, dest)."""
     rng = np.random.default_rng(seed)
     info = np.iinfo(dtype)
-    return rng.integers(info.min, info.max, size=(n, n, block, V), dtype=np.int64).astype(
-        dtype
-    )
+    return rng.integers(
+        info.min, info.max, size=(n, n, block, V), dtype=np.int64
+    ).astype(dtype)
 
 
 def _run(mesh, body, per_core, ranks, lanes=None):
@@ -219,7 +219,12 @@ def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, block):
 
     def body(x, r, _):
         return a2a.small_all_to_all(
-            x + jnp.int16(1), num_cores=N, axis=AXIS, row0=row0, rank=r, hbm_operand=True
+            x + jnp.int16(1),
+            num_cores=N,
+            axis=AXIS,
+            row0=row0,
+            rank=r,
+            hbm_operand=True,
         )
 
     got = _run(mesh, body, blocks.reshape(N, N * block, V), range(N))
@@ -230,7 +235,9 @@ def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, block):
 
     spec = P(mesh.axis_names)
     fn = jax.jit(
-        jax.shard_map(body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False)
+        jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False
+        )
     )
     args = (
         jax.ShapeDtypeStruct((N * N * block, V), jnp.int16),
@@ -239,5 +246,7 @@ def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, block):
     )
     lowered = fn.lower(*args)
     assert "input_memory_space_colors" in lowered.as_text()
-    staged = custom_call_operands_in_vmem(lowered.compile().as_text(), "small_all_to_all")
+    staged = custom_call_operands_in_vmem(
+        lowered.compile().as_text(), "small_all_to_all"
+    )
     assert staged and not any(staged.values()), staged

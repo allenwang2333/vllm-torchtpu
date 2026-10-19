@@ -230,13 +230,23 @@ def test_skip_unchanged_keeps_every_mask_and_skips_repeats(monkeypatch):
     monkeypatch.setenv("TPU_TOKEN_PADDING_SKIP_UNCHANGED", "1")
     size = 16
     seq = [
-        (4, 4), (4, 4), (4, 4),          # steady b1 decode: no padding rows
-        (3, 4), (3, 4),                  # one padding row
-        (3, 8), (3, 8), (2, 8),          # same end, new start
-        (0, 8), (0, 8),                  # warmup: all padding
-        (8, 8), (16, 16), (9, 2),        # empty ranges: all the same mask
-        (12, 40), (12, 16),              # end past the mask: clamped like a slice
-        (-4, 16), (12, 16),              # negative start indexes from the end
+        (4, 4),
+        (4, 4),
+        (4, 4),  # steady b1 decode: no padding rows
+        (3, 4),
+        (3, 4),  # one padding row
+        (3, 8),
+        (3, 8),
+        (2, 8),  # same end, new start
+        (0, 8),
+        (0, 8),  # warmup: all padding
+        (8, 8),
+        (16, 16),
+        (9, 2),  # empty ranges: all the same mask
+        (12, 40),
+        (12, 16),  # end past the mask: clamped like a slice
+        (-4, 16),
+        (12, 16),  # negative start indexes from the end
         (4, 4),
     ]
     counting = _CountingMask(size)

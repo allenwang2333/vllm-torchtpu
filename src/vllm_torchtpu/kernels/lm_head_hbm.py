@@ -22,8 +22,8 @@ rows lose 4-10 us, and a 2-slot ring loses 8 us.
 Numerics: one dot per tile over the full k, f32 accumulation, cast once to bf16. Not
 bit-identical to XLA's dot: about 1-2 in 10^4 logits differ, by 1-4 bf16 ulp of
 max(|logit|, 2^-6) (no k-chunking or summation order tried reproduces XLA's bits); the
-error against the f64 product matches XLA's. Draft-token use is lossless for the target distribution; the
-target sampler's use needs an accuracy check.
+error against the f64 product matches XLA's. Draft-token use is lossless for the
+target distribution; the target sampler's use needs an accuracy check.
 """
 
 from __future__ import annotations
@@ -45,11 +45,23 @@ VMEM_LIMIT = 32 * 1024 * 1024  # default config: ring 18.9 MB + x / out blocks <
 VMEM_LIMIT_MAX = 56 * 1024 * 1024
 
 # Timing-only and fault-injection variants for the kernel's own tests and benchmark.
-_VARIANTS = (None, "dma_only", "compute_only", "drop_tail", "off", "stale", "xrow", "kdrop")
+_VARIANTS = (
+    None,
+    "dma_only",
+    "compute_only",
+    "drop_tail",
+    "off",
+    "stale",
+    "xrow",
+    "kdrop",
+)
 
 
-def vmem_need(m: int, k: int, n: int, t: int = TILE, nbuf: int = NBUF, item: int = 2) -> int:
-    """Scoped VMEM bytes of one call: the ring plus the double-buffered x and out blocks."""
+def vmem_need(
+    m: int, k: int, n: int, t: int = TILE, nbuf: int = NBUF, item: int = 2
+) -> int:
+    """Scoped VMEM bytes of one call: the ring plus the double-buffered x and out
+    blocks."""
     t = min(t, n)
     return nbuf * t * k * item + 2 * m * k * item + 2 * m * n * item
 
@@ -92,13 +104,17 @@ def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, tiles, nbuf, variant):
             # its last 16 slot rows never written)
             s, r = s + SUBLANE_BF16, r - SUBLANE_BF16
         return pltpu.make_async_copy(
-            w_hbm.at[pl.ds(s, r), :], wbuf.at[j % nbuf, pl.ds(0, r), :], sem.at[j % nbuf]
+            w_hbm.at[pl.ds(s, r), :],
+            wbuf.at[j % nbuf, pl.ds(0, r), :],
+            sem.at[j % nbuf],
         )
 
     compute_only = variant == "compute_only"
     for j in range(min(nbuf, n_tiles)):
         copy(j).start()
-    if compute_only:  # timing only: fetch the first slots once, compute every tile from them
+    if (
+        compute_only
+    ):  # timing only: fetch the first slots once, compute every tile from them
         for j in range(min(nbuf, n_tiles)):
             copy(j).wait()
 
@@ -109,7 +125,9 @@ def _kernel(x_ref, w_hbm, o_ref, wbuf, sem, *, tiles, nbuf, variant):
         if not compute_only:
             copy(j).wait()
         slot = (j + 1) % nbuf if variant == "stale" else j % nbuf
-        if variant == "dma_only":  # timing only: no dot; keep a live sink on the last tile
+        if (
+            variant == "dma_only"
+        ):  # timing only: no dot; keep a live sink on the last tile
             if j == last:
                 rows = min(r, m)
                 o_ref[0:rows, 0:LANE] = wbuf[slot, 0:rows, 0:LANE].astype(o_ref.dtype)
@@ -161,7 +179,9 @@ def _build(m: int, k: int, n: int, dtype, t: int, nbuf: int, variant=None):
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",), vmem_limit_bytes=vmem_limit
         ),
-        name=f"lm_head_hbm_t{t}_b{nbuf}{'_' + variant if variant else ''}_m{m}_k{k}_n{n}",
+        name=(
+            f"lm_head_hbm_t{t}_b{nbuf}{'_' + variant if variant else ''}_m{m}_k{k}_n{n}"
+        ),
     )
 
 

@@ -200,7 +200,9 @@ def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, size):
 
     spec = P(mesh.axis_names)
     fn = jax.jit(
-        jax.shard_map(body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False)
+        jax.shard_map(
+            body, mesh=mesh, in_specs=(spec,) * 3, out_specs=spec, check_vma=False
+        )
     )
     args = (
         jax.ShapeDtypeStruct((N * size,), jnp.int32),
@@ -209,5 +211,7 @@ def test_hbm_operand_is_bitwise_and_not_staged_in_vmem(mesh, size):
     )
     lowered = fn.lower(*args)
     assert "input_memory_space_colors" in lowered.as_text()
-    staged = custom_call_operands_in_vmem(lowered.compile().as_text(), "small_all_gather")
+    staged = custom_call_operands_in_vmem(
+        lowered.compile().as_text(), "small_all_gather"
+    )
     assert staged and not any(staged.values()), staged

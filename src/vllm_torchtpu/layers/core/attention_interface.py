@@ -1178,7 +1178,9 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
             pin = tuple(sorted(p.strip() for p in pins.split("+")))
             bad = set(pin) - set(sparse_mla_kernel.SEND_EXCHANGE_PIN_ROLES)
             if bad:
-                raise ValueError(f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}")
+                raise ValueError(
+                    f"TPU_MLA_FUSED_SMALL_A2A_BUCKETS: unknown roles {bad}"
+                )
         return pin, int(mib) if mib.strip() else envs.TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB
     pin = num_tokens >= envs.TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS
     vmem_mib = (
@@ -1355,7 +1357,9 @@ def sparse_mla_attention_dcp(
             )
         lane_axes = tuple(a for a in mesh.axis_names if a != dcp_axis_name)
         if len(lane_axes) > 1:
-            raise ValueError(f"fused_exchange: at most one lane axis, got {mesh.axis_names}")
+            raise ValueError(
+                f"fused_exchange: at most one lane axis, got {mesh.axis_names}"
+            )
         lane_axis = lane_axes[0] if lane_axes else None
         if fused_merge:
             out_specs = out_specs[:2] + (P(dcp_axis_name, None, None),)  # merged
@@ -1509,6 +1513,7 @@ def sparse_mla_attention_dcp(
                         pin,
                         bool(merge_here),
                     )
+                    assert dcp_lane is not None  # lifted when fused_exchange
                     peer = [dcp_rank.astype(jnp.int32), dcp_lane.astype(jnp.int32)]
                     if merge_here:
                         # The real-token count: the kernel's unpack mask.
@@ -1626,7 +1631,11 @@ def sparse_mla_attention_dcp(
             if merge_here:
                 # The kernel merged: its second output is the merged rows' words.
                 merged = jax.lax.bitcast_convert_type(lse, jnp.bfloat16)
-                return (kv_cache_nope, kv_cache_rope, merged.reshape(num_tokens, per, -1))
+                return (
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    merged.reshape(num_tokens, per, -1),
+                )
             if fused_merge:
                 # Above MERGE_MAX_TOKENS: `lse` is the receive buffer; the unpack
                 # and the merge (its jnp form) run here, in the op.
@@ -1636,7 +1645,11 @@ def sparse_mla_attention_dcp(
                     block - sparse_mla_kernel.SEND_PAD_ROWS,
                 )
                 merged = _cp.merge_received_jax(o_recv, l_recv).astype(jnp.bfloat16)
-                return (kv_cache_nope, kv_cache_rope, merged.reshape(num_tokens, per, -1))
+                return (
+                    kv_cache_nope,
+                    kv_cache_rope,
+                    merged.reshape(num_tokens, per, -1),
+                )
             if not fuse_here:
                 # Below TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: `lse` is the send
                 # buffer, exchanged by the separate small all-to-all + unpack

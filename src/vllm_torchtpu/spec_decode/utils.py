@@ -422,9 +422,7 @@ def install_vocab_parallel_draft_argmax(
     )
 
 
-def with_device_vocab_start(
-    info: VocabParallelArgmax, device
-) -> VocabParallelArgmax:
+def with_device_vocab_start(info: VocabParallelArgmax, device) -> VocabParallelArgmax:
     """`info` with its shard offset as a device int32 scalar.
 
     For a program compiled once and shared across ranks (peer replay): an int
@@ -494,9 +492,9 @@ def vocab_parallel_argmax(
         # bf16 holds every bf16 logit and every integer up to 256, so the id
         # rides as three base-256 digits (vocab < 2**24).
         gid = (local_idx + info.org_vocab_start).to(torch.int32)
-        digits = torch.cat(
-            [gid // 65536, (gid // 256) % 256, gid % 256], dim=-1
-        ).to(torch.bfloat16)
+        digits = torch.cat([gid // 65536, (gid // 256) % 256, gid % 256], dim=-1).to(
+            torch.bfloat16
+        )
         payload = torch.cat(
             [
                 local_max,
@@ -509,9 +507,11 @@ def vocab_parallel_argmax(
             rows, info.tp_size, _ONEHOT_ARGMAX_W
         )
         best_rank = torch.argmax(g[..., 0], dim=1, keepdim=True)
-        d = torch.gather(
-            g[..., 1:4], 1, best_rank.unsqueeze(-1).expand(rows, 1, 3)
-        ).view(rows, 3).to(torch.int32)
+        d = (
+            torch.gather(g[..., 1:4], 1, best_rank.unsqueeze(-1).expand(rows, 1, 3))
+            .view(rows, 3)
+            .to(torch.int32)
+        )
         return d[:, 0] * 65536 + d[:, 1] * 256 + d[:, 2]
     # f32 holds every vocab id exactly (< 2**24) and every bf16 logit.
     pair = torch.cat(
@@ -565,9 +565,7 @@ class ColumnParallelEhProj(torch.nn.Module):
         local = torch.nn.functional.linear(x, self.weight).reshape(-1, n)
         rows = local.shape[0]
         if self.slot is not None:
-            return onehot_all_gather(local, self.slot).reshape(
-                *lead, self.out_features
-            )
+            return onehot_all_gather(local, self.slot).reshape(*lead, self.out_features)
         gathered = tensor_model_parallel_all_gather(local, dim=0)
         return (
             gathered.view(self.tp_size, rows, n)

@@ -656,7 +656,9 @@ def test_streamidx_shared_meta_is_off_for_the_mtp_indexer(monkeypatch, flag):
     assert target is flag
     assert draft is False
     # No config (unit tests building a bare layer): the env alone decides.
-    monkeypatch.setattr(mla_attention_op, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(
+        mla_attention_op, "get_current_vllm_config_or_none", lambda: None
+    )
     assert (
         mla_attention_op._streamidx_shared_meta_for(
             "model.layers.78.self_attn.indexer.k_cache"

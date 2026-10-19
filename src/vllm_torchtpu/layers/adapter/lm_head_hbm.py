@@ -52,7 +52,9 @@ def get_lm_head_op() -> Any:
 
         op = pallas.jax_op("pallas::lm_head_hbm_logits", lm_head_hbm.lm_head_logits)
         op.register_fake(
-            lambda x, w: torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+            lambda x, w: torch.empty(
+                x.shape[0], w.shape[0], dtype=x.dtype, device=x.device
+            )
         )
         _OP = op
     return _OP
@@ -93,7 +95,7 @@ def _refusal(head: Any) -> str | None:
         return "no lm_head"
     if type(head.quant_method) is not UnquantizedEmbeddingMethod:
         return f"quant method {type(head.quant_method).__name__}"
-    w = getattr(head, "weight", None)
+    w: Any = getattr(head, "weight", None)
     if not isinstance(w, torch.Tensor) or w.ndim != 2:
         return "weight is not a 2-D tensor"
     if w.dtype != torch.bfloat16:
@@ -134,16 +136,25 @@ def install_lm_head_hbm(
     if why is not None:
         logger.info("TPU_LM_HEAD_HBM=%s: not installed (%s).", mode, why)
         return 0
+    assert head is not None  # _refusal(None) is a reason
     op = op if op is not None else get_lm_head_op()
     n, k = head.weight.shape
     if mode == "all":
         head.quant_method = HbmLmHeadMethod(op)
-        shared = 0 if draft_model is None else sum(
-            1 for m in draft_model.modules() for c in m._modules.values() if c is head
+        shared = (
+            0
+            if draft_model is None
+            else sum(
+                1
+                for m in draft_model.modules()
+                for c in m._modules.values()
+                if c is head
+            )
         )
         logger.info(
             "Applied TPU patch: TPU_LM_HEAD_HBM=all - lm_head [%d, %d] logits from the "
-            "HBM-streaming kernel at decode row counts (target sampler + %d draft slot(s)).",
+            "HBM-streaming kernel at decode row counts (target sampler + %d draft "
+            "slot(s)).",
             n,
             k,
             shared,

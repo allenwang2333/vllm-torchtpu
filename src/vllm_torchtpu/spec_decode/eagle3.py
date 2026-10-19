@@ -349,17 +349,18 @@ class Eagle3Proposer:
                 self.draft_model
             )
             logger.info("Draft vocab-parallel argmax: %s", self._vocab_parallel_argmax)
-            if self._mtp_fused_loop is not None:
+            if (
+                self._mtp_fused_loop is not None
+                and self._vocab_parallel_argmax is not None
+            ):
                 # Before its first call: the program traces lazily. The shard
                 # offset goes in as a device tensor, not a Python int: an int
                 # is baked into the graph, so every rank traced its own
                 # program and peer replay (TPU_PRECOMPILE_PEER_REPLAY) refused
                 # every other rank's artifact -- each rank compiled every
                 # bucket itself.
-                self._mtp_fused_loop.vocab_parallel_argmax = (
-                    with_device_vocab_start(
-                        self._vocab_parallel_argmax, self.runner.device
-                    )
+                self._mtp_fused_loop.vocab_parallel_argmax = with_device_vocab_start(
+                    self._vocab_parallel_argmax, self.runner.device
                 )
 
         # IndexShare assumes the draft owns its KV cache and advances

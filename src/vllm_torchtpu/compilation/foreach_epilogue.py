@@ -29,7 +29,9 @@ _PAT_IF = re.compile(
     r"^    if orig_inputs\[(\d+)\]\.requires_grad: "
     r"orig_inputs\[(\d+)\]\.detach\(\)\.copy_\(updated_inputs\[(\d+)\]\)$"
 )
-_PAT_ELSE = re.compile(r"^    else: orig_inputs\[(\d+)\]\.copy_\(updated_inputs\[(\d+)\]\)$")
+_PAT_ELSE = re.compile(
+    r"^    else: orig_inputs\[(\d+)\]\.copy_\(updated_inputs\[(\d+)\]\)$"
+)
 _PAT_PLAIN = re.compile(r"^    orig_inputs\[(\d+)\]\.copy_\(updated_inputs\[(\d+)\]\)$")
 
 STATS = {"rewritten": 0, "kept": 0, "pairs": 0}
@@ -87,10 +89,12 @@ def rewrite(source: str) -> str | None:
             f"    _s = [{srcs}]",
             "    for _t in _d:",
             "        if _t.requires_grad:",
-            "            return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
+            "            return _h5b_original_apply_mutations("
+            "orig_inputs, updated_inputs)",
             "    for _t in _s:",
             "        if _t.requires_grad:",
-            "            return _h5b_original_apply_mutations(orig_inputs, updated_inputs)",
+            "            return _h5b_original_apply_mutations("
+            "orig_inputs, updated_inputs)",
             "    torch._foreach_copy_(_d, _s)",
         ]
     )

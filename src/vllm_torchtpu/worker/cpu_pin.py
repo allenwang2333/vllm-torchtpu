@@ -30,6 +30,7 @@ leaves the process unpinned.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import threading
@@ -113,7 +114,9 @@ def node_physical_cores(
         if cpu in seen:
             continue
         sib = parse_cpulist(
-            _read(f"{sys_root}/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
+            _read(
+                f"{sys_root}/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            )
         )
         seen.update(sib)
         if all(s in allowed for s in sib):
@@ -199,10 +202,10 @@ class WorkerCpuPinner:
             except OSError:
                 tids = []
             for t in tids:
-                try:
-                    os.sched_setaffinity(t, self._orig_masks.get(t, self._orig_affinity))
-                except OSError:
-                    pass
+                with contextlib.suppress(OSError):
+                    os.sched_setaffinity(
+                        t, self._orig_masks.get(t, self._orig_affinity)
+                    )
             self._seen.clear()
 
     def _pin(self, tid: int) -> None:
@@ -227,16 +230,16 @@ class WorkerCpuPinner:
                 )
             self.serving_cpus, self.other_cpus = p
             self.node = node
+        assert self.serving_cpus is not None and self.other_cpus is not None
         if self.serving_tid is not None:
             logger.warning(
                 "TPU_WORKER_CPU_PIN: serving thread changed %d -> %d; re-pinning",
                 self.serving_tid,
                 tid,
             )
-            try:
+            # The old serving thread may have exited (OSError).
+            with contextlib.suppress(OSError):
                 os.sched_setaffinity(self.serving_tid, self.other_cpus)
-            except OSError:
-                pass  # the old serving thread exited
         # Other threads first, so nothing new inherits the serving core after
         # the serving thread is pinned (threads spawned later by the serving
         # thread itself are caught by the sweeper).
@@ -271,6 +274,8 @@ class WorkerCpuPinner:
                 tids = [int(t) for t in os.listdir("/proc/self/task")]
             except OSError:
                 return 0
+            if self.other_cpus is None:
+                return 0  # not planned yet
             for t in tids:
                 if t == self.serving_tid or t in self._seen:
                     continue
@@ -283,13 +288,18 @@ class WorkerCpuPinner:
                     pass  # exited
                 self._seen.add(t)
             self._seen &= set(tids)
-            for t in [t for t in self._orig_masks if t not in self._seen and t != self.serving_tid]:
+            for t in [
+                t
+                for t in self._orig_masks
+                if t not in self._seen and t != self.serving_tid
+            ]:
                 del self._orig_masks[t]
         return moved
 
     def _sweep_loop(self) -> None:
         import time
 
+        assert self.other_cpus is not None  # started after the first pin
         os.sched_setaffinity(0, self.other_cpus)
         while True:
             time.sleep(self.sweep_s)
