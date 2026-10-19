@@ -506,7 +506,7 @@ local serverScript = agentx.fill(
     echo "Resolved Ray head address (HEAD_ADDR) as: ${HEAD_ADDR}"
 
     if [ -n "${VLLM_RS_BIN:-}" ]; then
-      VLLM_RS_DST="$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+      VLLM_RS_DST="$(python3 -c 'import importlib.util, os; print(os.path.join(os.path.dirname(importlib.util.find_spec("vllm").origin), "vllm-rs"))')"
       gcloud storage cp "${VLLM_RS_BIN}" "$VLLM_RS_DST" || exit 1
       chmod +x "$VLLM_RS_DST" && echo "Installed vllm-rs from ${VLLM_RS_BIN} at $VLLM_RS_DST: $("$VLLM_RS_DST" --version 2>&1 | head -1)"
     fi
