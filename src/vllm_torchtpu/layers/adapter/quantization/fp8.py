@@ -39,7 +39,6 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, cast
@@ -47,7 +46,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import refine_fp8_moe_block_shape
 from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
@@ -65,6 +63,10 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8MoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -102,7 +104,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -391,18 +393,13 @@ def _quantize_and_format_single_moe_weight(
     w = w.transpose(1, 2).contiguous()
 
     # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
+    # The `unsqueeze(2)` view is backed by the 3-D scale buffer, which
+    # torch_tpu would re-materialize as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. `fresh_buffer` gives the
+    # persistent parameter a plain 4-D buffer of its own.
     if w_scale is not None:
         s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+        w_scale = fresh_buffer(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -517,7 +514,8 @@ def _process_fp8_moe_weights(
     needs_padding = padded_intermediate != unpadded_intermediate
     local_real = padded_intermediate
     if needs_padding:
-        local_real = int(unpadded_intermediate or 0)
+        assert unpadded_intermediate is not None
+        local_real = unpadded_intermediate
 
     if weight_block_size is not None:
         # Validate block alignment
@@ -595,6 +593,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    if layer.w13_weight.device.type == "tpu":
+        # The checkpoint w13 and its scale are dead once the requantized pair
+        # is materialized; rebinding them here returns their HBM before w2's
+        # float32 chunks and output are allocated.
+        synchronize_tensors([w13] if w13_scale is None else [w13, w13_scale])
+        layer.w13_weight.data = w13
+        w13_scale_param.data = w13_scale
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         w2_scale_param.data,
@@ -677,13 +682,18 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             raise NotImplementedError(
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
+        # vLLM v0.31 rejects online quantization in `Fp8Config` and moved it to
+        # the `fp8_per_tensor` shorthand. The TPU path still quantizes BF16
+        # checkpoints online through its own linear/MoE methods, so construct
+        # the parent as serialized and restore the requested mode.
         super().__init__(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
         )
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -837,50 +847,42 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if self.quant_config.is_checkpoint_fp8_serialized and self.block_quant:
             assert self.weight_block_size is not None
             block_n, block_k = self.weight_block_size
-            full_inter = intermediate_size_per_partition * (moe_parallel_config.tp_size)
-            if hidden_size % block_n or hidden_size % block_k:
+            # Both dimensions occur as N and K across w13 and w2. A partial
+            # final checkpoint block cannot be evenly TP-sharded by the
+            # upstream scale loader. Without MoE TP, retain the existing
+            # padded allocation and zero the unused tail after dequantizing.
+            partial_block = any(
+                self.moe.intermediate_size % block for block in (block_n, block_k)
+            )
+            if (
+                hidden_size % block_n
+                or hidden_size % block_k
+                or (partial_block and moe_parallel_config.tp_size > 1)
+            ):
                 raise ValueError(
-                    f"Weight dimensions ({hidden_size=}, {full_inter=}) "
-                    f"must be divisible by block sizes ({block_n=}, {block_k=})."
+                    "FP8 MoE checkpoint dimensions must be divisible by "
+                    f"block size {self.weight_block_size}; got hidden={hidden_size}, "
+                    f"intermediate={self.moe.intermediate_size}"
                 )
-            if moe_parallel_config.tp_size == 1:
+            if partial_block:
                 block_size = max(block_n, block_k)
                 intermediate_size_per_partition = (
                     (intermediate_size_per_partition + block_size - 1)
                     // block_size
                     * block_size
                 )
-                return hidden_size, intermediate_size_per_partition
-            if full_inter % block_n or full_inter % block_k:
-                raise ValueError(
-                    f"Weight dimensions ({hidden_size=}, {full_inter=}) "
-                    f"must be divisible by block sizes ({block_n=}, {block_k=})."
-                )
-            # Upstream's helper puts hidden_dim in the gcd and refuses blocks
-            # under 32. RoutedExperts writes the rounded sizes back onto
-            # moe_config only after this returns, so hand it a shallow copy
-            # (no __post_init__ rerun) carrying the sizes just computed.
-            moe = copy.copy(self.moe)
-            moe.hidden_dim = hidden_size
-            moe.intermediate_size_per_partition = intermediate_size_per_partition
-            refined = refine_fp8_moe_block_shape(moe, self.weight_block_size)
-            if refined is not None:
-                self.moe_block_shape = refined
-                self.weight_scale_refine = (
-                    block_n // refined[0],
-                    block_k // refined[1],
-                )
             elif (
                 intermediate_size_per_partition % block_n
                 or intermediate_size_per_partition % block_k
             ):
-                raise ValueError(
-                    f"{intermediate_size_per_partition=} does not fit the "
-                    f"checkpoint's {block_n}x{block_k} blocks, and no common "
-                    f"block >= 32 divides it together with {hidden_size=}. "
-                    f"Choose a tensor-parallel size whose shard is a multiple "
-                    f"of 32."
-                )
+                # Reuse RoutedExperts' lossless scale refinement before TP
+                # slicing. The CUDA oracle requires blocks >=32; here these
+                # blocks only serve load-time dequantization, so smaller grids
+                # are valid too. Runtime formatting pads each logical shard
+                # to 128 after dequantization, never before checkpoint slicing.
+                block = gcd(block_n, block_k, intermediate_size_per_partition)
+                self.moe_block_shape = [block, block]
+                self.weight_scale_refine = (block_n // block, block_k // block)
         return hidden_size, intermediate_size_per_partition
 
     def create_weights(
@@ -1157,6 +1159,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+            moe_tp_decode_forward,
+            moe_tp_decode_supported,
+        )
+
+        if moe_tp_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return moe_tp_decode_forward(self, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1195,6 +1206,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
+
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+            fused_moe_decode,
+            fused_moe_decode_supported,
+        )
+
+        if fused_moe_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
 
@@ -1578,21 +1599,20 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
         if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
             return  # already flipped; reload paths re-enter this hook
-        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        # Prevent transposing for embedding lookup, keep [vocab_size, hidden_size].
+        is_embedding = isinstance(layer, VocabParallelEmbedding) and not isinstance(
+            layer, ParallelLMHead
+        )
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) or is_embedding
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
-        # The dequant/requant chain may leave views backed by higher-rank PJRT
-        # buffers. Allocate fresh contiguous persistent parameters so the
-        # matmul boundary sees plain row-major buffers.
-        weight = torch.empty(
-            weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
-        ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        # The dequant/requant chain may leave views backed by buffers of a
+        # different shape (e.g. a squeezed [n_out, 1] scale). Give the
+        # persistent parameters buffers of their own shape so the matmul
+        # boundary needs no per-step `tt_jit_as_strided` program.
+        weight = fresh_buffer(weight)
+        weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -1647,10 +1667,28 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        out = quantized_matmul(x, weight, layer.weight_scale)
+        if isinstance(layer, VocabParallelEmbedding):
+            # Prevent the quantization of activations to FP8 (W8A16).
+            out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
+        else:
+            out = quantized_matmul(x, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        layer = cast("TpuLinear", layer)
+        flat = input_.reshape(-1)
+        out_dtype = getattr(layer, "params_dtype", None) or torch.get_default_dtype()
+        w = torch.index_select(layer.weight, 0, flat).to(out_dtype)
+        s = torch.index_select(layer.weight_scale, 0, flat).to(out_dtype).unsqueeze(-1)
+        return (w * s).reshape(*input_.shape, -1)
+
+    def tie_weights(self, layer: torch.nn.Module, embed_tokens: torch.nn.Module):
+        layer.weight = embed_tokens.weight
+        layer.weight_scale = embed_tokens.weight_scale
+        setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
+        return layer
 
 
 def resolve_online_fp8(

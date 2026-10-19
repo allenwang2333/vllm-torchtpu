@@ -17,8 +17,8 @@
 # the launcher's --env flags in `env_args`.
 
 # Must name the tag setup_docker_env.sh pushes, so ask it rather than rebuild
-# the name: it publishes what it pushed as CI_IMAGE_TAG, which is what every
-# bare-metal consumer already reads. Composing the tag here means this file has
+# the name: it publishes what it pushed as CI_IMAGE_TAG, which every
+# consumer reads. Composing the tag here means this file has
 # to track every change to the scheme, and it did not - the tag carries the vLLM
 # commit as well as ours, for registry isolation, so a bare commit SHA names an
 # image that was never pushed. Nothing catches that: the build is green, and it
@@ -26,11 +26,11 @@
 # to sit idle.
 #
 # A step on another variant of the image - the -omni build - names it with
-# DOCKER_IMAGE_SUFFIX, as run_in_docker.sh reads it on bare metal. A step may
+# DOCKER_IMAGE_SUFFIX. A step may
 # also name its own image, which the disagg lane does - it builds one of its
 # own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}}" \
     --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
@@ -42,6 +42,28 @@ if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   exit 2
 fi
 export WORKLOAD_IMAGE
+
+# The image the Kimi-K3 AgentX pair's engines run (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else the one the build
+# published from build_k3_engine_image.sh, else the build's own.
+if [[ -z "${K3_ENGINE_IMAGE:-}" ]]; then
+  K3_ENGINE_IMAGE=$(buildkite-agent meta-data get K3_ENGINE_IMAGE --default "" 2>/dev/null || true)
+fi
+export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
+
+# Whether that pair's pods get the fleet's caches (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else `none` for a
+# megakernel point and empty, which keeps them, for anything else. A megakernel
+# boot needs the host memory the gcsfuse file cache would hold; see the
+# manifest. Tested for set rather than empty, so a step can keep the caches by
+# setting it empty.
+if [[ -z "${K3_FLEET_CACHES+set}" ]]; then
+  case "${K3_PD_CONFIG:-}" in
+    kimi-k3-megakernel*/*) K3_FLEET_CACHES=none ;;
+    *) K3_FLEET_CACHES="" ;;
+  esac
+fi
+export K3_FLEET_CACHES
 
 # Anything exported here must also be named in FORWARD below: the launcher
 # forwards only what --env names.
@@ -71,9 +93,10 @@ FORWARD=(
   # Lets a one-off build force an xprof capture; unset leaves the day rule in
   # benchmark_with_profile.sh to decide.
   CAPTURE_PROFILE
-  # run_in_docker.sh turns CONTAINER_TMPDIR into these two. A DSv4 compile
-  # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
-  # JSON, which is an evicted pod if it lands on ephemeral storage.
+  # Scratch, which steps needing more than the pod's disk point at /dev/shm. A
+  # DSv4 compile writes ~40 GB of inductor cache per host and a capture run
+  # ~30 GB of temp JSON, which is an evicted pod if it lands on ephemeral
+  # storage.
   TMPDIR RAY_TMPDIR
   # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
   # storage. A step that compiles a large model points them at /cache/jax.
@@ -86,7 +109,7 @@ FORWARD=(
   # The P/D benchmark loads its results into BigQuery when this is set.
   BQ_UPLOAD
   # Carries the -m filter into bktec's collection step; see the sharded steps
-  # in pipeline_tests_kube.yml.
+  # in pipeline_tests.yml.
   PYTEST_ADDOPTS
   # Unset on purpose: naming an unset variable is how the launcher is asked to
   # supply it from its env_secrets registry. HF_TOKEN is not here - every pod
@@ -96,6 +119,13 @@ FORWARD=(
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
+  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
+  # and the megakernel recipe: the eval-only job, the eval smoke, and skipping
+  # the post-replay eval.
+  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
+  # The config both engines of the pair and its client read, when a step serves
+  # another than the manifest's default (a Kimi-K3 megakernel recipe point).
+  K3_PD_CONFIG
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

@@ -115,10 +115,10 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
-        # With one or two stages every launch pairs on its own: stage 1's
-        # launch before forward m is stage 0's launch after it.
-        if not self.open or self.stages <= 2:
+        if not self.open:
             return
+        # With two stages the launches pair without pushes; the settle still
+        # goes out and issues stage 0's queued hand-off.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return
@@ -297,8 +297,18 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
+    def take_draft_token_ids(self):
+        # A pipeline admits prefill-only MTP alone (pp_validation): its
+        # drafts exist to fill the draft layer's KV, and no step consumes
+        # them. Asking the workers would also deadlock. The engine asks with
+        # a blocking RPC right after dispatching a step, while a stage can
+        # still sit in that step's hand-off, waiting for a push that only a
+        # wait on the step's future sends.
+        return None
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
+    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",

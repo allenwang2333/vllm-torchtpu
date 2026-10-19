@@ -18,12 +18,14 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
@@ -35,6 +37,8 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
     )
@@ -44,6 +48,21 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
+    """`t` with its leading dim sliced or padded (with `value`) to `rows`.
+
+    `rows` is always a bucket, never the live request count: torch-tpu compiles
+    a program per shape, so an exact-count slice costs a program per count.
+    """
+    n = t.shape[0]
+    if n == rows:
+        return t
+    if n > rows:
+        return t[:rows]
+    pad = [0] * (2 * (t.dim() - 1)) + [0, rows - n]
+    return F.pad(t, pad, value=value)
 
 
 @dataclass
@@ -110,6 +129,38 @@ def _force_draft_tp1():
         tp.rank_in_group = saved_rank
 
 
+def handoff_seed_tokens(
+    device_seed: torch.Tensor, req_ids: list[str], metadata: Any
+) -> torch.Tensor:
+    """Seeds a prefill-only draft's boundary row with the consumer's token.
+
+    A Stage-3 producer drops the last prompt token for the decode peer to
+    compute and samples a throwaway token in its place. The draft layer's KV
+    row at the prompt boundary has to be built from the real continuation,
+    which the send published in this step carries as
+    ``SendMeta.next_prompt_token_id``. Requests without such a send keep the
+    sampled seed.
+    """
+    reqs_to_send = getattr(metadata, "reqs_to_send", None)
+    if not reqs_to_send:
+        return device_seed
+    indices: list[int] = []
+    tokens: list[int] = []
+    for index, req_id in enumerate(req_ids):
+        send = reqs_to_send.get(req_id)
+        token = None if send is None else getattr(send, "next_prompt_token_id", None)
+        if token is not None:
+            indices.append(index)
+            tokens.append(int(token))
+    if not indices:
+        return device_seed
+    seed = device_seed.clone()
+    seed[torch.tensor(indices, dtype=torch.long, device=seed.device)] = torch.tensor(
+        tokens, dtype=seed.dtype, device=seed.device
+    )
+    return seed
+
+
 def gather_sharded_weight(
     sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
@@ -174,7 +225,7 @@ def maybe_share_embeddings(
     force_share: bool = False,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
@@ -184,6 +235,24 @@ def maybe_share_embeddings(
         if target_lm_model is not None
         else None
     )
+
+    if isinstance(target_embed, PPMissingLayer):
+        # DeepseekV2-style targets build embed_tokens only on the first PP stage, so
+        # the draft on the last stage keeps its own checkpoint-loaded embedding.
+        draft_embed = getattr(getattr(draft_model, "model", None), "embed_tokens", None)
+        needs_target = force_share or not getattr(
+            draft_model, "has_own_embed_tokens", True
+        )
+        if draft_embed is None or needs_target:
+            raise RuntimeError(
+                "The target's embed_tokens is not on this pipeline stage and the "
+                "draft has no loaded embed_tokens of its own"
+            )
+        logger.info(
+            "Target embed_tokens is not on this pipeline stage; the draft "
+            "keeps its own embed_tokens."
+        )
+        return
 
     if force_share:
         share_embed = True
@@ -301,7 +370,7 @@ def maybe_share_lm_head(
     materialize_if_mismatched: bool = True,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )

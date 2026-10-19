@@ -50,6 +50,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 
@@ -587,6 +588,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
+            num_spec_tokens=self.num_spec_tokens,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -642,10 +644,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # `fused` is the lazy result of a stack of views, and torch_tpu
         # re-materializes that lineage as a per-step `tt_jit_as_strided`
         # program at the dispatched op's boundary (same failure mode and fix as
-        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
-        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
-        out = torch.empty_like(fused)
-        out.copy_(fused)
+        # the w_scale case in quantization/fp8.py). `fresh_buffer` breaks the
+        # lazy chain so PJRT ships a plain row-major buffer.
+        out = fresh_buffer(fused)
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
@@ -801,17 +802,18 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
             )
-        if metadata.mamba_slot_read_offsets is not None:
-            # Speculative verify needs per-window state checkpoints; the
-            # pooled gather/scatter path keeps a single state per block.
-            raise NotImplementedError(
-                "Speculative decoding is not supported with pooled KDA"
-            )
         state_indices = metadata.mamba_state_indices
         if state_indices is None:
             raise RuntimeError(
                 "Pooled KDA requires mamba_state_indices in the attention metadata"
             )
+        # AttentionMetadata also describes the JAX-side representation. The
+        # builder supplies Torch tensors here, before the Torch-to-JAX bridge.
+        window_distribution = cast(
+            torch.Tensor | None, metadata.mamba_request_distribution
+        )
+        slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
+        ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
@@ -826,4 +828,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             cast(torch.Tensor, state_indices),
             cast(torch.Tensor, metadata.seq_lens),
             cast(torch.Tensor, metadata.request_distribution),
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
         )

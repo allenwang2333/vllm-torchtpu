@@ -199,8 +199,7 @@ run_lm_eval() {
     # our task definitions, not from the model: local-chat-completions leaves
     # the chat template to the server and fingerprints requests with an empty
     # tokenizer name. So they are cached per combination in the shared cache,
-    # $HF_HOME/hub (a gcsfuse bucket on kube, the host's model cache on bare
-    # metal), for every config and later run. lm-eval's own cache key leaves
+    # $HF_HOME/hub (a gcsfuse bucket on kube), for every config and later run. lm-eval's own cache key leaves
     # out --limit, --gen_kwargs and the task YAML contents, so the directory
     # name carries all of it.
     local request_spec=() skip_next=0 arg
@@ -244,7 +243,7 @@ run_lm_eval() {
     # Turning each redraw into its own line makes every TQDM_MININTERVAL tick
     # visible; stdbuf stops tr holding them in a block buffer. pipefail keeps
     # lm_eval's exit status.
-    LM_HARNESS_CACHE_PATH="$request_cache" lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 LM_HARNESS_CACHE_PATH="$request_cache" lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
@@ -278,7 +277,7 @@ run_mm_eval() {
         echo "Arming profiler for multimodal eval ($task)..."
         curl -s -X POST "http://$HOST:$PORT/start_profile" || true
     fi
-    evalscope eval \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 evalscope eval \
         --model "$MODEL" \
         --eval-type openai_api \
         --api-url "http://$HOST:$PORT/v1/chat/completions" \

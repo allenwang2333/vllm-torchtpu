@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -1025,15 +1026,16 @@ class TpuPlatform(Platform):
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
-            if scheduler_config.scheduler_cls != dp_sched_cls:
-                assert scheduler_config.scheduler_cls is None, (
-                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
-                    "scheduler being provided."
-                )
+            if scheduler_config.scheduler_cls is None:
                 scheduler_config.scheduler_cls = dp_sched_cls
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size,
+                )
+            elif scheduler_config.scheduler_cls != dp_sched_cls:
+                logger.warning(
+                    "DP scheduler is off: scheduler %s is configured.",
+                    scheduler_config.scheduler_cls,
                 )
 
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -1062,6 +1064,18 @@ class TpuPlatform(Platform):
                     "on hybrid attention+Mamba models requires the unified "
                     "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"
                 )
+
+    @classmethod
+    def _find_non_ssm_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """First non-SSM attention backend in layer order, or None.
+
+        vLLM v0.31 replaced this helper with `_find_non_ssm_backends`, which
+        lists every distinct backend; the TPU callers need the first one.
+        """
+        backends = cls._find_non_ssm_backends(vllm_config)
+        return backends[0] if backends else None
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
@@ -1257,14 +1271,14 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
-    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
-        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
-        return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
         )
+        return
+    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")

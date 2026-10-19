@@ -16,7 +16,7 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 ## What are you trying to do today?
 
-<div class="grid cards three-columns" markdown>
+<div class="grid cards two-columns" markdown>
 
 - :material-rocket-launch:{ .lg .middle } __I'm New__
 
@@ -42,13 +42,25 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-code-tags:{ .lg .middle } __I Want to Contribute__
 
-    Learn the architecture, run tests & benchmarks, and profile TPU kernels.
+    Contribute code, dive into inference examples, and follow the submission flow.
+
+    [:octicons-arrow-right-24: Inference Examples](api_and_code_examples/offline_inference.md)
 
     [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
 
+    [:octicons-arrow-right-24: Testing & CI](developers_guide/testing_and_ci.md)
+
+    [:octicons-arrow-right-24: Roadmap](roadmap.md)
+
+- :material-lightbulb-on-outline:{ .lg .middle } __I Want to Learn More__
+
+    Learn the architecture, run benchmarks, and profile TPU kernels.
+
     [:octicons-arrow-right-24: Coding Guidance](developers_guide/coding_guidance.md)
 
-    [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
+    [:octicons-arrow-right-24: Benchmarking](developers_guide/benchmarking.md)
+
+    [:octicons-arrow-right-24: Profiling](developers_guide/profiling/index.md)
 
     [:octicons-arrow-right-24: Environment Variables](reference/env_vars.md)
 
@@ -56,4 +68,4 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 ## Contribute
 
-We're always looking for ways to partner with the community to accelerate vLLM TorchTPU development. If you're interested in contributing, check out the [Contributing guide](developers_guide/contributing.md) and [Issues](https://github.com/vllm-project/vllm-torchtpu/issues) to start.
+We're always looking for ways to partner with the community to accelerate vLLM TorchTPU development. If you're interested in contributing, check out the [Contributing guide](developers_guide/contributing.md), the [Roadmap](roadmap.md) for what's planned next, and [Issues](https://github.com/vllm-project/vllm-torchtpu/issues) to start.

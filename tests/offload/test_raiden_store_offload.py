@@ -485,6 +485,7 @@ class TestConstructionGuards(unittest.TestCase):
         config.parallel.dcp_size = 1
         config.parallel.pcp_size = 1
         config.parallel.world_size = 1
+        config.parallel.pp_size = 1
         config.extra_config = {"cpu_bytes_to_use": 1024 * 1024}
         config.worker_kv_bytes_per_block = 1024
         config.groups = []
@@ -1168,6 +1169,11 @@ class _FakeFinishedRequest:
     def is_finished(self):
         return True
 
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return None
+
 
 class TestFinishedRequestStoreBuild(unittest.TestCase):
     """_build_store_jobs on aborted/finished requests, against the real
@@ -1192,7 +1198,13 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
 
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        sched = object.__new__(TPURaidenOffloadingScheduler)
+        class _TestTPURaidenOffloadingScheduler(TPURaidenOffloadingScheduler):
+            def __getattr__(self, name):
+                if name.startswith("__") and name.endswith("__"):
+                    raise AttributeError(name)
+                return None
+
+        sched = object.__new__(_TestTPURaidenOffloadingScheduler)
         sched.config = SchedulerOffloadConfig(
             kv_group_configs=(
                 GroupOffloadConfig(
@@ -1202,6 +1214,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                     hashes_per_chunk=1,
                     kv_event_group_spec=MagicMock(),
                     sliding_window_size_in_chunks=None,
+                    kv_cache_spec=MagicMock(),
+                    manager_cls=MagicMock(),
                 ),
             ),
             blocks_per_chunk=1,
@@ -1251,7 +1265,11 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         )
 
     def _sched_output(self, req_id):
-        return SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={req_id})
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {req_id}
+        return output
 
     def _aborted_setup(self, num_tokens=32, num_computed_tokens=12, num_blocks=3):
         from vllm.v1.request import RequestStatus
@@ -2573,11 +2591,28 @@ def _fake_tpu_sync(impl, kv_cache_manager_cls=None):
     return patch.dict(sys.modules, modules)
 
 
+def _worker_config(bytes_per_block, *, num_blocks=1):
+    """A per-worker KV cache config as the all-ranks recorder reads it."""
+    return SimpleNamespace(
+        num_blocks=num_blocks,
+        hisparse_host_num_blocks=None,
+        kv_cache_tensors=[SimpleNamespace(size=bytes_per_block * num_blocks)],
+    )
+
+
 def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
-    geometry, the block-major contract, and the namespace patched out."""
+    geometry, the block-major contract, and the namespace patched out. Under
+    pipeline parallelism the spec needs the recorded all-ranks bytes, so
+    every worker is recorded at the stub's 4096 bytes per block."""
     from vllm_torchtpu.offload import raiden_store as rs
 
+    if pp_size == 1:
+        rs._all_ranks_kv_bytes_per_block = None
+    elif rs.all_ranks_kv_bytes_per_block() is None:
+        rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(4096)] * (tp_size * pp_size * pcp_size)
+        )
     config = SimpleNamespace(
         extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
         enable_kv_cache_events=False,
@@ -2613,6 +2648,66 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
         patch.object(rs, "derive_offload_namespace", return_value=b"\0" * 16),
     ):
         return rs.TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
+
+class TestAllRanksKvBytesPerBlock(unittest.TestCase):
+    """Host capacity is sized from the bytes behind one block on every rank:
+    the recorded sum over the per-worker configs, or one worker's bytes times
+    the world size when nothing is recorded on a single stage."""
+
+    def setUp(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        patcher = patch.object(rs, "_all_ranks_kv_bytes_per_block", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_records_the_sum_over_unequal_workers(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        total = rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(1024), _worker_config(3072, num_blocks=2)]
+        )
+        self.assertEqual(total, 4096)
+        self.assertEqual(rs.all_ranks_kv_bytes_per_block(), 4096)
+
+    def test_falls_back_to_groups_without_tensors(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        group = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(page_size_bytes=256), layer_names=["a", "b"]
+        )
+        cfg = SimpleNamespace(
+            num_blocks=4,
+            hisparse_host_num_blocks=None,
+            kv_cache_tensors=[],
+            kv_cache_groups=[group],
+            prefix_cacheable_group_ids=(0,),
+        )
+        self.assertEqual(rs.record_all_ranks_kv_bytes_per_block([cfg]), 512)
+
+    def test_capacity_uses_the_recorded_sum(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        # Two stages of 4 ranks: one stage holds twice the bytes per block.
+        rs.record_all_ranks_kv_bytes_per_block(
+            [_worker_config(4096)] * 4 + [_worker_config(8192)] * 4
+        )
+        spec = _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
+        self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // 49152)
+
+    def test_single_stage_without_a_record_uses_the_world_size(self):
+        spec = _build_spec({"cpu_bytes_to_use": 1 << 20})
+        self.assertEqual(spec.offload_logical_blocks_capacity, (1 << 20) // (4096 * 4))
+
+    def test_pipeline_parallel_without_a_record_stops_construction(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch.object(rs, "record_all_ranks_kv_bytes_per_block"),
+            self.assertRaisesRegex(ValueError, "not recorded"),
+        ):
+            _build_spec({"cpu_bytes_to_use": 1 << 20}, pp_size=2)
 
 
 class TestStorageConfig(unittest.TestCase):
