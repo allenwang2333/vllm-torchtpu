@@ -1048,11 +1048,15 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     `send_small_a2a_applies`' `T <= cap` (a power of 2): the rest is static --
     the cap itself at most DECODE_STEP8_TOKENS (a power-of-2 bucket at or
     below it is its own step) and within the small-chunk path. Fixed at trace
-    time on the static bucket size."""
+    time on the static bucket size. The cap is the one that applies at this
+    DCP size (`dcp_mla_topk_cap`: the auto default caps only at DCP >= 8)."""
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+    from vllm_torchtpu.layers.core.attention_interface import dcp_mla_topk_cap
 
     if not (envs.TPU_MLA_FUSED_SMALL_A2A and send_small_a2a_applies(num_tokens)):
         return False
+    group = get_dcp_group()
+    dcp_size = 1 if group is None else int(group.world_size)
     value = envs.TPU_MLA_DECODE_BODY_LEVERS
     levers = (
         sparse_kernel.DECODE_BODY_DEFAULT
@@ -1063,7 +1067,7 @@ def fused_small_a2a_applies(num_tokens: int) -> bool:
     )
     return bool(
         "step8" in levers
-        and envs.TPU_DCP_MLA_TOPK_CAP
+        and dcp_mla_topk_cap(dcp_size)
         and envs.TPU_DCP_MLA_FUSED_PREP
         and envs.TPU_MLA_DECODE_ROW_WIDTHS
         and envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS

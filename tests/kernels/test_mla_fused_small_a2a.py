@@ -67,18 +67,19 @@ def test_gate_buckets():
 
 
 @pytest.mark.parametrize(
-    "key",
+    "key,off",
     [
-        "TPU_MLA_FUSED_SMALL_A2A",
-        "TPU_DCP_MLA_SEND_SMALL_A2A",
-        "TPU_DCP_RANK_OPERAND",
-        "TPU_DCP_MLA_FUSED_PREP",
-        "TPU_MLA_DECODE_ROW_WIDTHS",
-        "TPU_DCP_MLA_TOPK_CAP",
+        # Explicit off values: each of these is on by default on this branch.
+        ("TPU_MLA_FUSED_SMALL_A2A", "0"),
+        ("TPU_DCP_MLA_SEND_SMALL_A2A", "0"),
+        ("TPU_DCP_RANK_OPERAND", "0"),
+        ("TPU_DCP_MLA_FUSED_PREP", "0"),
+        ("TPU_MLA_DECODE_ROW_WIDTHS", ""),
+        ("TPU_DCP_MLA_TOPK_CAP", "0"),
     ],
 )
-def test_gate_off_without(key):
-    assert not _applies(4, **{key: None})
+def test_gate_off_without(key, off):
+    assert not _applies(4, **{key: off})
 
 
 def test_gate_needs_step8():
@@ -143,8 +144,13 @@ def test_bucket_config():
                     os.environ.pop(k, None)
             return ai.fused_small_a2a_bucket_config(tokens)
 
-    # Defaults (M1e): T < 8 unpinned at 16 MiB, T >= 8 everything pinned at 32.
-    assert cfg(4) == (False, 16) and cfg(8) == (True, 32)
+    # The default bucket spec (trial 6): T = 4 pins only the gathered KV at
+    # 16 MiB; T = 8 is not listed and takes the knob defaults.
+    assert cfg(4) == (("kv",), 16) and cfg(8) == (True, 32)
+    # Knob defaults (M1e, no spec): T < 8 unpinned at 16 MiB, T >= 8 everything
+    # pinned at 32.
+    no_spec = {"TPU_MLA_FUSED_SMALL_A2A_BUCKETS": ""}
+    assert cfg(4, **no_spec) == (False, 16) and cfg(8, **no_spec) == (True, 32)
     spec = "4=kv@16,8=kv+tab@32"
     assert cfg(4, TPU_MLA_FUSED_SMALL_A2A_BUCKETS=spec) == (("kv",), 16)
     assert cfg(8, TPU_MLA_FUSED_SMALL_A2A_BUCKETS=spec) == (("kv", "tab"), 32)
@@ -176,9 +182,9 @@ def test_merge_mode_constants():
     assert "send_merge_lo_skip" in sparse_mla.SEND_EXCHANGE_FAULTS
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE", None)
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is True  # default on (trial 6)
+    with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MERGE": "0"}):
         assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is False
-    with mock.patch.dict(os.environ, {"TPU_MLA_FUSED_SMALL_A2A_MERGE": "1"}):
-        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE is True
     with mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", None)
-        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS == 8
+        assert envs.TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS == 4
