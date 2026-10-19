@@ -11,7 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental raw VMEM views; every new view must be overwritten before reading."""
+"""Multi-shape VMEM pool aliasing over physical `(8, 128)`-tiled TPU memory.
+
+Every new view returned by `view()` aliases the underlying flat VMEM buffer and
+must be overwritten before reading.
+
+Why a private Mosaic lowering hook (`lowering._reshape_memref`) is needed:
+public `ref.reshape` lowers to `tpu.memref_reshape`, which reshapes in logical
+row-major order and cannot alias the physical `(8, 128)`-tiled VMEM layout,
+while `ref.bitcast` only changes the element dtype without changing the shape.
+`Reinterpret` lowers instead to `tpu.reinterpret_cast` with an explicit
+`#tpu.tiled` layout attribute followed by `tpu.erase_memref_layout`. The hook is
+installed lazily and idempotently on first call to `view()`.
+"""
 
 import dataclasses
 import math
@@ -30,6 +42,7 @@ class Reinterpret(types.ReshapeTransform):
 
 
 _original = lowering._reshape_memref
+_installed = False
 
 
 def _lower(ref, transform, aval, block_shape):
@@ -66,7 +79,11 @@ def _lower(ref, transform, aval, block_shape):
     return tpu.erase_memref_layout(erased, alias), transform.shape
 
 
-lowering._reshape_memref = _lower
+def _install() -> None:
+    global _installed
+    if not _installed:
+        lowering._reshape_memref = _lower
+        _installed = True
 
 
 def storage_size(shape, dtype):
@@ -78,6 +95,7 @@ def storage_size(shape, dtype):
 
 
 def view(ref, shape, dtype):
+    _install()
     ref = ref.bitcast(dtype)
     # pyrefly: ignore[bad-argument-count]
     return types.TransformedRef(ref.ref, (*ref.transforms, Reinterpret(tuple(shape))))

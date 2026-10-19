@@ -41,6 +41,13 @@ def test_pool_alias_reinterpret_mosaic_lowering():
     from jax._src.lib.mlir import ir
     from jax._src.pallas.mosaic import lowering
 
+    if not pool_alias._installed:
+        assert lowering._reshape_memref is pool_alias._original
+    pool_alias._install()
+    pool_alias._install()
+    assert pool_alias._installed
+    assert lowering._reshape_memref is pool_alias._lower
+
     for dtype, target_shape in [(F32, (16, 256)), (BF16, (32, 256)), (FP8, (64, 256))]:
         nbytes = pool_alias.storage_size(target_shape, jnp.dtype(dtype))
         itemsize = jnp.dtype(dtype).itemsize
