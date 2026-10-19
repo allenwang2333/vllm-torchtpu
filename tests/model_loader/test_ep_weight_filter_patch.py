@@ -99,6 +99,11 @@ def _restore_iterators(monkeypatch):
         "safetensors_weights_iterator",
         default_loader.safetensors_weights_iterator,
     )
+    monkeypatch.setattr(
+        default_loader.DefaultModelLoader,
+        "load_weights",
+        default_loader.DefaultModelLoader.load_weights,
+    )
 
 
 def test_patch_installs_predicate_and_is_idempotent(monkeypatch):
@@ -329,7 +334,9 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     monkeypatch.setattr(
         model_loader_patches,
         "_start_ep_range_prefetch",
-        lambda files, ids, threads, block: prefetches.append((files, ids)),
+        lambda files, ids, threads, block, is_unused=None: prefetches.append(
+            (files, ids)
+        ),
     )
     patch_default_loader_ep_weight_filter()
     iterator = weight_utils.safetensors_weights_iterator
@@ -346,3 +353,282 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     list(iterator([shard], False, "prefetch", local_expert_ids=None))
     assert strategies == ["lazy", "prefetch"]
     assert len(prefetches) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tensors the loading model discards (DefaultModelLoader.load_weights)
+# ---------------------------------------------------------------------------
+
+_STAGE_CHECKPOINT = {
+    "model.language_model.layers.0.weight": 1.0,
+    "model.language_model.layers.1.weight": 2.0,
+    "model.language_model.layers.2.weight": 3.0,
+    "model.language_model.embed_tokens.weight": 4.0,
+    "lm_head.weight": 5.0,
+    "mtp.fc.weight": 6.0,
+}
+# What the stage below loads: layer 1 and the head belong to other stages,
+# and its mapper drops the MTP tensors.
+_STAGE_READS = {
+    "model.language_model.layers.0.weight",
+    "model.language_model.layers.2.weight",
+    "model.language_model.embed_tokens.weight",
+}
+
+
+def _stage_model():
+    """A pipeline stage without layer 1 or the head, loading like vLLM's models."""
+    from vllm.model_executor.models.utils import (
+        AutoWeightsLoader,
+        PPMissingLayer,
+        WeightsMapper,
+    )
+
+    class Stage(torch.nn.Module):
+        hf_to_vllm_mapper = WeightsMapper(
+            orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None}
+        )
+
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList(
+                [
+                    PPMissingLayer() if i == 1 else torch.nn.Linear(2, 2, bias=False)
+                    for i in range(3)
+                ]
+            )
+            self.model.embed_tokens = torch.nn.Embedding(2, 2)
+            self.lm_head = PPMissingLayer()
+            for param in self.parameters():
+                torch.nn.init.zeros_(param)
+
+        def load_weights(self, weights):
+            return AutoWeightsLoader(self).load_weights(
+                weights, mapper=self.hf_to_vllm_mapper
+            )
+
+    return Stage()
+
+
+@pytest.fixture
+def default_loader_filter(tmp_path, monkeypatch):
+    """Installs the patch over a stand-in for vLLM's ``load_weights`` body.
+
+    The stand-in feeds the model from the patched safetensors iterator, as
+    ``DefaultModelLoader.load_weights`` does. Returns the shard, the
+    installed ``load_weights`` and the stand-in, and the names whose
+    ``get_tensor`` ran.
+    """
+    from safetensors.torch import save_file
+    from vllm.model_executor.model_loader import (
+        default_loader,
+        ep_weight_filter,
+        weight_utils,
+    )
+
+    shard = tmp_path / "model-00001.safetensors"
+    save_file(
+        {name: torch.full((2, 2), v) for name, v in _STAGE_CHECKPOINT.items()},
+        str(shard),
+    )
+
+    read_names = []
+    real_safe_open = weight_utils.safe_open
+
+    class _TrackingSafeOpen:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_safe_open(*args, **kwargs)
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def keys(self):
+            return self._inner.keys()
+
+        def get_tensor(self, name):
+            read_names.append(name)
+            return self._inner.get_tensor(name)
+
+    def stand_in(self, model, model_config):
+        model.load_weights(
+            default_loader.safetensors_weights_iterator([str(shard)], False)
+        )
+
+    monkeypatch.setattr(
+        weight_utils, "should_skip_weight", weight_utils.should_skip_weight
+    )
+    monkeypatch.setattr(
+        ep_weight_filter, "should_skip_weight", ep_weight_filter.should_skip_weight
+    )
+    monkeypatch.setattr(weight_utils, "_tpu_ep_filter_patch", False, raising=False)
+    _restore_iterators(monkeypatch)
+    monkeypatch.setattr(default_loader.DefaultModelLoader, "load_weights", stand_in)
+    monkeypatch.setattr(weight_utils, "safe_open", _TrackingSafeOpen)
+    monkeypatch.setattr(model_loader_patches, "_compute_local_expert_ids", lambda: None)
+    patch_default_loader_ep_weight_filter()
+    return (
+        str(shard),
+        default_loader.DefaultModelLoader.load_weights,
+        stand_in,
+        read_names,
+    )
+
+
+def test_load_weights_leaves_other_stages_tensors_unread(default_loader_filter):
+    _, load_weights, stand_in, read_names = default_loader_filter
+
+    stage = _stage_model()
+    load_weights(None, stage, None)
+    assert set(read_names) == _STAGE_READS
+    assert model_loader_patches._default_loader_unused.get() is None
+
+    # The same load without the filter reads every tensor and leaves the
+    # model with the same weights.
+    read_names.clear()
+    reference = _stage_model()
+    stand_in(None, reference, None)
+    assert set(read_names) == set(_STAGE_CHECKPOINT)
+    loaded = dict(stage.named_parameters())
+    for name, param in reference.named_parameters():
+        assert torch.equal(loaded[name], param), name
+    assert torch.equal(loaded["model.layers.2.weight"], torch.full((2, 2), 3.0))
+
+
+def test_load_weights_reads_only_what_a_draft_uses(default_loader_filter):
+    _, load_weights, _, read_names = default_loader_filter
+
+    class Draft(torch.nn.Module):
+        shared_checkpoint_keys = ("embed_tokens",)
+
+        def is_checkpoint_tensor_used(self, name: str) -> bool:
+            return name.startswith("mtp.") or "embed_tokens" in name
+
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    load_weights(None, Draft(), None)
+    # The embedding is borrowed from the target, so it is not read either.
+    assert read_names == ["mtp.fc.weight"]
+
+
+def test_load_weights_without_droppable_tensors_reads_everything(
+    default_loader_filter,
+):
+    _, load_weights, _, read_names = default_loader_filter
+
+    class Plain(torch.nn.Module):
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    load_weights(None, Plain(), None)
+    assert set(read_names) == set(_STAGE_CHECKPOINT)
+
+
+def test_prefetch_under_the_unused_tensor_filter_reads_only_used_ranges(
+    default_loader_filter, monkeypatch
+):
+    from vllm.model_executor.model_loader import weight_utils
+
+    shard, _, _, _ = default_loader_filter
+    is_unused = model_loader_patches._unused_checkpoint_tensor_predicate(_stage_model())
+    assert is_unused is not None
+
+    base, header = _header(shard)
+    covered = set()
+    for lo, hi in _local_tensor_ranges(shard, None, is_unused):
+        covered.update(range(lo, hi))
+    for name, info in header.items():
+        span = set(range(*(base + o for o in info["data_offsets"])))
+        assert (span <= covered) is (name in _STAGE_READS), name
+        assert span <= covered or not span & covered, name
+
+    prefetches = []
+    monkeypatch.setattr(
+        model_loader_patches,
+        "_start_ep_range_prefetch",
+        lambda files, ids, threads, block, is_unused=None: prefetches.append(
+            (files, ids, is_unused)
+        ),
+    )
+    token = model_loader_patches._default_loader_unused.set(is_unused)
+    try:
+        names = {
+            name
+            for name, _ in weight_utils.safetensors_weights_iterator(
+                [shard], False, "prefetch"
+            )
+        }
+    finally:
+        model_loader_patches._default_loader_unused.reset(token)
+    assert prefetches == [([shard], None, is_unused)]
+    assert names == _STAGE_READS
+
+
+def test_checkpoint_read_plan_counts_tensors_and_bytes(tmp_path):
+    shard = _save_shard(tmp_path)
+
+    plan = model_loader_patches._checkpoint_read_plan(
+        [shard], {0}, lambda name: "self_attn" in name
+    )
+
+    # Expert 0's packed weight and scale are read; experts 5 and 6 and
+    # expert 7's scale belong to other ranks; the model drops the attention.
+    assert plan == {"read": (2, 68), "non_local_expert": (3, 132), "unused": (1, 64)}
+
+
+def test_qwen35_pipeline_stage_reads_its_layers_and_the_embedding():
+    """Stage 0 of Qwen3.5-397B under VLLM_PP_LAYER_PARTITION=8,8,8,8,8,8,8,4.
+
+    The module tree mirrors ``Qwen3_5MoeForConditionalGeneration`` with
+    ``--language-model-only`` (the vision tower is a ``StageMissingLayer``)
+    and the model's own ``hf_to_vllm_mapper``; names are the checkpoint's.
+    """
+    from vllm.model_executor.models.qwen3_5 import (
+        Qwen3_5MoeForConditionalGeneration,
+    )
+    from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
+
+    class StageZero(torch.nn.Module):
+        hf_to_vllm_mapper = Qwen3_5MoeForConditionalGeneration.hf_to_vllm_mapper
+
+        def __init__(self):
+            super().__init__()
+            self.visual = StageMissingLayer("image", torch.nn.Linear(1, 1))
+            self.language_model = torch.nn.Module()
+            text = torch.nn.Module()
+            text.embed_tokens = torch.nn.Embedding(1, 1)
+            text.layers = torch.nn.ModuleList(
+                [
+                    torch.nn.Linear(1, 1) if i < 8 else PPMissingLayer()
+                    for i in range(60)
+                ]
+            )
+            text.norm = PPMissingLayer()
+            self.language_model.model = text
+            self.language_model.lm_head = PPMissingLayer()
+
+    is_unused = model_loader_patches._unused_checkpoint_tensor_predicate(StageZero())
+    assert is_unused is not None
+    for name in (
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.language_model.layers.3.mlp.experts.511.down_proj.weight_scale_inv",
+        "model.language_model.layers.7.self_attn.q_proj.weight",
+        "model.language_model.embed_tokens.weight",
+    ):
+        assert not is_unused(name), name
+    for name in (
+        "model.language_model.layers.8.mlp.experts.0.up_proj.weight",
+        "model.language_model.layers.43.mlp.shared_expert.gate_proj.weight",
+        "model.language_model.layers.59.self_attn.o_proj.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
+        "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+        "mtp.fc.weight",
+        "model.visual.blocks.0.attn.qkv.weight",
+    ):
+        assert is_unused(name), name

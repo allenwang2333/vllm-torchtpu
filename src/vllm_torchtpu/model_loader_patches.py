@@ -38,6 +38,15 @@ local-files path: ``should_skip_weight`` only matches names ending in
 per-expert tensors. The patch replaces the predicate with one whose suffix
 allowlist also covers ``.weight_packed`` and ``.weight_scale``.
 
+Both paths also leave unread the tensors the loading model's ``load_weights``
+discards (``_unused_checkpoint_tensor_predicate``): the Run:AI patch drops
+them from its fetch plan, and inside ``DefaultModelLoader.load_weights`` the
+predicate above skips them before ``get_tensor``. safetensors' ``get_tensor``
+faults in the first page of every tensor it returns, which on a disk with a
+large read-ahead reads most of the tensor; a pipeline stage that lets every
+tensor reach ``load_weights`` and drops the other stages' layers there reads
+the whole checkpoint.
+
 Divergence from upstream noted: upstream deliberately keeps every expert's
 scale tensors because some GPU backends reduce a global activation-scale
 max across experts. The TPU compressed-tensors MoE methods consume scales
@@ -59,7 +68,8 @@ import threading
 import time
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
-from typing import Protocol, runtime_checkable
+from contextvars import ContextVar
+from typing import Protocol, cast, runtime_checkable
 
 import torch
 
@@ -117,14 +127,27 @@ def _should_skip_weight_tpu(
 ) -> bool:
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
-    Same contract as upstream (``local_expert_ids=None`` means no
+    Same contract as upstream (``local_expert_ids=None`` means no expert
     filtering), but the suffix allowlist also covers the compressed-tensors
     MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read.
+    experts are skipped before their bytes are read. Inside
+    ``DefaultModelLoader.load_weights`` it also skips the tensors the model
+    being loaded discards.
     """
-    if local_expert_ids is None:
-        return False
-    return _should_skip(weight_name, local_expert_ids)
+    return _skip_before_read(
+        weight_name, local_expert_ids, _default_loader_unused.get()
+    )
+
+
+def _skip_before_read(
+    name: str,
+    local_expert_ids: set[int] | None,
+    is_unused: Callable[[str], bool] | None,
+) -> bool:
+    """Reports whether checkpoint tensor ``name`` stays unread on this rank."""
+    if is_unused is not None and is_unused(name):
+        return True
+    return local_expert_ids is not None and _should_skip(name, local_expert_ids)
 
 
 def _compute_local_expert_ids() -> set[int] | None:
@@ -257,6 +280,14 @@ def _unused_checkpoint_tensor_predicate(
         return name.startswith(missing)
 
     return unused
+
+
+# The unused-tensor predicate of the model ``DefaultModelLoader.load_weights``
+# is loading, set for the duration of that call. vLLM's safetensors iterators
+# run inside it and ask ``should_skip_weight`` before every ``get_tensor``.
+_default_loader_unused: ContextVar[Callable[[str], bool] | None] = ContextVar(
+    "default_loader_unused", default=None
+)
 
 
 class _OnlineFp8LayerFinisher:
@@ -587,7 +618,7 @@ def patch_runai_sharded_expert_streaming() -> None:
 
 
 def patch_default_loader_ep_weight_filter() -> None:
-    """Widen ``DefaultModelLoader``'s EP weight filter to MXFP4 names.
+    """Make ``DefaultModelLoader`` read only the tensors this rank loads.
 
     vLLM 0.27.0's ``should_skip_weight`` only skips names ending in
     ``.weight``; a compressed-tensors MXFP4 checkpoint stores per-expert
@@ -596,7 +627,11 @@ def patch_default_loader_ep_weight_filter() -> None:
     predicate by value, so both module references are replaced. When the
     loader passes ``local_expert_ids=None`` (upstream's flag is off), the
     iterator derives them with ``_compute_local_expert_ids``, which also
-    honors TPU_ENABLE_EP_WEIGHT_FILTER; None from there keeps everything.
+    honors TPU_ENABLE_EP_WEIGHT_FILTER; None from there keeps every expert.
+    ``DefaultModelLoader.load_weights`` also publishes the loading model's
+    unused-tensor predicate (``_default_loader_unused``), which the
+    replacement predicate applies to every name: a pipeline stage leaves the
+    other stages' layers unread, an MTP draft everything but its own tensors.
     """
     from vllm.model_executor.model_loader import (
         default_loader,
@@ -608,6 +643,19 @@ def patch_default_loader_ep_weight_filter() -> None:
         return
     weight_utils.should_skip_weight = _should_skip_weight_tpu
     ep_weight_filter.should_skip_weight = _should_skip_weight_tpu
+
+    # vLLM's tracing decorator hides the method's parameters from the checker.
+    original_load_weights = cast(
+        Callable[..., None], default_loader.DefaultModelLoader.load_weights
+    )
+
+    @functools.wraps(original_load_weights)
+    def load_weights(self, model, model_config):
+        token = _default_loader_unused.set(_unused_checkpoint_tensor_predicate(model))
+        try:
+            return original_load_weights(self, model, model_config)
+        finally:
+            _default_loader_unused.reset(token)
 
     # With the filter on, upstream's "prefetch" strategy still reads whole
     # files: rank r reads sorted_files[r::world_size] in full, every expert
@@ -632,9 +680,17 @@ def patch_default_loader_ep_weight_filter() -> None:
                 # No current vLLM config (a load outside engine setup) or a
                 # vLLM without the filter fields: read every tensor.
                 local_expert_ids = None
-        if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
+        is_unused = _default_loader_unused.get()
+        sorted_files = sorted(hf_weights_files, key=weight_utils._natural_sort_key)
+        if is_unused is not None:
+            _log_read_plan(
+                sorted_files, local_expert_ids, is_unused, safetensors_load_strategy
+            )
+        if safetensors_load_strategy == "prefetch" and (
+            local_expert_ids is not None or is_unused is not None
+        ):
             _start_ep_range_prefetch(
-                sorted(hf_weights_files, key=weight_utils._natural_sort_key),
+                sorted_files,
                 local_expert_ids,
                 kwargs.get(
                     "safetensors_prefetch_num_threads",
@@ -644,6 +700,7 @@ def patch_default_loader_ep_weight_filter() -> None:
                     "safetensors_prefetch_block_size",
                     weight_utils.DEFAULT_SAFETENSORS_PREFETCH_BLOCK_SIZE,
                 ),
+                is_unused=is_unused,
             )
             safetensors_load_strategy = "lazy"
         return original_iterator(
@@ -654,28 +711,90 @@ def patch_default_loader_ep_weight_filter() -> None:
             **kwargs,
         )
 
+    default_loader.DefaultModelLoader.load_weights = load_weights
     weight_utils.safetensors_weights_iterator = safetensors_weights_iterator
     default_loader.safetensors_weights_iterator = safetensors_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
         "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, and prefetch reads only "
-        "local tensors (DefaultModelLoader)."
+        ".weight_packed/.weight_scale/.scale, tensors the model does not load "
+        "are not read, and prefetch reads only local tensors (DefaultModelLoader)."
+    )
+
+
+def _safetensors_header(path: str) -> tuple[int, dict]:
+    """Returns the data section's file offset and the tensor entries of ``path``."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return 8 + header_len, header
+
+
+def _checkpoint_read_plan(
+    sorted_files: list[str],
+    local_expert_ids: set[int] | None,
+    is_unused: Callable[[str], bool],
+) -> dict[str, tuple[int, int]]:
+    """Counts the tensors and bytes this rank reads and leaves unread.
+
+    Keys are ``read``, ``non_local_expert`` and ``unused``; values are
+    (tensors, bytes). Classified in the order ``_skip_before_read`` applies.
+    """
+    plan = {"read": [0, 0], "non_local_expert": [0, 0], "unused": [0, 0]}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(sorted_files)))) as ex:
+        headers = list(ex.map(_safetensors_header, sorted_files))
+    for _, header in headers:
+        for name, info in header.items():
+            if is_unused(name):
+                kind = "unused"
+            elif local_expert_ids is not None and _should_skip(name, local_expert_ids):
+                kind = "non_local_expert"
+            else:
+                kind = "read"
+            plan[kind][0] += 1
+            plan[kind][1] += info["data_offsets"][1] - info["data_offsets"][0]
+    return {kind: (n, size) for kind, (n, size) in plan.items()}
+
+
+def _log_read_plan(
+    sorted_files: list[str],
+    local_expert_ids: set[int] | None,
+    is_unused: Callable[[str], bool],
+    strategy: str | None,
+) -> None:
+    """Logs ``_checkpoint_read_plan``; a header it cannot parse skips the log."""
+    try:
+        plan = _checkpoint_read_plan(sorted_files, local_expert_ids, is_unused)
+    except Exception:
+        logger.warning("[default-load] read plan unavailable", exc_info=True)
+        return
+    logger.info(
+        "[default-load] reading %d tensors (%.1f GB) from %d files; skipping "
+        "%d non-local expert tensors (%.1f GB) and %d tensors the model does "
+        "not load (%.1f GB) before get_tensor (strategy %s)",
+        plan["read"][0],
+        plan["read"][1] / 1e9,
+        len(sorted_files),
+        plan["non_local_expert"][0],
+        plan["non_local_expert"][1] / 1e9,
+        plan["unused"][0],
+        plan["unused"][1] / 1e9,
+        strategy or "auto",
     )
 
 
 def _local_tensor_ranges(
-    path: str, local_expert_ids: set[int]
+    path: str,
+    local_expert_ids: set[int] | None,
+    is_unused: Callable[[str], bool] | None = None,
 ) -> list[tuple[int, int]]:
     """Merged [start, end) file offsets of the tensors this rank keeps."""
-    with open(path, "rb") as f:
-        (header_len,) = struct.unpack("<Q", f.read(8))
-        header = json.loads(f.read(header_len))
-    base = 8 + header_len
+    base, header = _safetensors_header(path)
     spans = sorted(
         (base + v["data_offsets"][0], base + v["data_offsets"][1])
         for name, v in header.items()
-        if name != "__metadata__" and not _should_skip(name, local_expert_ids)
+        if not _skip_before_read(name, local_expert_ids, is_unused)
     )
     merged: list[list[int]] = []
     for start, end in spans:
@@ -688,9 +807,10 @@ def _local_tensor_ranges(
 
 def _start_ep_range_prefetch(
     sorted_files: list[str],
-    local_expert_ids: set[int],
+    local_expert_ids: set[int] | None,
     num_threads: int,
     block_size: int,
+    is_unused: Callable[[str], bool] | None = None,
 ) -> None:
     """Read this rank's tensors into the page cache in a background thread.
 
@@ -708,7 +828,7 @@ def _start_ep_range_prefetch(
             for path in sorted_files:
                 fd = os.open(path, os.O_RDONLY)
                 fds.append(fd)
-                for lo, hi in _local_tensor_ranges(path, local_expert_ids):
+                for lo, hi in _local_tensor_ranges(path, local_expert_ids, is_unused):
                     jobs.extend(
                         (fd, off, min(block_size, hi - off))
                         for off in range(lo, hi, block_size)
@@ -733,10 +853,11 @@ def _start_ep_range_prefetch(
                 os.close(fd)
 
     logger.info(
-        "[ep-prefetch] started: %d files, %d local experts, num_threads=%d, "
-        "block_size=%d bytes",
+        "[ep-prefetch] started: %d files, %s local experts, unused-tensor "
+        "filter %s, num_threads=%d, block_size=%d bytes",
         len(sorted_files),
-        len(local_expert_ids),
+        "all" if local_expert_ids is None else len(local_expert_ids),
+        "on" if is_unused is not None else "off",
         num_threads,
         block_size,
     )
