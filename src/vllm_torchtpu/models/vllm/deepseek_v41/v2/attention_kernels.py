@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
     indexer,
@@ -1291,8 +1292,10 @@ def initialize_paged_attention():
     _attention_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=cast(Any, (P(),) * 6 + (None, P())),
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P()))
+        ),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1322,8 +1325,10 @@ def initialize_paged_attention():
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=cast(Any, (P(),) * 8 + (None, P())),
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P()))
+        ),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1341,8 +1346,10 @@ def initialize_paged_attention():
     _gather_bf16_op = pallas.jax_op(
         "pallas::dsv41v2_gather_bf16_kv",
         gather_bf16_kv_jax,
-        mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 3 + (None,)),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 3 + (None,))
+        ),
     )
     _gather_bf16_op.register_fake(
         lambda pool, pool_hi, records, dim: pool.new_empty(
@@ -1384,8 +1391,10 @@ def initialize_paged_attention():
     _gather_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_gather_fp8_kv",
         gather_fp8_bridge,
-        mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 8 + (None,) * 3),
+        mesh=get_kernel_mesh(tp_mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None,) * 3)
+        ),
     )
 
     def fake_gather_fp8(
@@ -1567,8 +1576,11 @@ def initialize_paged_attention():
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
-        mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
+        mesh=get_kernel_mesh(tp_mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
+        ),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1623,8 +1635,11 @@ def initialize_paged_attention():
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
-        mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
+        mesh=get_kernel_mesh(tp_mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
+        ),
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1845,8 +1860,11 @@ def initialize_paged_attention():
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
-        mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
+        mesh=get_kernel_mesh(tp_mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
+        ),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1924,8 +1942,11 @@ def initialize_paged_attention():
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
-        mesh=tp_mesh,
-        input_partition_specs=cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
+        mesh=get_kernel_mesh(tp_mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
+        ),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
@@ -2541,7 +2562,15 @@ def _decode_select(
 
 
 def _prefill_score(
-    q, weights, pool, records, limit, *, page_records, halfplane: bool = False
+    q,
+    weights,
+    pool,
+    records,
+    limit,
+    *,
+    page_records,
+    halfplane: bool = False,
+    scheduling_group_id: int | None = None,
 ):
     """Resident-query scorer, manually replicated across the wrapper mesh."""
     from jax.sharding import PartitionSpec as P
@@ -2562,6 +2591,7 @@ def _prefill_score(
             key_tile=prefill_tuning.KEY_TILE,
             records=records,
             halfplane=halfplane,
+            scheduling_group_id=scheduling_group_id,
         )
 
     try:
@@ -2573,7 +2603,7 @@ def _prefill_score(
     )(q, weights, pool, records, limit)
 
 
-def _prefill_top_k(scores, lengths):
+def _prefill_top_k(scores, lengths, *, scheduling_group_id: int | None = None):
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -2581,7 +2611,9 @@ def _prefill_top_k(scores, lengths):
     )
 
     def select(s, n):
-        ids = streaming_topk.streaming_topk(s, valid_lengths=n, k=512)
+        ids = streaming_topk.streaming_topk(
+            s, valid_lengths=n, k=512, scheduling_group_id=scheduling_group_id
+        )
         values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
         ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
         return _compact_selected(ids)
@@ -2924,7 +2956,7 @@ def paged_indexer_jax(
                     return (*values[:-1], local_requests, row_records)
                 return (*values, records)
 
-            def score(args):
+            def score(args, scheduling_group_id: int | None = None):
                 queries, row_weights, row_lengths, _, row_requests, row_records = args
                 if use_prefill:
                     # The outer route proves every live query shares a request.
@@ -2941,6 +2973,7 @@ def paged_indexer_jax(
                         jnp.max(row_lengths, keepdims=True),
                         page_records=page_records,
                         halfplane=halfplane,
+                        scheduling_group_id=scheduling_group_id,
                     )
                 else:
                     scores = paged_index_scores_jax(
@@ -2957,10 +2990,12 @@ def paged_indexer_jax(
                     jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
                 )
 
-            def select(i, scores):
+            def select(i, scores, scheduling_group_id: int | None = None):
                 _, _, row_lengths, row_candidates, _, _ = prepare(i)
                 if use_prefill:
-                    selected = _prefill_top_k(scores, row_lengths)
+                    selected = _prefill_top_k(
+                        scores, row_lengths, scheduling_group_id=scheduling_group_id
+                    )
                     return selected, row_candidates
                 return select_indices_jax(
                     scores,
@@ -3428,8 +3463,10 @@ def initialize_indexer():
         "pallas::dsv41v2_exact_indexer",
         update_and_select_jax,
         donate_argnums=(1,),
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 10 + (None,) * 8,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 8
+        ),
     )
 
     def fake(
@@ -3465,8 +3502,10 @@ def initialize_indexer():
         "pallas::dsv41v2_exact_indexer_2bank",
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 8,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 8
+        ),
     )
 
     def fake_2bank(

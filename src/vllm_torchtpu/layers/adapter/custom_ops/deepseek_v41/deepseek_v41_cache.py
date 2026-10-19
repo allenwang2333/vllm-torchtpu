@@ -7,6 +7,7 @@ from typing import Any, NamedTuple, cast
 import jax
 import torch
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
 ROW_BYTES = ROW_WORDS * 4
@@ -305,8 +306,10 @@ def initialize_cache_ops():
     _read_values_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_read_values",
         read_cache_values,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), None, None, None, None, None),
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(), P(), None, None, None, None, None)
+        ),
     )
     _read_values_op.register_fake(
         lambda cache, slots, elements, fp32, *geometry: cache.new_empty(
@@ -316,8 +319,8 @@ def initialize_cache_ops():
     _write_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_write",
         _scatter_rows,
-        mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P()),
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -346,8 +349,10 @@ def initialize_cache_ops():
         "pallas::deepseek_v41_cache_write_values",
         write_values,
         donate_argnums=(0,),
-        mesh=mesh,
-        input_partition_specs=(P(), P(), P(), None, None, None),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(), P(), P(), None, None, None)
+        ),
     )
     _write_values_op.register_fake(
         lambda cache, slots, values, *geometry: torch.empty_like(cache)

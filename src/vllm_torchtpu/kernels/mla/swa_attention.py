@@ -36,135 +36,176 @@ def supports_swa(q: jax.Array, records: jax.Array) -> bool:
 
 
 def _kernel(
-    q_ref, kv_ref, mask_ref, sink_ref, out_ref, *, scale, query_tile, interpret
+    q_ref,
+    kv_ref,
+    mask_ref,
+    sink_ref,
+    out_ref,
+    *,
+    scale,
+    query_tile,
+    interpret,
 ):
     total_queries, heads, dim = q_ref.shape
     groups, queries, keys = mask_ref.shape
     rows = pl.cdiv(query_tile * heads, 16) * 16
-    stride = rows // 4
     tiles = total_queries // query_tile
 
-    def permute(x, *, inverse):
-        order = jnp.concatenate(
-            [
-                start + 2 * jnp.arange(128) + parity
-                for start in (0, 256)
-                for parity in (0, 1)
-            ]
-        )
-        matrix = (order[:, None] == jnp.arange(512)[None, :]).astype(x.dtype)
-        if not inverse:
-            matrix = matrix.T
-        if interpret:
-            return jnp.dot(x, matrix, preferred_element_type=jnp.float32).astype(
-                x.dtype
+    def compute(*accumulators):
+        def permute(x, *, inverse):
+            order = jnp.concatenate(
+                [
+                    start + 2 * jnp.arange(128) + parity
+                    for start in (0, 256)
+                    for parity in (0, 1)
+                ]
             )
-        for k in range(2):
-            for mxu in range(2):
-                pltpu.matmul_push_rhs(
-                    matrix[k * 256 : (k + 1) * 256, mxu * 256 : (mxu + 1) * 256], 0, mxu
+            matrix = (order[:, None] == jnp.arange(512)[None, :]).astype(x.dtype)
+            if not inverse:
+                matrix = matrix.T
+            if interpret:
+                return jnp.dot(x, matrix, preferred_element_type=jnp.float32).astype(
+                    x.dtype
                 )
-                pltpu.matmul_acc_lhs(4 * stride, x[:, k * 256 : (k + 1) * 256], mxu, 0)
-        return jnp.concatenate(
-            [
-                pltpu.matmul_pop(4 * stride, (x.shape[0], 256), jnp.float32, mxu)
-                for mxu in range(2)
-            ],
-            axis=1,
-        ).astype(x.dtype)
 
-    def load_kv(group):
-        mask = mask_ref[group]
-        used = mask.astype(jnp.int32).sum(0)[:, None] > 0
-        kv = jnp.concatenate([kv_ref[part, group] for part in range(4)], axis=1)
-        kv = jnp.where(used, kv, 0)
-        if queries != 1:
-            kv = permute(kv, inverse=True)
-        return jnp.pad(jnp.where(used, kv, 0), ((0, 256 - keys), (0, 0)))
+            def compute(*permutation_accumulators):
+                for k in range(2):
+                    for mxu in range(2):
+                        pltpu.matmul_push_rhs(
+                            matrix[
+                                k * 256 : (k + 1) * 256, mxu * 256 : (mxu + 1) * 256
+                            ],
+                            0,
+                            mxu,
+                        )
+                        pltpu.matmul_acc_lhs(
+                            permutation_accumulators[mxu],
+                            x[:, k * 256 : (k + 1) * 256],
+                            0,
+                        )
+                return jnp.concatenate(
+                    [
+                        pltpu.matmul_pop(permutation_accumulators[mxu])
+                        for mxu in range(2)
+                    ],
+                    axis=1,
+                ).astype(x.dtype)
 
-    shared_kv = load_kv(0) if queries != 1 else None
+            return pl.run_scoped(
+                compute,
+                *(pltpu.ACC(mxu)((x.shape[0], 256), jnp.float32) for mxu in range(2)),
+            )
 
-    def get_kv(i):
-        if queries == 1:
-            return load_kv(i)
-        assert shared_kv is not None
-        return shared_kv
+        def load_kv(group):
+            mask = mask_ref[group]
+            used = mask.astype(jnp.int32).sum(0)[:, None] > 0
+            kv = jnp.concatenate([kv_ref[part, group] for part in range(4)], axis=1)
+            kv = jnp.where(used, kv, 0)
+            if queries != 1:
+                kv = permute(kv, inverse=True)
+            return jnp.pad(jnp.where(used, kv, 0), ((0, 256 - keys), (0, 0)))
 
-    def query(i):
-        q = q_ref[pl.ds(i * query_tile, query_tile), :, :].reshape(-1, dim)
-        q = jnp.pad(q, ((0, rows - query_tile * heads), (0, 0)))
-        return permute(q, inverse=False) if queries == 1 else q
+        shared_kv = load_kv(0) if queries != 1 else None
 
-    def launch_qk(i):
-        q = query(i)
-        kv = get_kv(i)
-        for k in range(2):
-            ks = slice(k * 256, (k + 1) * 256)
-            pltpu.matmul_push_rhs(kv[:, ks], 0, 0, transpose=True)
-            pltpu.matmul_acc_lhs((i % 2) * stride, q[:, ks], 0, 0)
+        def get_kv(i):
+            if queries == 1:
+                return load_kv(i)
+            assert shared_kv is not None
+            return shared_kv
 
-    def pop_qk(i):
-        if interpret:
-            return jnp.dot(query(i), get_kv(i).T, preferred_element_type=jnp.float32)
-        return pltpu.matmul_pop((i % 2) * stride, (rows, 256), jnp.float32, 0)
+        def query(i):
+            q = q_ref[pl.ds(i * query_tile, query_tile), :, :].reshape(-1, dim)
+            q = jnp.pad(q, ((0, rows - query_tile * heads), (0, 0)))
+            return permute(q, inverse=False) if queries == 1 else q
 
-    def launch_pv(i, p):
-        kv = get_kv(i)
-        for mxu in range(2):
-            pltpu.matmul_push_rhs(kv[:, mxu * 256 : (mxu + 1) * 256], 0, mxu)
-            pltpu.matmul_acc_lhs((2 + i % 2) * stride, p, mxu, 0)
+        def launch_qk(i):
+            q = query(i)
+            kv = get_kv(i)
+            for k in range(2):
+                ks = slice(k * 256, (k + 1) * 256)
+                pltpu.matmul_push_rhs(kv[:, ks], 0, 0, transpose=True)
+                pltpu.matmul_acc_lhs(accumulators[i % 2], q[:, ks], 0)
 
-    def pop_pv(i, p):
-        if interpret:
-            return jnp.dot(p, get_kv(i), preferred_element_type=jnp.float32)
-        return jnp.concatenate(
-            [
-                pltpu.matmul_pop((2 + i % 2) * stride, (rows, 256), jnp.float32, mxu)
-                for mxu in range(2)
-            ],
-            axis=1,
-        )
+        def pop_qk(i):
+            if interpret:
+                return jnp.dot(
+                    query(i), get_kv(i).T, preferred_element_type=jnp.float32
+                )
+            return pltpu.matmul_pop(accumulators[i % 2])
 
-    def store(i, p, denominator):
-        value = pop_pv(i, p)[: query_tile * heads].reshape(query_tile, heads, dim)
-        value = (value / denominator[..., None]).astype(out_ref.dtype)
-        if queries == 1:
-            value = value.reshape(query_tile * heads, dim)
-            value = jnp.pad(value, ((0, rows - query_tile * heads), (0, 0)))
-            value = permute(value, inverse=True)[: query_tile * heads]
-        out_ref[pl.ds(i * query_tile, query_tile), :, :] = value.reshape(
-            query_tile, heads, dim
-        )
+        def launch_pv(i, p):
+            kv = get_kv(i)
+            for mxu in range(2):
+                pltpu.matmul_push_rhs(kv[:, mxu * 256 : (mxu + 1) * 256], 0, mxu)
+                pltpu.matmul_acc_lhs(accumulators[mxu * 4 + 2 + i % 2], p, 0)
 
-    if not interpret:
-        launch_qk(0)
-    previous_p = jnp.zeros((rows, 256), q_ref.dtype)
-    previous_den = jnp.ones((query_tile, heads), jnp.float32)
-    for i in range(tiles):
-        scores = pop_qk(i)[: query_tile * heads, :keys].reshape(query_tile, heads, keys)
-        if not interpret and i + 1 < tiles:
-            launch_qk(i + 1)
-        scores = jnp.where(
-            mask_ref[i, :, :][:, None, :]
-            if queries == 1
-            else mask_ref[0, pl.ds(i * query_tile, query_tile), :][:, None, :],
-            scores * scale,
-            -jnp.inf,
-        )
-        # Include the sink in the max to keep the all-masked case finite.
-        maximum = jnp.maximum(scores.max(-1), sink_ref[...][None, :])
-        probabilities = jnp.exp(scores - maximum[..., None])
-        denominator = probabilities.sum(-1) + jnp.exp(sink_ref[...][None, :] - maximum)
-        p = jnp.pad(
-            probabilities.reshape(query_tile * heads, keys),
-            ((0, rows - query_tile * heads), (0, 256 - keys)),
-        ).astype(q_ref.dtype)
+        def pop_pv(i, p):
+            if interpret:
+                return jnp.dot(p, get_kv(i), preferred_element_type=jnp.float32)
+            return jnp.concatenate(
+                [
+                    pltpu.matmul_pop(accumulators[mxu * 4 + 2 + i % 2])
+                    for mxu in range(2)
+                ],
+                axis=1,
+            )
+
+        def store(i, p, denominator):
+            value = pop_pv(i, p)[: query_tile * heads].reshape(query_tile, heads, dim)
+            value = (value / denominator[..., None]).astype(out_ref.dtype)
+            if queries == 1:
+                value = value.reshape(query_tile * heads, dim)
+                value = jnp.pad(value, ((0, rows - query_tile * heads), (0, 0)))
+                value = permute(value, inverse=True)[: query_tile * heads]
+            out_ref[pl.ds(i * query_tile, query_tile), :, :] = value.reshape(
+                query_tile, heads, dim
+            )
+
         if not interpret:
-            launch_pv(i, p)
-        if i:
-            store(i - 1, previous_p, previous_den)
-        previous_p, previous_den = p, denominator
-    store(tiles - 1, previous_p, previous_den)
+            launch_qk(0)
+        previous_p = jnp.zeros((rows, 256), q_ref.dtype)
+        previous_den = jnp.ones((query_tile, heads), jnp.float32)
+        for i in range(tiles):
+            scores = pop_qk(i)[: query_tile * heads, :keys].reshape(
+                query_tile, heads, keys
+            )
+            if not interpret and i + 1 < tiles:
+                launch_qk(i + 1)
+            scores = jnp.where(
+                mask_ref[i, :, :][:, None, :]
+                if queries == 1
+                else mask_ref[0, pl.ds(i * query_tile, query_tile), :][:, None, :],
+                scores * scale,
+                -jnp.inf,
+            )
+            # Include the sink in the max to keep the all-masked case finite.
+            maximum = jnp.maximum(scores.max(-1), sink_ref[...][None, :])
+            probabilities = jnp.exp(scores - maximum[..., None])
+            denominator = probabilities.sum(-1) + jnp.exp(
+                sink_ref[...][None, :] - maximum
+            )
+            p = jnp.pad(
+                probabilities.reshape(query_tile * heads, keys),
+                ((0, rows - query_tile * heads), (0, 256 - keys)),
+            ).astype(q_ref.dtype)
+            if not interpret:
+                launch_pv(i, p)
+            if i:
+                store(i - 1, previous_p, previous_den)
+            previous_p, previous_den = p, denominator
+        store(tiles - 1, previous_p, previous_den)
+
+    if interpret:
+        compute()
+    else:
+        pl.run_scoped(
+            compute,
+            *(
+                pltpu.ACC(mxu)((rows, 256), jnp.float32)
+                for mxu in range(2)
+                for _ in range(4)
+            ),
+        )
 
 
 def attend_swa(
@@ -227,9 +268,6 @@ def attend_swa(
         ),
         out_specs=q_spec,
         out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "arbitrary")
-        ),
         interpret=interpret,
         name="swa_native_layout",
     )(q, kv, mask, sink.astype(jnp.float32))

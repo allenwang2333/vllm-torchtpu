@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
 from .cache import (
@@ -234,14 +235,18 @@ def initialize_candidate_cache() -> None:
     _prepare_op = pallas.jax_op(
         "pallas::dsv41_candidate_prepare",
         prepare_candidate_cache_jax,
-        mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 5 + (None,) * 4),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 5 + (None,) * 4)
+        ),
     )
     _prepare_2bank_op = pallas.jax_op(
         "pallas::dsv41_candidate_prepare_2bank",
         prepare_candidate_cache_2bank_jax,
-        mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 6 + (None,) * 4),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None,) * 4)
+        ),
     )
 
     def fake_prepare(
@@ -296,14 +301,18 @@ def initialize_candidate_cache() -> None:
     _select_op = pallas.jax_op(
         "pallas::dsv41_candidate_select",
         select_candidate_cache_jax,
-        mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 12 + (None,) * 4),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 12 + (None,) * 4)
+        ),
     )
     _select_2bank_op = pallas.jax_op(
         "pallas::dsv41_candidate_select_2bank",
         select_candidate_cache_2bank_jax,
-        mesh=mesh,
-        input_partition_specs=cast(Any, (P(),) * 13 + (None,) * 4),
+        mesh=get_kernel_mesh(mesh),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 13 + (None,) * 4)
+        ),
     )
 
     def fake_select(

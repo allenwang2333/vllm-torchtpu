@@ -19,13 +19,14 @@ pre as a single kernel.
 """
 
 import functools
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
     post_kernel,
@@ -192,12 +193,15 @@ def _mhc_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...],
+                (
+                    P(ATTN_DATA_AXIS, None, None),  # residual
+                    P(),  # fn
+                    P(),  # hc_scale
+                    P(),  # hc_base
+                ),
             ),
         )
         op.register_fake(_fake_mhc_pre)
@@ -217,12 +221,15 @@ def get_mhc_post_op():
         op = pallas.jax_op(
             op_name,
             _mhc_post_jax,
-            mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...],
+                (
+                    P(ATTN_DATA_AXIS, None),  # x
+                    P(ATTN_DATA_AXIS, None, None),  # residual
+                    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                ),
             ),
         )
         op.register_fake(_fake_mhc_post)
@@ -252,15 +259,18 @@ def _mhc_fused_post_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...],
+                (
+                    P(ATTN_DATA_AXIS, None),  # x
+                    P(ATTN_DATA_AXIS, None, None),  # residual
+                    P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+                    P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+                    P(),  # fn
+                    P(),  # hc_scale
+                    P(),  # hc_base
+                ),
             ),
         )
         op.register_fake(_fake_mhc_fused_post_pre)
