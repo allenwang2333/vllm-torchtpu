@@ -115,6 +115,9 @@ local port = cdk.numVar('PORT', 47903);
 // still shard experts across all DP x TP = 16 ranks.
 local dataParallelSize = cdk.numVar('DATA_PARALLEL_SIZE', 16);
 local tensorParallelSize = cdk.numVar('TENSOR_PARALLEL_SIZE', 1);
+// EXPERT_PARALLEL=false shards the MoE experts tensor-parallel over the TP group instead (the B200 TP8 reference
+// passes no --enable-expert-parallel). The fused EP kernel and TPU_EXPERT_PLACEMENT need expert parallelism.
+local expertParallel = cdk.boolVar('EXPERT_PARALLEL', true);
 local maxModelLen = cdk.numVar('MAX_MODEL_LEN', 1048576);
 // Evolve defaults (forge run x2vw65z3, j-9fc3926b: 86,862 vs 69,267 total tok/s for the values in the notes
 // below, j-c7c6502d): every step carries at most a 128-token prefill chunk, so the DP-wide bucket stays
@@ -449,8 +452,9 @@ local serveArgs = [
   '--enable-prompt-tokens-details',
   '--kv-cache-dtype=%s' % kvCacheDtype,
   '--safetensors-load-strategy=prefetch',
-  '--enable-expert-parallel',
-  '--enable-ep-weight-filter',
+]
++ (if expertParallel then ['--enable-expert-parallel', '--enable-ep-weight-filter'] else [])
++ [
   '--gpu-memory-utilization=%s' % gpuMemoryUtilization,
   '"${OFFLOAD_ARGS[@]}"',
 ]
