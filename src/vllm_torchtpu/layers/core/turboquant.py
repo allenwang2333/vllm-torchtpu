@@ -366,19 +366,6 @@ def write_kv_cache(
     return flat.reshape(kv_cache.shape)
 
 
-def _use_fast_plane_layout(page_size: int, layout: TQLayout) -> bool:
-    """True when K and V planes divide evenly into 128-byte TPU vector lanes."""
-    d = layout.head_dim
-    k_bytes = d if layout.key_fp8 else layout.key_mse_bytes
-    v_bytes = layout.value_data_bytes
-    return (
-        d % 128 == 0
-        and page_size % 8 == 0
-        and (page_size * k_bytes) % 128 == 0
-        and (page_size * v_bytes) % 128 == 0
-    )
-
-
 def _plane_word_counts(page_size: int, layout: TQLayout) -> tuple[int, int, int]:
     """Number of 128-byte words per head for `(k_plane, v_plane, meta_plane)`."""
     d = layout.head_dim
@@ -389,6 +376,25 @@ def _plane_word_counts(page_size: int, layout: TQLayout) -> tuple[int, int, int]
     total_words = layout.page_words_128(page_size)
     meta_words = total_words - k_words - v_words
     return k_words, v_words, meta_words
+
+
+def _use_fast_plane_layout(page_size: int, layout: TQLayout) -> bool:
+    """True when K and V planes divide evenly into 128-byte TPU vector lanes."""
+    d = layout.head_dim
+    k_bytes = d if layout.key_fp8 else layout.key_mse_bytes
+    v_bytes = layout.value_data_bytes
+    if not (
+        d % 128 == 0
+        and page_size % 8 == 0
+        and (page_size * k_bytes) % 128 == 0
+        and (page_size * v_bytes) % 128 == 0
+    ):
+        return False
+    _, _, meta_words = _plane_word_counts(page_size, layout)
+    min_multi_meta_words = 2 if layout.key_fp8 else 3
+    return (page_size <= 16 and meta_words == 1) or (
+        page_size <= 64 and meta_words >= min_multi_meta_words
+    )
 
 
 def _pack_bits_lane_aligned(idx: jax.Array, bits: int) -> jax.Array:
@@ -439,22 +445,52 @@ def _pack_planes_from_unpacked(
 ) -> jax.Array:
     """Packs unpacked K/V indices and per-token metadata into `u8[N, W, H, 128]`."""
     n, page_size, h, d = k_unpacked.shape
-    k_words, v_words, meta_words = _plane_word_counts(page_size, layout)
-    k_plane = (
-        k_unpacked
-        if layout.key_fp8
-        else _pack_bits_lane_aligned(k_unpacked, layout.key_bits)
-    )
-    v_plane = _pack_bits_lane_aligned(v_idx, layout.value_bits)
-    if d != 128:
-        k_plane = k_plane.reshape(n, k_words, h, 128)
-        v_plane = v_plane.reshape(n, v_words, h, 128)
+    folds = d // 128
+    _, _, meta_words = _plane_word_counts(page_size, layout)
+    k_folds = []
+    v_folds = []
+    for f in range(folds):
+        ku_f = k_unpacked[..., f * 128 : (f + 1) * 128]
+        vi_f = v_idx[..., f * 128 : (f + 1) * 128]
+        k_folds.append(
+            ku_f if layout.key_fp8 else _pack_bits_lane_aligned(ku_f, layout.key_bits)
+        )
+        v_folds.append(_pack_bits_lane_aligned(vi_f, layout.value_bits))
+    k_plane = k_folds[0] if folds == 1 else jnp.concatenate(k_folds, axis=1)
+    v_plane = v_folds[0] if folds == 1 else jnp.concatenate(v_folds, axis=1)
 
-    meta_flat = meta_bytes.swapaxes(1, 2).reshape(n, h, page_size * meta_bytes.shape[-1])
-    pad_m = meta_words * 128 - meta_flat.shape[-1]
-    if pad_m > 0:
-        meta_flat = jnp.pad(meta_flat, [(0, 0), (0, 0), (0, pad_m)])
-    meta_plane = meta_flat.reshape(n, h, meta_words, 128).swapaxes(1, 2)
+    m_nh = meta_bytes.swapaxes(1, 2)  # [N, H, P, 4 or 6]
+    vs_lo = m_nh[..., :, 0]
+    vs_hi = m_nh[..., :, 1]
+    vz_lo = m_nh[..., :, 2]
+    vz_hi = m_nh[..., :, 3]
+
+    def _pad64(x: jax.Array) -> jax.Array:
+        pad = 64 - x.shape[-1]
+        return jnp.pad(x, [(0, 0), (0, 0), (0, pad)]) if pad > 0 else x
+
+    if meta_words == 1:
+        if layout.key_fp8:
+            lo_part = _pad64(jnp.concatenate([vs_lo, vz_lo], axis=-1))
+            hi_part = _pad64(jnp.concatenate([vs_hi, vz_hi], axis=-1))
+        else:
+            kn_lo = m_nh[..., :, 4]
+            kn_hi = m_nh[..., :, 5]
+            lo_part = _pad64(jnp.concatenate([vs_lo, vz_lo, kn_lo], axis=-1))
+            hi_part = _pad64(jnp.concatenate([vs_hi, vz_hi, kn_hi], axis=-1))
+        meta_plane = jnp.concatenate([lo_part, hi_part], axis=-1)[:, None, :, :]
+    else:
+        r0 = jnp.concatenate([_pad64(vs_lo), _pad64(vz_lo)], axis=-1)
+        r1 = jnp.concatenate([_pad64(vs_hi), _pad64(vz_hi)], axis=-1)
+        rows = [r0, r1]
+        if not layout.key_fp8:
+            kn_lo = m_nh[..., :, 4]
+            kn_hi = m_nh[..., :, 5]
+            r2 = jnp.concatenate([_pad64(kn_lo), _pad64(kn_hi)], axis=-1)
+            rows.append(r2)
+        while len(rows) < meta_words:
+            rows.append(jnp.zeros_like(r0))
+        meta_plane = jnp.stack(rows, axis=1)
     return jnp.concatenate([k_plane, v_plane, meta_plane], axis=1)
 
 
@@ -465,29 +501,181 @@ def _unpack_planes_to_components(
     """Unpacks `u8[N, W, H, 128]` into `(k_unpacked, v_idx, meta_bytes)`."""
     n, page_words, h, _ = raw_pages.shape
     d = layout.head_dim
+    folds = d // 128
     page_size = layout.page_size_from_words_128(page_words)
     k_words, v_words, meta_words = _plane_word_counts(page_size, layout)
+    k_wpf = k_words // folds
+    v_wpf = v_words // folds
 
     k_plane = raw_pages[:, :k_words]
     v_plane = raw_pages[:, k_words : k_words + v_words]
     meta_plane = raw_pages[:, k_words + v_words :]
-    if d != 128:
-        k_plane = k_plane.reshape(n, -1, h, d)
-        v_plane = v_plane.reshape(n, -1, h, d)
 
-    k_unpacked = (
-        k_plane
-        if layout.key_fp8
-        else _unpack_bits_lane_aligned(k_plane, layout.key_bits)
-    )
-    v_idx = _unpack_bits_lane_aligned(v_plane, layout.value_bits)
+    k_folds = []
+    v_folds = []
+    for f in range(folds):
+        kp_f = k_plane[:, f * k_wpf : (f + 1) * k_wpf]
+        vp_f = v_plane[:, f * v_wpf : (f + 1) * v_wpf]
+        k_folds.append(
+            kp_f if layout.key_fp8 else _unpack_bits_lane_aligned(kp_f, layout.key_bits)
+        )
+        v_folds.append(_unpack_bits_lane_aligned(vp_f, layout.value_bits))
+    k_unpacked = k_folds[0] if folds == 1 else jnp.concatenate(k_folds, axis=-1)
+    v_idx = v_folds[0] if folds == 1 else jnp.concatenate(v_folds, axis=-1)
 
-    m_b = 4 if layout.key_fp8 else 6
-    meta_flat = meta_plane.swapaxes(1, 2).reshape(n, h, meta_words * 128)[
-        ..., : page_size * m_b
-    ]
-    meta_bytes = meta_flat.reshape(n, h, page_size, m_b).swapaxes(1, 2)
+    p = page_size
+    if meta_words == 1:
+        m0 = meta_plane[:, 0]
+        vs_lo = m0[..., 0:p]
+        vz_lo = m0[..., p : 2 * p]
+        vs_hi = m0[..., 64 : 64 + p]
+        vz_hi = m0[..., 64 + p : 64 + 2 * p]
+        if layout.key_fp8:
+            m_nh = jnp.stack([vs_lo, vs_hi, vz_lo, vz_hi], axis=-1)
+        else:
+            kn_lo = m0[..., 2 * p : 3 * p]
+            kn_hi = m0[..., 64 + 2 * p : 64 + 3 * p]
+            m_nh = jnp.stack([vs_lo, vs_hi, vz_lo, vz_hi, kn_lo, kn_hi], axis=-1)
+    else:
+        r0 = meta_plane[:, 0]
+        r1 = meta_plane[:, 1]
+        vs_lo = r0[..., 0:p]
+        vz_lo = r0[..., 64 : 64 + p]
+        vs_hi = r1[..., 0:p]
+        vz_hi = r1[..., 64 : 64 + p]
+        if layout.key_fp8:
+            m_nh = jnp.stack([vs_lo, vs_hi, vz_lo, vz_hi], axis=-1)
+        else:
+            r2 = meta_plane[:, 2]
+            kn_lo = r2[..., 0:p]
+            kn_hi = r2[..., 64 : 64 + p]
+            m_nh = jnp.stack([vs_lo, vs_hi, vz_lo, vz_hi, kn_lo, kn_hi], axis=-1)
+    meta_bytes = m_nh.swapaxes(1, 2)
     return k_unpacked, v_idx, meta_bytes
+
+
+# ======================================================================================
+# Pallas VREG in-kernel page dequantization
+# ======================================================================================
+
+
+def _u16_to_f32_vreg(u16: jax.Array) -> jax.Array:
+    """Converts IEEE-754 fp16 bits in `u32` VREGs to `f32` without `i16->f16` bitcast."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    sign = (u16 >> 15) & 1
+    exp = (u16 >> 10) & 0x1F
+    mant = u16 & 0x3FF
+
+    normal_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+    normal_f32 = pltpu.bitcast(normal_bits, jnp.float32)
+
+    sub_f32 = mant.astype(jnp.float32) * np.float32(2.0**-24)
+    sub_f32 = jnp.where(sign != 0, -sub_f32, sub_f32)
+    return jnp.where(exp == 0, sub_f32, normal_f32)
+
+
+def _lookup_centroids_vreg(idx: jax.Array, bits: int, centroids: np.ndarray) -> jax.Array:
+    """VREG binary-tree select of `centroids[idx]` (7 selects for 3-bit, 15 for 4-bit)."""
+    vals = [jnp.full(idx.shape, float(c), dtype=jnp.float32) for c in centroids]
+    for b in range(bits):
+        bit_set = (idx & (1 << b)) != 0
+        vals = [
+            jnp.where(bit_set, vals[2 * j + 1], vals[2 * j])
+            for j in range(len(vals) // 2)
+        ]
+    return vals[0]
+
+
+def _unpack_bits_vreg(plane: jax.Array, bits: int) -> jax.Array:
+    """Unpacks `u8[P*bits//8, 128]` -> `u32[P, 128]` in TPU VREGs."""
+    u = plane.astype(jnp.uint32)
+    if bits == 4:
+        lo = u & 0xF
+        hi = (u >> 4) & 0xF
+        return jnp.concatenate([lo, hi], axis=0)
+    assert bits == 3, bits
+    g = u.shape[0] // 3
+    b0 = u[:g]
+    b1 = u[g : 2 * g]
+    b2 = u[2 * g : 3 * g]
+    word = b0 | (b1 << 8) | (b2 << 16)
+    parts = [(word >> (3 * k)) & 0x7 for k in range(8)]
+    return jnp.concatenate(parts, axis=0)
+
+
+def _dequant_tq_page_vreg(
+    page_h: jax.Array,  # u8[page_words, 128]
+    kv_dtype: jnp.dtype,
+    *,
+    layout: TQLayout,
+    tables: TQTables,
+) -> tuple[jax.Array, jax.Array]:
+    """Dequantizes one `(page, kv_head)` from `u8[W, 128]` to `(k, v)` in VREGs."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    page_words = page_h.shape[0]
+    page_size = layout.page_size_from_words_128(page_words)
+    p = page_size
+    folds = layout.head_dim // 128
+    k_words, v_words, meta_words = _plane_word_counts(page_size, layout)
+    k_wpf = k_words // folds
+    v_wpf = v_words // folds
+    meta_plane = page_h[k_words + v_words :]
+
+    if meta_words == 1:
+        mt = jnp.transpose(jnp.broadcast_to(meta_plane[0:1], (128, 128))).astype(
+            jnp.uint32
+        )
+        vs_u16 = mt[0:p] | (mt[64 : 64 + p] << 8)
+        vz_u16 = mt[p : 2 * p] | (mt[64 + p : 64 + 2 * p] << 8)
+        if not layout.key_fp8:
+            kn_u16 = mt[2 * p : 3 * p] | (mt[64 + 2 * p : 64 + 3 * p] << 8)
+    else:
+        mt0 = jnp.transpose(jnp.broadcast_to(meta_plane[0:1], (128, 128))).astype(
+            jnp.uint32
+        )
+        mt1 = jnp.transpose(jnp.broadcast_to(meta_plane[1:2], (128, 128))).astype(
+            jnp.uint32
+        )
+        vs_u16 = mt0[0:p] | (mt1[0:p] << 8)
+        vz_u16 = mt0[64 : 64 + p] | (mt1[64 : 64 + p] << 8)
+        if not layout.key_fp8:
+            mt2 = jnp.transpose(jnp.broadcast_to(meta_plane[2:3], (128, 128))).astype(
+                jnp.uint32
+            )
+            kn_u16 = mt2[0:p] | (mt2[64 : 64 + p] << 8)
+
+    v_scale = _u16_to_f32_vreg(vs_u16)
+    v_zero = _u16_to_f32_vreg(vz_u16)
+
+    dv_folds = []
+    k_folds = []
+    for f in range(folds):
+        kp_f = page_h[f * k_wpf : (f + 1) * k_wpf]
+        vp_f = page_h[k_words + f * v_wpf : k_words + (f + 1) * v_wpf]
+        v_idx_f = _unpack_bits_vreg(vp_f, layout.value_bits)
+        dv_folds.append((v_idx_f.astype(jnp.float32) * v_scale + v_zero).astype(kv_dtype))
+        if layout.key_fp8:
+            k_folds.append(pltpu.bitcast(kp_f, jnp.float8_e4m3fn).astype(kv_dtype))
+        else:
+            k_idx_f = _unpack_bits_vreg(kp_f, layout.key_bits)
+            k_folds.append(_lookup_centroids_vreg(k_idx_f, layout.key_bits, tables.centroids))
+
+    dv = dv_folds[0] if folds == 1 else jnp.concatenate(dv_folds, axis=1)
+    if layout.key_fp8:
+        dk = k_folds[0] if folds == 1 else jnp.concatenate(k_folds, axis=1)
+    else:
+        c = k_folds[0] if folds == 1 else jnp.concatenate(k_folds, axis=1)
+        if layout.norm_correction:
+            sq_sum = jnp.sum(c * c, axis=-1, keepdims=True)
+            inv_norm = jax.lax.rsqrt(sq_sum + _CENTROID_NORM_EPS)
+            c = c * jnp.broadcast_to(inv_norm, c.shape)
+        k_norm = _u16_to_f32_vreg(kn_u16)
+        if folds > 1:
+            k_norm = jnp.concatenate([k_norm] * folds, axis=1)
+        dk = (c * k_norm).astype(kv_dtype)
+    return dk, dv
 
 
 def _quantize_kv_components(
@@ -629,33 +817,97 @@ def tq_ragged_paged_attention(
 ) -> tuple[jax.Array, jax.Array]:
     """Ragged paged attention over a TurboQuant KV cache.
 
-    1. Quantizes this step's K/V and scatters it into `kv_cache`.
-    2. Dequantizes every page referenced by `page_indices` into a bf16 page
-       pool laid out for the RPA kernel (pages remapped to `0..N-1`).
-    3. Calls `rpa_fn` (an RPA-v3-compatible kernel) on that pool. The kernel
-       also writes this step's *unquantized* K/V into the temporary pool, so
-       current tokens attend at full precision and history at TQ precision,
-       like upstream's prefill path.
-
-    Peak extra memory is the bf16 pool for `max_num_seqs * pages_per_seq`
-    pages, i.e. this is a correctness reference, not a memory-optimal path.
+    When `kv_cache` uses the 128-byte lane-aligned plane layout and `rpa_fn` is
+    the Pallas RPA v3 kernel (`ragged_paged_attention`), the kernel fetches
+    compressed `uint8` pages directly into VMEM (`btq_x2_ref`) and dequantizes
+    only the active pages in VREGs on the fly, avoiding any HBM `bf16` page-pool
+    materialization.
 
     Returns `(new_kv_cache, outputs)`.
     """
+    import functools
+
+    from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
+        ragged_paged_attention,
+    )
+
     num_pages, dim1, num_kv_heads, minor_bytes = kv_cache.shape
     slot_bytes = layout.slot_size_aligned
     num_tokens = queries.shape[0]
     compute_dtype = queries.dtype
 
+    if layout.key_fp8:
+        q_in, k_in = queries, keys
+    else:
+        h = jnp.asarray(tables.hadamard)
+        q_in = rotate(queries, h).astype(compute_dtype)
+        k_in = rotate(keys, h).astype(compute_dtype)
+
     if minor_bytes == 128 and _use_fast_plane_layout(
         layout.page_size_from_words_128(dim1), layout
     ):
         page_size = layout.page_size_from_words_128(dim1)
+        if not skip_kv_update:
+            nk_u, nv_i, n_meta = _quantize_kv_components(keys, values, layout, tables)
+            local_slot, local_page = _compute_local_slot_mapping(
+                num_tokens, kv_lens, page_indices, cu_q_lens, distribution, page_size
+            )
+            phys_pages = page_indices[local_page]
+            slot_in_page = local_slot % page_size
+            valid_tok = local_slot >= 0
+
+            # Deduplicate tokens targeting the same physical page so multi-token
+            # prefills into a single page accumulate into one representative page.
+            same_page = (phys_pages[:, None] == phys_pages[None, :]) & valid_tok[None, :]
+            rep_t = jnp.argmax(same_page, axis=1)
+            is_rep = valid_tok & (jnp.arange(num_tokens, dtype=jnp.int32) == rep_t)
+            scatter_idx = jnp.where(
+                valid_tok, rep_t * page_size + slot_in_page, num_tokens * page_size
+            )
+
+            tk_u, tv_i, t_meta = _unpack_planes_to_components(
+                kv_cache[phys_pages], layout
+            )
+
+            def _scatter_touched(arr: jax.Array, new_val: jax.Array) -> jax.Array:
+                flat = arr.reshape(num_tokens * page_size, *arr.shape[2:])
+                flat = flat.at[scatter_idx].set(new_val, mode="drop")
+                return flat.reshape(arr.shape)
+
+            tk_u = _scatter_touched(tk_u, nk_u)
+            tv_i = _scatter_touched(tv_i, nv_i)
+            t_meta = _scatter_touched(t_meta, n_meta)
+
+            touched_raw = _pack_planes_from_unpacked(tk_u, tv_i, t_meta, layout)
+            valid_p = jnp.where(is_rep, phys_pages, num_pages)
+            kv_cache = kv_cache.at[valid_p].set(touched_raw, mode="drop")
+
+        if rpa_fn is ragged_paged_attention:
+            dequant_fn = functools.partial(
+                _dequant_tq_page_vreg, layout=layout, tables=tables
+            )
+            outputs, kv_cache = rpa_fn(
+                q_in,
+                k_in,
+                values.astype(compute_dtype),
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                skip_kv_update=skip_kv_update,
+                tq_page_size=page_size,
+                tq_dequant_page_fn=dequant_fn,
+            )
+            return kv_cache, outputs
+
         raw_gathered = kv_cache[page_indices]
         k_unpacked, v_idx, meta_bytes = _unpack_planes_to_components(
             raw_gathered, layout
         )
-
         v_scale = _bytes_to_f32(meta_bytes[..., 0:2])[..., None]
         v_zero = _bytes_to_f32(meta_bytes[..., 2:4])[..., None]
         if layout.key_fp8:
@@ -673,32 +925,6 @@ def tq_ragged_paged_attention(
             k_norm = _bytes_to_f32(meta_bytes[..., 4:6])[..., None]
             hist_k = (k_norm * c).astype(compute_dtype)
         hist_v = (v_idx.astype(jnp.float32) * v_scale + v_zero).astype(compute_dtype)
-
-        if not skip_kv_update:
-            nk_u, nv_i, n_meta = _quantize_kv_components(keys, values, layout, tables)
-            local_slot, local_page = _compute_local_slot_mapping(
-                num_tokens, kv_lens, page_indices, cu_q_lens, distribution, page_size
-            )
-            n_pages = page_indices.shape[0]
-            total_slots = n_pages * page_size
-            idx = jnp.where(local_slot >= 0, local_slot, total_slots)
-
-            def _scatter_comp(arr: jax.Array, new_val: jax.Array) -> jax.Array:
-                flat = arr.reshape(total_slots, *arr.shape[2:])
-                flat = flat.at[idx].set(new_val, mode="drop")
-                return flat.reshape(arr.shape)[local_page]
-
-            tk_u = _scatter_comp(k_unpacked, nk_u)
-            tv_i = _scatter_comp(v_idx, nv_i)
-            t_meta = _scatter_comp(meta_bytes, n_meta)
-
-            touched_raw = _pack_planes_from_unpacked(tk_u, tv_i, t_meta, layout)
-            is_first_in_page = jnp.concatenate(
-                [jnp.array([True]), local_page[1:] != local_page[:-1]]
-            )
-            write_page = (local_slot >= 0) & is_first_in_page
-            valid_p = jnp.where(write_page, page_indices[local_page], num_pages)
-            kv_cache = kv_cache.at[valid_p].set(touched_raw, mode="drop")
     else:
         if minor_bytes == slot_bytes:
             page_size = dim1
@@ -749,13 +975,6 @@ def tq_ragged_paged_attention(
     pool = merge_kv_pages(hist_k, hist_v)
     pool_page_indices = jnp.arange(page_indices.shape[0], dtype=page_indices.dtype)
 
-    if layout.key_fp8:
-        q_in, k_in = queries, keys
-    else:
-        h = jnp.asarray(tables.hadamard)
-        q_in = rotate(queries, h).astype(compute_dtype)
-        k_in = rotate(keys, h).astype(compute_dtype)
-
     outputs, _ = rpa_fn(
         q_in,
         k_in,
@@ -771,4 +990,5 @@ def tq_ragged_paged_attention(
         skip_kv_update=skip_kv_update,
     )
     return kv_cache, outputs
+
 

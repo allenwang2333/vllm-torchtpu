@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""TurboQuant KV-cache attention backend for TPU (JAX reference path).
+"""TurboQuant KV-cache attention backend for TPU (fused Pallas RPA v3 kernel).
 
 Selected for `--kv-cache-dtype turboquant_{k8v4,4bit_nc,k3v4_nc,3bit_nc}`.
 The KV cache of each layer is a packed byte pool
-`u8[num_blocks, block_size, num_kv_heads, slot_bytes]` whose slot layout is
-byte-compatible with upstream vLLM's TurboQuant backend; see
-`vllm_torchtpu.layers.core.turboquant` for the math.
+`u8[num_blocks, page_words_128, num_kv_heads, 128]` whose pages are DMA-fetched
+into VMEM and dequantized in VREGs inside the Pallas Ragged Paged Attention v3
+kernel; see `vllm_torchtpu.layers.core.turboquant` for the math and layout.
 
 Scope of this first version (anything else raises at init):
   * decoder self-attention, head_dim a power of two and a multiple of 128;
@@ -384,11 +384,8 @@ def check_turboquant_config(vllm_config: VllmConfig) -> None:
         )
         cache_config.kv_cache_dtype_skip_layers = []
 
-    logger.warning_once(
-        "TurboQuant KV cache (%s) on TPU uses the JAX reference path: KV pages "
-        "are dequantized to bf16 before attention. It saves KV-cache capacity "
-        "but decode is slower than a bf16 KV cache, and each layer temporarily "
-        "materializes max_num_seqs * max_model_len tokens of bf16 KV; keep "
-        "--max-num-seqs small.",
+    logger.info_once(
+        "TurboQuant KV cache (%s) on TPU uses fused Pallas RPA v3 VREG "
+        "dequantization with per-step quantized page updates.",
         preset,
     )
