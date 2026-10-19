@@ -83,7 +83,8 @@ def scratch(cfg, tiles, max_pages, bmax):
         "b_kring": pltpu.VMEM((g["SD"], g["NPG"], IR4, 4, pg), U8), "b_kring_sem": pltpu.SemaphoreType.DMA((g["SD"],)),
         "b_keys": pltpu.VMEM((g["POOL"], 8, 128), I32),
         "b_qblk": pltpu.VMEM((cfg.IH * 8, 128), qdt),
-        "b_wb": pltpu.VMEM((cfg.IH, 8, pg), F32), "b_lim": pltpu.VMEM((8, pg), I32),   # per-request head weights / row limits
+        "b_wb": pltpu.VMEM((cfg.IH, 4, pg), F32), "b_lim": pltpu.VMEM((4, pg), I32),   # per-request head weights / row limits
+        "b_qblk4": pltpu.VMEM((cfg.IH * 4, 128), qdt),                                 # scan q block, 4 rows per head
         "b_knew": pltpu.VMEM((128, 128), FP8), "b_snew": pltpu.VMEM((8, 128), F32),
         # threshold: per (group, parity) send / receive buffers and semaphores
         "b_csend": pltpu.VMEM((g["NG"], 2, 8, 128), I32), "b_crecv": pltpu.VMEM((g["NG"], 2, R, 8, 128), I32),
@@ -110,7 +111,7 @@ def scratch(cfg, tiles, max_pages, bmax):
         "kvb": pltpu.VMEM((2, 128, KL), BF16), "b_sbuf": pltpu.VMEM((2, g["QN"], 128), F32),
         "qb": pltpu.VMEM((g["QN"], KL), BF16), "qrb": pltpu.VMEM((g["QN"], 128), BF16),
         "att_acc": pltpu.VMEM((g["QN"], KL), F32),
-        "m_s": pltpu.VMEM((g["QN"], 128), F32), "l_s": pltpu.VMEM((g["QN"], 128), F32),
+        "m_s": pltpu.VMEM((g["QN"], 1), F32), "l_s": pltpu.VMEM((g["QN"], 1), F32),
     }
 
 
@@ -155,7 +156,6 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
         r_end = jnp.sum(((cc_ref[0] < c0 + kc) & valid).astype(I32))
         b_lo = r_first // 128
         b_hi = jnp.minimum(jnp.maximum((r_end + 127) // 128, b_lo), nbk)
-        acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
 
         def body(b, c2):
             ce_r = cc_ref[0, pl.ds(b, 1), :]
@@ -167,10 +167,20 @@ def extract_union(keys_ref, nbk, out_ref, row0, pre_ref, acc_ref, cc_ref, kc, mb
             ceh = jnp.floor(ce_c * (1.0 / 128))
             tail = jnp.where(li == 0, b.astype(F32), jnp.where(li == 1, ri.astype(F32), jnp.where(
                 li == 2, ceh, jnp.where(li == 3, ce_c - 128 * ceh, 0.0)))).astype(BF16)
-            acc_ref[:, 0:128] += lax.dot_general(oht, pre, NN, preferred_element_type=F32)
-            acc_ref[:, 128:256] += lax.dot_general(oht, tail, NN, preferred_element_type=F32)
             plane = (keys_ref[pl.ds(r0, 128), :] & 0xFF).astype(F32).astype(BF16)
-            acc_ref[:, 256:384] += lax.dot_general(oht, plane, NN, preferred_element_type=F32)
+            parts = (lax.dot_general(oht, pre, NN, preferred_element_type=F32),
+                     lax.dot_general(oht, tail, NN, preferred_element_type=F32),
+                     lax.dot_general(oht, plane, NN, preferred_element_type=F32))
+
+            @pl.when(b == b_lo)                  # first block assigns: no zero fill, no read-modify-write
+            def _():
+                for i_, v_ in enumerate(parts):
+                    acc_ref[:, 128 * i_:128 * (i_ + 1)] = v_
+
+            @pl.when(b > b_lo)
+            def _():
+                for i_, v_ in enumerate(parts):
+                    acc_ref[:, 128 * i_:128 * (i_ + 1)] += v_
             return c2
         lax.fori_loop(b_lo, b_hi, body, 0)
         RT = acc_ref[...]
@@ -269,6 +279,13 @@ def make(E):
         pos = rvec[0:TR, 1:2]
         mode = jnp.where(valid, jnp.where(pos + 1 <= KT, 1, 2), 0)
         row[0] = jnp.broadcast_to(mode, (TR, 128))
+
+        def zring(i, c):                                 # once per step: no NaN bytes in a never-written slot
+            r8 = pl.multiple_of(i * 64, 64)
+            scr["g_nope"][pl.ds(r8, 64), :] = jnp.zeros((64, 128), U32)
+            scr["g_rope"][pl.ds(r8, 64), :] = jnp.zeros((64, 128), U32)
+            return c
+        lax.fori_loop(0, GR * 2, zring, 0)
         # waves: consecutive requests whose rank-0 page counts fit the pool (identical on every rank)
 
         def wv(b, c):
@@ -346,13 +363,14 @@ def make(E):
     def scan_req_setup(t0, nq, seq):
         """Per request (first block): q block, lane-broadcast head weights and the per-row position limit
         (min(pos_q, seq - 1), -1 for rows >= nq) -> VMEM, so the page loop holds no broadcasts."""
-        build_qblk(t0)
-        wq = jnp.where(sub8 < 4, scr["wts"][pl.ds(t0, 8), :], 0.0)
+        q4 = jnp.concatenate([scr["iqv"][h_, pl.ds(t0, 4), :] for h_ in range(IH)], axis=0)   # rows 4h + q
+        scr["b_qblk4"][...] = q4.astype(FP8).astype(scr["b_qblk4"].dtype)
+        wq = scr["wts"][pl.ds(t0, 4), :]
         for h_ in range(IH):
-            scr["b_wb"][h_] = jnp.broadcast_to(wq[:, h_:h_ + 1], (8, pg))
-        pos_q = dup4(rvec[pl.ds(t0, 4), 1:2])
-        lim = jnp.where(sub8[:, 0:1] % 4 < nq, jnp.minimum(pos_q, seq - 1), -1)
-        scr["b_lim"][...] = jnp.broadcast_to(lim, (8, pg))
+            scr["b_wb"][h_] = jnp.broadcast_to(wq[:, h_:h_ + 1], (4, pg))
+        pos_q = rvec[pl.ds(t0, 4), 1:2]
+        lim = jnp.where(lax.broadcasted_iota(I32, (4, 1), 0) < nq, jnp.minimum(pos_q, seq - 1), -1)
+        scr["b_lim"][...] = jnp.broadcast_to(lim, (4, pg))
 
     def scan(l):
         """Every request of the current wave: score its local pages into the key pool."""
@@ -393,23 +411,23 @@ def make(E):
                 def _():
                     scan_req_setup(req[b, 7], req[b, 8], req[b, 5])
                 pbase = req[b, 4]
-                lane_r = lax.broadcasted_iota(I32, (8, pg), 1)
+                lane_r4 = lax.broadcasted_iota(I32, (4, pg), 1)
 
                 def page(p):
                     blk = ring[slot, p]                                          # [IR4, 4, pg] u8
                     kT = pltpu.bitcast(blk[0:IDIM // 4].reshape(IDIM, pg), FP8)
                     scale = pltpu.bitcast(blk[IDIM // 4:IDIM // 4 + 1].reshape(4, pg)[0:1],
                                           jnp.float8_e8m0fnu).astype(BF16).astype(F32)   # [1, pg]
-                    st_ = qdot(scr["b_qblk"][...], kT)                           # [8 * IH, pg]
-                    acc = jnp.maximum(st_[0:8], 0.0) * scr["b_wb"][0]
+                    st_ = qdot(scr["b_qblk4"][...], kT)                          # [4 * IH, pg]
+                    acc = jnp.maximum(st_[0:4], 0.0) * scr["b_wb"][0]
                     for h_ in range(1, IH):                                      # production order
-                        acc = acc + jnp.maximum(st_[h_ * 8:(h_ + 1) * 8], 0.0) * scr["b_wb"][h_]
+                        acc = acc + jnp.maximum(st_[h_ * 4:(h_ + 1) * 4], 0.0) * scr["b_wb"][h_]
                     score = acc * scale
-                    lidx = (j * NPG + p) * pg + lane_r
+                    lidx = (j * NPG + p) * pg + lane_r4
                     gpos = (lidx // ILV) * G_ + me * ILV + lidx % ILV
                     ok = (gpos <= scr["b_lim"][...]) & (score != -jnp.inf)
-                    key = jnp.where(ok, mono_key(score), jnp.int32(INT_MIN))    # [8, 256], rows 4..7 dead
-                    tile = jnp.where(sub8 < 4, key[:, 0:128], pltpu.roll(key[:, 128:256], 4, 0))
+                    key = jnp.where(ok, mono_key(score), jnp.int32(INT_MIN))    # [4, 256]
+                    tile = jnp.concatenate([key[:, 0:128], key[:, 128:256]], axis=0)
                     scr["b_keys"][pbase + j * NPG + p] = tile
 
                 PU = SCAN_UNROLL
@@ -929,22 +947,34 @@ def make(E):
     lane128 = lax.broadcasted_iota(I32, (128, 128), 1)
 
     def qload(t0):
+        """q of the request's QMAX rows -> qb [QN, KL] bf16 (row qq * NH + head) and qrb (rope dims in lanes
+        0..63): per row, the 16 ranks' packed rows are read as one (R, QH) block and each head's 640 values are
+        placed with sublane-strided stores (head = rank * HR + hh) into lane-blocked staging (b_sbuf, idle here)."""
+        assert QA % 128 == 0 and HR % 2 == 0
+        stg = scr["b_sbuf"]
         for qq in range(cfg.QMAX):
             t_ = jnp.minimum(t0 + qq, TMAX - 1)
-            heads = []
-            for s_ in range(R):
-                u = scr["qall"][s_, pl.ds(t_, 1), :]
-                full = jnp.concatenate([unpack_lo(u), unpack_hi(u)], axis=1)
-                heads += [full[:, hh * QA:(hh + 1) * QA] for hh in range(HR)]
-            Q = jnp.concatenate(heads, axis=0)                                   # [NH, QA] f32
+            blk = scr["qall"][:, pl.ds(t_, 1), :].reshape(R, QH)                  # [R, QH] u32
+            full = jnp.concatenate([unpack_lo(blk), unpack_hi(blk)], axis=1)      # [R, HR * QA] f32
+            for hh in range(HR):
+                for c in range(QA // 128):
+                    dst = stg.at[0] if c < 4 else stg.at[1]
+                    r_ = (c * NH if c < 4 else 0) + hh
+                    dst[pl.ds(r_, R, stride=HR), :] = full[:, hh * QA + c * 128:hh * QA + (c + 1) * 128]
             r0 = qq * NH
-            scr["qb"][r0:r0 + NH, :] = Q[:, 0:KL].astype(BF16)
-            scr["qrb"][r0:r0 + NH, :] = jnp.where(lane_h < cfg.DR, Q[:, KL:KL + 128], 0.0).astype(BF16)
+            qn = jnp.concatenate([stg[0, c * NH:(c + 1) * NH, :] for c in range(4)], axis=1)   # [NH, KL]
+            scr["qb"][r0:r0 + NH, :] = qn.astype(BF16)
+            scr["qrb"][r0:r0 + NH, :] = jnp.where(lane_h < cfg.DR, stg[1, 0:NH, :], 0.0).astype(BF16)
 
     def reset():
-        scr["m_s"][...] = jnp.full((QN, 128), NEG, F32)
-        scr["l_s"][...] = jnp.zeros((QN, 128), F32)
+        scr["m_s"][...] = jnp.full((QN, 1), NEG, F32)
+        scr["l_s"][...] = jnp.zeros((QN, 1), F32)
         scr["att_acc"][...] = jnp.zeros((QN, KL), F32)
+
+    def dec8(b):
+        """fp8 byte (in i32) -> bf16, without the NaN-code fix: gathered rows are written cache rows (writes clip
+        to +-448) and the ring is zeroed once per step, so a masked tail row is stale-but-finite, never NaN."""
+        return lax.bitcast_convert_type(b.astype(U8), FP8).astype(BF16)
 
     def front(r, buf):
         """Granule r, independent of the softmax state: decode the nope rows into kvb[buf], scores (4 nope +
@@ -955,7 +985,7 @@ def make(E):
         base = pl.multiple_of((r % GR) * 128, 128)
         w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(base, 128), :], I32)
         for b_ in range(4):
-            scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128] = fp8_decode_hw(shr(w, 8 * b_) & 0xFF)
+            scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128] = dec8(shr(w, 8 * b_) & 0xFF)
         s = jnp.zeros((QN, 128), F32)
         for b_ in range(4):
             s = s + lax.dot_general(scr["qb"][:, b_ * 128:(b_ + 1) * 128],
@@ -964,13 +994,13 @@ def make(E):
         seg = iv & 3                                     # rope quarter (local index & 3 == slot & 3)
         if fault == "ropeseg":
             seg = (seg + 1) & 3
-        segc = jnp.transpose(jnp.broadcast_to(seg, (128, 128)))[:, 0:1]           # [128, 1]
+        segc = jnp.transpose(jnp.broadcast_to(seg, (8, 128)))[:, 0:1]             # [128, 1]
         rw = lax.bitcast_convert_type(scr["g_rope"][pl.ds(base, 128), :], I32)
         A = jnp.where(segc == 0, rw, jnp.where(segc == 1, pltpu.roll(rw, 96, 1), jnp.where(
             segc == 2, pltpu.roll(rw, 64, 1), pltpu.roll(rw, 32, 1))))
         W0 = A & 0xFF
         W1 = shr(pltpu.roll(A, 32, 1), 8) & 0xFF
-        Wb = fp8_decode_hw(jnp.where(lane128 < 32, W0, jnp.where(lane128 < 64, W1, 0)))
+        Wb = dec8(jnp.where(lane128 < 32, W0, jnp.where(lane128 < 64, W1, 0)))
         s = s + lax.dot_general(scr["qrb"][...], Wb, NT, preferred_element_type=F32)
         s = s * sm_scale
         if KS != 1.0 and fault != "kscale":
@@ -984,17 +1014,37 @@ def make(E):
         """Online-softmax update + PV for the granule in (sbuf, kvb)[buf]."""
         s = scr["b_sbuf"][buf]
         mask = s > NEG
-        m_old = scr["m_s"][:, 0:1]
+        m_old = scr["m_s"][...]
         m_new = jnp.maximum(m_old, jnp.max(s, axis=1, keepdims=True))
         alpha = jnp.exp(m_old - m_new)
         p = jnp.where(mask, jnp.exp(s - m_new), 0.0)
-        scr["l_s"][...] = jnp.broadcast_to(alpha * scr["l_s"][:, 0:1] + jnp.sum(p, axis=1, keepdims=True), (QN, 128))
+        scr["l_s"][...] = alpha * scr["l_s"][...] + jnp.sum(p, axis=1, keepdims=True)
         if tiles.pv == "f32":
             pv = lax.dot_general(p, scr["kvb"][buf].astype(F32), NN, preferred_element_type=F32)
         else:
             pv = lax.dot_general(p.astype(BF16), scr["kvb"][buf], NN, preferred_element_type=F32)
         scr["att_acc"][...] = alpha * scr["att_acc"][...] + pv
-        scr["m_s"][...] = jnp.broadcast_to(m_new, (QN, 128))
+        scr["m_s"][...] = m_new
+
+    def back2():
+        """Online-softmax update + PV for the two granules in buffers 0 and 1 at once: one rescale of the
+        accumulator and one K = 256 PV pass per pair (the MXU sums the pair)."""
+        s0 = scr["b_sbuf"][0]
+        s1 = scr["b_sbuf"][1]
+        m_old = scr["m_s"][...]
+        m_new = jnp.maximum(m_old, jnp.maximum(jnp.max(s0, axis=1, keepdims=True), jnp.max(s1, axis=1, keepdims=True)))
+        alpha = jnp.exp(m_old - m_new)
+        p0 = jnp.where(s0 > NEG, jnp.exp(s0 - m_new), 0.0)
+        p1 = jnp.where(s1 > NEG, jnp.exp(s1 - m_new), 0.0)
+        scr["l_s"][...] = alpha * scr["l_s"][...] + jnp.sum(p0, axis=1, keepdims=True) + jnp.sum(p1, axis=1, keepdims=True)
+        p = jnp.concatenate([p0, p1], axis=1)
+        kv = jnp.concatenate([scr["kvb"][0], scr["kvb"][1]], axis=0)
+        if tiles.pv == "f32":
+            pv = lax.dot_general(p, kv.astype(F32), NN, preferred_element_type=F32)
+        else:
+            pv = lax.dot_general(p.astype(BF16), kv, NN, preferred_element_type=F32)
+        scr["att_acc"][...] = alpha * scr["att_acc"][...] + pv
+        scr["m_s"][...] = m_new
 
     def emit_row(t_, qq, empty):
         r0 = qq * NH
@@ -1018,11 +1068,23 @@ def make(E):
             scr["dbgl"][pl.ds(t_, 1), :] = lse_row
             if "dbgo" in scr:
                 scr["dbgo"][t_] = out
+        # per owner d: heads 4d..4d+3 packed (lo: heads 4d, 4d+1; hi: 4d+2, 4d+3) | lse lanes (head - 4d):
+        # sublane-strided loads give each head index hh's 16 owners at once (lane-blocked staging in b_sbuf)
+        stg = scr["b_sbuf"]
+        for c in range(4):
+            stg[0, c * NH:(c + 1) * NH, :] = out[:, c * 128:(c + 1) * 128]
+        H = []
+        for hh in range(HR):
+            H.append(jnp.concatenate([stg[0, pl.ds(c * NH + hh, R, stride=HR), :] for c in range(4)], axis=1))   # [R, KL]
+        P = pack2(jnp.concatenate(H[:HR // 2], axis=1), jnp.concatenate(H[HR // 2:], axis=1))            # [R, OH]
+        stg[1, 0:NH, :] = jnp.broadcast_to(lse, (NH, 128))
+        lane_r = lax.broadcasted_iota(I32, (R, 128), 1)
+        L16 = jnp.full((R, 128), -jnp.inf, F32)
+        for hh in range(HR):                                 # lane hh of owner d's row = lse of head d * HR + hh
+            L16 = jnp.where(lane_r == hh, stg[1, pl.ds(hh, R, stride=HR), :], L16)
+        blk = jnp.concatenate([P, lax.bitcast_convert_type(L16, U32)], axis=1)                           # [R, OW]
         for d in range(R):
-            od = jnp.concatenate([out[d * HR + hh:d * HR + hh + 1] for hh in range(HR)], axis=1)
-            lrow = pltpu.roll(lse_row, (128 - d * HR) % 128, 1) if d else lse_row
-            scr["osend"][d, pl.ds(t_, 1), :] = jnp.concatenate(
-                [pack2(od[:, :OH], od[:, OH:]), lax.bitcast_convert_type(lrow, U32)], axis=1)
+            scr["osend"][d, pl.ds(t_, 1), :] = blk[d:d + 1]
 
     def emit(b, empty):
         t0, nq = req[b, 7], req[b, 8]
@@ -1075,39 +1137,40 @@ def make(E):
                         def _():
                             issue(l, r + GR)
 
-                    @pl.when(nrow == 1)
-                    def _():
-                        gwait(r0)
+                    def fr(r, buf, last):
+                        if last:
+                            gwait(r)
+                        else:
+                            wait_full(r)
                         if compute:
-                            front(r0, 0)
-
-                    @pl.when(nrow > 1)
-                    def _():
-                        wait_full(r0)
-                        if compute:
-                            front(r0, 0)
-                    refill(r0)
-
-                    def gbody(j, c2):                # front(j + 1) and back(j): one basic block
-                        r = r0 + j + 1
-                        wait_full(r)
-                        if compute:
-                            front(r, (j + 1) % 2)
-                            back(j % 2)
+                            front(r, buf)
                         refill(r)
+
+                    npair = nrow // 2
+
+                    def pbody(i, c2):                # granule pairs: two independent fronts, one back
+                        r = r0 + 2 * i
+                        fr(r, 0, False)
+                        fr(r + 1, 1, False)
+                        if compute:
+                            back2()
                         return c2
-                    lax.fori_loop(0, jnp.maximum(nrow - 2, 0), gbody, 0)
+                    # every pair but a last one that ends the request (its second granule may be partial)
+                    lax.fori_loop(0, jnp.where(nrow % 2 == 0, npair - 1, npair), pbody, 0)
 
-                    @pl.when(nrow > 1)
+                    @pl.when(jnp.logical_and(nrow % 2 == 0, nrow > 0))
                     def _():
-                        r = r0 + nrow - 1
-                        gwait(r)
+                        r = r0 + nrow - 2
+                        fr(r, 0, False)
+                        fr(r + 1, 1, True)
                         if compute:
-                            front(r, (nrow - 1) % 2)
-                            back(nrow % 2)
-                        refill(r)
-                    if compute:
-                        back((nrow - 1) % 2)
+                            back2()
+
+                    @pl.when(nrow % 2 == 1)
+                    def _():
+                        fr(r0 + nrow - 1, 0, True)
+                        if compute:
+                            back(0)
                     emit(b, False)
             return c
         lax.fori_loop(0, B_(), per_req, 0)

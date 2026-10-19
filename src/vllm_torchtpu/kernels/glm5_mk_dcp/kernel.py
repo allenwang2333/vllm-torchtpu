@@ -36,7 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 import types
 
-from . import dsa_batched, dsa_batched_v1, pool_alias, topk2
+from . import dsa_batched, dsa_batched_v1, dsa_batched_v2, pool_alias, topk2
 from .layout import rup, smalls_layout
 
 FP8 = jnp.float8_e4m3fn
@@ -342,8 +342,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     assert set(skip) <= set(ABLATIONS), skip
     assert not draft or cfg.V > 0
     DSA = "legacy" if draft else tiles.dsa
-    assert DSA in ("legacy", "batched", "batched_v1"), DSA
-    DSAM = {"batched": dsa_batched, "batched_v1": dsa_batched_v1}.get(DSA)
+    assert DSA in ("legacy", "batched", "batched_v1", "batched_v2"), DSA
+    DSAM = {"batched": dsa_batched, "batched_v1": dsa_batched_v1, "batched_v2": dsa_batched_v2}.get(DSA)
     assert not (probe and (draft or debug))
     R, L, H = cfg.R, cfg.L, cfg.H
     TMAX, RPR = cfg.TMAX, cfg.RPR
