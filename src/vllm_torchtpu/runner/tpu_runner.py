@@ -7395,8 +7395,10 @@ class TPUModelRunner(GPUModelRunner):
         cc = self.vllm_config.compilation_config
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
         saved_sizes = cc.compile_sizes
+        # The request caps already reflect the finalized block size: vLLM
+        # calls get_kv_cache_spec() (which refreshes them) before
+        # determine_available_memory() reaches this profile run.
         with set_current_vllm_config(self.vllm_config):
-            self._refresh_smem_request_caps()
             self._initialize_attention_kernels()
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
