@@ -38,6 +38,7 @@
 #                                 set; unset for the first
 #   RECIPE_STORE_SERVERS          1: the decode-host store servers (oct13, oct16)
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
+#   RECIPE_PREFILL_MAX_NUM_SEQS   the prefill's --max-num-seqs; optional, 4
 #
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
@@ -419,7 +420,7 @@ if [ "$_role" = prefill ]; then
   ROLE_ARGS=(
     --decode-context-parallel-size 32
     --load-format megakernel --model-loader-extra-config "$_loader"
-    --max-num-seqs 4 --max-num-batched-tokens 8192
+    --max-num-seqs "${RECIPE_PREFILL_MAX_NUM_SEQS:-4}" --max-num-batched-tokens 8192
     --kv-cache-memory-bytes "$_kv_cache_bytes"
     "${_retention[@]}"
     --kv-transfer-config "$_kv"
