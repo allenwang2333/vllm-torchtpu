@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 from typing import Callable
 
 import numpy as np
@@ -63,6 +64,11 @@ class Plan:
     kv: str = "M"           # K: whose bytes land in the caches for this step's rows
     draft: str = "M"        # D: hidden handed to the drafter
     stats: bool = False     # shadow statistics (needs both forwards)
+    # per-arm debug switches (None: follow the global env). Each one host-syncs every step, and a
+    # sync between consecutive megakernel steps can hide an ordering hazard, so arms can opt out.
+    kvdiff: bool | None = None      # +kv / -kv
+    idcheck: bool | None = None     # +id / -id
+    specdbg: bool | None = None     # +sd / -sd
 
     @property
     def run_stock(self) -> bool:
@@ -97,21 +103,40 @@ def _mix(code: str, label: str | None = None, stats: bool = False) -> Plan:
 
 
 class _Alt:
-    def __init__(self, k: int):
+    def __init__(self, k: int, flags: dict | None = None, name: str | None = None):
         if k < 2:
             raise ValueError(f"alt:{k}: period must be >= 2")
         self.k = k
         self.i = 0
+        self.flags = flags or {}
+        self.name = name or f"alt:{k}"
 
     def next(self) -> Plan:
         i, self.i = self.i, self.i + 1
-        lab = f"alt:{self.k}"
-        return dataclasses.replace(STOCK if i % self.k == self.k - 1 else MK,
-                                   label=f"{lab}/{'stock' if i % self.k == self.k - 1 else 'mk'}")
+        stock = i % self.k == self.k - 1
+        return dataclasses.replace(STOCK if stock else MK, **self.flags,
+                                   label=f"{self.name}/{'stock' if stock else 'mk'}")
+
+
+_FLAGS = {"kv": "kvdiff", "id": "idcheck", "sd": "specdbg"}
 
 
 def _parse_one(tok: str):
     tok = tok.strip()
+    parts = re.split(r"([+-])(?=kv|id|sd)", tok)
+    base, flags = parts[0], {}
+    for sign, f in zip(parts[1::2], parts[2::2]):
+        if f not in _FLAGS:
+            raise ValueError(f"GLM5_MKD_MODE flag {sign}{f} in {tok!r}")
+        flags[_FLAGS[f]] = sign == "+"
+    p = _parse_base(base)
+    if isinstance(p, _Alt):
+        p.flags, p.name = flags, tok
+        return p
+    return dataclasses.replace(p, label=tok if flags else p.label, **flags)
+
+
+def _parse_base(tok: str):
     if tok == "stock":
         return STOCK
     if tok == "mk":
@@ -164,10 +189,19 @@ class ModeSchedule:
             return
         self.seen.update(new)
         if self.cycle:
-            for _ in new:
+            for r in new:
                 if self.n_new > 0:
                     self.arm = (self.arm + 1) % len(self.arms)
                 self.n_new += 1
+                logger.info("GLM5_MKD_MODE arm %d (%s) for new request %s (#%d)", self.arm,
+                            self.arm_names[self.arm], r, self.n_new)
+
+    def any_flag(self, field: str) -> bool:
+        for a in self.arms:
+            f = a.flags.get(field) if isinstance(a, _Alt) else getattr(a, field)
+            if f:
+                return True
+        return False
 
     def plan(self) -> Plan:
         a = self.arms[self.arm]

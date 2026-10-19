@@ -433,3 +433,20 @@ def test_forward_routing():
     out, _ = r.forward_model(ids, pos)
     assert torch.equal(out, torch.zeros(4, 8)) and not r.glm5_mkd.aux.called
     assert r._fwd_was_mkd == "alt:2/stock"
+
+
+def test_arm_flags():
+    s = D.ModeSchedule("cycle:mk-sd/mk+kv+id/alt:4-sd/shadow+kv")
+    p = s.plan()
+    assert p.pure_mk and p.specdbg is False and p.kvdiff is None and p.label == "0:mk-sd"
+    s.observe_requests(["a"])
+    s.observe_requests(["b"])
+    p = s.plan()
+    assert p.pure_mk and p.kvdiff is True and p.idcheck is True
+    s.observe_requests(["c"])
+    p = s.plan()
+    assert p.pure_mk and p.specdbg is False and p.label == "2:alt:4-sd/mk"
+    assert s.any_flag("kvdiff") and s.needs_probe
+    assert not D.ModeSchedule("mk").any_flag("kvdiff")
+    with pytest.raises(ValueError):
+        D.ModeSchedule("mk+zz+kv")

@@ -4532,7 +4532,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                     topk_candidates=topk_candidates,
                 ).view(-1)
-        if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+        if self._specdbg_on():
             self._specdbg_logits(
                 md,
                 target_logits,
@@ -4563,7 +4563,7 @@ class TPUModelRunner(GPUModelRunner):
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=accept_u,
             )
-            if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+            if self._specdbg_on():
                 self._specdbg_output(md, sel)
             return sel
         assert accept_u is not None
@@ -4589,7 +4589,7 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
         )
-        if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+        if self._specdbg_on():
             self._specdbg_output(md, sel)
         return sel
 
@@ -7599,6 +7599,13 @@ class TPUModelRunner(GPUModelRunner):
             # Padding-mask support is currently limited to the ALL layout.
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
+
+    def _specdbg_on(self) -> bool:
+        """GLM5_MKD_SPECDBG=1, unless this step's GLM5_MKD_MODE arm opted out (-sd)."""
+        if os.environ.get("GLM5_MKD_SPECDBG") != "1":
+            return False
+        plan = getattr(self, "_mkd_plan", None)
+        return plan is None or getattr(plan, "specdbg", None) is not False
 
     def _specdbg_obj(self):
         st = self.__dict__.get("_specdbg_st")

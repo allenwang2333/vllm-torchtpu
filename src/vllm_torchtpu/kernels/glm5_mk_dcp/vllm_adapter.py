@@ -428,8 +428,9 @@ class Glm5MKD:
         self.caches = caches
         self.nb = nb
         self._cmap = cmap
-        self._step = self._build_op(writer=True, staging=self.kvdiff)
-        if self.sched.needs_probe or self.kvdiff:
+        self._step_staging = self.kvdiff or self.sched.any_flag("kvdiff")
+        self._step = self._build_op(writer=True, staging=self._step_staging)
+        if self.sched.needs_probe or self._step_staging:
             # read-only megakernel (no writer, caches not donated) returning its staged rows
             self._probe = self._build_op(writer=False, staging=True)
 
@@ -649,7 +650,8 @@ class Glm5MKD:
         res = fn(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
                  self.cos_sin, self.smalls, self.weights, self.caches)
         out = res[0]
-        stg = tuple(res[1:4]) if (fn is self._probe or self.kvdiff) and len(res) >= 4 else None
+        has = fn is self._probe or (fn is self._step and self._step_staging)
+        stg = tuple(res[1:4]) if has and len(res) >= 4 else None
         rest = res[4:] if stg is not None else res[1:]
         if len(rest) > 0:
             self.last_dbg = tuple(rest)
@@ -663,14 +665,16 @@ class Glm5MKD:
         if self._step is None:               # capture_model was skipped (e.g. a microbenchmark)
             self.bind_caches(runner)
         md = self._metadata()
+        plan = getattr(runner, "_mkd_plan", None)
+        kv = self._kv_on(plan)
         coords = snap = None
-        if self.kvdiff:
+        if kv:
             coords, snap = self._dbg_safe(lambda: self._coords_snapshot(md, positions), (None, None))
         out, stg = self._run(self._step, md, input_ids, positions)
-        if self.kvdiff and stg is not None and coords is not None:
+        if kv and stg is not None and coords is not None:
             # after the megakernel's own writer: placement must be byte-exact, neighbours untouched
             self._dbg_safe(lambda: self._kv_report("writer", coords, stg, snap))
-        self._after_step(md, positions)
+        self._after_step(md, positions, self._id_on(plan))
         return out
 
     @torch.no_grad()
@@ -681,28 +685,35 @@ class Glm5MKD:
         read-only (plan.kv == 'S'), then hand back the hidden the plan selects; the drafter's hidden
         goes through runner._mkd_draft_hidden."""
         md = self._metadata()
+        kv = self._kv_on(plan)
         if plan.mk_writer:
             coords = snap = None
-            if self.kvdiff:
+            if kv:
                 coords, snap = self._dbg_safe(lambda: self._coords_snapshot(md, positions), (None, None))
             out, stg = self._run(self._step, md, input_ids, positions)
-            if self.kvdiff and stg is not None and coords is not None:
+            if kv and stg is not None and coords is not None:
                 self._dbg_safe(lambda: self._kv_report("writer", coords, stg, snap))
         else:
             out, stg = self._run(self._probe, md, input_ids, positions)
-            if self.kvdiff and stg is not None:
+            if kv and stg is not None:
                 # the caches hold what the STOCK forward just wrote for these rows: numerics/format
                 self._dbg_safe(lambda: self._kv_report(
                     "numerics", self._coords_snapshot(md, positions, snap=False)[0], stg, None))
         if plan.stats:
             self._dbg_safe(lambda: self._shadow(runner, plan, md, out, stock_out))
-        self._after_step(md, positions)
+        self._after_step(md, positions, self._id_on(plan))
         ret = out if plan.ret == "M" else stock_out
         drafted = out if plan.draft == "M" else stock_out
         runner._mkd_draft_hidden = None if plan.draft == plan.ret else drafted
         return ret
 
     # ------------------------------------------------------------- debug helpers
+
+    def _kv_on(self, plan) -> bool:
+        return self.kvdiff if plan is None or plan.kvdiff is None else plan.kvdiff
+
+    def _id_on(self, plan) -> bool:
+        return self.idcheck if plan is None or plan.idcheck is None else plan.idcheck
 
     def _dbg_safe(self, fn, default=None):
         try:
@@ -758,9 +769,9 @@ class Glm5MKD:
         a[4] = max(a[4], st["dh_max"])
         a[5] = max(a[5], st["dh_rel_max"])
 
-    def _after_step(self, md, positions) -> None:
+    def _after_step(self, md, positions, idcheck: bool) -> None:
         self.n_dbg += 1
-        if self.idcheck:
+        if idcheck:
             def chk():
                 qsl = md.query_start_loc.cpu().numpy()
                 seq = md.seq_lens.cpu().numpy()
@@ -773,7 +784,7 @@ class Glm5MKD:
                                    "requests: %s", self.rank, bad, n, ex)
             self._dbg_safe(chk)
         if self.n_dbg % self.dbg_every == 0:
-            if self.idcheck and self.rank == 0:
+            if self.id_tot[0] and self.rank == 0:
                 logger.info("IDCHECK steps %d requests %d violations %d", self.n_dbg, *self.id_tot)
             for kind, tot in self.kv_tot.items():
                 logger.info("KVDIFF %s rank %d steps %d: %s", kind, self.rank, self.n_dbg,
