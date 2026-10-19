@@ -594,7 +594,9 @@ class Glm5MKD:
                 for dst, src in zip(caches, outs[1:1 + len(caches)]):
                     dst.copy_(src)
                 k += len(caches)
-            return (outs[0][:TMAX], *outs[k:])
+            # what the kernel was handed (rows: valid, pos, req, seq; requests: t0, nq, seq, valid),
+            # for the in-graph metadata check (debug; two small extra outputs)
+            return (outs[0][:TMAX], rmeta[:, :4], qmeta, *outs[k:])
 
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
@@ -650,6 +652,8 @@ class Glm5MKD:
         res = fn(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
                  self.cos_sin, self.smalls, self.weights, self.caches)
         out = res[0]
+        self._seen = (res[1], res[2])                # rmeta[:, :4], qmeta as consumed by the kernel
+        res = (out, *res[3:])
         has = fn is self._probe or (fn is self._step and self._step_staging)
         stg = tuple(res[1:4]) if has and len(res) >= 4 else None
         rest = res[4:] if stg is not None else res[1:]
@@ -771,6 +775,13 @@ class Glm5MKD:
 
     def _after_step(self, md, positions, idcheck: bool) -> None:
         self.n_dbg += 1
+        if self.sched.spec != "mk" or self.idcheck:
+            # in-graph check, batched: keep device refs, sync once per dbg_every steps
+            q = self.__dict__.setdefault("_seen_q", [])
+            q.append((self._seen[0], self._seen[1], positions, md.seq_lens, md.query_start_loc))
+            if len(q) >= self.dbg_every:
+                self._dbg_safe(self._seen_check)
+                q.clear()
         if idcheck:
             def chk():
                 qsl = md.query_start_loc.cpu().numpy()
@@ -794,6 +805,42 @@ class Glm5MKD:
                     logger.info("SHADOW %s steps %d mean KL(p_mk||p_stock) %.4g max %.4g argmax "
                                 "agree %.4f max|dh| %.4g max rel|dh| %.4g", lab, a[0], a[1] / a[0],
                                 a[2], a[3] / a[0], a[4], a[5])
+
+    def _seen_check(self) -> None:
+        """For every queued step: the rows the KERNEL got (rmeta pos / seq, qmeta seq / nq, built
+        inside the compiled step) must satisfy p0 = seq - nq == pos[t0] (the identity, (b)) and must
+        equal the runner's corrected position_ids / seq_lens read now. A mismatch with the second
+        while the first holds would mean the step consumed its inputs before an async correction
+        (subtract_num_rejected_tokens) landed: an ordering hazard, invisible to a host read."""
+        n_id = n_ord = n_tot = 0
+        ex = []
+        for rmeta, qmeta, pos, seq, qsl in self._seen_q:
+            rm = rmeta.cpu().numpy()
+            qm = qmeta.cpu().numpy()
+            qs = qsl.cpu().numpy()
+            T = int(qs[-1])
+            ps = pos[:T].cpu().numpy()
+            sq = seq.cpu().numpy()
+            n_tot += 1
+            bad_id = bad_ord = False
+            for b in range(qm.shape[0]):
+                t0, nq, s_k, v = (int(x) for x in qm[b])
+                if not v:
+                    continue
+                if any(int(rm[t0 + j, 1]) != s_k - nq + j for j in range(nq)):
+                    bad_id = True
+                if b < len(sq) and int(sq[b]) != s_k:
+                    bad_ord = True
+            if T and (rm[:T, 1] != ps).any():
+                bad_ord = True
+            n_id += bad_id
+            n_ord += bad_ord
+            if (bad_id or bad_ord) and len(ex) < 2:
+                ex.append(dict(kernel_pos=rm[:T, 1].tolist(), runner_pos=ps.tolist(),
+                               kernel_seq=qm[:, 2][qm[:, 3] > 0].tolist(), runner_seq=sq[:4].tolist()))
+        if n_id or n_ord or self.rank == 0:
+            logger.info("SEENCHECK rank %d: %d steps, identity violations %d, kernel-vs-runner "
+                        "mismatches %d %s", self.rank, n_tot, n_id, n_ord, ex if ex else "")
 
     def warmup(self, runner) -> None:
         """Compile and run once: one request of QMAX rows at positions 0..QMAX-1 on block 0 (the
