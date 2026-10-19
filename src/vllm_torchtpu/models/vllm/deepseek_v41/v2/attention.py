@@ -491,9 +491,6 @@ def _request_row_slots(
     return blocks[:, :width] + offsets
 
 
-_DEFAULT_REQUEST_ROW_SLOTS = _request_row_slots
-
-
 def _read_rows(cache, block_table, requests, logical):
     slots = _row_slots(cache, block_table, requests, logical)
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
@@ -1257,34 +1254,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                 cached_idx_entry is None
                                 or cached_idx_entry[0] is not keys_meta.block_tables
                             ):
-                                if _request_row_slots is _DEFAULT_REQUEST_ROW_SLOTS:
-                                    cached_idx_req = _request_row_slots(
-                                        index_cache,
-                                        idx_table,
-                                        capacity,
-                                        page_stride=(
-                                            index_cache.page_stride
-                                            if has_fast_idx_offset
-                                            else None
-                                        ),
-                                        dtype=(
-                                            torch.int32
-                                            if has_fast_idx_offset
-                                            else torch.int64
-                                        ),
-                                    )
-                                else:
-                                    req_slots = _request_row_slots(
-                                        index_cache, idx_table, capacity
-                                    )
-                                    cached_idx_req = (
-                                        req_slots
-                                        // index_cache.shape[1]
-                                        * index_cache.page_stride
-                                        + req_slots % index_cache.shape[1]
+                                cached_idx_req = _request_row_slots(
+                                    index_cache,
+                                    idx_table,
+                                    capacity,
+                                    page_stride=(
+                                        index_cache.page_stride
                                         if has_fast_idx_offset
-                                        else req_slots
-                                    )
+                                        else None
+                                    ),
+                                    dtype=(
+                                        torch.int32
+                                        if has_fast_idx_offset
+                                        else torch.int64
+                                    ),
+                                )
                                 if stage_cache is not None:
                                     stage_cache[idx_req_key] = (
                                         keys_meta.block_tables,
