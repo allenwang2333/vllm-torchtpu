@@ -2015,19 +2015,31 @@ def _assert_hidden_equal_per_row(
 # qwen35-candidate30-fused tiles B=8 seeds 0/2/4, B=24 seeds 0-2, T=4) are
 # bitwise equal on TPU v7x for hidden and every pool page (job
 # j-42e743ba-11c1-45c5-bec8), so this is a CPU-interpret codegen artifact.
-# Bounded at the largest measured value (177 ULP, test tiles seed 4).
-CPU_FUSED_T4_HIDDEN_ULP_BOUND = 177
+# Each case is bounded at its own measured hidden max bf16 ULP (CPU interpret,
+# B1 head); every other T > 1 case must stay bitwise (bound 0).
+CPU_FUSED_HIDDEN_ULP_BOUNDS: dict[tuple, int] = {
+    # test_fused_pool_io_bit_exact_and_hlo (test tiles): ("test", T, B, seed)
+    ("test", 4, 8, 2): 6,
+    ("test", 4, 8, 4): 177,
+    # test_candidate30_fused_profile_vs_split: ("c30f", B, seed), T=4
+    ("c30f", 8, 0): 11,
+    ("c30f", 24, 0): 36,
+}
 
 
-def _xfail_on_cpu_fused_artifact(out_f: Any, out_s: Any, R: int, pools: tuple) -> None:
-    """Pass if hidden is bitwise; else bounded XFAIL (CPU-interpret artifact)."""
+def _xfail_on_cpu_fused_artifact(
+    out_f: Any, out_s: Any, R: int, pools: tuple, case: tuple
+) -> None:
+    """Pass if hidden is bitwise; else XFAIL within the case's bound (CPU artifact)."""
     d = _hidden_row_ulp(out_f, out_s, R)
     if not d.any():
         return
+    bound = CPU_FUSED_HIDDEN_ULP_BOUNDS.get(case, 0)
     msg = (
-        f"hidden per-row max bf16 ULP {d.tolist()}; pools: {_pool_diff_summary(*pools)}"
+        f"hidden per-row max bf16 ULP {d.tolist()} (case {case}, bound {bound}); "
+        f"pools: {_pool_diff_summary(*pools)}"
     )
-    assert int(d.max()) <= CPU_FUSED_T4_HIDDEN_ULP_BOUND, msg
+    assert int(d.max()) <= bound, msg
     pytest.xfail(f"CPU-interpret fused T>1 artifact (TPU bit-exact): {msg}")
 
 
@@ -2069,7 +2081,7 @@ WIDE_FUSED_REC_ULP_BOUND = 12
         (2, 4, 1),
         (2, 4, 2),
         (4, 8, 1),
-        # CPU-interpret artifact (see CPU_FUSED_T4_HIDDEN_ULP_BOUND; bitwise on
+        # CPU-interpret artifact (see CPU_FUSED_HIDDEN_ULP_BOUNDS; bitwise on
         # TPU): seed 2 differs on hidden rows 2-3 by up to 6 bf16 ULP, seed 4 on
         # rows 3-7 by up to 177 ULP. Reported as bounded XFAIL with per-row ULP
         # and the per-kind pool diff.
@@ -2181,7 +2193,9 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     if T == 1:
         _assert_hidden_equal_per_row(out_f, out_s, ex.R, pools=pools_cmp)
     else:
-        _xfail_on_cpu_fused_artifact(out_f, out_s, ex.R, pools_cmp)
+        _xfail_on_cpu_fused_artifact(
+            out_f, out_s, ex.R, pools_cmp, case=("test", T, B, seed)
+        )
     rec_ulp = max(1, T - 1)
     if ex.WIDE:
         # Known open deviation (root cause under investigation): on WIDE buckets
@@ -2286,7 +2300,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
         # Measured at the B1 head (CPU interpret): hidden bitwise, rec-state
         # pages within T - 1 ULP.
         (8, 1),
-        # CPU-interpret artifact (see CPU_FUSED_T4_HIDDEN_ULP_BOUND; bitwise on
+        # CPU-interpret artifact (see CPU_FUSED_HIDDEN_ULP_BOUNDS; bitwise on
         # TPU): B=8 seed 0 differs on hidden row 7 by 11 bf16 ULP, B=24 seed 0
         # on rows 6-7 by 36 ULP. Reported as bounded XFAIL.
         (8, 0),
@@ -2364,7 +2378,7 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
     out_f, raw_f = step_f(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
     kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
     _xfail_on_cpu_fused_artifact(
-        out_f, out_s, ex.R, (raw_f, raw_s, ex.num_pages, kinds)
+        out_f, out_s, ex.R, (raw_f, raw_s, ex.num_pages, kinds), case=("c30f", B, seed)
     )
     worst = max(
         _rec_pool_max_ulp(r_f, r_s, ex.num_pages, kinds)

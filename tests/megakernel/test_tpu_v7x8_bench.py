@@ -2170,3 +2170,118 @@ def test_m5_tpu_v7x8_frozen_parity_bisect(variant: str, monkeypatch):
         print(f"=== M5_BISECT variant={variant} NOT_EXACT: {exc}", flush=True)
         if variant == "default":
             raise
+
+
+# Fused vs split pool I/O at T=4 (verify), TPU bitwise. These configs include
+# every case that deviates on CPU interpret (bounded XFAILs in
+# test_m3_cache_eplb.py); on TPU hidden output and every pool page must match
+# bytewise. First measured in job j-42e743ba-11c1-45c5-bec8 (libtpu 0.0.50).
+_FUSED_T4_TPU_CASES = [
+    # (tiles, B, seed): "c30f" = qwen35-candidate30-fused exec_for tiles,
+    # "test" = the CPU fused test's tiles (head-major GDN, conv_stage off).
+    ("c30f", 8, 0),
+    ("c30f", 8, 2),
+    ("c30f", 8, 4),
+    ("c30f", 24, 0),
+    ("c30f", 24, 1),
+    ("c30f", 24, 2),
+    ("test", 8, 0),
+    ("test", 8, 2),
+    ("test", 8, 4),
+]
+
+
+@pytest.mark.parametrize("tiles,B,seed", _FUSED_T4_TPU_CASES)
+def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
+    """Fused pool I/O is bitwise equal to split on TPU (hidden + every pool page)."""
+    if not _has_tpu_v7x8():
+        pytest.skip("Requires 8 TPU TensorCores (v7x-8)")
+    from test_m3_cache_eplb import (
+        _pool_diff_summary,
+        _pool_page_kinds,
+        _tiny_exec,
+        _tiny_geom,
+    )
+
+    from vllm_torchtpu import megakernel as mk
+
+    T = 4
+    mesh = Mesh(np.array(jax.devices()[:2]), ("tp",))
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    spec = qwen35.qwen35_spec(g)
+    num_pages = 512 if B <= 8 else 2048
+    if tiles == "test":
+        ex0 = _tiny_exec(
+            R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=num_pages, stack_e=False
+        )
+        ex = dataclasses.replace(
+            ex0,
+            tiles=dataclasses.replace(
+                ex0.resolved_tiles, conv_stage=False, gdn_head_major=True
+            ),
+            pool_gather=False,
+            interpret=False,
+        )
+        key = 710 + T * 10 + B + 1000 * seed
+    else:
+        prof = get_profile("qwen35-candidate30-fused")
+        base = ExecSpec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=num_pages)
+        ex = prof.exec_for(base, B=B, T=T, g=g)
+        t = ex.resolved_tiles
+        t = dataclasses.replace(
+            t,
+            bank=512 << 10,
+            nbd=10,
+            nbe=max(6, min(t.nbe, 12)),
+            ebank=256 << 10,
+            kv_blk=256,
+            vmem_mib=32,
+            kv_sub=128 if t.kv_sub else 0,
+        )
+        ex = dataclasses.replace(ex, tiles=t, pool_gather=False, interpret=False)
+        key = 810 + B + 1000 * seed
+    assert should_fuse_pool_io(spec, ex, fused_pool_io=True)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(key), g, ex)
+    pos_list = []
+    for s_i in range(ex.NS):
+        base_p = 126 if s_i == 0 else (20 + 10 * s_i)
+        pos_list.extend(base_p + t_i for t_i in range(T))
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+    st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+
+    def _fresh_pools():
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+        )
+
+    step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex, donate=False
+    )
+    step_f, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+        mesh, spec, ex, donate=True
+    )
+    pools_in = [np.asarray(r).view(np.uint8) for r in _fresh_pools()]
+    out_s, raw_s = step_s(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    out_f, raw_f = step_f(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    hs = np.asarray(out_s).view(np.uint8)
+    hf = np.asarray(out_f).view(np.uint8)
+    # Non-trivial: the split step wrote the pools and produced a finite output.
+    assert np.isfinite(np.asarray(out_s, dtype=np.float32)).all()
+    assert any(
+        (np.asarray(r).view(np.uint8) != p).any() for r, p in zip(raw_s, pools_in)
+    )
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    summary = _pool_diff_summary(raw_f, raw_s, ex.num_pages, kinds)
+    print(
+        f"[FUSED_T4_TPU tiles={tiles} B={B} seed={seed}] "
+        f"hidden_equal={bool((hs == hf).all())} pool_diff={summary}",
+        flush=True,
+    )
+    np.testing.assert_array_equal(hf, hs)
+    assert not summary, summary
