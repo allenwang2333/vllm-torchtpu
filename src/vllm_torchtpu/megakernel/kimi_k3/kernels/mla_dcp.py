@@ -64,16 +64,29 @@ HEAD_SLOTS = 4  # most rows per rank and batch row in a packet (see packet_layou
 NEG = -1e30  # finite "no tokens" log-sum-exp
 MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (see _attend_chunked)
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
+DP4_HEADS = 12  # attention DP4's held heads per rank (four TP32 shards)
+
+
+def _lookup_rows(batch, heads=HEADS_PER_RANK):
+    """Calls whose page steps find their row by a binary search over SMEM
+    bounds (and stage rows one by one): 32, 48 and 64 rows; attention DP4's
+    16, 24 and 32 group rows."""
+    if heads == DP4_HEADS:
+        return batch in (16, 24, 32)
+    return batch in (32, 48, 64)
 
 
 def chunk_layout(batch: int, heads: int = HEADS_PER_RANK, *, chunk_rows: int | None = None) -> tuple[int, int]:
     """``(chunk rows, ring slots)`` of a chunked call (``batch > MAX_ROWS``):
-    8-row chunks at B16/B32/B48/B64 (amortizing exchanges), else 4 (also
-    attention DP2's B128: 64 group rows of six heads, for VMEM); ring slots
+    8-row chunks at B16/B32/B48/B64 and attention DP4's 24 group rows
+    (amortizing exchanges), else 4 (also attention DP2's B128 and DP4's: 64
+    group rows of six heads, 32 of twelve, for VMEM); ring slots
     4 at B32 with three heads per rank, 3 for 8-row chunks, else 2
     (``persistent_scratch`` uses 4 for FP8 query packets). ``chunk_rows``
     overrides the width and keeps at least three slots for a staged combine."""
     wide = batch <= 16 or batch in (32, 48, 64) and not (batch == 64 and heads == 6)
+    if heads == DP4_HEADS:
+        wide = batch <= 24
     rows = chunk_rows if chunk_rows is not None else 8 if wide else 4
     ring = 4 if batch == 32 and heads == HEADS_PER_RANK else 3 if wide or chunk_rows is not None else 2
     if rows not in (4, 8) or batch % rows or rows > MAX_ROWS or ring not in (2, 3, 4):
@@ -92,14 +105,15 @@ def page_plan(batch: int, heads: int = HEADS_PER_RANK, sequence_rows: int = 1,
     rank (``sequence_rows`` per sequence): ``span`` pages per step and
     ``buffers`` steps in flight, sized to fit VMEM. Up to four rows and plain
     decode: ``SPAN`` x ``BUFFERS`` (3 buffers chunked, except attention DP2's
-    FP8 B128, whose long-context page reads outrun three; FP8 B64 and B96
+    and DP4's FP8 B128, whose long-context page reads outrun three; FP8 B64 and B96
     stage twice the span, see ``staged_folds``). Verifies above four rows:
     half the span, twice the buffers (4 at B64 and attention DP's B32), 3/4
     chunked."""
     if batch <= 4:
         return {"span": SPAN, "buffers": BUFFERS}
     if sequence_rows == 1:
-        deep = batch == 64 and heads == 6 and cache_dtype == jnp.float8_e4m3fn
+        deep = (batch == 64 and heads == 6 or batch == 32 and heads == DP4_HEADS) and (
+            cache_dtype == jnp.float8_e4m3fn)
         return {"span": SPAN, "buffers": 3 if chunked(batch) and not deep else BUFFERS}
     span = max(1, SPAN // 2)
     buffers = 4 if batch == 64 or (batch == 32 and heads != HEADS_PER_RANK) else BUFFERS * SPAN // span
@@ -249,11 +263,13 @@ def persistent_scratch(batch, group=GROUP, heads=HEADS_PER_RANK, *,
                        chunk_rows=None):
     # Send the receiver's identical FP8 operand and lossless FP32 scale
     # (``fp8_wire``: for any shape, e.g. the MLA DSpark draft's two heads).
-    # Plain attention DP2 holds six heads for B/2 rows. Speculative attention
+    # Plain attention DP2 holds six heads for B/2 rows, DP4 twelve for B/4.
+    # Speculative attention
     # retains full-precision owner queries for its causal new-token fold.
     plain = sequence_rows == 1 and (
         (batch in (32, 64) and heads == HEADS_PER_RANK)
-        or (group == 16 and batch in (16, 32, 48, 64) and heads == 6))
+        or (group == 16 and batch in (16, 32, 48, 64) and heads == 6)
+        or (group == 8 and batch in (16, 24, 32) and heads == DP4_HEADS))
     query_dtype = (jnp.uint8 if cache_dtype == jnp.float8_e4m3fn
                    and (plain or fp8_wire or _grouped_spec(batch, group, heads, sequence_rows))
                    else jnp.bfloat16)
@@ -291,7 +307,11 @@ def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.b
     MXU's native tile (retiled by the DMA) rather than as the pool's
     ``[span * 128, packing, 640]`` blocks, whose loads relayout every tile:
     attention DP2's plain B96 and B128 (48 and 64 group rows of six heads)
-    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``)."""
+    and FP8 B64 (32; not under the opt-in ``mla_decode_ktile=2048``);
+    attention DP4's plain B96 and B128 and FP8 B64 (24, 32 and 16 rows)."""
+    if heads == DP4_HEADS:
+        return sequence_rows == 1 and (
+            batch in (24, 32) or batch == 16 and cache_dtype == jnp.float8_e4m3fn)
     return heads == 6 and sequence_rows == 1 and (
         batch in (48, 64) or batch == 32 and cache_dtype == jnp.float8_e4m3fn
         and _config().mla_decode_ktile == 1024)
@@ -299,11 +319,14 @@ def native_pages(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.b
 
 def staged_folds(batch, heads=HEADS_PER_RANK, sequence_rows=1, cache_dtype=jnp.bfloat16) -> int:
     """Softmax folds per page step. Attention DP2's FP8 B64 and B96 (32 and
-    48 group rows) stage two: one page wait, row lookup, pool pick and QK per
-    2048 tokens, folded as two 1024-token parts in order (the normalization
-    and FP8 probability boundaries of 1024-token steps, so outputs are
-    unchanged). Their rows end with a static tail
+    48 group rows) and DP4's (16 and 24) stage two: one page wait, row
+    lookup, pool pick and QK per 2048 tokens, folded as two 1024-token parts
+    in order (the normalization and FP8 probability boundaries of 1024-token
+    steps, so outputs are unchanged). Their rows end with a static tail
     (``DcpAttention._staged_tail``), which B128 has no VMEM for."""
+    if heads == DP4_HEADS:
+        return 2 if (native_pages(batch, heads, sequence_rows, cache_dtype)
+                     and batch in (16, 24) and cache_dtype == jnp.float8_e4m3fn) else 1
     return 2 if (native_pages(batch, heads, sequence_rows, cache_dtype) and batch in (32, 48)
                  and cache_dtype == jnp.float8_e4m3fn and _config().mla_decode_ktile == 1024) else 1
 
@@ -343,8 +366,8 @@ def scoped_scratch(batch, span=SPAN, buffers=BUFFERS, heads=HEADS_PER_RANK, grou
           (tpu.VMEM((rows, LANES), jnp.float32),
            tpu.VMEM((rows, LANES), jnp.float32),
            tpu.VMEM((8, 128), jnp.float32))),
-        tpu.SMEM((batch if batch in (32, 48, 64) else 1,), jnp.int32),
-        tpu.SMEM((batch if batch in (32, 48, 64) else 1,), jnp.int32),
+        tpu.SMEM((batch if _lookup_rows(batch, heads) else 1,), jnp.int32),
+        tpu.SMEM((batch if _lookup_rows(batch, heads) else 1,), jnp.int32),
         tpu.VMEM((held, tile, 1), jnp.float32),
     )
 
@@ -427,7 +450,7 @@ class DcpAttention:
             self.counts.append(count if not self.shared or b % sequence_rows == 0 else 0)
             starts.append(starts[-1] + (self.counts[-1] + self.span - 1) // self.span)
         self.starts, self.total = starts, starts[-1]
-        if batch in (32, 48, 64):
+        if _lookup_rows(batch, heads):
             for b in range(batch):
                 workspace.lookup_bounds[b] = starts[b]
                 workspace.lookup_counts[b] = self.counts[b]
@@ -441,7 +464,7 @@ class DcpAttention:
         return self.position_ref[row // self.sequence_rows * self.sequence_rows]
 
     def _locate(self, step):
-        if self.batch in (32, 48, 64):
+        if _lookup_rows(self.batch, self.heads):
             row = jnp.int32(0)
             for bit in range((self.batch - 1).bit_length() - 1, -1, -1):
                 candidate = jnp.minimum(row + (1 << bit), self.batch - 1)
@@ -1446,10 +1469,11 @@ def _attend_chunked(self, queries, new_latents, between, *, keys=None, key_valid
         if "merge" in self.skip:
             return
         if self.sequence_rows == 1 or self.cache_verify_rows:
-            # Attention DP2's B128 and FP8 B96 merge four peers a step.
+            # Attention DP2's and DP4's B128 and FP8 B96 merge four peers a step.
             ws.merged[c, :rows, :] = _merge_received(
                 ws.receive.at[ring(c)], ws.own_rows[c, :rows, :], ws.new_rows[c, :rows, :], group,
-                unroll=4 if self.heads == 6 and (batch == 64 or batch == 48 and self.fp8) else 1)
+                unroll=4 if self.heads == 6 and (batch == 64 or batch == 48 and self.fp8) else
+                4 if self.heads == DP4_HEADS and (batch == 32 or batch == 24 and self.fp8) else 1)
             return
         if keys is not None:
             assert key_valid is not None

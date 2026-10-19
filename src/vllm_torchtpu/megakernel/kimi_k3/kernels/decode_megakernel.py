@@ -1864,13 +1864,18 @@ def _run_routed_expert_stream(
                 run_next_expert_pair(iteration)
 
 
+def _staging_slot_rows(payload_rows: int) -> int:
+    """A staged per-pair payload's slot: whole 16-row BF16 tiles."""
+    return -(-payload_rows // 16) * 16
+
+
 def projection_staging_scratch(batch_size: int, attention_dp: int = 1) -> tuple[Any, ...]:
     """Above B32: send/receive staging of the attention projection's four
-    per-pair payloads ([2, 4 * payload, 128] BF16)."""
+    per-pair payloads ([2, 4 * slot, 128] BF16)."""
     if batch_size <= 32:
         return ()
     payload_rows = (batch_size // attention_dp // 4) * 3584 // 128
-    return (tpu.VMEM((2, 4 * payload_rows, 128), jnp.bfloat16),)
+    return (tpu.VMEM((2, 4 * _staging_slot_rows(payload_rows), 128), jnp.bfloat16),)
 
 
 def routed_send_scratch(batch_size: int) -> tuple[Any, ...]:
@@ -3485,10 +3490,10 @@ DP_WEIGHT_STREAMS = {
 def _dp_dcp_weight_streams(dp: int, group_rows: int) -> dict[str, tuple[int, int]]:
     """Attention DP under DCP: the KDA input projection (13 chunks per held
     shard) and MLA q-down (12) stream so the DCP pages and packets fit, while
-    key-value-up stays resident. DP2 ring depths shrink as the group rows
-    grow; with one group row (B2) MLA query-up and gate are also copied whole."""
+    key-value-up stays resident. Ring depths shrink as the group rows grow;
+    with one group row (DP2 B2) MLA query-up and gate are also copied whole."""
     if dp != 2:
-        depths = (4, 4)
+        depths = {8: (13, 12), 16: (7, 7)}.get(group_rows, (6, 4))
     elif group_rows <= 8:
         depths = (13, 12)
     else:
@@ -3848,7 +3853,8 @@ class KdaStateStreamSlice:
     """
 
     def __init__(self, parent, *, first_chunk: int, chunks: int):
-        if first_chunk < 0 or chunks < 1 or first_chunk + chunks > parent.chunks:
+        if isinstance(first_chunk, int) and (
+                first_chunk < 0 or chunks < 1 or first_chunk + chunks > parent.chunks):
             raise ValueError("A state-stream slice must fit within its parent")
         self.parent = parent
         self.first_chunk, self.chunks = first_chunk, chunks
@@ -3886,6 +3892,30 @@ def _shard_dot(stream, x, shard, guard):
         for index in range(per_shard)
     ]
     return parts[0] if per_shard == 1 else jnp.concatenate(parts, axis=1)
+
+
+def _traced_dot_position(stream, x_ref, position, guard, out_ref):
+    """``dot_position`` at a traced ``position`` of a ring column stream with
+    equal chunks: wait, multiply ``x_ref`` by the chunk into ``out_ref``
+    (BF16), refill the slot ``depth`` positions ahead."""
+    if stream.slots is None or stream.order is not None or len(set(stream.sizes)) != 1:
+        raise ValueError("A traced stream position needs a ring of equal chunks")
+    size = stream.sizes[0]
+    slot = position % stream.depth
+
+    def copy(at, destination, semaphore):
+        source = stream.source.at[:, pl.ds(pl.multiple_of(at * size, 128), size)]
+        return tpu.make_async_copy(source, destination, semaphore)
+
+    for index, destination in enumerate(stream.slots):
+        @pl.when(slot == index)
+        def consume(destination=destination, semaphore=stream.semaphores.at[stream.base + index]):
+            copy(position, destination, semaphore).wait()
+            out_ref[...] = _dot(x_ref[...], destination[...]).astype(jnp.bfloat16)
+
+            @pl.when(guard & (position + stream.depth < stream.chunks))
+            def refill():
+                copy(position + stream.depth, destination, semaphore).start()
 
 
 @jax.tree_util.register_dataclass
@@ -3937,9 +3967,9 @@ class KimiDeltaAttentionWeights:
 def _kda_row_chunk(batch_size: int, attention_dp: int = 1) -> int:
     """Rows per KDA recurrence chunk above B8 (smaller batches run whole).
     TP32 B128 and above use four: eight-row chunks exceed the compiler's VMEM
-    although _vmem_budget accepts them. Attention DP2's B128 peaks outside KDA
+    although _vmem_budget accepts them. Attention DP's B128 peaks outside KDA
     and fits eight."""
-    return 8 if batch_size < 128 or attention_dp == 2 and batch_size == 128 else 4
+    return 8 if batch_size < 128 or attention_dp > 1 and batch_size == 128 else 4
 
 
 def kda(
@@ -4066,7 +4096,17 @@ def kda(
             feature_gate_vmem = feature_gate_vmem.at[
                 :, pl.ds(shard_index * attention_width, attention_width)
             ]
-        if rolled:
+        if rolled and traced_shard and feature_gate_vmem.shape[1] > 2 * attention_width:
+            raw_gate = _dot(gate_features, feature_gate_vmem[...])
+            selected = raw_gate[:, :attention_width]
+            for held in range(1, feature_gate_vmem.shape[1] // attention_width):
+                selected = jnp.where(
+                    shard_index == held,
+                    raw_gate[:, held * attention_width : (held + 1) * attention_width],
+                    selected,
+                )
+            gate_vmem[...] = selected.astype(jnp.bfloat16).reshape(chunk_count, row_chunk, -1)
+        elif rolled:
             gate_vmem[...] = (
                 _dot(gate_features, feature_gate_vmem[...])
                 .astype(jnp.bfloat16)
@@ -5242,17 +5282,23 @@ def _project_attention_dp(
         rows_per_pair *= 2
     else:
         # Reduce-scatter the group's rows: pair q of each local host owns rows
-        # q * r .. q * r + r - 1.
+        # q * r .. q * r + r - 1. Staged slots are whole 16-row BF16 tiles
+        # (DP4 B96's six rows per pair are 168 payload rows).
+        slot_rows = payload_rows if staging is None else _staging_slot_rows(payload_rows)
         local_send = (local.at[0].bitcast(jnp.bfloat16) if staging is None else staging.at[0]).at[
-            pl.ds(0, 4 * payload_rows), :
-        ].reshape(4, payload_rows, 128)
+            pl.ds(0, 4 * slot_rows), :
+        ].reshape(4, slot_rows, 128)
         local_receive = (local.at[1].bitcast(jnp.bfloat16) if staging is None else staging.at[1]).at[
-            pl.ds(0, 4 * payload_rows), :
-        ].reshape(4, payload_rows, 128)
+            pl.ds(0, 4 * slot_rows), :
+        ].reshape(4, slot_rows, 128)
         for target_pair in range(4):
-            local_send[target_pair] = comm[
+            wire = comm[
                 pl.ds(target_pair * rows_per_pair if owners == 4 else 0, rows_per_pair), :half
             ].astype(jnp.bfloat16).reshape(payload_rows, 128)
+            if slot_rows != payload_rows:
+                wire = jnp.concatenate(
+                    [wire, jnp.zeros((slot_rows - payload_rows, 128), jnp.bfloat16)])
+            local_send[target_pair] = wire
         local_receive[pair] = local_send[pair]
         copies = []
         for offset in range(3, 0, -1):
@@ -5266,6 +5312,8 @@ def _project_attention_dp(
         for copy in copies:
             copy.wait()
         local_sum = jnp.sum(local_receive[...].astype(jnp.float32), axis=0)
+        if slot_rows != payload_rows:
+            local_sum = local_sum[:payload_rows]
 
         if shards == 2:
             # TP16 spans two hosts; TP8 finishes its reduction on one host.
@@ -5354,9 +5402,10 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     Each rank holds [batch / (4 * DP), hidden] for its (DP group, local pair)
     and ends with the whole batch in ``out`` and its pair's rows of all groups
     in ``owned_out``. Own rows go to the local pairs and the other groups
-    together, so the inter-group exchange does not delay the local one. Flat
-    wires use lanes 4..7 of ``local``: the wire from relative position
-    (group ^ o, pair ^ k) lands in slot (o, k) on every rank.
+    together, so the inter-group exchange does not delay the local one; each
+    group's wire is forwarded as soon as it lands. Flat wires use lanes 4..7
+    of ``local``: the wire from relative position (group ^ o, pair ^ k) lands
+    in slot (o, k) on every rank.
     """
     rank = jax.lax.axis_index("tp")
     group_size = 32 // shards
@@ -5384,7 +5433,7 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         return copy
 
     wire(0, 0)[...] = row.reshape(payload, 128)
-    if rows <= 2:
+    if rows <= 2 and shards == 2:
         # Short wires (DP2 B8/B16) go to every peer directly: one hop.
         direct = [send(wire(0, 0), o, k, 7 if o == 0 else 8)
                   for o in range(shards) for k in range(4) if o or k]
@@ -5392,12 +5441,10 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
             copy.wait()
     else:
         local_copies = [send(wire(0, 0), 0, k, 7) for k in range(1, 4)]
-        group_copies = [send(wire(0, 0), o, 0, 8) for o in range(1, shards)]
-        # The groups' wires share one semaphore: forward only once all landed.
-        for copy in group_copies:
-            copy.wait_recv()
+        group_copies = [send(wire(0, 0), o, 0, (8, 10, 11)[o - 1]) for o in range(1, shards)]
         forwarded = []
-        for o in range(1, shards):
+        for o, copy in enumerate(group_copies, 1):
+            copy.wait_recv()
             for k in range(1, 4):
                 forwarded.append(tpu.make_async_remote_copy(
                     wire(o, 0), wire(o, k), sends.at[9], recvs.at[9],
@@ -6315,7 +6362,8 @@ def stack(
     bank offset and follow shard-major group rows; with ``state_row``, slot
     ``state_slots[state_row]``), instead of the caller gathering the rows
     first. The updated states are still returned per row. Needs
-    ``state_row`` or ``batch_size`` > 4 with DP1, or B2..B128 with DP2.
+    ``state_row`` or ``batch_size`` > 4 with DP1, B2..B128 with DP2 or
+    B32..B128 with DP4.
     """
     if not 1 <= batch_size <= MAX_BATCH:
         raise ValueError(f"The fused decoder stack supports batch sizes from 1 to {MAX_BATCH}")
@@ -6430,10 +6478,10 @@ def stack(
         )
     if attention_dp_ownership and (
         attention_dp == 1
-        or batch_size not in (32, 64, 96)
-        and not (attention_dp == 2 and batch_size in (2, 4, 8, 16, 128))
+        or batch_size not in (32, 64, 96, 128)
+        and not (attention_dp == 2 and batch_size in (2, 4, 8, 16))
     ):
-        raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32/B64/B96")
+        raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32..B128")
     if moe_token_pipeline and (
         attention_dp not in (2, 4)
         or batch_size not in (32, 64)
@@ -6521,8 +6569,10 @@ def stack(
     slot_reads = state_slots is not None
     if slot_reads and not (
             attention_dp == 1 and (select_state_row or not persist_kda_state)
-            or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)):
-        raise ValueError("state_slots needs DP1 with state_row or batch > 4, or DP2 at B2..B128")
+            or attention_dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
+            or attention_dp == 4 and batch_size in (32, 64, 96, 128)):
+        raise ValueError(
+            "state_slots needs DP1 with state_row or batch > 4, DP2 at B2..B128 or DP4 at B32..B128")
     overlap_kda_state_reads = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
     overlap_kda_state_writes = batch_size in (6, *SCATTER_BATCHES) or attention_dp > 1
 
@@ -7792,7 +7842,91 @@ def stack(
                                 sequence_rows=sequence_rows,
                             )
                             shared_state_stream.prime()
-                        for shard in range(attention_dp):
+                        input_stream = streams.get("input")
+                        # DP4 runs its 24- and 32-row groups through one traced-shard
+                        # body: four unrolled copies stall on instruction overlays.
+                        rolled_shards = (
+                            attention_dp == 4 and group_rows in (24, 32)
+                            and attention_schedule in ("auto", "overlap")
+                            and input_stream is not None and input_stream.slots is not None
+                            and shared_state_stream is not None and slot_reads
+                            and "kda" not in DEBUG_SKIP
+                        )
+                        per_shard = chunk_columns = 0
+                        if rolled_shards:
+                            assert input_stream is not None
+                            per_shard = input_stream.chunks // attention_dp
+                            chunk_columns = input_stream.sizes[0]
+
+                        def run_rolled_shards(projection):
+                            """One KDA body for every held shard (traced index): the
+                            shared gate features first, then per shard its input
+                            projection chunks and the recurrence."""
+                            def shard_weights(shard):
+                                return KimiDeltaAttentionWeights(
+                                    layer_weights["k_gate"].at[state_index],
+                                    kda_projection_vmem[0],
+                                    layer_weights["k_projection"].at[state_index],
+                                    kda_projection_vmem[1],
+                                    layer_weights["k_fb"].at[state_index],
+                                    kda_projection_vmem[2],
+                                    layer_weights["k_o"].at[state_index],
+                                    kda_projection_vmem[3],
+                                    *(auxiliary_vmem[index].at[shard] for index in range(3)),
+                                    auxiliary_vmem[3],
+                                    pool_semaphores,
+                                )
+                            copies = shard_weights(0).make_projection_copies()
+                            copies.gate.wait()
+                            copies.feature_gate.wait()
+                            dp_compressed_vmem[:, :128] = _dot(
+                                group_input_vmem[...], kda_projection_vmem[0][...]
+                            ).astype(jnp.bfloat16)
+                            guard = communication_workspace.reduction_phase[0] >= 0
+
+                            @pl.loop(0, attention_dp)
+                            def shard_loop(shard):
+                                @pl.loop(0, per_shard)
+                                def project(position):
+                                    _traced_dot_position(
+                                        input_stream, group_input_vmem, shard * per_shard + position,
+                                        guard, projection.at[position],
+                                    )
+                                rows = pl.ds(pl.multiple_of(shard * group_rows, 8), group_rows)
+                                kda(
+                                    group_input_vmem,
+                                    group_input_vmem,
+                                    convolution_output_ref.at[:, state_index].at[rows],
+                                    recurrent_output_ref.at[:, state_index].at[rows],
+                                    weights=shard_weights(shard),
+                                    convolution_history_ref=convolution_ref.at[:, state_index],
+                                    recurrent_state_ref=recurrent_ref.at[:, state_index],
+                                    communication_workspace=communication_workspace,
+                                    epsilon=eps,
+                                    synchronize_devices=False,
+                                    weights_are_prefetched=True,
+                                    sequence_rows=sequence_rows,
+                                    streams=streams,
+                                    shard_index=shard,
+                                    attended_out=dp_attended_vmem.at[shard],
+                                    gate_features_vmem=dp_compressed_vmem,
+                                    stage_projections=True,
+                                    state_stream=KdaStateStreamSlice(
+                                        shared_state_stream,
+                                        first_chunk=shard * chunks_per_shard,
+                                        chunks=chunks_per_shard,
+                                    ),
+                                    projected_rows=jnp.concatenate(
+                                        [projection[c] for c in range(per_shard)], axis=1),
+                                    first_call=False,
+                                )
+
+                        if rolled_shards:
+                            pl.run_scoped(
+                                run_rolled_shards,
+                                tpu.VMEM((per_shard, group_rows, chunk_columns), jnp.bfloat16),
+                            )
+                        for shard in range(0 if rolled_shards else attention_dp):
                             rows = pl.ds(shard * group_rows, group_rows)
                             history_rows = convolution_ref.at[:, state_index]
                             state_rows = recurrent_ref.at[:, state_index]

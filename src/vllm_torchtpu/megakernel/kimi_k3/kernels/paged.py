@@ -136,7 +136,7 @@ def commit_latent_rows(pools, rows, block_tables, positions, pool_map, *, group=
     # One fused commit for all MLA layers; the generic scatter below handles
     # other layouts and repeated pool maps (ordered by layer, not token).
     if (_config().fused_cache_commit
-            and rows.shape[0] in (1, 2, 4, 8, 16, 32, 48, 64)
+            and rows.shape[0] in (1, 2, 4, 8, 16, 24, 32, 48, 64)
             and rows.shape[1:] == (len(pool_map), 640)
             and 0 < len(pool_map) <= MLA_LAYERS and len(set(pool_map)) == len(pool_map)
             and all(0 <= index < len(pools) for index in pool_map)
@@ -250,10 +250,12 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         local = jnp.where(local == 0, 0, local - data_group * (group_slots - 1))
         state_index = jnp.concatenate([local + k * group_slots for k in range(dp)])
     # The stack reads the input KDA states from their slots itself where it
-    # can (DP1 above four rows or a selected verify row; DP2 at B2..B128).
-    # DP2 indices already include each held head shard's bank offset.
+    # can (DP1 above four rows or a selected verify row; DP2 at B2..B128,
+    # DP4 at B32..B128). DP indices already include each held head shard's
+    # bank offset.
     in_place = ((state_row is not None or batch_size > 4) and dp == 1
-                or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128))
+                or dp == 2 and batch_size in (2, 4, 8, 16, 32, 64, 96, 128)
+                or dp == 4 and batch_size in (32, 64, 96, 128))
     if in_place:
         conv, recurrent = conv_slots, recurrent_slots
     else:
@@ -269,13 +271,13 @@ def decode_paged(weights, conv_slots, recurrent_slots, pool, tokens, positions, 
         logits, aux, (conv, recurrent, new_keys, new_values) = result
     else:
         logits, (conv, recurrent, new_keys, new_values) = result
-    # DP2 returns shard-major rows; commit each to its shard-bank index,
-    # preserving untouched slots and ordered null-slot writes.
+    # Attention DP returns shard-major rows; commit each to its shard-bank
+    # index, preserving untouched slots and ordered null-slot writes.
     if defer_kda_commit:
         # Keep the input banks alive until acceptance. Return the native
         # post-states without touching persistent slots or gathering rows.
         conv_slots, recurrent_slots = conv, recurrent
-    elif batch_size > 16 and dp in (1, 2):
+    elif batch_size > 16 and dp in (1, 2, 4):
         conv_slots, recurrent_slots = _commit_kda_states(
             conv_slots, recurrent_slots, conv, recurrent, state_index)
     else:

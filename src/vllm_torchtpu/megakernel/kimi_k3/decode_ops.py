@@ -63,9 +63,9 @@ DP_BATCH_SIZES = (2, 4, 8, 16, 32, 64, 96, 128)
 
 def dp_batch_sizes(requested: tuple[int, ...], attention_dp: int) -> tuple[int, ...]:
     """Attention DP's compiled sizes for ``requested`` batches: the
-    ``DP_BATCH_SIZES`` (B128 with DP2 only) from the one holding the smallest
+    ``DP_BATCH_SIZES`` (from B32 with DP4) from the one holding the smallest
     requested batch to the one holding the largest; a step pads to the next."""
-    sizes = tuple(b for b in DP_BATCH_SIZES if b <= 96 or attention_dp == 2)
+    sizes = tuple(b for b in DP_BATCH_SIZES if attention_dp == 2 or b >= 32)
     first = sum(b < min(requested) for b in sizes)
     last = sum(b < max(requested) for b in sizes)
     return sizes[first : last + 1]
