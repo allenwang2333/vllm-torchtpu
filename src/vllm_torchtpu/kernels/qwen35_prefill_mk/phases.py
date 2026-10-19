@@ -160,31 +160,57 @@ def swiglu_quant(gu_hbm, xq_hbm, xs_hbm, *, inter, tm, g0=0):
 # ------------------------------------------------------------------------------------------------
 
 
-def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm,
-             q_hbm, k_hbm, v_hbm, gb_hbm, conv_out_hbm, *, kq, vh, kd, vd, ks, eps, tm):
-    """Causal depthwise conv1d over time (carrying the conv state), SiLU, split, L2-norm of q and
-    k (q scaled by kd^-0.5), and the gates: g = -exp(A_log) * softplus(a + dt_bias),
-    beta = sigmoid(b).
+@dataclasses.dataclass(frozen=True)
+class Segments:
+    """A step's sequences in the padded token layout, as SMEM refs: each sequence's tokens start
+    at a multiple of SEG_ALIGN rows, so no 64-row block, GDN chunk or attention q tile straddles
+    two sequences. tile_seg[i]: segment of 64-row block i (-1: padding past the last segment);
+    start / length / ctx (cached tokens before the step) / slot (state slot) per segment."""
+    tile_seg: jax.Ref
+    start: jax.Ref
+    length: jax.Ref
+    ctx: jax.Ref
+    slot: jax.Ref
 
-    qkvz [T, QKV + Z] bf16 (conv input = columns :QKV), ba [T, 2 vh] bf16, conv_state
-    [ks - 1, QKV] bf16, conv_w [ks, QKV] bf16, a_log / dt_bias [1, vh] f32. Writes q, k
-    [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32 (g | beta) and the new conv state
-    (the sequence's last ks - 1 conv inputs)."""
+
+SEG_ALIGN = 256
+BLK = 64                  # the row granule tile_seg is indexed by
+
+
+def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm,
+             q_hbm, k_hbm, v_hbm, gb_hbm, conv_out_hbm, segs, *, kq, vh, kd, vd, ks, eps, tm):
+    """Causal depthwise conv1d over time (each sequence continuing from its conv state), SiLU,
+    split, L2-norm of q and k (q scaled by kd^-0.5), and the gates: g = -exp(A_log) *
+    softplus(a + dt_bias), beta = sigmoid(b); padding rows get g = beta = 0 so they cannot move
+    a state.
+
+    qkvz [T, QKV + Z] bf16 (conv input = columns :QKV), ba [T, 2 vh] bf16, conv_state / conv_out
+    [slots, ks - 1, QKV] bf16 (may alias), conv_w [ks, QKV] bf16, a_log / dt_bias [1, vh] f32.
+    Writes q, k [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32 (g | beta), and per
+    sequence its new conv state (its last ks - 1 conv inputs). tm must divide BLK."""
     t = qkvz_hbm.shape[0]
     qkv = 2 * kq * kd + vh * vd
     halo = 16                                 # >= ks - 1; whole bf16 (16, 128) tiles
-    assert tm % halo == 0
+    assert tm % halo == 0 and BLK % tm == 0
 
     def run(prev_ref, cs_v, sem):
         # prev_ref holds the 16 input rows before the current tile (f32); the conv taps use its
         # last ks - 1. Every DMA and store is whole and tile aligned.
-        cp = pltpu.make_async_copy(conv_state_hbm, cs_v, sem.at[0])
-        cp.start()
-        cp.wait()
-        prev_ref[...] = jnp.concatenate(
-            [jnp.zeros((halo - (ks - 1), qkv), F32), cs_v[...].astype(F32)], 0)
-
         def body(x_ref, ba_ref, w_ref, al_ref, dt_ref, q_ref, k_ref, v_ref, gb_ref):
+            i = pl.program_id(0)
+            seg = segs.tile_seg[(i * tm) // BLK]
+            sg = jnp.maximum(seg, 0)
+            local = i * tm - segs.start[sg]          # first row of the tile within its sequence
+            n = jnp.where(seg >= 0, segs.length[sg], 0)
+
+            @pl.when((seg >= 0) & (local == 0))
+            def _():
+                cp = pltpu.make_async_copy(conv_state_hbm.at[segs.slot[sg]], cs_v, sem.at[0])
+                cp.start()
+                cp.wait()
+                prev_ref[...] = jnp.concatenate(
+                    [jnp.zeros((halo - (ks - 1), qkv), F32), cs_v[...].astype(F32)], 0)
+
             x = x_ref[...].astype(F32)                                  # [tm, QKV]
             full = jnp.concatenate([prev_ref[...], x], 0)               # [halo + tm, QKV]
             w = w_ref[...].astype(F32)                                  # [ks, QKV]
@@ -192,6 +218,19 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
             for j in range(ks):
                 acc = acc + full[halo - (ks - 1) + j:halo - (ks - 1) + j + tm] * w[j:j + 1]
             prev_ref[...] = x[tm - halo:tm]
+
+            # The sequence ends in this tile: its last ks - 1 inputs are its new conv state.
+            end = n - local                                             # rows of it in the tile
+            @pl.when((seg >= 0) & (end >= 1) & (end <= tm))
+            def _():
+                row = jax.lax.broadcasted_iota(jnp.int32, (halo + tm, 1), 0)
+                rows = [jnp.sum(jnp.where(row == halo + end - (ks - 1) + j, full, 0.0), 0,
+                                keepdims=True) for j in range(ks - 1)]
+                cs_v[...] = jnp.concatenate(rows, 0).astype(cs_v.dtype)
+                cp = pltpu.make_async_copy(cs_v, conv_out_hbm.at[segs.slot[sg]], sem.at[0])
+                cp.start()
+                cp.wait()
+
             y = jax.nn.silu(acc.astype(BF16).astype(F32))
             kdim = kq * kd
             def l2(z):
@@ -202,8 +241,10 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
             k_ref[...] = l2(y[:, kdim:2 * kdim])
             v_ref[...] = y[:, 2 * kdim:]
             ba = ba_ref[...].astype(F32)
-            beta = jax.nn.sigmoid(ba[:, :vh])
-            g = -jnp.exp(al_ref[...]) * jax.nn.softplus(ba[:, vh:] + dt_ref[...])
+            live = jax.lax.broadcasted_iota(jnp.int32, (tm, 1), 0) < end
+            beta = jnp.where(live, jax.nn.sigmoid(ba[:, :vh]), 0.0)
+            g = jnp.where(live, -jnp.exp(al_ref[...]) * jax.nn.softplus(ba[:, vh:] + dt_ref[...]),
+                          0.0)
             gb_ref[...] = jnp.concatenate([g, beta], -1)
 
         kdim = kq * kd
@@ -220,36 +261,30 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
                        pl.BlockSpec((tm, vh * vd), lambda i: (i, 0)),
                        pl.BlockSpec((tm, 2 * vh), lambda i: (i, 0))],
         )(qkvz_hbm, ba_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm, q_hbm, k_hbm, v_hbm, gb_hbm)
-        # New conv state: the sequence's last ks - 1 conv inputs, from the halo.
-        cs_v[...] = prev_ref[halo - (ks - 1):, :].astype(cs_v.dtype)
-        cp = pltpu.make_async_copy(cs_v, conv_out_hbm, sem.at[0])
-        cp.start()
-        cp.wait()
 
     pl.run_scoped(run, pltpu.VMEM((halo, qkv), F32), pltpu.VMEM((ks - 1, qkv), BF16),
                   pltpu.SemaphoreType.DMA((1,)))
 
 
-def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, *, kq, vh, kd, vd, chunk):
-    """The gated delta rule over the sequence, chunk by chunk, all v-heads at once, the
-    [vh, kd, vd] f32 state resident in VMEM. Per chunk (see gdn_chunked for the algebra):
-    factors (cumulative decay, A, T = (I + A)^-1 by repeated squaring, Ub, W, M) then
-    U = Ub - W S, O = Qg S + M U, S = Gamma_C S + Kd^T U.
+def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, kq, vh, kd, vd,
+               chunk):
+    """The gated delta rule, chunk by chunk, all v-heads at once, the [vh, kd, vd] f32 state of
+    the chunk's sequence resident in VMEM (loaded at its first chunk, stored after its last).
+    Per chunk (see gdn_chunked for the algebra): factors (cumulative decay, A, T = (I + A)^-1 by
+    repeated squaring, Ub, W, M) then U = Ub - W S, O = Qg S + M U, S = Gamma_C S + Kd^T U.
 
-    q, k [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32, s0 / s_out [vh, kd, vd] f32,
-    o [T, vh * vd] bf16."""
+    q, k [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32, s0 / s_out [slots, vh, kd, vd]
+    f32 (may alias), o [T, vh * vd] bf16. chunk must divide BLK."""
     t = q_hbm.shape[0]
     c = chunk
     rep = vh // kq
+    assert BLK % c == 0
     bmm = (((2,), (1,)), ((0,), (0,)))        # [H,a,b] x [H,b,c]
     bnt = (((2,), (2,)), ((0,), (0,)))        # [H,a,d] x [H,b,d] -> [H,a,b]
     btn = (((1,), (1,)), ((0,), (0,)))        # [H,c,a] x [H,c,b] -> [H,a,b]
     dot = functools.partial(jax.lax.dot_general, preferred_element_type=F32)
 
     def run(s_ref, sem):
-        cp = pltpu.make_async_copy(s0_hbm, s_ref, sem.at[0])
-        cp.start()
-        cp.wait()
         ti = jax.lax.broadcasted_iota(jnp.int32, (c, c), 0)
         si = jax.lax.broadcasted_iota(jnp.int32, (c, c), 1)
         strict, lower = ti > si, ti >= si
@@ -264,35 +299,54 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, *, kq, vh,
             return jnp.swapaxes(x, 0, 1)
 
         def body(q_ref, k_ref, v_ref, gb_ref, o_ref):
-            q = heads(q_ref[...], kd, True)                               # [H, C, kd]
-            k = heads(k_ref[...], kd, True)
-            v = heads(v_ref[...], vd, False)                              # [H, C, vd]
-            gb = gb_ref[...]
-            g = jnp.swapaxes(gb[:, :vh], 0, 1)                            # [H, C]
-            beta = jnp.swapaxes(gb[:, vh:], 0, 1)
-            gam = jax.lax.dot_general(g, upper_incl, (((1,), (0,)), ((), ())),
-                                      preferred_element_type=F32)         # inclusive cumsum
-            diff = gam[:, :, None] - gam[:, None, :]
-            dec = jnp.exp(jnp.where(lower[None], diff, -jnp.inf))
-            a = jnp.where(strict[None], beta[:, :, None] * dec * dot(k, k, bnt), 0.0)
-            tinv = eye[None] - a
-            p = a
-            n = 2
-            while n < c:
-                p = dot(p, p, bmm)
-                tinv = tinv + dot(tinv, p, bmm)
-                n *= 2
-            big = jnp.exp(gam)
-            ub = dot(tinv, beta[:, :, None] * v, bmm)
-            w = dot(tinv, (beta * big)[:, :, None] * k, bmm)
-            m = jnp.where(lower[None], dec * dot(q, k, bnt), 0.0)
-            qg = big[:, :, None] * q
-            kdec = jnp.exp(gam[:, -1:] - gam)[:, :, None] * k
-            s = s_ref[...]
-            u = ub - dot(w, s, bmm)
-            o = dot(qg, s, bmm) + dot(m, u, bmm)                          # [H, C, vd]
-            s_ref[...] = big[:, -1][:, None, None] * s + dot(kdec, u, btn)
-            o_ref[...] = jnp.swapaxes(o, 0, 1).reshape(c, vh * vd).astype(o_ref.dtype)
+            i = pl.program_id(0)
+            seg = segs.tile_seg[(i * c) // BLK]
+            sg = jnp.maximum(seg, 0)
+            local = i * c - segs.start[sg]
+
+            @pl.when((seg >= 0) & (local == 0))
+            def _():
+                cp = pltpu.make_async_copy(s0_hbm.at[segs.slot[sg]], s_ref, sem.at[0])
+                cp.start()
+                cp.wait()
+
+            @pl.when(seg >= 0)
+            def _():
+                q = heads(q_ref[...], kd, True)                           # [H, C, kd]
+                k = heads(k_ref[...], kd, True)
+                v = heads(v_ref[...], vd, False)                          # [H, C, vd]
+                gb = gb_ref[...]
+                g = jnp.swapaxes(gb[:, :vh], 0, 1)                        # [H, C]
+                beta = jnp.swapaxes(gb[:, vh:], 0, 1)
+                gam = jax.lax.dot_general(g, upper_incl, (((1,), (0,)), ((), ())),
+                                          preferred_element_type=F32)     # inclusive cumsum
+                diff = gam[:, :, None] - gam[:, None, :]
+                dec = jnp.exp(jnp.where(lower[None], diff, -jnp.inf))
+                a = jnp.where(strict[None], beta[:, :, None] * dec * dot(k, k, bnt), 0.0)
+                tinv = eye[None] - a
+                p = a
+                n = 2
+                while n < c:
+                    p = dot(p, p, bmm)
+                    tinv = tinv + dot(tinv, p, bmm)
+                    n *= 2
+                big = jnp.exp(gam)
+                ub = dot(tinv, beta[:, :, None] * v, bmm)
+                w = dot(tinv, (beta * big)[:, :, None] * k, bmm)
+                m = jnp.where(lower[None], dec * dot(q, k, bnt), 0.0)
+                qg = big[:, :, None] * q
+                kdec = jnp.exp(gam[:, -1:] - gam)[:, :, None] * k
+                s = s_ref[...]
+                u = ub - dot(w, s, bmm)
+                o = dot(qg, s, bmm) + dot(m, u, bmm)                      # [H, C, vd]
+                s_ref[...] = big[:, -1][:, None, None] * s + dot(kdec, u, btn)
+                o_ref[...] = jnp.swapaxes(o, 0, 1).reshape(c, vh * vd).astype(o_ref.dtype)
+
+            @pl.when((seg >= 0) & (local + c >= segs.length[sg]))
+            def _():                                 # the sequence's last chunk
+                cp = pltpu.make_async_copy(s_ref, s_out_hbm.at[segs.slot[sg]], sem.at[0])
+                cp.start()
+                cp.wait()
 
         pltpu.emit_pipeline(
             body,
@@ -303,9 +357,6 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, *, kq, vh,
                       pl.BlockSpec((c, 2 * vh), lambda i: (i, 0))],
             out_specs=[pl.BlockSpec((c, vh * vd), lambda i: (i, 0))],
         )(q_hbm, k_hbm, v_hbm, gb_hbm, o_hbm)
-        cp = pltpu.make_async_copy(s_ref, s_out_hbm, sem.at[0])
-        cp.start()
-        cp.wait()
 
     pl.run_scoped(run, pltpu.VMEM((vh, kd, vd), F32), pltpu.SemaphoreType.DMA((1,)))
 

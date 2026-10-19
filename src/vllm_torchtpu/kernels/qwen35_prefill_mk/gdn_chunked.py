@@ -172,18 +172,24 @@ def phase2_scan(ub, w, qg, kd, m, decay, s0, out_dtype):
 def gdn_prefill(qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log, dt_bias,
                 *, n_kq, n_v, d_k, d_v, kernel_size, chunk=64, factor_dtype=F32,
                 use_pallas=True, interpret=False):
-    """One sequence of T new tokens (T % chunk == 0) after `conv_state` [K-1, dim] and
-    `recurrent_state` [n_v, d_k, d_v]. Returns (new_conv_state, new_recurrent_state), output
-    [T, n_v * d_v] in qkv's dtype."""
-    t = qkv.shape[0]
+    """One sequence of T new tokens after `conv_state` [K-1, dim] and `recurrent_state`
+    [n_v, d_k, d_v]. Returns (new_conv_state, new_recurrent_state), output [T, n_v * d_v] in
+    qkv's dtype. T is padded to a multiple of `chunk` with g = beta = 0, which leaves the state
+    unchanged."""
+    t0 = qkv.shape[0]
     q, k, v, g, beta, new_conv = prepare(qkv, b, a, conv_state, conv_weight, conv_bias, a_log,
                                          dt_bias, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
                                          kernel_size=kernel_size)
+    pad = (-t0) % chunk
+    if pad:
+        q, k, v, g, beta = (jnp.pad(x, [(0, pad)] + [(0, 0)] * (x.ndim - 1))
+                            for x in (q, k, v, g, beta))
+    t = t0 + pad
     ub, w, qg, kd, m, decay = phase1(q, k, v, g, beta, chunk)
     ub, w, qg, kd, m = (x.astype(factor_dtype) for x in (ub, w, qg, kd, m))
     if use_pallas:
         o, s = phase2_pallas(ub, w, qg, kd, m, decay, recurrent_state, qkv.dtype, interpret)
     else:
         o, s = phase2_scan(ub, w, qg, kd, m, decay, recurrent_state, qkv.dtype)
-    out = o.transpose(0, 2, 1, 3).reshape(t, n_v * d_v)
+    out = o.transpose(0, 2, 1, 3).reshape(t, n_v * d_v)[:t0]
     return (new_conv, s.astype(recurrent_state.dtype)), out
