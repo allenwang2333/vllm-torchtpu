@@ -117,7 +117,7 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--csa-precision", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--csa-precision", choices=("bf16", "fp8"), default="fp8")
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5

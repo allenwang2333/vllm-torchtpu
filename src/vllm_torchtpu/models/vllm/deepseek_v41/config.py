@@ -35,7 +35,7 @@ class CSAPrecision(StrEnum):
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
-    csa_precision: CSAPrecision = CSAPrecision.BF16
+    csa_precision: CSAPrecision = CSAPrecision.FP8
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
@@ -45,7 +45,7 @@ class DeepseekV41Config:
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
-            csa_precision=CSAPrecision(value.get("csa_precision", "bf16")),
+            csa_precision=CSAPrecision(value.get("csa_precision", "fp8")),
         )
 
     @classmethod

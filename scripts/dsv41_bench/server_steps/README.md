@@ -90,7 +90,7 @@ checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`
 
 For a matched CSA precision comparison, run the same frozen inputs and source
 twice with `--csa-precision bf16` and `--csa-precision fp8`, using separate output
-directories. The default is BF16. FP8 changes Q/P rounding inside CSA2 while
+directories. The default is FP8. FP8 changes Q/P rounding inside CSA2 while
 keeping SWA in BF16; compare accepted-token throughput as well as the fixed
 acceptance-rate estimate, because speculative acceptance can change.
 

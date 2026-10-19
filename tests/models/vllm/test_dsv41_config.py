@@ -75,13 +75,13 @@ def test_rejects_unknown_or_mistyped_options(policy):
         verify_and_update_config(config(**policy))
 
 
-def test_defaults_are_explicit_and_do_not_enable_approximation():
+def test_defaults_are_explicit_and_select_fp8_csa():
     cfg = config()
     verify_and_update_config(cfg)
     assert cfg.additional_config["deepseek_v41"] == {
         "execution": "full",
         "moe": "gmm",
-        "csa_precision": "bf16",
+        "csa_precision": "fp8",
     }
 
 
@@ -92,6 +92,7 @@ def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):
     verify_and_update_config(cfg)
     monkeypatch.delenv("TPU_DEEPSEEK_V41_CED")
     assert DeepseekV41Config.from_vllm_config(cfg).execution == ExecutionMode.CED
+    assert DeepseekV41Config.from_vllm_config(cfg).csa_precision == "fp8"
 
 
 def test_conflicting_legacy_env_is_rejected(monkeypatch):
