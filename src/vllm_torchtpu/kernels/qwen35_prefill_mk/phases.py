@@ -432,7 +432,7 @@ def att_qk_norm_rope_kv(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, ctx, qn_hbm, kc_h
 
 
 def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max, sub=4,
-              fp8=False):
+              fp8=False, mxu_sum=False):
     """Causal GQA attention of the T new tokens (positions ctx + t) over the cache rows
     0 .. ctx + T - 1, per kv head with its nh / nkv q heads folded into the rows.
 
@@ -444,6 +444,8 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
     fp8: QK and PV as native fp8 matmuls (opt-in; changes numerics): q quantized per row with a
     dynamic scale against the fp8 K cache, probabilities (in [0, 1]) scaled by 448 into fp8
     against the fp8 V; the softmax sum is taken over the same quantized probabilities.
+    mxu_sum: the softmax row sum comes out of the PV matmul (V gets 128 columns of ones), not a
+    VPU / XLU lane reduction.
     qn [nh, T, hd] bf16, kc / vc [nkv, S, hd] fp8, o [nh, T, hd] f32."""
     t = qn_hbm.shape[1]
     grp = nh // nkv
@@ -463,6 +465,8 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
             else:
                 kk = k_ref[0].astype(BF16)
                 vv = v_ref[0].astype(BF16)
+            if mxu_sum:
+                vv = jnp.concatenate([vv, jnp.ones((bkv, 128), vv.dtype)], -1)
 
             def pv(c, p, alpha):                 # chunk c's PV and accumulator update
                 r = slice(c * rc, (c + 1) * rc)
@@ -470,6 +474,9 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                                         preferred_element_type=F32)
                 if fp8:
                     y = y * (1.0 / P_FP8_SCALE)
+                if mxu_sum:
+                    l_ref[r, :] = alpha * l_ref[r, :] + y[:, hd:]
+                    y = y[:, :hd]
                 acc_ref[r, :] = alpha * acc_ref[r, :] + y
 
             # Software pipelined like the serving RPA: chunk c's QK + softmax, then chunk c-1's
@@ -500,10 +507,12 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                 p = jnp.exp(s - m_new.astype(BF16))
                 if fp8:
                     p = (p * jnp.asarray(P_FP8_SCALE, BF16)).astype(FP8)
-                    psum = jnp.sum(p.astype(F32), -1, keepdims=True) * (1.0 / P_FP8_SCALE)
-                else:
-                    psum = jnp.sum(p, -1, keepdims=True, dtype=F32)
-                l_ref[r, :] = jnp.broadcast_to(alpha * l_ref[r, :1] + psum, (rc, 128))
+                if not mxu_sum:
+                    if fp8:
+                        psum = jnp.sum(p.astype(F32), -1, keepdims=True) * (1.0 / P_FP8_SCALE)
+                    else:
+                        psum = jnp.sum(p, -1, keepdims=True, dtype=F32)
+                    l_ref[r, :] = jnp.broadcast_to(alpha * l_ref[r, :1] + psum, (rc, 128))
                 m_ref[r, :] = jnp.broadcast_to(m_new, (rc, 128))
                 if prev is not None:
                     pv(*prev)

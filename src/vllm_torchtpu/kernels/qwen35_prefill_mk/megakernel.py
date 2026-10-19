@@ -61,6 +61,7 @@ class MKTiles:
     bq: int = 256            # attention q tile (tokens)
     bkv: int = 2048          # attention kv tile (j-692719db-95ef-4ea4-8b2f: best of 512..4096)
     att_sub: int = 8         # attention row sub-chunks (MXU / softmax overlap)
+    att_mxu_sum: int = 0     # 1: softmax row sum from the PV matmul (ones columns in V)
     att_fp8: int = 0         # 1: native fp8 QK / PV (opt-in, changes attention numerics)
     rt: int = 256            # MoE grouped rows per tile (j-964229e0-90a9-4258-a763: 150 vs 153 ms)
     moe_wslots: int = 2      # expert weight buffers (lookahead = wslots - 1)
@@ -183,7 +184,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                 with jax.named_scope(f"L{li}_att_flash"):
                     P.att_flash(W["qn"], ls["k"], ls["v"], ctx, W["ao"], nh=c.NH, nkv=c.NKV,
                                 hd=c.HD, bq=tl.bq, bkv=tl.bkv, s_max=s_max, sub=tl.att_sub,
-                                fp8=bool(tl.att_fp8))
+                                fp8=bool(tl.att_fp8), mxu_sum=bool(tl.att_mxu_sum))
                 with jax.named_scope(f"L{li}_att_gate_quant"):
                     P.att_gate_quant(W["ao"], W["att"], W["aq"], W["as"], nh=c.NH, hd=c.HD,
                                      tm=tl.tm_gate)
