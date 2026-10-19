@@ -246,6 +246,11 @@ def _build_llm(
     }
     if cudagraph_mm_encoder:
         compilation_config["encoder_cudagraph_token_budgets"] = [CHUNK_TOKEN_BUDGET]
+        # EncoderCudaGraphManager otherwise derives max_batch_size (and from it
+        # max_frames_per_batch and the static cu_seqlens template length) from
+        # min(max_num_batched_tokens, max_model_len) // min_budget (64). Keep
+        # the 8192 // 64 = 128 template shape when max_num_batched_tokens=2048.
+        compilation_config["encoder_cudagraph_max_vision_items_per_batch"] = 128
 
     engine_args = EngineArgs(
         model=MODEL_NAME,
