@@ -177,8 +177,15 @@ SEG_ALIGN = 256
 BLK = 64                  # the row granule tile_seg is indexed by
 
 
+def _region_copy(pool_hbm, region, stride, state_idx, win, sem):
+    """The whole-page DMA descriptor of one slot's state region (see gdn/v3 memory_ref)."""
+    return pltpu.make_async_copy(
+        pool_hbm.at[pl.ds(state_idx * stride + region.kb0, region.nblocks)], win, sem)
+
+
 def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm,
-             q_hbm, k_hbm, v_hbm, gb_hbm, conv_out_hbm, segs, *, kq, vh, kd, vd, ks, eps, tm):
+             q_hbm, k_hbm, v_hbm, gb_hbm, conv_out_hbm, segs, *, kq, vh, kd, vd, ks, eps, tm,
+             plan=None, stride=0):
     """Causal depthwise conv1d over time (each sequence continuing from its conv state), SiLU,
     split, L2-norm of q and k (q scaled by kd^-0.5), and the gates: g = -exp(A_log) *
     softplus(a + dt_bias), beta = sigmoid(b); padding rows get g = beta = 0 so they cannot move
@@ -187,13 +194,49 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
     qkvz [T, QKV + Z] bf16 (conv input = columns :QKV), ba [T, 2 vh] bf16, conv_state / conv_out
     [slots, ks - 1, QKV] bf16 (may alias), conv_w [ks, QKV] bf16, a_log / dt_bias [1, vh] f32.
     Writes q, k [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32 (g | beta), and per
-    sequence its new conv state (its last ks - 1 conv inputs). tm must divide BLK."""
+    sequence its new conv state (its last ks - 1 conv inputs). tm must divide BLK.
+
+    plan (a gdn v3 StateSourcePlan): conv_state / conv_out are the serving pool instead (they
+    alias), the state is read from and written to its pages at slot * stride + plan.conv.kb0
+    through the plan's typed view (vmem_ldst), as the serving GDN kernel does; a sequence with
+    no cached context starts from zeros."""
+    from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
+
     t = qkvz_hbm.shape[0]
     qkv = 2 * kq * kd + vh * vd
     halo = 16                                 # >= ks - 1; whole bf16 (16, 128) tiles
     assert tm % halo == 0 and BLK % tm == 0
+    pooled = plan is not None
 
-    def run(prev_ref, cs_v, sem):
+    def load_conv(sg, cs_v, win, sem):
+        if not pooled:
+            cp = pltpu.make_async_copy(conv_state_hbm.at[segs.slot[sg]], cs_v, sem.at[0])
+            cp.start()
+            cp.wait()
+            return cs_v[...].astype(F32)
+        has_init = segs.ctx[sg] > 0
+
+        @pl.when(has_init)
+        def _():
+            cp = _region_copy(conv_state_hbm, plan.conv, stride, segs.slot[sg], win, sem.at[0])
+            cp.start()
+            cp.wait()
+        cs = vmem_ldst.load_state_region(win, plan.conv, (ks - 1, 1, qkv)).astype(F32)
+        return jnp.where(has_init, cs.reshape(ks - 1, qkv), 0.0)
+
+    def store_conv(sg, rows, cs_v, win, sem):
+        if not pooled:
+            cs_v[...] = rows.astype(cs_v.dtype)
+            cp = pltpu.make_async_copy(cs_v, conv_out_hbm.at[segs.slot[sg]], sem.at[0])
+        else:
+            vmem_ldst.store_state_region(win, plan.conv, rows.reshape(ks - 1, 1, qkv))
+            cp = pltpu.make_async_copy(win, conv_out_hbm.at[
+                pl.ds(segs.slot[sg] * stride + plan.conv.kb0, plan.conv.nblocks)], sem.at[0])
+        cp.start()
+        cp.wait()
+
+    def run(prev_ref, cs_v, sem, *win):
+        win = win[0] if win else None
         # prev_ref holds the 16 input rows before the current tile (f32); the conv taps use its
         # last ks - 1. Every DMA and store is whole and tile aligned.
         def body(x_ref, ba_ref, w_ref, al_ref, dt_ref, q_ref, k_ref, v_ref, gb_ref):
@@ -205,11 +248,8 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
 
             @pl.when((seg >= 0) & (local == 0))
             def _():
-                cp = pltpu.make_async_copy(conv_state_hbm.at[segs.slot[sg]], cs_v, sem.at[0])
-                cp.start()
-                cp.wait()
                 prev_ref[...] = jnp.concatenate(
-                    [jnp.zeros((halo - (ks - 1), qkv), F32), cs_v[...].astype(F32)], 0)
+                    [jnp.zeros((halo - (ks - 1), qkv), F32), load_conv(sg, cs_v, win, sem)], 0)
 
             x = x_ref[...].astype(F32)                                  # [tm, QKV]
             full = jnp.concatenate([prev_ref[...], x], 0)               # [halo + tm, QKV]
@@ -226,10 +266,7 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
                 row = jax.lax.broadcasted_iota(jnp.int32, (halo + tm, 1), 0)
                 rows = [jnp.sum(jnp.where(row == halo + end - (ks - 1) + j, full, 0.0), 0,
                                 keepdims=True) for j in range(ks - 1)]
-                cs_v[...] = jnp.concatenate(rows, 0).astype(cs_v.dtype)
-                cp = pltpu.make_async_copy(cs_v, conv_out_hbm.at[segs.slot[sg]], sem.at[0])
-                cp.start()
-                cp.wait()
+                store_conv(sg, jnp.concatenate(rows, 0).astype(BF16).astype(F32), cs_v, win, sem)
 
             y = jax.nn.silu(acc.astype(BF16).astype(F32))
             kdim = kq * kd
@@ -262,19 +299,29 @@ def gdn_prep(qkvz_hbm, ba_hbm, conv_state_hbm, conv_w_hbm, a_log_hbm, dt_bias_hb
                        pl.BlockSpec((tm, 2 * vh), lambda i: (i, 0))],
         )(qkvz_hbm, ba_hbm, conv_w_hbm, a_log_hbm, dt_bias_hbm, q_hbm, k_hbm, v_hbm, gb_hbm)
 
-    pl.run_scoped(run, pltpu.VMEM((halo, qkv), F32), pltpu.VMEM((ks - 1, qkv), BF16),
-                  pltpu.SemaphoreType.DMA((1,)))
+    scratch = [pltpu.VMEM((halo, qkv), F32), pltpu.VMEM((ks - 1, qkv), BF16),
+               pltpu.SemaphoreType.DMA((1,))]
+    if pooled:
+        scratch.append(pltpu.VMEM((plan.conv.nblocks, *conv_state_hbm.shape[1:]),
+                                  conv_state_hbm.dtype))
+    pl.run_scoped(run, *scratch)
 
 
 def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, kq, vh, kd, vd,
-               chunk):
+               chunk, plan=None, stride=0):
     """The gated delta rule, chunk by chunk, all v-heads at once, the [vh, kd, vd] f32 state of
     the chunk's sequence resident in VMEM (loaded at its first chunk, stored after its last).
     Per chunk (see gdn_chunked for the algebra): factors (cumulative decay, A, T = (I + A)^-1 by
     repeated squaring, Ub, W, M) then U = Ub - W S, O = Qg S + M U, S = Gamma_C S + Kd^T U.
 
     q, k [T, kq * kd] f32, v [T, vh * vd] f32, gb [T, 2 vh] f32, s0 / s_out [slots, vh, kd, vd]
-    f32 (may alias), o [T, vh * vd] bf16. chunk must divide BLK."""
+    f32 (may alias), o [T, vh * vd] bf16. chunk must divide BLK. plan: s0 / s_out are the
+    serving pool, read and written through plan.recurrent as gdn_prep does the conv state."""
+    from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
+
+    pooled = plan is not None
+    if pooled:
+        assert plan.scale is None, "quantized GDN states are not supported"
     t = q_hbm.shape[0]
     c = chunk
     rep = vh // kq
@@ -284,7 +331,8 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, k
     btn = (((1,), (1,)), ((0,), (0,)))        # [H,c,a] x [H,c,b] -> [H,a,b]
     dot = functools.partial(jax.lax.dot_general, preferred_element_type=F32)
 
-    def run(s_ref, sem):
+    def run(s_ref, sem, *win):
+        win = win[0] if win else None
         ti = jax.lax.broadcasted_iota(jnp.int32, (c, c), 0)
         si = jax.lax.broadcasted_iota(jnp.int32, (c, c), 1)
         strict, lower = ti > si, ti >= si
@@ -306,9 +354,21 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, k
 
             @pl.when((seg >= 0) & (local == 0))
             def _():
-                cp = pltpu.make_async_copy(s0_hbm.at[segs.slot[sg]], s_ref, sem.at[0])
-                cp.start()
-                cp.wait()
+                if not pooled:
+                    cp = pltpu.make_async_copy(s0_hbm.at[segs.slot[sg]], s_ref, sem.at[0])
+                    cp.start()
+                    cp.wait()
+                else:
+                    has_init = segs.ctx[sg] > 0
+
+                    @pl.when(has_init)
+                    def _():
+                        cp = _region_copy(s0_hbm, plan.recurrent, stride, segs.slot[sg], win,
+                                          sem.at[0])
+                        cp.start()
+                        cp.wait()
+                    st = vmem_ldst.load_state_region(win, plan.recurrent, (vh, kd, vd))
+                    s_ref[...] = jnp.where(has_init, st.astype(F32), 0.0)
 
             @pl.when(seg >= 0)
             def _():
@@ -344,7 +404,13 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, k
 
             @pl.when((seg >= 0) & (local + c >= segs.length[sg]))
             def _():                                 # the sequence's last chunk
-                cp = pltpu.make_async_copy(s_ref, s_out_hbm.at[segs.slot[sg]], sem.at[0])
+                if not pooled:
+                    cp = pltpu.make_async_copy(s_ref, s_out_hbm.at[segs.slot[sg]], sem.at[0])
+                else:
+                    vmem_ldst.store_state_region(win, plan.recurrent, s_ref[...])
+                    cp = pltpu.make_async_copy(win, s_out_hbm.at[pl.ds(
+                        segs.slot[sg] * stride + plan.recurrent.kb0, plan.recurrent.nblocks)],
+                        sem.at[0])
                 cp.start()
                 cp.wait()
 
@@ -358,7 +424,10 @@ def gdn_chunks(q_hbm, k_hbm, v_hbm, gb_hbm, s0_hbm, o_hbm, s_out_hbm, segs, *, k
             out_specs=[pl.BlockSpec((c, vh * vd), lambda i: (i, 0))],
         )(q_hbm, k_hbm, v_hbm, gb_hbm, o_hbm)
 
-    pl.run_scoped(run, pltpu.VMEM((vh, kd, vd), F32), pltpu.SemaphoreType.DMA((1,)))
+    scratch = [pltpu.VMEM((vh, kd, vd), F32), pltpu.SemaphoreType.DMA((1,))]
+    if pooled:
+        scratch.append(pltpu.VMEM((plan.recurrent.nblocks, *s0_hbm.shape[1:]), s0_hbm.dtype))
+    pl.run_scoped(run, *scratch)
 
 
 def gdn_gated_norm_quant(o_hbm, qkvz_hbm, w_hbm, xq_hbm, xs_hbm, *, vh, vd, qkv, eps, tm):
@@ -1062,3 +1131,214 @@ def moe_combine(y_sorted_hbm, pos_hbm, topw_hbm, sd_hbm, sg_hbm, out_hbm, *, top
 
     pl.run_scoped(run, pltpu.SMEM((2, tm, topk), jnp.int32), pltpu.VMEM((2, n_rows, h), F32),
                   pltpu.SemaphoreType.DMA((2, inflight)), pltpu.SemaphoreType.DMA((1,)))
+
+
+# ------------------------------------------------------------------------------------------------
+# Gated attention over the serving KV pool (128-token pages, SEQ_ALONG_LANE: a page is K^T / V^T)
+# ------------------------------------------------------------------------------------------------
+
+PAGE = 128
+U32 = jnp.uint32
+
+
+def _page_t(ref, interpret):
+    """A (hd / 4, 4, n) fp8 VMEM ref of head-dim-major page data -> its (hd, n) fp8 value (rows
+    are head dims d = 4 i + j, lanes tokens)."""
+    w, n = ref.shape[0], ref.shape[-1]
+    if interpret:
+        return ref[...].reshape(4 * w, n)
+    return pltpu.bitcast(ref.bitcast(U32).reshape(w, n)[...], FP8)
+
+
+def _store_page_t(ref, x, interpret):
+    """Inverse of _page_t: write a (hd, n) fp8 value into a (hd / 4, 4, n) fp8 VMEM ref."""
+    w, n = ref.shape[0], ref.shape[-1]
+    if interpret:
+        ref[...] = x.reshape(w, 4, n)
+    else:
+        ref.bitcast(U32).reshape(w, n)[...] = pltpu.bitcast(x, U32)
+
+
+def att_qk_norm_rope_kv_paged(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, pool_hbm, bt, pps, qn_hbm,
+                              segs, *, nh, nkv, hd, rot, eps, k_scale, v_scale, interpret=False):
+    """Per-head zero-centered RMSNorm of q and k, NeoX RoPE on their first `rot` dims at each
+    token's position (its sequence's ctx + its offset), q -> qn [nh, T, hd] bf16, and the new
+    k, v -> fp8 (divided by the layer's k / v scale) written as whole 128-token pages of the
+    serving pool (pool [pages, 2 nkv, hd / 4, 4, 128] fp8, heads K0 V0 K1 V1, a page is K^T / V^T),
+    page = bt[seg * pps + pos // 128]. Lanes past a sequence's end are written as zeros.
+
+    Precondition: every sequence's ctx is a multiple of 128 (true for this PP prefill: prefix
+    hits on 2176-token blocks, chunks on 2304-token granules), so pages are never shared with
+    tokens written by an earlier step. att [2 nh + 2 nkv, T, hd] bf16 (head-major), rope [S, rot]
+    f32, bt: SMEM flat page table [seqs * pps]."""
+    t = att_hbm.shape[1]
+    half = rot // 2
+    tm = PAGE
+
+    def run(rope_v, pb, sem):
+        def body(q_ref, k_ref, v_ref, qw_ref, kw_ref, qo_ref):
+            m = pl.program_id(0)
+            seg = segs.tile_seg[(m * tm) // BLK]
+            sg = jnp.maximum(seg, 0)
+            local = m * tm - segs.start[sg]
+            valid = jnp.where(seg >= 0, jnp.clip(segs.length[sg] - local, 0, tm), 0)
+            pos0 = pl.multiple_of(segs.ctx[sg] + local, PAGE)
+
+            @pl.when(valid > 0)
+            def _():
+                cp = pltpu.make_async_copy(rope_hbm.at[pl.ds(pos0, tm)], rope_v, sem.at[0])
+                cp.start()
+                cp.wait()
+
+            cs = rope_v[...]
+            cos, sin = cs[:, :half][None], cs[:, half:][None]           # [1, tm, half]
+
+            def norm_rope(x, w):                                         # x [n, tm, hd]
+                x = x.astype(F32)
+                x = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+                x = (x * (1.0 + w.astype(F32).reshape(1, 1, hd))).astype(BF16).astype(F32)
+                x1, x2, rest = x[..., :half], x[..., half:rot], x[..., rot:]
+                y = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], -1)
+                return y.astype(BF16)
+
+            qo_ref[...] = norm_rope(q_ref[...], qw_ref[...])
+
+            @pl.when(valid > 0)
+            def _():
+                live = jax.lax.broadcasted_iota(jnp.int32, (1, tm, 1), 1) < valid
+                kq = jnp.where(live, norm_rope(k_ref[...], kw_ref[...]).astype(F32) / k_scale, 0.0)
+                vq = jnp.where(live, v_ref[...].astype(F32) / v_scale, 0.0)
+                for h in range(nkv):
+                    for r, x in ((2 * h, kq[h]), (2 * h + 1, vq[h])):
+                        _store_page_t(pb.at[r], x.T.astype(FP8), interpret)   # [hd, tm]
+                page = bt[sg * pps + pos0 // PAGE]
+                cp = pltpu.make_async_copy(pb, pool_hbm.at[page], sem.at[1])
+                cp.start()
+                cp.wait()
+
+        kslot, vslot = 2 * nh // nkv, (2 * nh + nkv) // nkv
+        pltpu.emit_pipeline(
+            body,
+            grid=(t // tm,),
+            in_specs=[pl.BlockSpec((nh, tm, hd), lambda m: (0, m, 0)),
+                      pl.BlockSpec((nkv, tm, hd), lambda m: (kslot, m, 0)),
+                      pl.BlockSpec((nkv, tm, hd), lambda m: (vslot, m, 0)),
+                      pl.BlockSpec((1, hd), lambda m: (0, 0)),
+                      pl.BlockSpec((1, hd), lambda m: (0, 0))],
+            out_specs=[pl.BlockSpec((nh, tm, hd), lambda m: (0, m, 0))],
+        )(att_hbm, att_hbm, att_hbm, qn_w_hbm, kn_w_hbm, qn_hbm)
+
+    pl.run_scoped(run, pltpu.VMEM((tm, rot), F32), pltpu.VMEM((2 * nkv, hd // 4, 4, PAGE), FP8),
+                  pltpu.SemaphoreType.DMA((2,)))
+
+
+def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, bkv, sub=8,
+                    k_scale=1.0, v_scale=1.0, interpret=False):
+    """Causal GQA attention of each sequence's new tokens over its pages of the serving pool
+    (see att_qk_norm_rope_kv_paged), per kv head with its nh / nkv q heads folded into the rows.
+    The KV tiles (bkv tokens = bkv / 128 pages of K^T and V^T) are DMA'd by hand, double
+    buffered, only as far as the q tile's causal reach. Arithmetic as att_flash: bf16 scores
+    and exponentials, f32 state, chunk-level software pipelining. V lanes past the sequence's
+    length are zeroed (pool pages can hold anything there). qn [nh, T, hd] bf16, o [nh, T, hd]
+    f32; q tiles never straddle sequences (bq divides SEG_ALIGN)."""
+    t = qn_hbm.shape[1]
+    grp = nh // nkv
+    rows = grp * bq
+    rc = rows // sub
+    npg = bkv // PAGE
+    scale = hd ** -0.5
+    fold = math.frexp(scale)[0] == 0.5
+    assert SEG_ALIGN % bq == 0 and bq % BLK == 0
+
+    def run(m_ref, l_ref, acc_ref, kbuf, vbuf, sems):
+        def fetch(g, sg, jt, slot):
+            for p in range(npg):
+                page = bt[sg * pps + jt * npg + p]
+                for src_row, dst in ((2 * g, kbuf), (2 * g + 1, vbuf)):
+                    pltpu.make_async_copy(pool_hbm.at[page, src_row],
+                                          dst.at[slot, :, :, pl.ds(p * PAGE, PAGE)],
+                                          sems.at[slot]).start()
+
+        def wait(slot):
+            for p in range(npg):
+                for dst in (kbuf, vbuf):
+                    pltpu.make_async_copy(pool_hbm.at[0, 0], dst.at[slot, :, :, pl.ds(p * PAGE, PAGE)],
+                                          sems.at[slot]).wait()
+
+        def body(q_ref, o_ref):
+            g, i = pl.program_id(0), pl.program_id(1)
+            seg = segs.tile_seg[(i * bq) // BLK]
+            sg = jnp.maximum(seg, 0)
+            local = i * bq - segs.start[sg]
+            ln = segs.length[sg]
+            ctx = segs.ctx[sg]
+            live_q = (seg >= 0) & (local < ln)
+            kv_len = ctx + jnp.minimum(local + bq, ln)        # keys this q tile can see
+            n_kv = jnp.where(live_q, (kv_len + bkv - 1) // bkv, 0)
+            m_ref[...] = jnp.full(m_ref.shape, -jnp.inf, F32)
+            l_ref[...] = jnp.zeros(l_ref.shape, F32)
+            acc_ref[...] = jnp.zeros(acc_ref.shape, F32)
+            q_all = q_ref[...].reshape(rows, hd)
+            if fold:
+                q_all = q_all * jnp.asarray(scale, BF16)
+
+            @pl.when(n_kv > 0)
+            def _():
+                fetch(g, sg, 0, 0)
+
+            def kv_step(jt, carry):
+                slot = jt % 2
+
+                @pl.when(jt + 1 < n_kv)
+                def _():
+                    fetch(g, sg, jt + 1, 1 - slot)
+                wait(slot)
+                kk = _page_t(kbuf.at[slot], interpret)                    # [hd, bkv] fp8
+                vv = _page_t(vbuf.at[slot], interpret)
+                col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1) + jt * bkv
+                vv = jnp.where(col < kv_len, vv.astype(BF16), 0.0).astype(BF16)
+                kk = kk.astype(BF16)
+                masked = (jt + 1) * bkv - 1 > ctx + local          # crosses the diagonal
+
+                def pv(c, p, alpha):
+                    r = slice(c * rc, (c + 1) * rc)
+                    y = jax.lax.dot_general(p, vv, (((1,), (1,)), ((), ())),
+                                            preferred_element_type=F32) * v_scale
+                    acc_ref[r, :] = alpha * acc_ref[r, :] + y
+
+                prev = None
+                for c in range(sub):
+                    r = slice(c * rc, (c + 1) * rc)
+                    s = jax.lax.dot_general(q_all[r], kk, (((1,), (0,)), ((), ())),
+                                            preferred_element_type=F32)
+                    s = (s * (k_scale if fold else scale * k_scale)).astype(BF16)
+                    row = jax.lax.broadcasted_iota(jnp.int32, (rc, 1), 0) + c * rc
+                    pos = ctx + local + row % bq                    # rows are (head, token)
+                    s = jnp.where(masked & (col > pos), -jnp.inf, s)
+                    m_prev = m_ref[r, :1]
+                    m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True).astype(F32))
+                    alpha = jnp.exp(m_prev - m_new)
+                    p = jnp.exp(s - m_new.astype(BF16))
+                    l_ref[r, :] = jnp.broadcast_to(
+                        alpha * l_ref[r, :1] + jnp.sum(p, -1, keepdims=True, dtype=F32), (rc, 128))
+                    m_ref[r, :] = jnp.broadcast_to(m_new, (rc, 128))
+                    if prev is not None:
+                        pv(*prev)
+                    prev = (c, p, alpha)
+                pv(*prev)
+                return carry
+
+            jax.lax.fori_loop(0, n_kv, kv_step, 0)
+            o_ref[...] = jnp.where(live_q, acc_ref[...] / jnp.maximum(l_ref[:, :1], 1e-30),
+                                   0.0).reshape(grp, bq, hd)
+
+        pltpu.emit_pipeline(
+            body,
+            grid=(nkv, t // bq),
+            in_specs=[pl.BlockSpec((grp, bq, hd), lambda g, i: (g, i, 0))],
+            out_specs=[pl.BlockSpec((grp, bq, hd), lambda g, i: (g, i, 0))],
+        )(qn_hbm, o_hbm)
+
+    pl.run_scoped(run, pltpu.VMEM((rows, 128), F32), pltpu.VMEM((rows, 128), F32),
+                  pltpu.VMEM((rows, hd), F32), pltpu.VMEM((2, hd // 4, 4, bkv), FP8),
+                  pltpu.VMEM((2, hd // 4, 4, bkv), FP8), pltpu.SemaphoreType.DMA((2,)))
