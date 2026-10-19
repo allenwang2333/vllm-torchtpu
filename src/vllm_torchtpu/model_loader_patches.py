@@ -982,11 +982,23 @@ _loaded_weight_files: dict[str, None] = {}
 
 
 def _release_host_memory_to_os() -> None:
-    """Returns freed host heap to the OS: a GC pass, then glibc malloc_trim(0)."""
+    """Returns freed host heap to the OS: a GC pass, then the owning allocator's release.
+
+    The serving image preloads gperftools tcmalloc (LD_PRELOAD=libtcmalloc.so.4), so glibc
+    malloc_trim(0) is a no-op there: measured 16.9 GiB in use vs 34-38 GiB heap per PP worker
+    after loading, and MallocExtension_ReleaseFreeMemory took RSS from ~111 to ~93 GiB per worker.
+    """
     gc.collect()
-    # A libc other than glibc has no libc.so.6 or no malloc_trim; nothing to trim.
-    with contextlib.suppress(OSError, AttributeError):
+    lib = ctypes.CDLL(None)
+    release = getattr(lib, "MallocExtension_ReleaseFreeMemory", None)
+    if release is not None:
+        release()
+        return
+    try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        # A libc other than glibc has no libc.so.6 or no malloc_trim; nothing to trim.
+        pass
 
 
 def evict_loaded_weights_page_cache() -> None:
