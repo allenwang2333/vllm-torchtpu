@@ -103,6 +103,8 @@ STREAMIDX_ENABLE_EARLY_EXIT = True
 # StreamIdx block sizes as (decode, prefill, MIXED), tuned by microbenchmark.
 STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
 STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
+STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
 # Small-bucket MIXED kv pages per block under TPU_STREAMIDX_DECODE_PACK when
 # TPU_STREAMIDX_SMALL_BUCKET_BKVP is unset: `T <= cap` buckets (1-2 MTP
 # requests) take the long block, larger small buckets the short one. GLM-5.2
@@ -291,12 +293,6 @@ def _dcp_indexer_a2a_for_bucket(
     that does not divide keeps the all-gather unless TPU_DCP_INDEXER_A2A_MERGE
     was set.
     """
-    if (
-        enabled
-        and num_tokens % dcp_size
-        and not envs.is_set("TPU_DCP_INDEXER_A2A_MERGE")
-    ):
-        return False
     return enabled and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
@@ -602,12 +598,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0],
-                small_bucket_bq,
-                small_bucket_bkvp,
-                small_bucket_tokens,
-                mixed_bkvp,
-                decode_pack,
+                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
             )
             topk_indices = streamindex_topk(
                 q,
@@ -649,9 +640,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             (
                 topk,
                 chunk_tokens,
-                small_bucket_bq,
-                small_bucket_bkvp,
-                small_bucket_tokens,
+                *small_bucket,
                 skip_empty_decode,
                 skip_empty_decode_chunked,
                 mixed_bkvp,
@@ -776,12 +765,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0],
-                small_bucket_bq,
-                small_bucket_bkvp,
-                small_bucket_tokens,
-                mixed_bkvp,
-                decode_pack,
+                q.shape[0], *small_bucket, mixed_bkvp, decode_pack
             )
             overlap = {}
             if qb_overlap:
@@ -1777,30 +1761,10 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
-
-        # TPU_MLA_ABSORB_TOKEN_MAJOR: register the absorb ops here, outside
-        # Dynamo (building one takes a lock).
-        if envs.TPU_MLA_ABSORB_TOKEN_MAJOR in ("1", "pallas"):
-            from vllm_torchtpu.layers.adapter.attention import get_mla_absorb_op
-
-            get_mla_absorb_op(False)
-            get_mla_absorb_op(True)
-
-        # TPU_DCP_MERGE_VSPACE: the chunked DCP merge applies W_UV before its
-        # reduce-scatter, to the partials of every head in the DCP group, so
-        # W_UV has to span them too (the same gather, the same head order as
-        # W_UK_T_dcp_qrep). Sparse DCP layers only -- the merge's only user.
-        self.W_UV_dcp_vspace = None
-        self.W_UV_dcp_vspace_scale = None
-        if envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
-            dcp_group = get_dcp_group()
-            assert dcp_group is not None
-            self.W_UV_dcp_vspace = fresh_buffer(
-                dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
-            )
-            if hasattr(self, "W_UV_scale"):
-                self.W_UV_dcp_vspace_scale = fresh_buffer(
-                    dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+            # The group's W_UV too, so W_UV can run before the merge.
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
                 )
                 if hasattr(self, "W_UV_scale"):
                     self.W_UV_dcp_qrep_scale = fresh_buffer(

@@ -1871,53 +1871,59 @@ def _attention_kernel(
         else:
             cp.start()
 
-    if is_dcp_mode:
-
+    def _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, *, wait=False):
+        sem_nope = sems.at[0, bkv_sem_idx]
+        sem_rope = sems.at[3, bkv_sem_idx]
         bkv_nope_vmem_ref = bkv_nope_x2_ref.at[bkv_sem_idx, :]
         bkv_rope_vmem_ref = bkv_rope_x2_ref.at[bkv_sem_idx, :]
-
-        # The index into cache_kv_hbm_ref should be relative to the current
-        # chunk.
+        # "lrows": token b moves rows [0, n_b), n_b = its kv_len rounded
+        # up to 32 (>= 32, <= rows); one DMA per (token, cache) on the
+        # cache's semaphore, waited with the same descriptors.
         page_idx_start = seq_idx_start - start_seq_idx
-        if rows is not None and "lrows" in body_levers:
-            # "lrows": token b moves rows [0, n_b), n_b = its kv_len rounded
-            # up to 32 (>= 32, <= rows); one DMA per (token, cache) on the
-            # cache's semaphore, waited with the same descriptors.
-            page_idx_start = seq_idx_start - start_seq_idx
-            rope_div = bkv_sz // cache_kv_rope_hbm_ref.shape[1]
-            for b in range(batch_size):
-                kv_b = kv_lens_ref[seq_idx_start + b]
-                n_b = jnp.clip((kv_b + 31) // 32 * 32, 32, rows)
-                n_b = pl.multiple_of(n_b, 32)
-                r_b = pl.multiple_of(n_b // rope_div, 8)
-                nope_dst = bkv_nope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, n_b)]
-                rope_dst = bkv_rope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, r_b)]
-                if wait:
-                    _async_copy(nope_dst, nope_dst, sem_nope, True)
-                    _async_copy(rope_dst, rope_dst, sem_rope, True)
-                else:
-                    _async_copy(
-                        cache_kv_nope_hbm_ref.at[
-                            pl.ds(page_idx_start + b, 1), pl.ds(0, n_b)
-                        ],
-                        nope_dst,
-                        sem_nope,
-                        False,
-                    )
-                    _async_copy(
-                        cache_kv_rope_hbm_ref.at[
-                            pl.ds(page_idx_start + b, 1), pl.ds(0, r_b)
-                        ],
-                        rope_dst,
-                        sem_rope,
-                        False,
-                    )
-            return
-        if rows is not None:
-            # `row_widths`: only the first `rows` rows of each token's tile.
-            rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
-            nope_src = cache_kv_nope_hbm_ref.at[
-                pl.ds(page_idx_start, batch_size), pl.ds(0, rows)
+        rope_div = bkv_sz // cache_kv_rope_hbm_ref.shape[1]
+        for b in range(batch_size):
+            kv_b = kv_lens_ref[seq_idx_start + b]
+            n_b = jnp.clip((kv_b + 31) // 32 * 32, 32, rows)
+            n_b = pl.multiple_of(n_b, 32)
+            r_b = pl.multiple_of(n_b // rope_div, 8)
+            nope_dst = bkv_nope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, n_b)]
+            rope_dst = bkv_rope_vmem_ref.at[pl.ds(b, 1), pl.ds(0, r_b)]
+            if wait:
+                _async_copy(nope_dst, nope_dst, sem_nope, True)
+                _async_copy(rope_dst, rope_dst, sem_rope, True)
+            else:
+                _async_copy(
+                    cache_kv_nope_hbm_ref.at[
+                        pl.ds(page_idx_start + b, 1), pl.ds(0, n_b)
+                    ],
+                    nope_dst,
+                    sem_nope,
+                    False,
+                )
+                _async_copy(
+                    cache_kv_rope_hbm_ref.at[
+                        pl.ds(page_idx_start + b, 1), pl.ds(0, r_b)
+                    ],
+                    rope_dst,
+                    sem_rope,
+                    False,
+                )
+
+    if is_dcp_mode:
+
+        def _fetch_bkv_slice(seq_idx_start, bkv_sem_idx, slice_sz, *, wait=False):
+            sem_nope = sems.at[0, bkv_sem_idx]
+            sem_rope = sems.at[3, bkv_sem_idx]
+            nope_rows = (
+                slice_sz if sparsecore_layout else slice_sz * kv_cache_utils.WORD_BYTES
+            )
+            rope_rows = (
+                slice_sz // native_sc_gather.ROPE_PACKING
+                if sparsecore_layout
+                else slice_sz
+            )
+            bkv_nope_vmem_ref = bkv_nope_x2_ref.at[
+                bkv_sem_idx, :, pl.ds(0, nope_rows), :
             ]
             bkv_rope_vmem_ref = bkv_rope_x2_ref.at[
                 bkv_sem_idx, :, pl.ds(0, rope_rows), :
@@ -1967,6 +1973,15 @@ def _attention_kernel(
                     wait,
                 )
                 return
+            if (
+                row_widths
+                and sparsecore_layout
+                and rows is not None
+                and "lrows" in body_levers
+            ):
+                # The token-row layout `_fetch_live_rows` addresses.
+                _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, wait=wait)
+                return
             if row_widths:
                 # `row_widths` picks the width (`with_row_width`), not the rungs.
                 _fetch_bkv_slice(
@@ -1998,6 +2013,9 @@ def _attention_kernel(
             # The index into cache_kv_hbm_ref should be relative to the current
             # chunk.
             page_idx_start = seq_idx_start - start_seq_idx
+            if rows is not None and "lrows" in body_levers:
+                _fetch_live_rows(seq_idx_start, bkv_sem_idx, rows, wait=wait)
+                return
             if rows is not None:
                 # `row_widths`: only the first `rows` rows of each token's tile.
                 rope_rows = rows * cache_kv_rope_hbm_ref.shape[1] // bkv_sz
@@ -2912,7 +2930,11 @@ def _attention_kernel(
                     # even when the batch is all-empty.
                     wait_fetch_bkv_batch(batch_start_seq_idx, bi_sem_idx, rows)
                     pl.when(batch_max_kv_len > 0)(
-                        functools.partial(run_steps, bkv_sz if rows is None else rows)
+                        functools.partial(
+                            run_steps,
+                            bkv_sz if rows is None else rows,
+                            tuple(body_levers),
+                        )
                     )
 
                 with_row_width(batch_start_seq_idx, wait_and_run)

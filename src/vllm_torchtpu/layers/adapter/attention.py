@@ -5,7 +5,6 @@ import dataclasses
 import functools
 import inspect
 import math
-import threading
 import weakref
 from collections.abc import Callable
 from typing import Any, ClassVar, cast
@@ -572,122 +571,6 @@ def _pallas_rpa_kernel_batched(
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN)
-# --- TPU_MLA_ABSORB_TOKEN_MAJOR: token-major W_UK absorb -------------------
-# `pallas.jax_op` infers static args from the signature (non-`jax.Array`
-# positional params), so each operand arity is its own function.
-def _mla_absorb_jax(q: jax.Array, w_uk_t: jax.Array, nope_dim: int) -> jax.Array:
-    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
-
-    return mla_absorb_token_major(q, w_uk_t, None, nope_dim=nope_dim)
-
-
-def _mla_absorb_scaled_jax(
-    q: jax.Array, w_uk_t: jax.Array, w_scale: jax.Array, nope_dim: int
-) -> jax.Array:
-    from vllm_torchtpu.kernels.mla.absorb import mla_absorb_token_major
-
-    return mla_absorb_token_major(q, w_uk_t, w_scale, nope_dim=nope_dim)
-
-
-_MLA_ABSORB_OPS: dict[bool, Any] = {}
-_MLA_ABSORB_OPS_LOCK = threading.Lock()
-
-
-def get_mla_absorb_op(scaled: bool) -> Any:
-    """The cached torch op; build it outside Dynamo (it takes a lock)."""
-    op = _MLA_ABSORB_OPS.get(scaled)
-    if op is not None:
-        return op
-    with _MLA_ABSORB_OPS_LOCK:
-        op = _MLA_ABSORB_OPS.get(scaled)
-        if op is not None:
-            return op
-        if scaled:
-            op = pallas.jax_op(
-                "pallas::mla_absorb_token_major_s", _mla_absorb_scaled_jax
-            )
-        else:
-            op = pallas.jax_op("pallas::mla_absorb_token_major", _mla_absorb_jax)
-
-        def _fake(q, w_uk_t, *rest):
-            return q.new_empty((q.shape[0], q.shape[1], w_uk_t.shape[-1]))
-
-        op.register_fake(_fake)
-        _MLA_ABSORB_OPS[scaled] = op
-        return op
-
-
-def mla_absorb_mode(num_tokens: int, is_backbone: bool = True) -> str | None:
-    """ "pallas" / "einsum" when TPU_MLA_ABSORB_TOKEN_MAJOR applies to a bucket
-    of `num_tokens` tokens, else None (the head-major bmm).
-
-    Only the backbone may branch on the token count: it is traced once per
-    bucket group (`_precompile_backbone` retraces where a branch needs it).
-    The MTP drafter (model_tag "eagle_head") is traced once for every bucket,
-    so the comparison below would pin its graph to the first size and the
-    other buckets fail with ShapeSpecializationError. The drafter keeps the
-    bmm, so the flag never touches its graph (checked before the comparison:
-    no guard is recorded)."""
-    mode = envs.TPU_MLA_ABSORB_TOKEN_MAJOR
-    if mode in (None, "0") or not is_backbone:
-        return None
-    # Cap rule: absorb is `T > edge` (edge a power of 2), MIN_TOKENS (the
-    # smallest bucket that absorbs) giving the edge below it.
-    edge = envs.bucket_gate_edge(envs.TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS)
-    if envs.TPU_DCP_LSE_MERGE_A2A:
-        # The DCP merge takes the all-to-all at `T <= cap` (same trace). An
-        # absorb gate that also held at a bucket `<= cap` would leave a trace
-        # where both hold; at the cap bucket that pins the token count to one
-        # constant (ConstraintViolationError, and the bucket's inputs lose a
-        # SymInt). Starting above the cap reuses the merge's own comparison:
-        # absorb `T > cap`, the merge's reduce-scatter side.
-        edge = max(edge, envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS)
-    if not num_tokens > edge:
-        return None
-    return "pallas" if mode == "1" else mode
-
-
-def mla_absorb_w_uk(
-    q_src: torch.Tensor,
-    nope_dim: int,
-    w_uk_t: torch.Tensor,
-    w_uk_t_scale: torch.Tensor | None,
-    out_dtype: torch.dtype,
-    mode: str | None,
-) -> torch.Tensor:
-    """``ql_nope [T, H, lora] = q_src[:, :, :nope_dim] @ w_uk_t[h]`` per head.
-
-    `q_src` is ``[T, H, qk]`` with the nope part leading (`qk >= nope_dim`);
-    passing the whole q head (not the nope slice) lets the Pallas kernel read
-    q_b's output in place. `mode` None is the reference path: head-major bmm
-    between two transposes, bit for bit what `forward` always did.
-    """
-    if mode == "pallas":
-        if (
-            q_src.dtype != torch.bfloat16
-            or w_uk_t.shape[-1] % 128
-            or q_src.shape[1] % ABSORB_HEADS_PER_BLOCK
-        ):
-            mode = "einsum"
-        else:
-            if w_uk_t_scale is None:
-                out = get_mla_absorb_op(False)(q_src, w_uk_t, nope_dim)
-            else:
-                out = get_mla_absorb_op(True)(q_src, w_uk_t, w_uk_t_scale, nope_dim)
-            return out.to(out_dtype)
-    q_nope = q_src[..., :nope_dim]
-    w = w_uk_t.to(q_nope.dtype) if w_uk_t.dtype != q_nope.dtype else w_uk_t
-    if mode == "einsum":
-        ql_nope = torch.einsum("thd,hdc->thc", q_nope, w)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale.transpose(0, 1)
-        return ql_nope.to(out_dtype)
-    ql_nope = torch.bmm(q_nope.transpose(0, 1), w)
-    if w_uk_t_scale is not None:
-        ql_nope = ql_nope * w_uk_t_scale
-    return ql_nope.transpose(0, 1).to(out_dtype)
-
-
 class PallasAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes = [
         "auto",

@@ -387,8 +387,13 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         onehot_threshold=resolve_onehot_permute_threshold(),
         use_ep=bool(par.use_ep),
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
-        # The prefill kernel's weight ring holds whole experts: TP experts only.
-        prefill_min_tokens=None if par.use_ep else prefill_min_tokens(),
+        # The prefill kernel's weight ring holds whole experts: TP experts
+        # only, and it quantizes per 512 columns, so the hidden size divides.
+        prefill_min_tokens=(
+            None
+            if par.use_ep or hidden % _PREFILL_Q_BLOCK
+            else prefill_min_tokens()
+        ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )
     return _Admitted(

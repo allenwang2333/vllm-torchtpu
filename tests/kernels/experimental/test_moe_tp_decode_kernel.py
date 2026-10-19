@@ -28,6 +28,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
 
 F8, BF16, F32 = jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32
@@ -704,29 +706,6 @@ def _worker(part):
             for a, s in zip(operands, in_specs, strict=True)
         ]
 
-    result = {"race_control": _race_control(), "cases": {}, "fast": {}}
-    for rows, n_valid in CASES:
-        x, scores = inputs(rows)
-        operands = (
-            jnp.tile(x, (N_RANKS, 1)),
-            jnp.tile(scores, (N_RANKS, 1)),
-            bias,
-            jnp.asarray([n_valid], jnp.int32),
-            rank_ids,
-            *stacked,
-        )
-        start = time.monotonic()
-        out, races = _interpret(run, *put(operands, specs))
-        result["cases"][f"{rows}:{n_valid}"] = checks(
-            out, x, scores, rows, n_valid, races, start
-        )
-        if (rows, n_valid) in FAST_CASES:
-            fast, fast_races = _interpret(run_fast, *put(operands, specs))
-            result["fast"][f"{rows}:{n_valid}"] = dict(
-                bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
-                races_found=fast_races,
-            )
-
     # The adapter's op body: the operands moe_tp_decode_forward passes, with a
     # padding mask longer than the token count, as the runner's is.
     from vllm_torchtpu.layers.adapter import moe_tp_decode as adapter
@@ -764,7 +743,7 @@ def _worker(part):
             body_specs,
         )
 
-    result = {"cases": {}}
+    result = {"cases": {}, "fast": {}}
     if part == "a":
         result["race_control"] = _race_control()
     for rows, n_valid in CASES:
@@ -784,6 +763,12 @@ def _worker(part):
         result["cases"][f"{rows}:{n_valid}"] = checks(
             out, x, scores, rows, n_valid, races, start, rows
         )
+        if (rows, n_valid) in FAST_CASES:
+            fast, fast_races = _interpret(run_fast, *put(operands, specs))
+            result["fast"][f"{rows}:{n_valid}"] = dict(
+                bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+                races_found=fast_races,
+            )
 
     if part == "a":
         rows, n_valid = BODY_CASE

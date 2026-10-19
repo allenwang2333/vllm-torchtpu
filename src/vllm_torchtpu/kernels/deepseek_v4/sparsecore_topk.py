@@ -89,9 +89,9 @@ def _topk_body(
     shared_counts_vmem,
     shared_idx_vmem,
     shared_key_vmem,
-    rowdata_vmem=None,
-    lenall_vmem=None,
-    dma_sem=None,
+    meta_vmem,
+    slices_vmem,
+    slice_sems,
     lidx_vmem=None,
     *,
     b: int,
@@ -103,18 +103,14 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
-    row_cap: bool = False,
-    dma_chunk: int = 0,
     rank_major_dcp: int = 0,
 ):
     dcp_merge = local_idxs_hbm is not None
-    if row_cap:
-        assert not dcp_merge and dma_chunk > 0
     if rank_major_dcp:
-        # Unpadded DCP merge (see `_sc_topk_direct`): one wave, P = 1, and the
-        # row arrives as `rank_major_dcp` k-word DMAs of `dma_chunk` words.
-        assert dcp_merge and p == 1 and num_waves == 1 and not row_cap
-        assert dma_chunk == k and n == rank_major_dcp * k
+        # Unpadded DCP merge (see `_sc_topk_direct`): one wave at P = 1, the
+        # row fetched as `rank_major_dcp` k-word pieces.
+        assert dcp_merge and p == 1 and num_waves == 1
+        assert n == rank_major_dcp * k and slice_len == n
     num_subcores = 16
     num_sc_cores = 2
     core = lax.axis_index("core")
@@ -461,9 +457,14 @@ def _topk_body(
             carry=(jnp.int32(0), prior_ties),
         )(emit_ranked)
 
-        if (row_cap or rank_major_dcp) and p == 1:
-            # The caller copies `rowbuf_vmem` / `keybuf_vmem` out itself.
-            pass
+        if p == 1 and out_vmem is None:
+            # The wave loop has no pipeline output block: write the row out.
+            out_off = pl.multiple_of(row * k, LANES)
+            pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(out_off, k)])
+            if return_scores:
+                pltpu.sync_copy(
+                    keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)]
+                )
         elif p == 1:
 
             def copy_out(i):
@@ -590,136 +591,40 @@ def _topk_body(
                     )
 
     cores_per_chip = num_sc_cores * num_subcores
-    # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
-    buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
 
-    def hist0_chunks_wait(c):
-        del c
-        assert rowdata_vmem is not None and dma_sem is not None
-        pltpu.make_async_copy(
-            scores_hbm.at[pl.ds(0, dma_chunk)],
-            rowdata_vmem.at[pl.ds(0, dma_chunk)],
-            dma_sem.at[0],
-        ).wait()
-
-    if row_cap and p > 1:
-        # Rows wider than one single-buffered slice: groups of `p` subcores
-        # share a row as in the cooperative path below, but the row is split
-        # by its length -- subcore `s` owns [s * seg, (s + 1) * seg) with
-        # seg = ceil(row_length / p) rounded up to `dma_chunk`
-        # (ROW_CAP_SPLIT_WORDS) -- and only
-        # those columns are read from HBM. Slices stay in column order, so
-        # tie ranks and the output order match the default partition.
-        pltpu.sync_copy(lengths_hbm, lenall_vmem)
-        log2_chunk = int(np.log2(dma_chunk))
-        log2_p = int(np.log2(p))
-        row_stride = slice_len * p
-
-        @pl.loop(0, num_waves)
-        def _(w):
-            row = w * groups_per_chip + core * groups_per_core + group_id
-            row_len = jnp.where(row < b, jnp.minimum(vec_at(lenall_vmem, row), n), 0)
-            seg_dyn = jnp.minimum(
-                jnp.int32(slice_len),
-                jnp.left_shift(
-                    jnp.right_shift(
-                        jnp.right_shift(row_len + (p - 1), log2_p) + (dma_chunk - 1),
-                        log2_chunk,
-                    ),
-                    log2_chunk,
-                ),
-            )
-            cb_dyn = pl.multiple_of(s * seg_dyn, dma_chunk)
-            my_len = jnp.clip(row_len - cb_dyn, 0, seg_dyn)
-            num_dmas = jnp.right_shift(my_len + (dma_chunk - 1), log2_chunk)
-            row_base = row * row_stride + cb_dyn
-
-            @pl.loop(0, num_dmas)
-            def _(c):
-                assert rowdata_vmem is not None and dma_sem is not None
-                off = pl.multiple_of(c * dma_chunk, dma_chunk)
-                pltpu.make_async_copy(
-                    scores_hbm.at[pl.ds(row_base + off, dma_chunk)],
-                    rowdata_vmem.at[pl.ds(off, dma_chunk)],
-                    dma_sem.at[0],
-                ).start()
-
-            # Writes this row's output itself (the cooperative gather).
-            _run_step(
-                rowdata_vmem,
-                None,
-                w_override=w,
-                row_len_override=row_len,
-                hist0_chunks=num_dmas,
-                col_base_override=cb_dyn,
-                seg_override=seg_dyn,
-            )
-
-    elif row_cap:
-        # One whole row per subcore per wave, all 32 subcores busy, and only
-        # the row's first `row_length` words (rounded up to `dma_chunk`) are
-        # ever read from HBM: the resident slice is `n` words, so a short row
-        # in a long bucket no longer pays for the bucket's width.
-        pltpu.sync_copy(lengths_hbm, lenall_vmem)
-        log2_chunk = int(np.log2(dma_chunk))
-
-        @pl.loop(0, num_waves)
-        def _(w):
-            row = w * cores_per_chip + flat
-            row_len = jnp.where(row < b, jnp.minimum(vec_at(lenall_vmem, row), n), 0)
-            num_dmas = jnp.right_shift(row_len + (dma_chunk - 1), log2_chunk)
-            row_base = row * slice_len
-
-            @pl.loop(0, num_dmas)
-            def _(c):
-                off = pl.multiple_of(c * dma_chunk, dma_chunk)
-                assert rowdata_vmem is not None and dma_sem is not None
-                pltpu.make_async_copy(
-                    scores_hbm.at[pl.ds(row_base + off, dma_chunk)],
-                    rowdata_vmem.at[pl.ds(off, dma_chunk)],
-                    dma_sem.at[0],
-                ).start()
-
-            _run_step(
-                rowdata_vmem,
-                None,
-                w_override=w,
-                row_len_override=row_len,
-                hist0_chunks=num_dmas,
-            )
-            out_off = pl.multiple_of(row * k, LANES)
-            pltpu.sync_copy(rowbuf_vmem.at[pl.ds(0, k)], out_hbm.at[pl.ds(out_off, k)])
-            if return_scores:
-                pltpu.sync_copy(
-                    keybuf_vmem.at[pl.ds(0, k)], keys_hbm.at[pl.ds(out_off, k)]
-                )
-
-    elif rank_major_dcp:
-        # Unpadded DCP merge: subcore `flat` owns row `flat` if `flat < b`.
-        # Its `n = dcp * k` scores are rank-major in HBM -- rank r's list for
-        # every row, then rank r + 1's (the flat candidate all-gather) -- so
-        # the row is `dcp` k-word pieces at stride `b * k`, landed back to back
-        # in VMEM: the same `n` words, in the same order, as the padded path's
-        # row. Each piece is waited for just before its histogram pass.
-        # Subcores past `b` read and write nothing.
+    def _rank_major_merge(local_idxs_hbm):
+        # Subcore `flat` owns row `flat` if `flat < b`. Its `n = dcp * k`
+        # scores are rank-major in HBM -- rank r's list for every row, then
+        # rank r + 1's (the flat candidate all-gather) -- so the row is `dcp`
+        # k-word pieces at stride `b * k`, landed back to back in VMEM: the
+        # same `n` words, in the same order, as the padded path's row. The
+        # row's rank and local slots are only read at emission and travel on
+        # their own semaphore, in flight with the score pieces. Subcores past
+        # `b` read and write nothing (P = 1 has no barriers to keep).
+        assert meta_vmem is not None and slices_vmem is not None
+        assert slice_sems is not None and lidx_vmem is not None
         row = flat
         active_row = row < b
         num_dmas = jnp.where(active_row, rank_major_dcp, 0)
-        # The row's rank and local slots are only read at emission: fetch them
-        # on their own semaphore, in flight with the score pieces, rather than
-        # as two serial copies ahead of them.
         meta_copies = (
             pltpu.make_async_copy(
                 lengths_hbm.at[pl.ds(pl.multiple_of(row * LANES, LANES), LANES)],
-                lenall_vmem.at[pl.ds(0, LANES)],
-                dma_sem.at[1],
+                meta_vmem.at[pl.ds(0, LANES)],
+                slice_sems.at[1],
             ),
             pltpu.make_async_copy(
                 local_idxs_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
                 lidx_vmem.at[pl.ds(0, k)],
-                dma_sem.at[1],
+                slice_sems.at[1],
             ),
         )
+
+        def piece(r):
+            return pltpu.make_async_copy(
+                scores_hbm.at[pl.ds(pl.multiple_of((r * b + row) * k, LANES), k)],
+                slices_vmem.at[pl.ds(pl.multiple_of(r * k, LANES), k)],
+                slice_sems.at[0],
+            )
 
         @pl.when(active_row)
         def _():
@@ -728,36 +633,36 @@ def _topk_body(
 
         @pl.loop(0, num_dmas)
         def _(r):
-            pltpu.make_async_copy(
-                scores_hbm.at[pl.ds(pl.multiple_of((r * b + row) * k, LANES), k)],
-                rowdata_vmem.at[pl.ds(pl.multiple_of(r * k, LANES), k)],
-                dma_sem.at[0],
-            ).start()
+            piece(r).start()
+
+        @pl.loop(0, num_dmas)
+        def _(r):
+            piece(r).wait()
 
         @pl.when(active_row)
         def _():
             for c in meta_copies:
                 c.wait()
-
-        _run_step(
-            rowdata_vmem,
-            lenall_vmem,
-            None,
-            None,
-            lidx_vmem,
-            w_override=jnp.int32(0),
-            row_len_override=jnp.where(active_row, n, 0),
-            hist0_chunks=num_dmas,
-        )
-
-        @pl.when(active_row)
-        def _():
-            pltpu.sync_copy(
-                rowbuf_vmem.at[pl.ds(0, k)],
-                out_hbm.at[pl.ds(pl.multiple_of(row * k, LANES), k)],
+            # No pipeline output block: `_run_step` writes the row out itself.
+            _run_step(
+                slices_vmem,
+                meta_vmem,
+                None,
+                None,
+                lidx_vmem,
+                w=jnp.int32(0),
+                row_len=jnp.int32(n),
             )
 
-    elif p == 1:
+    if dcp_merge:
+        # Merge rows are full by construction (n = dcp_size * k), so there is
+        # nothing to bound: they stream through emit_pipeline.
+        assert p == 1 and not return_scores
+        if rank_major_dcp:
+            _rank_major_merge(local_idxs_hbm)
+            return
+        # A slice past MAX_SLICE_WORDS only fits in tile memory single-buffered.
+        buf_count = 1 if (num_waves == 1 or slice_len > MAX_SLICE_WORDS) else 2
         in_specs = (
             pl.BlockSpec(
                 (slice_len,),
@@ -934,7 +839,6 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
-    row_cap: bool = False,
     rank_major_dcp: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
@@ -946,10 +850,6 @@ def _sc_topk_direct(
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
 
-    ``row_cap`` replaces the pipelined full-width read with per-row DMAs
-    bounded by the row's length; see ``_row_cap_dma_chunk``. At ``p > 1`` the
-    ``p`` subcores of a group split each row by its length.
-
     ``rank_major_dcp`` (DCP merge only, ``b <= 32``): ``scores`` is the flat
     rank-major candidate all-gather ``i32[dcp * b * k]`` -- every row's list
     from rank 0, then from rank 1, ... -- rather than ``[b, dcp * k]``. Each
@@ -958,7 +858,7 @@ def _sc_topk_direct(
     and only ``b * k`` slots are written. Same row contents, same output.
     """
     if rank_major_dcp:
-        if local_idxs is None or p != 1 or row_cap or scores.ndim != 1:
+        if local_idxs is None or p != 1 or scores.ndim != 1:
             raise ValueError("rank_major_dcp needs a flat DCP merge at p = 1")
         b = local_idxs.shape[0]
         n = rank_major_dcp * k
@@ -969,17 +869,6 @@ def _sc_topk_direct(
             )
     else:
         b, n = scores.shape
-    dma_chunk = k if rank_major_dcp else 0
-    if row_cap:
-        if local_idxs is not None:
-            raise ValueError("row_cap needs no local_idxs")
-        if n % (p * LANES):
-            raise ValueError(f"row_cap needs {n=} divisible by {p * LANES}")
-        dma_chunk = (
-            _row_cap_dma_chunk(n)
-            if p == 1
-            else min(ROW_CAP_SPLIT_WORDS, _row_cap_dma_chunk(n // p))
-        )
     info = pltpu.get_tpu_info()
     sc = info.sparse_core
     if sc is None:
@@ -997,7 +886,7 @@ def _sc_topk_direct(
     padded_b = b if rank_major_dcp else num_waves * groups_per_chip
     pad_b = padded_b - b
     pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
+    if not rank_major_dcp and (pad_b > 0 or pad_n > 0):
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
@@ -1053,19 +942,12 @@ def _sc_topk_direct(
         else None,  # slices_vmem
         pltpu.SemaphoreType.DMA((2,)) if wave_loop else None,  # slice_sems
     )
-    if row_cap:
+    if rank_major_dcp:
         scratch_types = (
-            *scratch_types,
-            pltpu.VMEM((slice_len,), jnp.int32),  # rowdata_vmem
-            pltpu.VMEM((padded_b + LANES,), jnp.int32),  # lenall_vmem
-            pltpu.SemaphoreType.DMA((1,)),  # dma_sem
-        )
-    elif rank_major_dcp:
-        scratch_types = (
-            *scratch_types,
-            pltpu.VMEM((slice_len,), jnp.int32),  # rowdata_vmem
-            pltpu.VMEM((LANES,), jnp.int32),  # lenall_vmem: this row's rank
-            pltpu.SemaphoreType.DMA((2,)),  # dma_sem: [scores, rank + slots]
+            *scratch_types[:-3],
+            pltpu.VMEM((LANES,), jnp.int32),  # meta_vmem: this row's rank
+            pltpu.VMEM((slice_len,), jnp.int32),  # slices_vmem: the row
+            pltpu.SemaphoreType.DMA((2,)),  # slice_sems: [scores, rank + slots]
             pltpu.VMEM((k,), jnp.int32),  # lidx_vmem: this row's local idxs
         )
 
@@ -1079,8 +961,6 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
-        row_cap=row_cap,
-        dma_chunk=dma_chunk,
         rank_major_dcp=rank_major_dcp,
     )
     if local_idxs is not None:
@@ -1123,6 +1003,13 @@ def _sc_topk_direct(
         keys_2d = keys.reshape(padded_b, k)[:b]
         return slots_2d, keys_2d
     return slots_2d
+
+
+def rank_major_merge_fits(b: int) -> bool:
+    """Whether `sparsecore_topk_dcp_merge` takes ``rank_major`` scores for
+    ``b`` rows: one wave of the 32 P = 1 subcores, ``b <= 32``. Wider calls
+    keep the pipelined, double-buffered row read (``b > 32``)."""
+    return b <= 32
 
 
 def _pick_partition(b: int, n: int, k: int) -> int:
@@ -1203,13 +1090,6 @@ def sparsecore_topk(
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
     )
-
-
-def rank_major_merge_fits(b: int) -> bool:
-    """Whether `sparsecore_topk_dcp_merge` takes ``rank_major`` scores for
-    ``b`` rows: one wave of the 32 P = 1 subcores, ``b <= 32``. Wider calls
-    keep the pipelined, double-buffered row read (``b > 32``)."""
-    return b <= 32
 
 
 @functools.partial(

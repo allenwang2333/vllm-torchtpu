@@ -352,10 +352,20 @@ def _unused(fn):
     return fn
 
 
-def _row_scale(amax):
-    """quantize_tensor's per-row scale: amax / FP8 max, 0 replaced by 1."""
-    scale = amax / FP8_MAX
-    return jnp.where(scale == 0, 1.0, scale)
+def _quantize_blocks(x, q_ref, scale_ref):
+    """x [m, h] bf16 to FP8 in q_ref as gmm_v2 quantizes its LHS: per row per
+    _Q_BLOCK columns, scale = block amax / FP8 max and its inverse (0 for an
+    all-zero block) in bf16, x * inverse in bf16, no clip (as
+    moe_dense_expert._quantize). Block k's scales go to scale_ref[k] as an
+    [m, lanes] plane, so each read is one contiguous tile."""
+    m, h = x.shape
+    lanes = scale_ref.shape[-1]
+    for k in range(0, h, _Q_BLOCK):
+        block = x[:, k : k + _Q_BLOCK]
+        scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / FP8_MAX
+        inv = jnp.where(scale == 0, 0, 1 / scale)
+        q_ref[:, k : k + _Q_BLOCK] = (block * inv).astype(FP8)
+        scale_ref[k // _Q_BLOCK] = jnp.broadcast_to(scale, (m, lanes))
 
 
 def _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref):
@@ -495,7 +505,7 @@ def _kernel(
     def transfers(step):
         if nc > 1:
             return chunk_transfers(step)
-        # UPDATE: active_ids_ref / ring_sem names; otherwise #1512's transfers.
+        # Active expert `step`'s weights and scales into ring slot step % nb.
         e, slot = active(step), step % nb
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], ring_sem.at[slot, 0]),
@@ -509,9 +519,9 @@ def _kernel(
         ]
 
     def chunk_transfers(step):
-        # UPDATE: ring item `step` is chunk step % nc of active expert
-        # step // nc: w13's gate and up column chunks side by side, the
-        # matching w2 rows, their scales, and the expert's w2 scale.
+        # Ring item `step` is chunk step % nc of active expert step // nc:
+        # w13's gate and up column chunks side by side, the matching w2 rows,
+        # their scales, and the expert's w2 scale.
         e = active(lax.div(step, nc))
         c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
         slot = step % nb
@@ -544,45 +554,35 @@ def _kernel(
         active_ids_ref[count] = e
         return count + hit.astype(jnp.int32)
 
-        @pl.when(hit_e != 0)
-        def record():
-            active_ids_ref[count] = e
-
-            # UPDATE: #1512 primes the ring after the compaction; here active
-            # expert `count` starts its items' copies as soon as it is recorded.
-            for c in range(nc):
-                item = count * nc + c
-
-                @pl.when(item < nb)
-                def prime():
-                    for copy in transfers(item):
-                        copy.start()
-
-        return count + (hit_e != 0).astype(jnp.int32)
-
     if fast:
+        # The vector compaction's count, row 3 of the hit table.
         count = hits_s_ref[3, 0]
     else:
-        # UPDATE: local_experts is #1512's `experts`.
         count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
-    if fast:
+    # Ring items, nc per active expert.
+    items = count * nc
 
-        def prime(item, carry):
+    if fast:
+        # One loop starts the first nb ring items, with no DMA under a
+        # pl.when.
+
+        def prime_fast(item, carry):
             for copy in transfers(item):
                 copy.start()
             return carry
 
-        lax.fori_loop(0, jnp.minimum(count * nc, nb), prime, 0)
+        lax.fori_loop(0, jnp.minimum(items, nb), prime_fast, 0)
+    else:
 
-    def prime(step):
-        @pl.when(step < items)
-        def start():
-            for copy in transfers(step):
-                copy.start()
+        def prime(step):
+            @pl.when(step < items)
+            def start():
+                for copy in transfers(step):
+                    copy.start()
 
-    # The first nb ring items start their weight copies.
-    for s in range(nb):
-        prime(jnp.int32(s))
+        # The first nb ring items start their weight copies.
+        for s in range(nb):
+            prime(jnp.int32(s))
 
     # The shared expert's copies started at entry. Waiting for them here,
     # before the zeroing and the x quantization, leaves no DMA wait between
@@ -623,8 +623,8 @@ def _kernel(
 
     def finish(step, slot, acc1):
         e = active(lax.div(step, nc)) if nc > 1 else active(step)
-        # UPDATE: global column e0 + e of the in-kernel routing table over all
-        # E experts, not the caller's coefficient table.
+        # Each row's routing weight for expert e (global column e0 + e of the
+        # routing table, 0 for rows that did not pick it).
         coeff = jnp.sum(
             jnp.where(expert_columns == e0 + e, wtab_ref[...], 0.0),
             axis=1,
@@ -646,9 +646,6 @@ def _kernel(
             owner_ref[:, n : n + _N_CHUNK] += (
                 acc2 * s2_ref[slot, :, n : n + _N_CHUNK] * ms
             )
-
-    # UPDATE: ring items, nc per active expert.
-    items = count * nc
 
     def ring_step(step, acc1, refill):
         """Wait for item step + 1, issue its gate_up, finish item step, and

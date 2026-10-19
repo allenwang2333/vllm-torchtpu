@@ -1324,7 +1324,7 @@ def streamindex_topk(
     final_sc_tie: tuple = (),
     decode_pack: bool = False,
     decode_page_major: bool | None = None,
-) -> jax.Array | tuple[jax.Array, ...]:
+) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
     Args:

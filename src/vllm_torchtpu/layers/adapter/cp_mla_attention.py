@@ -194,85 +194,10 @@ def merge_lse_partials_scatter_heads(
     # Same trace-time rule as above: only the backbone may split by size.
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
     if chunks > 1:
-        return _retain_rank(_merge_chunked(output, lse, group, chunks))
-    # Unchunked reduce-scatter buckets (above the a2a cap, below the chunk
-    # gate): TPU_DCP_RS_OUT_PRECISION sends the weighted terms in the
-    # output's dtype (bf16), as TPU_DCP_MERGE_RS_BF16=1 does for the chunked
-    # buckets. Backbone only; the drafter keeps f32 (upstream #1808).
-    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
-    if rs_dtype is None:
-        return _retain_rank(cp_lse_ag_out_rs(output, lse, group))
-    return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
-
-
-def merge_lse_partials_scatter_heads_vspace(
-    output: torch.Tensor,
-    lse: torch.Tensor,
-    w_uv: torch.Tensor,
-    w_uv_scale: torch.Tensor | None = None,
-    is_backbone: bool = True,
-    query_start_loc: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, bool]:
-    """`merge_lse_partials_scatter_heads`, merging in V space where
-    TPU_DCP_MERGE_VSPACE applies (`vspace_merge_applies`).
-
-    `w_uv` is W_UV gathered for the whole DCP group's heads `[H, C, V]` (the
-    head order of `output`; `w_uv_scale` its gathered per-channel scale for a
-    quantized W_UV). Where V space applies, every chunk of the chunked merge
-    projects this rank's partial through W_UV for all `H` heads, weights it
-    and reduce-scatters the `V`-wide result, so the bytes on the merge's
-    binding collective scale with V (256) instead of C (kv_lora_rank, 512).
-
-    Returns `(merged, projected)`: `projected` True means `merged` is
-    `[T, H / world, V]`, this rank's heads already through W_UV (the caller
-    skips its own W_UV); False means it is the latent merge
-    `merge_lse_partials_scatter_heads` returns, `[T, H / world, C]`.
-    """
-    if not vspace_merge_applies(output.shape[0], is_backbone):
-        return (
-            merge_lse_partials_scatter_heads(
-                output, lse, is_backbone=is_backbone, query_start_loc=query_start_loc
-            ),
-            False,
+        return _retain_rank(
+            _merge_chunked(output, lse, group, chunks, rs_dtype=rs_dtype)
         )
-    group = get_dcp_group()
-    chunks = _merge_chunks(output.shape[0])
-    merged = _merge_chunked(output, lse, group, chunks, vspace=(w_uv, w_uv_scale))
-    return _retain_rank(merged), True
-
-
-def vspace_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
-    """Whether this step's merge runs in V space (TPU_DCP_MERGE_VSPACE): the
-    backbone's chunked reduce-scatter merge, exactly the buckets
-    `merge_lse_partials_scatter_heads` sends to `_merge_chunked`.
-
-    Fixed at trace time. Every token-count comparison here is one the merge
-    already makes for the same bucket (the a2a cap, the chunk gate), so V
-    space adds no shape guard -- except TPU_DCP_MERGE_VSPACE_MIN_TOKENS above
-    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS, which is compared only then. The MTP
-    drafter (traced once for every bucket) never compares and never takes it.
-    """
-    if not envs.TPU_DCP_MERGE_VSPACE or not is_backbone:
-        return False
-    # RS_BF16=2 exchanges the latent operand by all-to-all; not ported.
-    if envs.TPU_DCP_MERGE_RS_BF16 == 2:
-        return False
-    group = get_dcp_group()
-    if group is None or int(group.world_size) == 1:
-        return False
-    if (
-        envs.TPU_DCP_LSE_MERGE_A2A
-        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
-    ):
-        return False
-    if _merge_chunks(num_tokens) <= 1:
-        return False
-    min_tokens = envs.TPU_DCP_MERGE_VSPACE_MIN_TOKENS
-    if min_tokens > envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS and not (
-        num_tokens > envs.bucket_gate_edge(min_tokens)
-    ):
-        return False
-    return True
+    return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
 def _merge_chunks(num_tokens: int) -> int:
@@ -393,7 +318,7 @@ def _weighted_reduce_scatter(
         envs.TPU_DCP_MERGE_WEIGHTED_HM
         and envs.TPU_DCP_MERGE_RS_BF16 != 2
         and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
-        >= envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS
+        > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
     ):
         if after is not None and merged_lse.device.type == "tpu":
             from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
