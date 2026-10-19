@@ -76,6 +76,15 @@ def carry(out, args):
     return (out[0],) + tuple(args[1:])
 
 
+# The engine builds the ops through build_dcp_kernels; with the flag set it
+# must log once that the v2 path is used.
+os.environ["TPU_RPA_DECODE_V2"] = "1"
+_ops = CP.build_dcp_kernels(
+    sliding_window=None, sm_scale=1 / 16, logits_soft_cap=None, q_scale=None, k_scale=1.0,
+    v_scale=1.0, cp_group_size=DCP, cp_rank=0, kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+    decode_query_size=T)
+emit(built_ops=[type(o).__name__ for o in _ops], registry=[k[0] for k in CP._DCP_KERNEL_REGISTRY])
+
 kv, q, knew, lens, pidx, cu = build(N)
 for rank in (() if os.environ.get("CP_MULTI_ONLY") == "1" else (0, 3)):
     for name, dist in (("decode", jnp.array([N, N, N], jnp.int32)),
