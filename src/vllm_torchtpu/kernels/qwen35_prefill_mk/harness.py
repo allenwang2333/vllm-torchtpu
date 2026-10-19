@@ -139,7 +139,8 @@ def _state_kernel(plan, stride, n, conv_shape, rec_shape, store, interpret):
                     cp.wait()
                     if reg is plan.conv:
                         conv_out[i] = vmem_ldst.load_state_region(
-                            win, reg, (conv_shape[0], 1, conv_shape[1])).reshape(conv_shape)
+                            win, reg, (conv_shape[0], 1, conv_shape[1])).reshape(
+                                conv_shape).astype(jnp.float32)
                     else:
                         rec_out[i] = vmem_ldst.load_state_region(win, reg, rec_shape).astype(
                             jnp.float32)
