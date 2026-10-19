@@ -31,7 +31,9 @@ import torch.fx as fx
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.export.weight_name_mapper import resolve_source_tensor_and_path
+from vllm_torchtpu.export.weight_name_mapper import (
+    expand_or_resolve_weight_sources,
+)
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -2383,27 +2385,9 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                             tp_size_hint=tp_size_cfg,
                             has_ep_hint=has_ep_any,
                         )
-                    sources = w_spec.get("sources")
-                    if not isinstance(sources, list) or not sources:
-                        sources = [
-                            {
-                                "path": "",
-                                "source_tensor": w_name,
-                                "source_shape": w_shape,
-                            }
-                        ]
-                        w_spec["sources"] = sources
-                    for src_entry in sources:
-                        if not isinstance(src_entry, dict):
-                            continue
-                        raw_target = str(src_entry.get("source_tensor") or w_name)
-                        src_tensor, shard_path = resolve_source_tensor_and_path(
-                            raw_target, tensor_to_file, default_st_path
-                        )
-                        src_entry["source_tensor"] = src_tensor
-                        src_entry["path"] = shard_path
-                        if "source_shape" not in src_entry and w_shape:
-                            src_entry["source_shape"] = w_shape
+                    w_spec["sources"] = expand_or_resolve_weight_sources(
+                        w_name, w_spec, tensor_to_file, default_st_path
+                    )
                     w_spec.pop("is_internal_constant", None)
 
                 out_wj: dict[str, Any] = {"mesh": mesh_doc, **weights_dict}

@@ -95,3 +95,73 @@ def test_unmatched_tensor_falls_back_gracefully() -> None:
     )
     assert name == "non_existent.weight"
     assert path == "/fallback.safetensors"
+
+
+def test_gdn_linear_attention_composite_expansion() -> None:
+    # 397B GDN attention: in_proj_qkvz.weight [20480, 4096] expands to
+    # in_proj_qkv (12288) and in_proj_z (8192)
+    valid_keys = {
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": "/path/qkv.st",
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight": "/path/z.st",
+    }
+    w_name = "model.layers.0.linear_attn.in_proj_qkvz.weight"
+    w_spec = {"shape": [20480, 4096]}
+    from vllm_torchtpu.export.weight_name_mapper import expand_or_resolve_weight_sources
+
+    sources = expand_or_resolve_weight_sources(w_name, w_spec, valid_keys, "")
+    assert len(sources) == 2
+    assert (
+        sources[0]["source_tensor"]
+        == "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    )
+    assert sources[0]["path"] == "/path/qkv.st"
+    assert sources[0]["dst_slices"] == [{"dim": 0, "start": 0, "length": 12288}]
+
+    assert (
+        sources[1]["source_tensor"]
+        == "model.language_model.layers.0.linear_attn.in_proj_z.weight"
+    )
+    assert sources[1]["path"] == "/path/z.st"
+    assert sources[1]["dst_slices"] == [{"dim": 0, "start": 12288, "length": 8192}]
+
+
+def test_moe_routed_experts_composite_expansion() -> None:
+    # 480B / MoE: routed_experts.w13_weight [2, 6144, 5120] expands per-expert
+    # into gate_proj and up_proj
+    valid_keys = {
+        "model.layers.0.mlp.experts.0.gate_proj.weight": "/path/e0.st",
+        "model.layers.0.mlp.experts.0.up_proj.weight": "/path/e0.st",
+        "model.layers.0.mlp.experts.1.gate_proj.weight": "/path/e1.st",
+        "model.layers.0.mlp.experts.1.up_proj.weight": "/path/e1.st",
+    }
+    w_name = "model.layers.0.mlp.experts.routed_experts.w13_weight"
+    w_spec = {"shape": [2, 6144, 5120]}
+    from vllm_torchtpu.export.weight_name_mapper import expand_or_resolve_weight_sources
+
+    sources = expand_or_resolve_weight_sources(w_name, w_spec, valid_keys, "")
+    assert len(sources) == 4
+    # expert 0 gate
+    assert (
+        sources[0]["source_tensor"] == "model.layers.0.mlp.experts.0.gate_proj.weight"
+    )
+    assert sources[0]["path"] == "/path/e0.st"
+    assert sources[0]["dst_slices"] == [
+        {"dim": 0, "start": 0, "length": 1},
+        {"dim": 2, "start": 0, "length": 2560},
+    ]
+    assert sources[0]["transpose"] == [1, 0]
+    # expert 0 up
+    assert sources[1]["source_tensor"] == "model.layers.0.mlp.experts.0.up_proj.weight"
+    assert sources[1]["dst_slices"] == [
+        {"dim": 0, "start": 0, "length": 1},
+        {"dim": 2, "start": 2560, "length": 2560},
+    ]
+    assert sources[1]["transpose"] == [1, 0]
+    # expert 1 gate
+    assert (
+        sources[2]["source_tensor"] == "model.layers.0.mlp.experts.1.gate_proj.weight"
+    )
+    assert sources[2]["dst_slices"] == [
+        {"dim": 0, "start": 1, "length": 1},
+        {"dim": 2, "start": 0, "length": 2560},
+    ]
