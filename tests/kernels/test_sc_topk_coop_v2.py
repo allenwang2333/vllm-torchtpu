@@ -14,10 +14,10 @@
 """TPU_SC_TOPK_COOP_V2 and TPU_SC_TOPK_COOP_MERGE are bitwise identical to the
 default SparseCore top-k paths: same indices in the same order, same keys.
 
-* ``sparsecore_topk_valid.sparsecore_topk(coop_v2=True)``: the level loop and the
+* ``sparsecore_topk.sparsecore_topk(coop_v2=True)``: the level loop and the
   winner gather (prefix scatter at P >= 4, overlapped peer copies at P = 2) on
   single-wave calls; multi-wave calls keep the default path.
-* ``sparsecore_topk_valid.sparsecore_topk_dcp_merge_coop``: the DCP merge split
+* ``sparsecore_topk.sparsecore_topk_dcp_merge_coop``: the DCP merge split
   over P subcores by rank segment, against
   ``sparsecore_topk.sparsecore_topk_dcp_merge(rank_major=True)``.
 
@@ -36,7 +36,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk as sc_topk
-from vllm_torchtpu.kernels.deepseek_v4 import sparsecore_topk_valid as sc_valid
 
 pytestmark = pytest.mark.tpu_test
 
@@ -94,8 +93,8 @@ def _local_case(b, kind, seed):
 def test_coop_v2_local_is_bitwise(b, kind):
     _require_sparsecore()
     scores, lens = _local_case(b, kind, seed=b * 7 + len(kind))
-    want = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
-    got = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
+    want = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
+    got = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
     assert _same(got, want) is None, _same(got, want)
 
 
@@ -105,7 +104,7 @@ def test_coop_v2_engages_on_single_wave_only():
         scores = jnp.zeros((b, N), jnp.float32)
         lens = jnp.full((b,), 4096, jnp.int32)
         txt = (
-            jax.jit(lambda s, l: sc_valid.sparsecore_topk(s, K, l, return_scores=True, coop_v2=True))
+            jax.jit(lambda s, l: sc_topk.sparsecore_topk(s, K, l, return_scores=True, coop_v2=True))
             .lower(scores, lens)
             .as_text()
         )
@@ -141,29 +140,28 @@ def _a2a_case(b, kind, seed):
 def test_coop_v2_a2a_stage2_is_bitwise(b, kind):
     _require_sparsecore()
     scores, lens = _a2a_case(b, kind, seed=b + len(kind))
-    want = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
-    got = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
+    want = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
+    got = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
     assert _same(got, want) is None, _same(got, want)
     assert (np.asarray(got[0])[0] == -1).all()  # the padding row selects nothing
     # The comparison sees a fault INSIDE the kernel: an in-kernel "-inf" key moved up
     # to the key of +0.0 drops the all-negative row's candidates in the kernel only.
-    key_neg_inf = sc_valid.KEY_NEG_INF
+    key_neg_inf = sc_topk.KEY_NEG_INF
     try:
         jax.clear_caches()
-        sc_valid.KEY_NEG_INF = 0
-        bad = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
+        sc_topk.KEY_NEG_INF = 0
+        bad = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=True)
     finally:
-        sc_valid.KEY_NEG_INF = key_neg_inf
+        sc_topk.KEY_NEG_INF = key_neg_inf
         jax.clear_caches()
     assert _same(bad, want) is not None, "in-kernel fault not detected"
 
 
 def test_coop_v2_engages_through_the_a2a_dispatcher(monkeypatch):
     """The a2a merge's stage 2 reaches this kernel through
-    sparsecore_topk.sparsecore_topk (TPU_SC_TOPK_VALID_READS) with coop_v2 read
-    from the env: engaged exactly on the allow-listed shapes."""
+    sparsecore_topk.sparsecore_topk with coop_v2 read from the env: engaged
+    exactly on the allow-listed shapes."""
     _require_sparsecore()
-    monkeypatch.setattr(envs, "TPU_SC_TOPK_VALID_READS", True)
     monkeypatch.setattr(envs, "TPU_SC_TOPK_COOP_V2", True)
     for b, engaged in ((8, True), (16, True), (32, False), (4, False)):
         scores = jnp.zeros((b, N_A2A), jnp.float32)
@@ -196,7 +194,7 @@ def _merge_case(b, dcp, k, seed, kind):
 @pytest.mark.parametrize("kind", ["ties", "relu"])
 def test_coop_merge_is_bitwise(b, dcp, k, kind):
     _require_sparsecore()
-    if not sc_valid.coop_merge_fits(b, dcp, k):
+    if not sc_topk.coop_merge_fits(b, dcp, k):
         pytest.skip("shape outside the coop merge")
     flat, idxs = _merge_case(b, dcp, k, seed=b * 131 + dcp + k, kind=kind)
     for rank in sorted({0, dcp // 2, dcp - 1}):
@@ -204,7 +202,7 @@ def test_coop_merge_is_bitwise(b, dcp, k, kind):
         want = sc_topk.sparsecore_topk_dcp_merge(
             flat, idxs, k, dcp_rank=r, dcp_size=dcp, rank_major=True
         )
-        got = sc_valid.sparsecore_topk_dcp_merge_coop(flat, idxs, k, dcp_rank=r, dcp_size=dcp)
+        got = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, k, dcp_rank=r, dcp_size=dcp)
         assert _same((got,), (want,)) is None, (rank, _same((got,), (want,)))
 
 
@@ -223,17 +221,17 @@ def test_coop_merge_route(monkeypatch):
             .as_text()
         )
         assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_coop", txt)) is routed, b
-    assert sc_valid.coop_merge_fits(16, 8, K) and not sc_valid.coop_merge_fits(32, 8, K)
-    assert not sc_valid.coop_merge_fits(4, 6, K)
+    assert sc_topk.coop_merge_fits(16, 8, K) and not sc_topk.coop_merge_fits(32, 8, K)
+    assert not sc_topk.coop_merge_fits(4, 6, K)
 
 
 def test_comparison_detects_a_corrupted_row():
     _require_sparsecore()
     scores, lens = _local_case(4, "ties", seed=3)
-    want = sc_valid.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
+    want = sc_topk.sparsecore_topk(scores, K, lens, return_scores=True, coop_v2=False)
     bad = (want[0].at[2, 100].set(want[0][2, 101]), want[1])
     assert _same(bad, want) is not None
     flat, idxs = _merge_case(4, 8, K, seed=5, kind="ties")
-    m = sc_valid.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(5), dcp_size=8)
-    m_wrong_rank = sc_valid.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(4), dcp_size=8)
+    m = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(5), dcp_size=8)
+    m_wrong_rank = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(4), dcp_size=8)
     assert _same((m,), (m_wrong_rank,)) is not None

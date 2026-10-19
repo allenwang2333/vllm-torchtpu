@@ -14,9 +14,27 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_LIVE_GATHER: bool = True
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 32
-    TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
-    TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = True
-    TPU_MTP_DCP_MERGE_SIZED: bool = True
+    TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
+    TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
+    TPU_MLA_SPARSE_SPLIT_Q: bool = True
+    TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
+    TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
+    TPU_MTP_DCP_MERGE_SIZED: bool = False
+    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
+    TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = False
+    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 0
+    TPU_DCP_MERGE_RS_BF16: int = 0
+    TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 16
+    TPU_DCP_MLA_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_FUSED_PREP: bool = False
+    TPU_DCP_MLA_MIXED_LIVE: bool = False
+    TPU_DCP_MLA_MIXED_LIVE_WIDTHS: str = ""
+    TPU_MLA_DECODE_ROW_WIDTHS: str = ""
+    TPU_DCP_MLA_MIXED_BODY: str = ""
+    TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
+    TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
     TPU_MTP_DCP_MERGE_SMALL_A2A: bool = False
     TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS: int = 8
     TPU_VOCAB_EMBED_I32_BOUNDS: bool = False
@@ -38,10 +56,6 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = False
     TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 8
     TPU_SMALL_COLL_HBM_OPERAND: bool = False
-    TPU_DCP_MERGE_CHUNKED: int = 8
-    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
-    TPU_DCP_MERGE_CHUNKED_LSE_AG: bool = True
-    TPU_DCP_MERGE_CHUNKED_LSE_AG_MAX_TOKENS: int = 2048
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
@@ -174,8 +188,6 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = False
-    TPU_SC_TOPK_ROW_CAP: bool = False
-    TPU_SC_TOPK_VALID_READS: bool = True
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
     TPU_SC_TOPK_COOP_V2: bool = False
     TPU_SC_TOPK_COOP_MERGE: bool = False
@@ -281,18 +293,15 @@ if TYPE_CHECKING:
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = "self_attn.o_proj,q_b_proj"
     TPU_MOE_ROUTER_HBM_PIN: bool = False
     TPU_LM_HEAD_HBM: str = ""
-    TPU_FUSED_ADD_RMSNORM: bool = True
+    TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
-    TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = True
-    TPU_SAMPLER_VOCAB_PARALLEL: bool = True
-    TPU_MTP_EH_PROJ_TP: bool = True
+    TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
-    TPU_SAMPLER_VERIFY_TRIM: bool = True
     TPU_SAMPLER_GRAPH_RNG: bool = False
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
@@ -555,7 +564,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each bucket at its concrete shape, so the choice leaves no guard. Same
     # per-element weights as the reduce-scatter merge; only the order the
     # ranks' weighted partials are summed in differs.
-    "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=True),
+    "TPU_MTP_DCP_MERGE_SIZED": env_bool("TPU_MTP_DCP_MERGE_SIZED", default=False),
     # With TPU_MTP_DCP_MERGE_SIZED, on drafter buckets of
     # T <= TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS tokens (a power of 2): move
     # the sized merge's packed words with one Pallas round of remote DMAs
@@ -1562,8 +1571,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copy of 32 * dcp * k words, plus relayouts of the local slots and the
     # output slice). T > 32 keeps the padded path. Bitwise identical output.
     "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool("TPU_SC_TOPK_DCP_MERGE_FLAT", default=True),
-    # `sparsecore_topk_valid` (TPU_SC_TOPK_VALID_READS) at P > 1: the refinement
-    # levels as one runtime loop (the SparseCore call's startup grows with its
+    # `sparsecore_topk` at P > 1: the refinement levels as one runtime loop (the SparseCore call's startup grows with its
     # program size), each level's peer reduce + scan + bucket search as one
     # loop, and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
     # decode shapes): each subcore scatters its winners into the group's
@@ -1573,7 +1581,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SC_TOPK_COOP_V2": env_bool("TPU_SC_TOPK_COOP_V2", default=False),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat merge and T <= 16 rows: split each
     # merge row over p = min(dcp, 32 / T) subcores by rank segment
-    # (`sparsecore_topk_valid.sparsecore_topk_dcp_merge_coop`) instead of one
+    # (`sparsecore_topk.sparsecore_topk_dcp_merge_coop`) instead of one
     # subcore walking all dcp * k scores; only the subcore holding this rank's
     # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
     "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=False),
@@ -1961,7 +1969,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # nn.Linear upstream) by output column across TP and all-gather the
     # result, so each draft pass reads H*2H/tp weight bytes instead of H*2H
     # (spec_decode/utils.ColumnParallelEhProj). Same per-element dot product.
-    "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP", True),
+    "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP"),
     # MTP draft: the two tiny TP all-gathers per draft pass -- the column-
     # parallel eh_proj output (TPU_MTP_EH_PROJ_TP) and the vocab-parallel
     # argmax (max, id) pairs (TPU_SAMPLER_VOCAB_PARALLEL) -- become a TP
@@ -1994,7 +2002,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # logits length (16 at 1-2 requests with MTP k=3). The dropped rows are
     # padding slots; the uniforms are drawn at the full shape and sliced, so
     # tokens and accept decisions are unchanged.
-    "TPU_SAMPLER_VERIFY_TRIM": env_bool("TPU_SAMPLER_VERIFY_TRIM", True),
+    "TPU_SAMPLER_VERIFY_TRIM": env_bool("TPU_SAMPLER_VERIFY_TRIM"),
     # With TPU_SAMPLER_FUSED_CHAIN: the fused verify chain draws its three
     # uniforms (bonus_u, accept_u, recover_u) inside the compiled program
     # instead of as six eager programs before it. Dynamo cannot take a
@@ -2004,7 +2012,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with the same state, so the stream (and every token) is unchanged as long
     # as nothing else draws from the default generator while serving.
     "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
-    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", True),
     # With TPU_FP8_LINEAR_PALLAS: the skinny kernel takes its per-channel weight
     # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
     # ring. Without it XLA stages the scale (o_proj f32[6144]) into VMEM with a copy

@@ -4517,7 +4517,7 @@ class TPUModelRunner(GPUModelRunner):
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
             assert self.speculative_config is not None
-            trim_kwargs = {}
+            trim_kwargs: dict[str, Any] = {}
             if rows := self._verify_trim_rows(
                 md.target_logits_indices.shape[0], md.draft_lengths_cpu
             ):
