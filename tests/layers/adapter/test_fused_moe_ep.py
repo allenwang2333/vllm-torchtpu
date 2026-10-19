@@ -171,6 +171,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         has_score_bias=has_bias,
         routed_scaling_factor=scale,
         token_replica_groups=groups,
+        logical_intermediate_size=None,
     )
     replicated = bridge._build_op(*args, **options)
     assert bridge._build_op(*args, **options) is replicated
@@ -180,9 +181,10 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
+        dict(logical_intermediate_size=2304),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
+    assert len(closures) == 6
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -198,6 +200,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         operands += (bias,)
     assert closures[0](*operands) is x
     forwarded = kernel.call_args.kwargs
+    assert forwarded["logical_intermediate_size"] is None
     assert forwarded["token_replica_groups"] == groups
     assert forwarded["scoring_fn"] == scoring_fn
     assert forwarded["routed_scaling_factor"] == scale
@@ -1076,3 +1079,19 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+@pytest.mark.parametrize(
+    "local_rows,expected", [(128, None), (288, None), (2048, 2304)]
+)
+def test_logical_intermediate_respects_actual_tile_height_schedule(
+    local_rows, expected
+):
+    x = SimpleNamespace(shape=(local_rows * 8, 5120))
+    w1 = SimpleNamespace(shape=(384, 5120, 5120))
+    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: 8})
+    groups = tuple((rank,) for rank in range(8))
+    assert (
+        bridge._logical_intermediate_for_bucket(2304, x, w1, mesh, 6, groups)
+        == expected
+    )

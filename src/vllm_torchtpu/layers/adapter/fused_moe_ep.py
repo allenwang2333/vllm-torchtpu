@@ -161,6 +161,28 @@ def fused_moe_ep_supported(owner: Any) -> bool:
     return getattr(owner, FUSED_MOE_EP_OP_ATTR, None) is not None
 
 
+def _logical_intermediate_for_bucket(logical, x, w1, mesh, topk, groups):
+    """Only enable the fixed kernel's trim on its supported height schedule."""
+    if logical is None:
+        return None
+    from vllm_torchtpu.kernels.fused_moe.v2.host import ragged_stride_bound
+    from vllm_torchtpu.kernels.fused_moe.v2.kernel import tile_height_rungs
+    from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+
+    ep = mesh.shape[EP_AXIS_NAME]
+    layout = TokenReplicaLayout.create(
+        ep=ep,
+        input_rows=x.shape[0] // ep,
+        groups=groups,
+        row_alignment=U32_SUBLANE_TILE,
+    )
+    experts = w1.shape[0]
+    stride = ragged_stride_bound(ep * layout.local_rows, topk, experts, _TILE_M)
+    if tile_height_rungs(_TILE_M, stride, experts // ep, ep) == (_TILE_M,):
+        return logical
+    return None
+
+
 def _build_op(
     mesh,
     topk: int,
@@ -176,6 +198,7 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    logical_intermediate_size=None,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -193,6 +216,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        logical_intermediate_size,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -232,6 +256,9 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            logical_intermediate_size=_logical_intermediate_for_bucket(
+                logical_intermediate_size, x, w1, mesh, topk, token_replica_groups
+            ),
             **bias_kw,
             **routing_kw,
         )
@@ -482,6 +509,7 @@ def prebuild_fused_moe_ep(
     rhs_qb=None,
     weights=None,
     supplies_hash_ids=False,
+    logical_intermediate_size=None,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -655,6 +683,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        logical_intermediate_size=logical_intermediate_size,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

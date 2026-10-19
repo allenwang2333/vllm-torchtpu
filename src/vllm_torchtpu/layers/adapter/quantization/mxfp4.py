@@ -472,6 +472,13 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             rhs_qb=block,
             weights=weights,
             supplies_hash_ids=True,
+            logical_intermediate_size=(
+                orig_intermediate_size
+                if block == 512
+                and orig_intermediate_size % 256 == 0
+                and 0 < inter - orig_intermediate_size < block
+                else None
+            ),
         )
 
     def _resolve_tpu_activation(self, layer) -> str:
