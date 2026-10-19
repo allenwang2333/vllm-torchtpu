@@ -31,10 +31,18 @@ def _up_kernel(mid_ref, norm_ref, weight_ref, mixed_ref, *, hidden, branches):
 
 @functools.partial(jax.jit, static_argnames=("branches", "hidden", "token_tile"))
 def _up_epilogue(mid, norm, weight, *, branches, hidden, token_tile):
+    if branches <= 0 or hidden <= 0 or hidden % 128:
+        raise ValueError(
+            "HC up epilogue requires positive branches and 128-aligned hidden"
+        )
+    if token_tile <= 0 or token_tile % 128:
+        raise ValueError("HC up epilogue requires positive 128-aligned token tiles")
     tokens, lowrank = mid.shape
     width = branches * hidden
     if (
-        tokens % token_tile
+        tokens == 0
+        or lowrank == 0
+        or tokens % token_tile
         or norm.shape != (tokens, width)
         or weight.shape != (width, lowrank)
         or mid.dtype != jnp.bfloat16

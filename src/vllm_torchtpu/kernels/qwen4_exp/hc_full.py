@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Optional prefill HyperConnection mixer with resident weights and two tiles.
 
-The kernel keeps the checkpoint's BF16 rounding boundaries. It stages the
+Normalization and SiLU use FP32 internally, matching upstream NVIDIA HC.
+Projection and stored outputs remain BF16. The kernel stages the
 normalization and both projection weights once, overlaps the next input tile
 with the current computation, and drains output tiles only before reuse.
 """
@@ -64,77 +65,35 @@ def _kernel(
                 x_sems.at[1 - parity],
             ).start()
 
-        if token_tile >= 32 and token_tile % 32 == 0:
+        @pl.when(step == 0)
+        def _wait_weight():
+            weight_dma.wait()
 
-            @pl.when(step == 0)
-            def _wait_weight():
-                weight_dma.wait()
+        @pl.when(step >= 2)
+        def _wait_prior_norm_output():
+            pltpu.make_async_copy(
+                norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
+            ).wait()
 
-            @pl.when(step >= 2)
-            def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
+        weight = weight_vm[...].astype(jnp.float32)
 
-            def normalize_rows(index, carry):
-                offset = index * 32
-                weight = weight_vm[...].astype(jnp.float32)
-                for branch in range(branches):
-                    start = branch * hidden
-                    values = x_vm[
-                        parity, pl.ds(offset, 32), pl.ds(start, hidden)
-                    ].astype(jnp.float32)
-                    variance = jnp.mean(values * values, axis=-1, keepdims=True)
-                    normalized = (
-                        (values * jax.lax.rsqrt(variance + eps))
-                        .astype(jnp.bfloat16)
-                        .astype(jnp.float32)
-                    )
-                    scaled = (
-                        (normalized * weight[None, start : start + hidden])
-                        .astype(jnp.bfloat16)
-                        .astype(jnp.float32)
-                    )
-                    norm_vm[parity, pl.ds(offset, 32), pl.ds(start, hidden)] = (
-                        normalized + scaled
-                    ).astype(jnp.bfloat16)
-                return carry
-
-            jax.lax.fori_loop(0, token_tile // 32, normalize_rows, jnp.int32(0))
-            norm = norm_vm[parity]
-        else:
-            x = x_vm[parity].astype(jnp.float32)
-
-            @pl.when(step == 0)
-            def _wait_weight():
-                weight_dma.wait()
-
-            weight = weight_vm[...].astype(jnp.float32)
-            pieces = []
+        def normalize_rows(index, carry):
+            offset = index * 32
             for branch in range(branches):
                 start = branch * hidden
-                values = x[:, start : start + hidden]
+                values = x_vm[parity, pl.ds(offset, 32), pl.ds(start, hidden)].astype(
+                    jnp.float32
+                )
                 variance = jnp.mean(values * values, axis=-1, keepdims=True)
-                normalized = (
-                    (values * jax.lax.rsqrt(variance + eps))
-                    .astype(jnp.bfloat16)
-                    .astype(jnp.float32)
-                )
-                scaled = (
-                    (normalized * weight[None, start : start + hidden])
-                    .astype(jnp.bfloat16)
-                    .astype(jnp.float32)
-                )
-                pieces.append(normalized + scaled)
-            norm = jnp.concatenate(pieces, axis=-1).astype(jnp.bfloat16)
+                normalized = values * jax.lax.rsqrt(variance + eps)
+                scaled = normalized * weight[None, start : start + hidden]
+                norm_vm[parity, pl.ds(offset, 32), pl.ds(start, hidden)] = (
+                    normalized + scaled
+                ).astype(jnp.bfloat16)
+            return carry
 
-            @pl.when(step >= 2)
-            def _wait_prior_norm_output():
-                pltpu.make_async_copy(
-                    norm_vm.at[parity], norm_vm.at[parity], norm_sems.at[parity]
-                ).wait()
-
-            norm_vm[parity] = norm
+        jax.lax.fori_loop(0, token_tile // 32, normalize_rows, jnp.int32(0))
+        norm = norm_vm[parity]
         pltpu.make_async_copy(
             norm_vm.at[parity],
             norm_hbm.at[pl.ds(step * token_tile, token_tile)],
@@ -151,8 +110,7 @@ def _kernel(
             dimension_numbers=(((1,), (1,)), ((), ())),
             preferred_element_type=jnp.float32,
         ).astype(jnp.bfloat16)
-        gate = (down / branches).astype(jnp.bfloat16)
-        gate = jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16)
+        gate = jax.nn.silu(down.astype(jnp.float32) / branches).astype(jnp.bfloat16)
 
         @pl.when(step == 0)
         def _wait_up():
@@ -204,10 +162,18 @@ def _kernel(
 
 @functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile"))
 def _full_mix(x, weight, down, up, *, branches, hidden, eps, token_tile):
+    if branches <= 0 or hidden <= 0 or hidden % 128:
+        raise ValueError(
+            "HC full mix requires positive branches and 128-aligned hidden"
+        )
+    if token_tile <= 0 or token_tile % 128:
+        raise ValueError("HC full mix requires positive 128-aligned token tiles")
     tokens, width = x.shape
     lowrank = down.shape[0]
     if (
-        tokens % (2 * token_tile)
+        tokens == 0
+        or lowrank == 0
+        or tokens % (2 * token_tile)
         or width != branches * hidden
         or weight.shape != (width,)
         or down.shape != (lowrank, width)
