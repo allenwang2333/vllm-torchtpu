@@ -65,7 +65,7 @@ def main() -> None:
     if args.profile or args.trace_mode is not None:
         os.environ["LIBTPU_INIT_ARGS"] = (
             os.environ.get("LIBTPU_INIT_ARGS", "")
-            + " --xla_enable_custom_call_region_trace=true"
+            + " --xla_enable_custom_call_region_trace=false"
             + " --xla_xprof_enable_custom_call_tracing=true"
         ).strip()
 
