@@ -203,22 +203,21 @@ def _pallas_rpa_kernel_dcp(
         decode_query_size=decode_query_size,
     )
 
-    def skip_branch(kv):
-        return kv, jnp.zeros_like(v2_output), jnp.zeros_like(v2_lse)
+    # v2_branch passes the v2 results through the cond: that data dependency
+    # orders the cond (whose fallback branch updates the cache in place) after
+    # decode_v2's read of the cache. Selecting the v2 results after a cond that
+    # does not depend on them lets XLA reorder the two, and it then reserves
+    # memory to keep the cache readable (measured: program load needed 5.02G of
+    # HBM headroom against 4.00G free on the decode leg, j-ba8a0879).
+    def v2_branch(kv):
+        return kv, v2_output, v2_lse
 
     def rpa_branch(kv):
         new_kv_cache, output, lse = batched_rpa(kv)
         return new_kv_cache, output, lse.astype(jnp.float32)
 
     all_decode = request_distribution[0] >= request_distribution[2]
-    # The cond only runs the fallback; the v2 results are selected after it, so
-    # they are not copied through the cond's outputs.
-    new_kv_cache, rpa_output, rpa_lse = jax.lax.cond(
-        all_decode, skip_branch, rpa_branch, kv_cache
-    )
-    output = jnp.where(all_decode, v2_output, rpa_output)
-    lse = jnp.where(all_decode, v2_lse, rpa_lse)
-    return new_kv_cache, output, lse
+    return jax.lax.cond(all_decode, v2_branch, rpa_branch, kv_cache)
 
 
 # ---------------------------------------------------------------------------
