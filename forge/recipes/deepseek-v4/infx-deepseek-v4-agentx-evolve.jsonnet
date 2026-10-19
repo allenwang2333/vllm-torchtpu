@@ -25,6 +25,10 @@ local serverImage = cdk.var('IMAGE', 'us-central1-docker.pkg.dev/cloud-ullm-infe
 // editable /workspace/vllm-torchtpu/src before the patches below. Pair it with the nightly built from
 // the same dependency pins; empty runs the image's own source.
 local vllmTorchtpuSrc = cdk.var('VLLM_TORCHTPU_SRC', '');
+// gs:// path of a vllm-rs binary (vLLM's Rust API-server frontend, as the B200 reference serves with) built for
+// the image's vLLM version. The image ships vLLM without it; this installs it where VLLM_RUST_FRONTEND_PATH=auto
+// looks. It is only used with SERVER_EXTRA_ENV=VLLM_USE_RUST_FRONTEND=1.
+local vllmRsBin = cdk.var('VLLM_RS_BIN', '');
 local clientImage = cdk.var('BENCH_IMAGE', 'us-central1-docker.pkg.dev/cloud-tpu-inference-test/inferencex/inferencex-agentx:latest');
 
 local modelPath = cdk.var('MODEL_PATH', 'deepseek-ai/DeepSeek-V4-Pro-0813');
@@ -501,6 +505,11 @@ local serverScript = agentx.fill(
     HEAD_ADDR="@HEAD_ADDR@"
     echo "Resolved Ray head address (HEAD_ADDR) as: ${HEAD_ADDR}"
 
+    if [ -n "${VLLM_RS_BIN:-}" ]; then
+      VLLM_RS_DST="$(python3 -c 'import os, vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+      gcloud storage cp "${VLLM_RS_BIN}" "$VLLM_RS_DST" || exit 1
+      chmod +x "$VLLM_RS_DST" && echo "Installed vllm-rs from ${VLLM_RS_BIN} at $VLLM_RS_DST: $("$VLLM_RS_DST" --version 2>&1 | head -1)"
+    fi
     if [ -n "${VLLM_TORCHTPU_SRC:-}" ]; then
       echo "Replacing /workspace/vllm-torchtpu/src with ${VLLM_TORCHTPU_SRC}..."
       rm -rf /tmp/vllm-torchtpu-src && mkdir -p /tmp/vllm-torchtpu-src
@@ -743,6 +752,7 @@ local serverJob = cdk.job(
         SERVED_MODEL_NAME: servedModelName,
         GCS_CKPT_DIR: gcsCkptDir,
         VLLM_TORCHTPU_SRC: vllmTorchtpuSrc,
+        VLLM_RS_BIN: vllmRsBin,
         HF_HUB_OFFLINE: cdk.var('HF_HUB_OFFLINE', '1'),
         JOBSET_JOB_INDEX: { valueFrom: { fieldRef: { fieldPath: "metadata.labels['jobset.sigs.k8s.io/job-index']" } } },
         POD_NAMESPACE: { valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
