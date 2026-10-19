@@ -96,6 +96,12 @@ PATCHES = (
         "vllm_torchtpu.core.prefill_srpt:patch_scheduler_prefill_srpt",
         _ENGINE,
     ),
+    # Decode-only steps between prefill chunks (TPU_SCHED_DECODE_INTERLEAVE_*,
+    # TPU_SCHED_DECODE_FINISH_*). After SRPT: wraps it.
+    Patch(
+        "vllm_torchtpu.core.decode_interleave:patch_scheduler_decode_interleave",
+        _ENGINE,
+    ),
     Patch(
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,

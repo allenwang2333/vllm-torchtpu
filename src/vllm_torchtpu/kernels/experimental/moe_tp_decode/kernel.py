@@ -719,7 +719,10 @@ def _kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("routed_scale", "topk", "n_ranks", "fast"))
+@functools.partial(
+    jax.jit,
+    static_argnames=("routed_scale", "topk", "n_ranks", "fast", "hbm_operands"),
+)
 def moe_tp_decode(
     x,
     scores,
@@ -740,6 +743,7 @@ def moe_tp_decode(
     topk: int,
     n_ranks: int,
     fast: bool = False,
+    hbm_operands: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -762,6 +766,12 @@ def moe_tp_decode(
       topk: experts per token.
       n_ranks: TP ranks.
       fast: the fast schedule (module docstring); the same output bits.
+      hbm_operands: constrain the 8 weight operands to HBM
+        (``pltpu.with_memory_space_constraint``). The in_specs only type the
+        kernel refs; without the constraint XLA may stage a whole weight into
+        VMEM with a copy-start/-done before the call (exposed in the MTP
+        drafter's one-layer program), though the kernel DMAs the rows it uses
+        itself. Same bytes read, same output bits.
 
     Returns:
       bf16(sum over ranks of each rank's shared + routed_scale * routed),
@@ -813,6 +823,20 @@ def moe_tp_decode(
         )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights = (
+        w13,
+        w2,
+        s13,
+        s2,
+        shared_w13,
+        shared_s13.reshape(1, 2 * shared_inter),
+        shared_w2,
+        shared_s2.reshape(1, h),
+    )
+    if hbm_operands:
+        weights = tuple(
+            pltpu.with_memory_space_constraint(w, pltpu.HBM) for w in weights
+        )
     return pl.pallas_call(
         functools.partial(
             _split_entry if split else _kernel,
@@ -861,12 +885,5 @@ def moe_tp_decode(
         x,
         scores,
         bias.reshape(1, e_pad),
-        w13,
-        w2,
-        s13,
-        s2,
-        shared_w13,
-        shared_s13.reshape(1, 2 * shared_inter),
-        shared_w2,
-        shared_s2.reshape(1, h),
+        *weights,
     )
