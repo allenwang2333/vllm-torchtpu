@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = -1
-    TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 512
     TPU_SPARSE_MLA_LIVE_GATHER: bool = True
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 32
@@ -35,27 +35,27 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MIXED_BODY: str = ""
     TPU_DCP_MLA_MIXED_MASK_IN_KERNEL: bool = False
     TPU_DCP_MLA_MIXED_FUSED_PREP: bool = False
-    TPU_MTP_DCP_MERGE_SMALL_A2A: bool = False
+    TPU_MTP_DCP_MERGE_SMALL_A2A: bool = True
     TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS: int = 8
-    TPU_VOCAB_EMBED_I32_BOUNDS: bool = False
-    TPU_MOE_TP_DECODE_HBM_OPERANDS: str = ""
+    TPU_VOCAB_EMBED_I32_BOUNDS: bool = True
+    TPU_MOE_TP_DECODE_HBM_OPERANDS: str = "drafter"
     TPU_DCP_MLA_SEND_LAYOUT: bool = True
     TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = True
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
     TPU_DCP_MLA_SEND_DENSE: bool = False
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
-    TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
+    TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
-    TPU_MLA_FUSED_SMALL_A2A: bool = False
+    TPU_MLA_FUSED_SMALL_A2A: bool = True
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
     TPU_MLA_FUSED_SMALL_A2A_PIN_VMEM_MIB: int = 32
-    TPU_MLA_FUSED_SMALL_A2A_BUCKETS: str = ""
+    TPU_MLA_FUSED_SMALL_A2A_BUCKETS: str = "4=kv@16"
     TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: int = 1
-    TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = False
-    TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 8
-    TPU_SMALL_COLL_HBM_OPERAND: bool = False
+    TPU_MLA_FUSED_SMALL_A2A_MERGE: bool = True
+    TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS: int = 4
+    TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
@@ -134,14 +134,14 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
-    TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = False
-    TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = False
+    TPU_TOKEN_PADDING_SKIP_UNCHANGED: bool = True
+    TPU_STAGE_TIMING_ONLY_WITH_CONSUMER: bool = True
     TPU_HOST_SCHED_DIAG_STEPS: int = 0
-    TPU_WORKER_CPU_PIN: bool = False
+    TPU_WORKER_CPU_PIN: bool = True
     TPU_WORKER_CPU_PIN_SKIP: int = 2
-    TPU_AOT_SKIP_GUARD_CHECK: bool = False
-    TPU_FOREACH_MUTATION_EPILOGUE: bool = False
-    TPU_H2D_REUSE_STEADY: bool = False
+    TPU_AOT_SKIP_GUARD_CHECK: bool = True
+    TPU_FOREACH_MUTATION_EPILOGUE: bool = True
+    TPU_H2D_REUSE_STEADY: bool = True
     TPU_HOST_LEVER_ALTERNATE: str = ""
     TPU_MOE_ONEHOT_SORTFREE: bool = True
     TPU_MOE_SC_COMBINE_TILED: bool = False
@@ -187,10 +187,10 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_STREAMIDX_DECODE_PACK: bool = True
-    TPU_STREAMIDX_SHARED_META: bool = False
+    TPU_STREAMIDX_SHARED_META: bool = True
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
-    TPU_SC_TOPK_COOP_V2: bool = False
-    TPU_SC_TOPK_COOP_MERGE: bool = False
+    TPU_SC_TOPK_COOP_V2: bool = True
+    TPU_SC_TOPK_COOP_MERGE: bool = True
     TPU_DCP_INDEXER_SMALL_AG: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
@@ -275,8 +275,8 @@ if TYPE_CHECKING:
     TPU_SCHED_DECODE_FINISH_MAX_STEPS: int = 32
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
-    VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = False
-    TPU_MTP_TOPK_INPLACE: bool = False
+    VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
+    TPU_MTP_TOPK_INPLACE: bool = True
     TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -292,17 +292,17 @@ if TYPE_CHECKING:
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = "self_attn.o_proj,q_b_proj"
     TPU_MOE_ROUTER_HBM_PIN: bool = False
-    TPU_LM_HEAD_HBM: str = ""
+    TPU_LM_HEAD_HBM: str = "drafter"
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
     TPU_MTP_EH_PROJ_TP: bool = False
-    TPU_MTP_ONEHOT_AR: bool = False
+    TPU_MTP_ONEHOT_AR: bool = True
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
-    TPU_SAMPLER_GRAPH_RNG: bool = False
+    TPU_SAMPLER_GRAPH_RNG: bool = True
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
 
@@ -530,8 +530,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Gather/attention chunk (query tokens) of the capped path: fewer, larger
     # chunks amortise the per-chunk calls; each chunk's static gather buffer
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
-    # are written.
-    "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # are written. Default 512 (trial 6 served it; bit-identical to 256 on the
+    # served mixed config).
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 512),
     # Capped path: the native gather skips each window row's atoms past its live
     # top-k count (outputs unchanged). On by default.
     "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=True),
@@ -574,7 +575,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # addressed by (lane, rank) as data (the op takes the DCP rank and lane
     # operands on every bucket). Needs TPU_DCP_RANK_OPERAND.
     "TPU_MTP_DCP_MERGE_SMALL_A2A": env_bool(
-        "TPU_MTP_DCP_MERGE_SMALL_A2A", default=False
+        "TPU_MTP_DCP_MERGE_SMALL_A2A", default=True
     ),
     "TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS", 8
@@ -586,7 +587,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bounds are < 2**31, so the masks and the shifted ids are the same
     # values; the ids are widened to int64 for the lookup as before.
     "TPU_VOCAB_EMBED_I32_BOUNDS": env_bool(
-        "TPU_VOCAB_EMBED_I32_BOUNDS", default=False
+        "TPU_VOCAB_EMBED_I32_BOUNDS", default=True
     ),
     # With TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and TPU_MLA_DECODE_PROLOGUE: on
     # decode buckets the DCP MLA kernel writes the packed real-rows exchange's
@@ -645,7 +646,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (lane, rank) as data, so it needs the lane operand the indexer's
     # TPU_DCP_INDEXER_SMALL_AG already lifts on every bucket (with
     # TPU_SC_TOPK_DCP_MERGE_FLAT and TPU_DCP_RANK_OPERAND); otherwise off.
-    "TPU_DCP_MLA_SEND_SMALL_A2A": env_bool("TPU_DCP_MLA_SEND_SMALL_A2A", default=False),
+    "TPU_DCP_MLA_SEND_SMALL_A2A": env_bool("TPU_DCP_MLA_SEND_SMALL_A2A", default=True),
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
     ),
@@ -656,7 +657,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once to the peer -- and returns the receive buffer, so the send buffer
     # and the separate small all-to-all call are gone. Same received bits,
     # same unpack and merge. Other buckets keep their exchange.
-    "TPU_MLA_FUSED_SMALL_A2A": env_bool("TPU_MLA_FUSED_SMALL_A2A", default=False),
+    "TPU_MLA_FUSED_SMALL_A2A": env_bool("TPU_MLA_FUSED_SMALL_A2A", default=True),
     # With TPU_MLA_FUSED_SMALL_A2A: the fused call's scoped VMEM limit (MiB). It
     # decides what XLA may keep in VMEM across the call -- the receive buffer
     # the unpack reads, and the prefetches of the next ops' weights.
@@ -677,8 +678,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "T=<pins>@<MiB>,..." with <pins> all | none | operand roles joined by
     # "+" (kv, q, q_pe, tab, recv), e.g. "4=kv@16,8=kv@32" pins only the
     # gathered KV and leaves q (and its relayout copy) where XLA puts it.
+    # Default "4=kv@16" (trial 6): T=4 pins only the gathered KV at 16 MiB;
+    # other buckets take the knobs above.
     "TPU_MLA_FUSED_SMALL_A2A_BUCKETS": lambda: os.getenv(
-        "TPU_MLA_FUSED_SMALL_A2A_BUCKETS", ""
+        "TPU_MLA_FUSED_SMALL_A2A_BUCKETS", "4=kv@16"
     ),
     # Buckets below this many tokens keep the separate small all-to-all inside
     # the same op (kernel send buffer -> small_all_to_all -> unpack: the
@@ -694,20 +697,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unpack or merge ops after the call. Not bit-identical to torch's merge
     # (exp / summation order). Needs MIN_TOKENS = 1.
     "TPU_MLA_FUSED_SMALL_A2A_MERGE": env_bool(
-        "TPU_MLA_FUSED_SMALL_A2A_MERGE", default=False
+        "TPU_MLA_FUSED_SMALL_A2A_MERGE", default=True
     ),
     # With _MERGE: buckets above this many tokens keep the in-kernel exchange
     # but merge in the op (cp_mla_attention.merge_received_jax), returning the
     # same merged [T, L, V]. Static per bucket in the JAX op.
     "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS": env_int(
-        "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 8
+        "TPU_MLA_FUSED_SMALL_A2A_MERGE_MAX_TOKENS", 4
     ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
     # right before the call, exposed (~0.9-1.1 us per call at decode); the
     # kernels only DMA the operand, so the bytes and the results are the same.
-    "TPU_SMALL_COLL_HBM_OPERAND": env_bool("TPU_SMALL_COLL_HBM_OPERAND", default=False),
+    "TPU_SMALL_COLL_HBM_OPERAND": env_bool("TPU_SMALL_COLL_HBM_OPERAND", default=True),
     # The reduce-scatter merge of a backbone bucket of at least
     # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
     # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
@@ -1182,7 +1185,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # weights into VMEM with a copy-start/-done right before the call (the
     # drafter's one-layer program: ~7 us/pass exposed). Same output bits.
     "TPU_MOE_TP_DECODE_HBM_OPERANDS": lambda: os.getenv(
-        "TPU_MOE_TP_DECODE_HBM_OPERANDS", ""
+        "TPU_MOE_TP_DECODE_HBM_OPERANDS", "drafter"
     ).strip().lower(),
     # Decode-sized residual RMSNorm (rows below the Pallas threshold): pin the
     # f32 sum x + residual and the bf16 residual it returns behind an
@@ -1253,12 +1256,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its padding rows are unchanged since the last write (steady decode at a
     # fixed bucket). The device mask is then already what the upload would
     # write.
-    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool("TPU_TOKEN_PADDING_SKIP_UNCHANGED"),
+    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool("TPU_TOKEN_PADDING_SKIP_UNCHANGED", default=True),
     # Record runner stage timings (TpuEvent pairs + a collector thread) only
     # when a KV connector can consume them; without a KV transfer config the
     # samples are dropped every step, so the stages become no-ops.
     "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER": env_bool(
-        "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER"
+        "TPU_STAGE_TIMING_ONLY_WITH_CONSUMER", default=True
     ),
     # Every N runner steps, log the serving thread's CPU time and run-queue
     # wait, the process's busiest threads and the cgroup's CFS throttling
@@ -1268,24 +1271,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of its TPU chip (core TPU_WORKER_CPU_PIN_SKIP + LOCAL_RANK of that node)
     # and move the process's other threads to the rest of the node
     # (worker/cpu_pin.py). Placement only.
-    "TPU_WORKER_CPU_PIN": env_bool("TPU_WORKER_CPU_PIN"),
+    "TPU_WORKER_CPU_PIN": env_bool("TPU_WORKER_CPU_PIN", default=True),
     "TPU_WORKER_CPU_PIN_SKIP": env_int("TPU_WORKER_CPU_PIN_SKIP", 2),
     # After warmup, skip the per-call Dynamo guard check of AOT-compiled model
     # forwards when vLLM compiled them without guards (dynamic_shapes_config
     # .evaluate_guards False). vLLM already does this for an AOT artifact
     # loaded from disk; a freshly compiled one keeps checking an empty guard
     # set on every call.
-    "TPU_AOT_SKIP_GUARD_CHECK": env_bool("TPU_AOT_SKIP_GUARD_CHECK"),
+    "TPU_AOT_SKIP_GUARD_CHECK": env_bool("TPU_AOT_SKIP_GUARD_CHECK", default=True),
     # Write the inputs a compiled graph mutates (the KV caches) back with one
     # torch._foreach_copy_ instead of one copy_ per input in AOTAutograd's
     # epilogue (compilation/foreach_epilogue.py). Same pairs, same order.
-    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE"),
+    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE", default=True),
     # Reuse the previous device copy of per-step host tensors whose values
     # repeat in steady decode -- the padded sampling params (temperature,
     # top_k, top_p) and the drafter loop's query_start_loc / request
     # distribution -- instead of a fresh H2D each step (value-keyed, like
     # _upload_unless_unchanged).
-    "TPU_H2D_REUSE_STEADY": env_bool("TPU_H2D_REUSE_STEADY"),
+    "TPU_H2D_REUSE_STEADY": env_bool("TPU_H2D_REUSE_STEADY", default=True),
     # Diagnostic A/B inside one served run: with TPU_HOST_SCHED_DIAG_STEPS=N,
     # switch the listed host levers (pin, guard, foreach, h2d -- each must
     # also have its own flag on) off and on every N steps; each HOSTDIAG line
@@ -1552,7 +1555,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only inside the branch that runs them (never, under MTP). GLM-5.2 full
     # depth, 1 decoder: 21 layers x (3 schedule conds + 1 operand fusion)
     # = 190 us per step. Same operands, same result.
-    "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=False),
+    "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=True),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
@@ -1578,13 +1581,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # staging slot at its prefix offset; P = 2: all peer copies in flight
     # before the first wait. Single-wave calls only (T <= 16 at DCP8); larger
     # buckets keep the default path. Bitwise identical output.
-    "TPU_SC_TOPK_COOP_V2": env_bool("TPU_SC_TOPK_COOP_V2", default=False),
+    "TPU_SC_TOPK_COOP_V2": env_bool("TPU_SC_TOPK_COOP_V2", default=True),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat merge and T <= 16 rows: split each
     # merge row over p = min(dcp, 32 / T) subcores by rank segment
     # (`sparsecore_topk.sparsecore_topk_dcp_merge_coop`) instead of one
     # subcore walking all dcp * k scores; only the subcore holding this rank's
     # segment emits. T > 16 keeps the one-subcore merge. Bitwise identical.
-    "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=False),
+    "TPU_SC_TOPK_COOP_MERGE": env_bool("TPU_SC_TOPK_COOP_MERGE", default=True),
     # With TPU_SC_TOPK_DCP_MERGE_FLAT's flat path, buckets T <= 8
     # (streamindex_topk.SMALL_AG_MAX_TOKENS): the DCP
     # indexer's candidate all-gather (dcp x T * k int32 words) as one Pallas
@@ -1882,7 +1885,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Support IndexShare (GLM-5.2 / DeepSeek-V3.2) in _MtpFusedLoop by taking
     # saved step-0 top-k rows and installing them in-graph before each unrolled step.
     "VLLM_TPU_MTP_FUSED_INDEXSHARE": env_bool(
-        "VLLM_TPU_MTP_FUSED_INDEXSHARE", default=False
+        "VLLM_TPU_MTP_FUSED_INDEXSHARE", default=True
     ),
     # IndexShare's per-propose top-k bookkeeping without pool-sized copies.
     # The step-0 rows are snapshotted with one gather (no compaction write
@@ -1891,7 +1894,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # place (kernels/partial_kv_update.pallas_index_copy_). Eager slice
     # assignment into the table is functional on TPU: each one copied the
     # whole 32 MiB table (~26 us on tpu7x), three times per propose.
-    "TPU_MTP_TOPK_INPLACE": env_bool("TPU_MTP_TOPK_INPLACE", default=False),
+    "TPU_MTP_TOPK_INPLACE": env_bool("TPU_MTP_TOPK_INPLACE", default=True),
     # Benchmark fidelity: run_dp_dummy_draft (outside DP lockstep, i.e. the
     # workload microbenchmark's drafter replay) also does propose()'s
     # IndexShare host work -- the step-0 snapshot and the restore before each
@@ -1977,7 +1980,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which TPU_SMALL_ALL_REDUCE_DRAFT routes to the small Pallas all-reduce
     # (~8 us) instead of XLA's all-gather (~14 us at 16 cores). Bitwise the
     # gather up to the sign of a zero: each element sums one block and 15 +0.
-    "TPU_MTP_ONEHOT_AR": env_bool("TPU_MTP_ONEHOT_AR"),
+    "TPU_MTP_ONEHOT_AR": env_bool("TPU_MTP_ONEHOT_AR", default=True),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
@@ -2011,7 +2014,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one; a compiled torch.rand on it yields the same bits as the eager draw
     # with the same state, so the stream (and every token) is unchanged as long
     # as nothing else draws from the default generator while serving.
-    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
+    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG", default=True),
     # With TPU_FP8_LINEAR_PALLAS: the skinny kernel takes its per-channel weight
     # scale as an HBM operand and DMAs it to VMEM itself, issued with the weight
     # ring. Without it XLA stages the scale (o_proj f32[6144]) into VMEM with a copy
@@ -2047,8 +2050,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sharing the target's weight) -- drafts only, lossless for the target
     # distribution. "all": also the target sampler's logits. NOT bit-identical: ~1-2
     # in 10^4 logits differ from XLA's dot by 1-4 bf16 ulp (MXU accumulation order),
-    # so "all" needs an accuracy check. "" (default): off.
-    "TPU_LM_HEAD_HBM": env_str("TPU_LM_HEAD_HBM", ""),
+    # so "all" needs an accuracy check. "" = off. Default "drafter" (trial 6).
+    "TPU_LM_HEAD_HBM": env_str("TPU_LM_HEAD_HBM", "drafter"),
     # RMSNorm (and fused add + RMSNorm) on >= MIN_TOKENS rows of a >= MIN_HIDDEN
     # residual stream runs as one Pallas pass (layers/adapter/rmsnorm.py) instead of
     # XLA's reduce + re-read apply. Decode-sized batches are unchanged. Residual
