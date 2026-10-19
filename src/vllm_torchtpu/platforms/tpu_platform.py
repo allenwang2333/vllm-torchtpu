@@ -59,6 +59,22 @@ else:
 
 logger = init_logger(__name__)
 
+_TURBOQUANT_KV_CACHE_DTYPES = frozenset(
+    (
+        "turboquant_k8v4",
+        "turboquant_4bit_nc",
+        "turboquant_k3v4_nc",
+        "turboquant_3bit_nc",
+    )
+)
+
+
+def _is_turboquant_cache_dtype(cache_dtype: object) -> bool:
+    return isinstance(cache_dtype, str) and cache_dtype.lower().strip().startswith(
+        "turboquant_"
+    )
+
+
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
 # list against. How that key relates to the topology string differs by
@@ -567,11 +583,17 @@ class TpuPlatform(Platform):
 
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+        elif _is_turboquant_cache_dtype(attn_selector_config.kv_cache_dtype):
+            # Registers the TPU class under AttentionBackendEnum.TURBOQUANT.
+            import vllm_torchtpu.layers.adapter.turboquant_attention  # noqa: F401
+
+            selected_backend = AttentionBackendEnum.TURBOQUANT
 
         supported_backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
+            AttentionBackendEnum.TURBOQUANT,
         ]
         if selected_backend not in supported_backends:
             logger.info(
@@ -669,6 +691,13 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+
+        if _is_turboquant_cache_dtype(vllm_config.cache_config.cache_dtype):
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                check_turboquant_config,
+            )
+
+            check_turboquant_config(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -1171,7 +1200,9 @@ class TpuPlatform(Platform):
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
-        return kv_cache_dtype in supported
+        return (
+            kv_cache_dtype in supported or kv_cache_dtype in _TURBOQUANT_KV_CACHE_DTYPES
+        )
 
     @classmethod
     def use_sync_weight_loader(cls) -> bool:

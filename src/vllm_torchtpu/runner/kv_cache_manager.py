@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
 )
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -290,13 +291,15 @@ class KVCacheManager:
                     # imply, with no other signal that it did. Take the backend
                     # off this layer so it always matches the dimensions below.
                     assert backend_cls is not None
-                    _warn_if_kv_cache_is_padded(
-                        backend_cls,
-                        block_size,
-                        attn_module.num_kv_heads,
-                        attn_module.head_size,
-                        self.runner.kv_cache_dtype,
-                    )
+                    is_turboquant = getattr(backend_cls, "is_turboquant", False)
+                    if not is_turboquant:
+                        _warn_if_kv_cache_is_padded(
+                            backend_cls,
+                            block_size,
+                            attn_module.num_kv_heads,
+                            attn_module.head_size,
+                            self.runner.kv_cache_dtype,
+                        )
                     page_size_padded = (
                         self.runner._hybrid_uniform_page_size_bytes
                         if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -307,6 +310,21 @@ class KVCacheManager:
                             self.runner.kv_cache_dtype,
                         )
                     )
+                    spec_kwargs: dict = {}
+                    if is_turboquant:
+                        # One packed K+V slot per (token, KV head); publish its
+                        # byte size so vLLM's page math matches the allocation.
+                        tq_page_bytes = backend_cls.get_kv_cache_page_size_bytes(
+                            block_size,
+                            attn_module.num_kv_heads,
+                            attn_module.head_size,
+                            self.runner.kv_cache_dtype,
+                        )
+                        spec_kwargs = dict(
+                            kv_quant_mode=get_kv_quant_mode(cache_dtype_str),
+                            state_content_bytes=tq_page_bytes
+                            // (block_size * attn_module.num_kv_heads),
+                        )
                     if attn_module.sliding_window is not None:
                         kv_cache_spec[layer_name] = SlidingWindowSpec(
                             block_size=block_size,
@@ -315,6 +333,7 @@ class KVCacheManager:
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
                             sliding_window=attn_module.sliding_window,
+                            **spec_kwargs,
                         )
                     else:
                         kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -323,6 +342,7 @@ class KVCacheManager:
                             head_size=attn_module.head_size,
                             dtype=self.runner.kv_cache_dtype,
                             page_size_padded=page_size_padded,
+                            **spec_kwargs,
                         )
                 elif attn_module.attn_type in (
                     AttentionType.ENCODER,
