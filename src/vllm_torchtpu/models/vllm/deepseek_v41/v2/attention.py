@@ -1759,6 +1759,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     lengths_part,
                     block_size=self.candidate_block_size,
                     capacity=capacity,
+                    # Query rows stay dynamic; JAX checks Q6 and fallback.
+                    packed=(
+                        getattr(index_cache, "index_key_layout", "ordinary")
+                        == "halfplane"
+                    ),
                 )
                 stage_cache[cache_key] = prepared
             return select_candidate_cache(
