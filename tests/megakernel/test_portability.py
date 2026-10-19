@@ -54,6 +54,8 @@ def test_megakernel_portability_ast_guard():
         "spec.py",
         "stream.py",
         "vmem.py",
+        "blocks/__init__.py",
+        "blocks/moe.py",
         "profiles/__init__.py",
         "profiles/default.py",
     }

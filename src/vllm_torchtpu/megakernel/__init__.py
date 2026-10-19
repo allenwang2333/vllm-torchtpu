@@ -14,6 +14,7 @@
 """Config-driven composable TPU Pallas megakernel library."""
 
 from . import (
+    blocks,
     comm,
     errors,
     ops,
@@ -23,6 +24,10 @@ from . import (
     spec,
     stream,
     vmem,
+)
+from .blocks import (
+    MoEBlock,
+    MoEParams,
 )
 from .comm import AllReduceRing
 from .errors import MegakernelConfigError, MegakernelLayoutError
@@ -55,6 +60,8 @@ __all__ = [
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
+    "MoEBlock",
+    "MoEParams",
     "ModelSpec",
     "PoolBackend",
     "ScratchReq",
@@ -65,6 +72,7 @@ __all__ = [
     "Tiles",
     "TwoRing",
     "WeightDecl",
+    "blocks",
     "comm",
     "default_tiles",
     "encode_ecopy",

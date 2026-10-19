@@ -1,0 +1,454 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unit tests for `MoEBlock` declarations and Pallas `interpret=True` execution."""
+
+from __future__ import annotations
+
+import ast
+import dataclasses
+import pathlib
+
+import jax
+import jax.numpy as jnp
+import pytest
+from conftest import FakeGeometry, FakeMixerBlock, MiniCtx
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
+
+from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
+from vllm_torchtpu.megakernel.blocks import MoEBlock
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
+from vllm_torchtpu.megakernel.spec import (
+    TINY_TILES,
+    ExecSpec,
+    LayerType,
+    ModelSpec,
+)
+
+BLOCKS_DIR = pathlib.Path(blocks.__file__).resolve().parent
+
+# Row-count names that must never be compared to a literal inside `blocks/`.
+_ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
+# Remaining literal row-count comparisons are hardware / layout limits, not
+# per-bucket tuning (each one with its reason).
+_ALLOWED = {
+    ("moe.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
+    ("gqa.py", "ex.NS <= 64"): "GQ packs 128 // NS lanes per sequence (m | l) field",
+}
+
+
+def _row_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and node.id in _ROW_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in _ROW_NAMES:
+        return node.attr
+    return None
+
+
+def _is_num(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def test_blocks_have_no_row_count_literal_comparisons():
+    """Blocks read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
+    assert (BLOCKS_DIR / "moe.py").is_file()
+    found = []
+    for path in sorted(BLOCKS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            ops = [node.left, *node.comparators]
+            for a, b in zip(ops, ops[1:]):
+                pair = (_row_name(a) and _is_num(b)) or (_row_name(b) and _is_num(a))
+                if pair:
+                    key = (path.name, ast.unparse(node))
+                    if key not in _ALLOWED:
+                        found.append(f"{path.name}:{node.lineno}: {key[1]}")
+    assert not found, "row-count literal comparisons in blocks/:\n" + "\n".join(found)
+
+
+def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
+    """Verify `MoEBlock` declarations drive `planner`/`vmem` and `emit` in Pallas."""
+    g_decl = FakeGeometry(L=2, att_every=1, H=256)
+    moe_decl = MoEBlock()
+    ms_decl = ModelSpec(
+        "moe_decl_test",
+        config=g_decl,
+        layer_type=LayerType("lt", slots=(FakeMixerBlock(), moe_decl)),
+    )
+
+    p_decl = planner.plan(ms_decl, fake_ex)
+    assert p_decl.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
+    assert p_decl.dynamic_kinds == ("e13", "e2")
+    assert p_decl.w_names == (
+        "att_in",
+        "att_out",
+        "router",
+        "sh13",
+        "sh2",
+        "e13",
+        "e2",
+        "es",
+        "smalls",
+        "final_norm",
+    )
+
+    cp_decl, scr_decl = vmem.build_scratch(ms_decl, fake_ex, p_decl)
+    assert (
+        "wn" in scr_decl
+        and "elist" in scr_decl
+        and "es" in scr_decl
+        and "st" in scr_decl
+    )
+    assert cp_decl.block("moe").EW == g_decl.E // fake_ex.R
+
+    ex = ExecSpec(
+        B=4, T=1, R=1, ctx=256, stack_e=True, tiles=TINY_TILES, interpret=True
+    )
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=256,
+        NH=2,
+        NKV=1,
+        HD=128,
+        E=128,
+        TOPK=2,
+        I=128,
+        IS=128,
+        moe_tp=True,
+    )
+    moe = MoEBlock()
+    ms = ModelSpec("moe_exec", config=g, layer_type=LayerType("lt", slots=(moe,)))
+    cp, scratch = vmem.build_scratch(ms, ex)
+    p = cp.plan
+    wsh = planner.weight_shapes(ms, ex, p)
+    osh = planner.kernel_out_shapes(ms, ex, p)
+    s_names = list(scratch.keys())
+
+    assert moe.input_norm == "post_norm"
+
+    def pallas_body(pos_ref, hid_ref, *rest):
+        n_w, n_o = len(p.w_names), len(p.o_names)
+        W = dict(zip(p.w_names, rest[:n_w]))
+        O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+        scr = dict(zip(s_names, rest[n_w + n_o :]))
+        me = jnp.int32(0)
+        ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=cp,
+            pos_ref=pos_ref,
+            W=W,
+            ST={},
+            O=O,
+            scr=scr,
+            me=me,
+            stream=ring,
+            comm=ar,
+        )
+
+        for i in range(cp.stream.NBD):
+            ring.fetch(jnp.int32(i))
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).start()
+        moe.prologue(ctx)
+        scr["res"][...] = hid_ref[: ex.MB].astype(F32)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+        moe.init_buffers(ctx)
+
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).wait()
+        ring.begin_layer(jnp.int32(0))
+        ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
+        part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
+        ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
+        O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        if ex.MB < ex.M:
+            O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, g.H), BF16)
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.SMEM),
+        pl.BlockSpec(memory_space=pltpu.VMEM),
+    ] + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names]
+    out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM) for _ in p.o_names]
+    out_shape = [jax.ShapeDtypeStruct(*osh[k]) for k in p.o_names]
+
+    call = pl.pallas_call(
+        pallas_body,
+        out_shape=out_shape,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=[scratch[k] for k in s_names],
+        interpret=pltpu.InterpretParams(),
+    )
+
+    pos = jnp.array([4, 8, 12, 16], dtype=I32)
+    hid = jnp.ones((ex.M, g.H), dtype=BF16) * 0.1
+    w_args = [jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names]
+    (hid_out,) = jax.jit(call)(pos, hid, *w_args)
+    assert hid_out.shape == (ex.M, g.H)
+    assert jnp.all(jnp.isfinite(hid_out))
+
+
+@pytest.mark.parametrize(
+    "moe_tp,R,pipe",
+    [
+        (False, 1, False),
+        (True, 1, False),
+        (True, 1, True),
+        (False, 2, False),
+        (False, 2, True),
+        (True, 2, True),
+    ],
+)
+def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
+    """Compare `MoEBlock.emit` in Pallas `interpret=True` against a JAX reference."""
+    devs = jax.devices("cpu")
+    assert len(devs) >= R
+
+    H, E, TOPK, IR, ISR = 128, 128, 2, 128, 128
+    ER = E // R
+    EW = E if moe_tp else ER
+    tiles = dataclasses.replace(TINY_TILES, pipe=pipe, war=1, mb8=2)
+    ex = ExecSpec(B=2, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=True)
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=H,
+        NH=2,
+        NKV=1,
+        HD=128,
+        E=E,
+        TOPK=TOPK,
+        I=IR * R if moe_tp else IR,
+        IS=ISR * R,
+        moe_tp=moe_tp,
+    )
+    moe = MoEBlock()
+    ms = ModelSpec("moe_num", config=g, layer_type=LayerType("lt", slots=(moe,)))
+    cp, scratch = vmem.build_scratch(ms, ex)
+    assert cp.block("moe").PIPE is pipe
+    p = cp.plan
+    wsh = planner.weight_shapes(ms, ex, p)
+    osh = planner.kernel_out_shapes(ms, ex, p)
+    s_names = list(scratch.keys())
+
+    keys = jax.random.split(jax.random.PRNGKey(101), 12)
+    hid = jax.random.normal(keys[0], (ex.M, H), dtype=BF16) * 0.5
+    post_norm = jax.random.uniform(keys[1], (H,), dtype=F32, minval=-0.2, maxval=0.2)
+
+    # Construct router weights so token 0 strongly prefers experts on rank 0
+    # and token 1 strongly prefers experts on rank (R - 1), exercising both
+    # ranks and the multi-hit PIPE loop.
+    x_norm0 = rmsnorm(
+        hid[: ex.B].astype(F32), post_norm, g.eps, zero_centered=g.zero_centered_norm
+    ).astype(BF16)
+    router_f32 = jax.random.normal(keys[2], (H, E), dtype=F32) * 0.05
+    b0_dir = x_norm0[0].astype(F32)
+    b1_dir = x_norm0[1].astype(F32)
+    e_r0_a, e_r0_b = 2, 5
+    e_r1_a, e_r1_b = (R - 1) * ER + 3, (R - 1) * ER + 7
+    router_f32 = router_f32.at[:, e_r0_a].add(b0_dir * 2.0)
+    router_f32 = router_f32.at[:, e_r0_b].add(b0_dir * 1.5)
+    router_f32 = router_f32.at[:, e_r1_a].add(b1_dir * 2.0)
+    router_f32 = router_f32.at[:, e_r1_b].add(b1_dir * 1.5)
+    router = router_f32.astype(BF16)
+
+    sh_gate = jax.random.normal(keys[3], (H,), dtype=F32) * 0.2
+    sh13 = (jax.random.normal(keys[4], (R, H, 2 * ISR), dtype=F32) * 0.4).astype(FP8)
+    sh13_s = jax.random.uniform(
+        keys[5], (R, 2 * ISR), dtype=F32, minval=0.05, maxval=0.15
+    )
+    sh2 = (jax.random.normal(keys[6], (R, ISR, H), dtype=F32) * 0.4).astype(FP8)
+    sh2_s = jax.random.uniform(keys[7], (R, H), dtype=F32, minval=0.05, maxval=0.15)
+    e13 = (jax.random.normal(keys[8], (R, EW, H, 2 * IR), dtype=F32) * 0.4).astype(FP8)
+    e13_s = jax.random.uniform(
+        keys[9], (R, EW, 2 * IR), dtype=F32, minval=0.05, maxval=0.15
+    )
+    e2 = (jax.random.normal(keys[10], (R, EW, IR, H), dtype=F32) * 0.4).astype(FP8)
+    e2_s = jax.random.uniform(keys[11], (R, EW, H), dtype=F32, minval=0.05, maxval=0.15)
+
+    lay = p.smalls_layout
+    sm = jnp.zeros((R, 1, 1, p.smalls_width), dtype=F32)
+    for name, val in (
+        ("post_norm", jnp.broadcast_to(post_norm[None, :], (R, H))),
+        ("sh13_s", sh13_s),
+        ("sh2_s", sh2_s),
+        ("sh_gate", jnp.broadcast_to(sh_gate[None, :], (R, H))),
+    ):
+        o, w = lay[name]
+        sm = sm.at[:, 0, 0, o : o + w].set(val)
+
+    w_by_name = {
+        "router": jnp.broadcast_to(router[None, ...], (R, 1, H, E)).reshape(
+            R, *wsh["router"][0]
+        ),
+        "sh13": sh13.reshape(R, *wsh["sh13"][0]),
+        "sh2": sh2.reshape(R, *wsh["sh2"][0]),
+        "e13": e13.reshape(R, *wsh["e13"][0]),
+        "e2": e2.reshape(R, *wsh["e2"][0]),
+        "es": jnp.concatenate([e13_s, e2_s], axis=-1).reshape(R, *wsh["es"][0]),
+        "smalls": sm,
+        "final_norm": jnp.zeros((R, *wsh["final_norm"][0]), dtype=F32),
+    }
+
+    def pallas_body(pos_ref, hid_ref, *rest):
+        n_w, n_o = len(p.w_names), len(p.o_names)
+        W = dict(zip(p.w_names, rest[:n_w]))
+        O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+        scr = dict(zip(s_names, rest[n_w + n_o :]))
+        me = lax.axis_index("tp").astype(I32) if R > 1 else jnp.int32(0)
+        if R > 1:
+            barrier = pltpu.get_barrier_semaphore()
+            for off in range(1, R):
+                pl.semaphore_signal(
+                    barrier,
+                    1,
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(barrier, R - 1)
+
+        ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+        ar = comm.AllReduceRing(cp.comm, scr, me)
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=cp,
+            pos_ref=pos_ref,
+            W=W,
+            ST={},
+            O=O,
+            scr=scr,
+            me=me,
+            stream=ring,
+            comm=ar,
+        )
+
+        for i in range(cp.stream.NBD):
+            ring.fetch(jnp.int32(i))
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).start()
+        moe.prologue(ctx)
+        scr["res"][...] = hid_ref[: ex.MB].astype(F32)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+        moe.init_buffers(ctx)
+
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).wait()
+        ring.begin_layer(jnp.int32(0))
+        ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
+        part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
+        ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
+        ar.drain_sends()
+        O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+        if ex.MB < ex.M:
+            O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.SMEM),
+        pl.BlockSpec(memory_space=pltpu.VMEM),
+    ] + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names]
+    out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM) for _ in p.o_names]
+    out_shape = [jax.ShapeDtypeStruct(*osh[k]) for k in p.o_names]
+
+    call = pl.pallas_call(
+        pallas_body,
+        out_shape=out_shape,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=[scratch[k] for k in s_names],
+        compiler_params=pltpu.CompilerParams(collective_id=0) if R > 1 else None,
+        interpret=pltpu.InterpretParams(),
+    )
+
+    pos = jnp.array([4, 8], dtype=I32)
+    w_all = [w_by_name[k] for k in p.w_names]
+    if R == 1:
+        (hid_out,) = jax.jit(call)(pos, hid, *[w[0] for w in w_all])
+        out_ranks = hid_out[None, : ex.B]
+    else:
+        mesh = Mesh(devs[:R], ("tp",))
+        step = jax.jit(
+            jax.shard_map(
+                lambda pos_in, hid_in, *ws: call(
+                    pos_in, hid_in[0], *[w[0] for w in ws]
+                )[0][None],
+                mesh=mesh,
+                in_specs=(P(), P("tp"), *(P("tp") for _ in p.w_names)),
+                out_specs=P("tp"),
+                check_vma=False,
+            )
+        )
+        hid_rep = jnp.broadcast_to(hid[None, ...], (R, ex.M, H))
+        out_ranks = step(pos, hid_rep, *w_all)[:, : ex.B]
+
+    # Pure-JAX MoE reference: RMSNorm -> router softmax + top-k -> shared + routed
+    res = hid[: ex.B].astype(F32)
+    x_moe = rmsnorm(res, post_norm, g.eps, zero_centered=g.zero_centered_norm)
+    xb_moe = x_moe.astype(BF16).astype(F32)
+
+    logits = xb_moe @ router.astype(F32)
+    probs = jax.nn.softmax(logits, axis=-1)
+    top_vals, top_idx = lax.top_k(probs, TOPK)
+    top_w = top_vals / jnp.sum(top_vals, axis=-1, keepdims=True)
+
+    sg = jax.nn.sigmoid(jnp.sum(x_moe * sh_gate[None, :], axis=-1, keepdims=True))
+    partials = []
+    for r in range(R):
+        g13 = (xb_moe @ sh13[r].astype(F32)) * sh13_s[r]
+        mid_sh = (
+            rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+            .astype(BF16)
+            .astype(F32)
+        )
+        part_r = (mid_sh @ sh2[r].astype(F32)) * sh2_s[r] * sg
+        for b in range(ex.B):
+            for k in range(TOPK):
+                e = int(top_idx[b, k])
+                if not moe_tp and (e // ER) != r:
+                    continue
+                w_slot = e if moe_tp else (e - r * ER)
+                h_e = (xb_moe[b : b + 1] @ e13[r, w_slot].astype(F32)) * e13_s[
+                    r, w_slot
+                ]
+                mid_e = (
+                    rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))
+                    .astype(BF16)
+                    .astype(F32)
+                )
+                y_e = rnd((mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot])
+                part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
+        partials.append(part_r.astype(BF16).astype(F32))
+
+    ref_out = (res + jnp.sum(jnp.stack(partials, axis=0), axis=0)).astype(BF16)
+    for r in range(R):
+        assert jnp.allclose(
+            out_ranks[r].astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
+        )
