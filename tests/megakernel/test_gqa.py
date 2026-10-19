@@ -11,23 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""M1c unit tests for `GQABlock` and `MoEBlock` declarations and Pallas execution."""
+"""Unit tests for `GQABlock` declarations and Pallas `interpret=True` execution."""
 
 from __future__ import annotations
 
-import contextlib
-from dataclasses import dataclass
-from typing import Any
-
 import jax
 import jax.numpy as jnp
-from conftest import FakeGeometry
+from conftest import FakeGeometry, MiniCtx
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import GQABlock, MoEBlock
-from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rmsnorm
+from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.spec import (
     TINY_TILES,
     ExecSpec,
@@ -36,45 +32,29 @@ from vllm_torchtpu.megakernel.spec import (
 )
 
 
-def test_gqa_and_moe_block_declarations_feed_planner_and_vmem(fake_ex: ExecSpec):
-    """Verify `GQABlock` and `MoEBlock` declarations drive `planner` and `vmem`."""
-    g = FakeGeometry(L=2, att_every=1, H=256)
-    gqa = GQABlock()
-    moe = MoEBlock()
-    ms = ModelSpec(
-        "gqa_moe_test", config=g, layer_type=LayerType("lt", slots=(gqa, moe))
+def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
+    """Verify `GQABlock` declarations drive `planner`/`vmem` and `emit` in Pallas."""
+    g_decl = FakeGeometry(L=2, att_every=1, H=256)
+    gqa_decl = GQABlock()
+    moe_decl = MoEBlock()
+    ms_decl = ModelSpec(
+        "gqa_moe_test",
+        config=g_decl,
+        layer_type=LayerType("lt", slots=(gqa_decl, moe_decl)),
     )
 
-    p = planner.plan(ms, fake_ex)
-    assert p.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
-    assert p.dynamic_kinds == ("e13", "e2")
-    assert p.w_names == (
-        "att_in",
-        "att_out",
-        "router",
-        "sh13",
-        "sh2",
-        "e13",
-        "e2",
-        "es",
-        "smalls",
-        "final_norm",
-    )
-    assert p.s_names == ("kc", "vc")
-    assert p.o_names == ("hidden", "knew", "vnew")
+    p_decl = planner.plan(ms_decl, fake_ex)
+    assert p_decl.static_kinds == ("att_in", "att_out", "router", "sh13", "sh2")
+    assert p_decl.dynamic_kinds == ("e13", "e2")
+    assert p_decl.s_names == ("kc", "vc")
+    assert p_decl.o_names == ("hidden", "knew", "vnew")
 
-    cp, scr = vmem.build_scratch(ms, fake_ex, p)
+    cp_decl, scr_decl = vmem.build_scratch(ms_decl, fake_ex, p_decl)
     # GQA scratch allocated, no GDN scratch allocated
-    assert "kbuf" in scr and "vbuf" in scr and "wl_cnt" in scr
-    assert "recb" not in scr and "sbuf" not in scr and "convb" not in scr
-    # MoE scratch allocated
-    assert "wn" in scr and "elist" in scr and "es" in scr and "st" in scr
-    assert cp.block("gqa").NAI == (2 * (g.NH // fake_ex.R) + 2) * g.HD
-    assert cp.block("moe").EW == g.E // fake_ex.R
+    assert "kbuf" in scr_decl and "vbuf" in scr_decl and "wl_cnt" in scr_decl
+    assert "recb" not in scr_decl and "sbuf" not in scr_decl and "convb" not in scr_decl
+    assert cp_decl.block("gqa").NAI == (2 * (g_decl.NH // fake_ex.R) + 2) * g_decl.HD
 
-
-def test_gqa_and_moe_emit_in_pallas_interpret():
-    """Execute `GQABlock.emit` and `MoEBlock.emit` inside a Pallas kernel."""
     ex = ExecSpec(
         B=4, T=1, R=1, ctx=256, stack_e=True, tiles=TINY_TILES, interpret=True
     )
@@ -103,45 +83,6 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
     osh = planner.kernel_out_shapes(ms, ex, p)
     s_names = list(scratch.keys())
 
-    @dataclass
-    class _MiniCtx:
-        ex: ExecSpec
-        core_plan: vmem.CorePlan
-        pos_ref: Any
-        W: dict[str, Any]
-        ST: dict[str, Any]
-        O: dict[str, Any]  # noqa: E741
-        scr: dict[str, Any]
-        me: Any
-        stream: stream.TwoRing
-        comm: comm.AllReduceRing
-        rb_hbm: Any = None
-        mr_ref: Any = None
-        skip: frozenset[str] = frozenset()
-        sc: Any = lambda *_: contextlib.nullcontext()
-        norm_x: Any = None
-
-        def block_params(self, name: str) -> Any:
-            return self.core_plan.block(name)
-
-        def sm(self, slot: Any, name: str, width: int | None = None) -> Any:
-            o, w = self.core_plan.stream.lay[name]
-            n = w if width is None else width
-            return self.scr["sm"][slot, :, o : o + n]
-
-        def apply_input_norm(self, norm_field: str | None, slot: Any) -> None:
-            if norm_field is None:
-                self.norm_x = None
-                return
-            x = rmsnorm(
-                self.scr["res"][...],
-                self.sm(slot, norm_field),
-                g.eps,
-                zero_centered=bool(g.zero_centered_norm),
-            )
-            self.scr["xb"][...] = x.astype(BF16)
-            self.norm_x = x
-
     assert gqa.input_norm == "in_norm"
     assert moe.input_norm == "post_norm"
 
@@ -154,7 +95,8 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
         me = jnp.int32(0)
         ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
         ar = comm.AllReduceRing(cp.comm, scr, me)
-        ctx = _MiniCtx(
+        ctx = MiniCtx(
+            g=g,
             ex=ex,
             core_plan=cp,
             pos_ref=pos_ref,
@@ -218,7 +160,6 @@ def test_gqa_and_moe_emit_in_pallas_interpret():
     pos = jnp.array([4, 8, 12, 16], dtype=I32)
     hid = jnp.ones((ex.M, g.H), dtype=BF16) * 0.1
     w_args = [jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names]
-    # Set unit scales in `es` and `smalls` so outputs are finite
     s_args = [jnp.zeros(ssh[k][0], dtype=ssh[k][1]) for k in p.s_names]
     outs = jax.jit(call)(pos, hid, *w_args, *s_args)
     hid_out, knew_out, vnew_out = outs

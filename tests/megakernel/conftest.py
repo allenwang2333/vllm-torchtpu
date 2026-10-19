@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -37,7 +38,7 @@ os.environ["XLA_FLAGS"] = _xla_flags
 import pytest  # noqa: E402
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8  # noqa: E402
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
     TINY_TILES,
     Block,
@@ -318,3 +319,46 @@ def make_fake_model_spec(
 @pytest.fixture
 def fake_ex() -> ExecSpec:
     return ExecSpec(B=4, T=1, R=2, ctx=256, tiles=TINY_TILES, interpret=True)
+
+
+@dataclass
+class MiniCtx:
+    """Minimal kernel execution context for testing block `emit` in Pallas."""
+
+    g: FakeGeometry
+    ex: ExecSpec
+    core_plan: Any
+    pos_ref: Any
+    W: dict[str, Any]
+    ST: dict[str, Any]
+    O: dict[str, Any]  # noqa: E741
+    scr: dict[str, Any]
+    me: Any
+    stream: Any
+    comm: Any
+    rb_hbm: Any = None
+    mr_ref: Any = None
+    skip: frozenset[str] = frozenset()
+    sc: Any = lambda *_: contextlib.nullcontext()
+    norm_x: Any = None
+
+    def block_params(self, name: str) -> Any:
+        return self.core_plan.block(name)
+
+    def sm(self, slot: Any, name: str, width: int | None = None) -> Any:
+        o, w = self.core_plan.stream.lay[name]
+        n = w if width is None else width
+        return self.scr["sm"][slot, :, o : o + n]
+
+    def apply_input_norm(self, norm_field: str | None, slot: Any) -> None:
+        if norm_field is None:
+            self.norm_x = None
+            return
+        x = rmsnorm(
+            self.scr["res"][...],
+            self.sm(slot, norm_field),
+            self.g.eps,
+            zero_centered=bool(self.g.zero_centered_norm),
+        )
+        self.scr["xb"][...] = x.astype(BF16)
+        self.norm_x = x

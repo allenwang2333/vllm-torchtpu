@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""M1b unit tests executing `TwoRing` and `AllReduceRing` in Pallas `interpret=True`."""
+"""Unit tests executing `TwoRing` and `AllReduceRing` in Pallas `interpret=True`."""
 
 from __future__ import annotations
 

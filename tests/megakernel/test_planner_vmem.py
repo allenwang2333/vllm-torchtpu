@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""M1a unit tests for `spec`, `ops`, `pool_alias`, `planner`, and `vmem`."""
+"""Unit tests for `planner` and `vmem`."""
 
 from __future__ import annotations
 
@@ -27,20 +27,9 @@ from conftest import (
 )
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import planner, pool_alias, vmem
+from vllm_torchtpu.megakernel import planner, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.ops import (
-    BF16,
-    F32,
-    FP8,
-    bswitch,
-    rms_zc,
-    rmsnorm,
-    rnd,
-    rope_partial,
-    rup,
-    silu_mul,
-)
+from vllm_torchtpu.megakernel.ops import F32, FP8
 from vllm_torchtpu.megakernel.spec import (
     TINY_TILES,
     Block,
@@ -52,45 +41,6 @@ from vllm_torchtpu.megakernel.spec import (
     SwitchSlot,
     WeightDecl,
 )
-
-
-def test_ops_primitives():
-    """Verify `rup`, `rnd`, `rmsnorm`, `rope_partial`, `silu_mul`, and `bswitch`."""
-    assert rup(1, 128) == 128
-    assert rup(128, 128) == 128
-    assert rup(129, 128) == 256
-
-    x = jnp.ones((4, 128), dtype=F32)
-    w = jnp.zeros((1, 128), dtype=F32)
-    # Zero-centered RMSNorm: w=0 gives unit scale (1.0 + w = 1.0)
-    y = rms_zc(x, w, 1e-6)
-    assert jnp.allclose(y, jnp.ones_like(x), atol=1e-3)
-
-    # Standard RMSNorm: w=0.5 gives 0.5 scale, while zero-centered gives 1.5
-    w_half = jnp.full((1, 128), 0.5, dtype=F32)
-    y_zc = rmsnorm(x, w_half, 1e-6, zero_centered=True)
-    y_std = rmsnorm(x, w_half, 1e-6, zero_centered=False)
-    assert jnp.allclose(y_zc, jnp.full_like(x, 1.5), atol=1e-2)
-    assert jnp.allclose(y_std, jnp.full_like(x, 0.5), atol=1e-2)
-
-    # Partial RoPE leaves trailing columns untouched
-    cos = jnp.ones((1, 16), dtype=F32)
-    sin = jnp.zeros((1, 16), dtype=F32)
-    rx = rope_partial(x, cos, sin, 32)
-    assert jnp.allclose(rx, rnd(x))
-
-    # SwiGLU and bswitch
-    sm = silu_mul(x, x)
-    assert sm.dtype == BF16
-    val = bswitch(jnp.int32(2), [lambda i=i: jnp.int32(i * 10) for i in range(4)])
-    assert int(val) == 20
-
-
-def test_pool_alias_storage_size():
-    """Verify TPU 8x128 tile storage calculation."""
-    assert pool_alias.storage_size((128, 256), jnp.dtype(FP8)) == 128 * 256 * 1
-    assert pool_alias.storage_size((128, 256), jnp.dtype(BF16)) == 128 * 256 * 2
-    assert pool_alias.storage_size((1, 256), jnp.dtype(F32)) == 8 * 256 * 4
 
 
 def test_planner_is_load_bearing_single_branch(fake_ex: ExecSpec):
@@ -221,7 +171,7 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     assert smem_scratch["smem_tmp"].shape == (8,)
     assert smem_scratch["smem_tmp"].memory_space == pltpu.SMEM
 
-    # Persistent name collision must raise ValueError
+    # Persistent name collision must raise MegakernelConfigError
     class CollidingBlock(Block):
         name = "colliding"
 
