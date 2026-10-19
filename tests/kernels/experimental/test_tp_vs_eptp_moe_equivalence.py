@@ -232,13 +232,13 @@ def _run_all():
         router_bias=os.environ.get("TPU_MOE_ROUTER_TOPK_BIAS", "0") == "1",
     )
     st_tp = adapter._OpStatics(
-        routed_scale=SCALE, use_ep=False, prefill_min_tokens=256, **common
+        routed_scale=SCALE, use_ep=False, prefill_above=128, **common
     )
     st_ep = adapter._OpStatics(
-        routed_scale=SCALE, use_ep=True, prefill_min_tokens=None, **common
+        routed_scale=SCALE, use_ep=True, prefill_above=None, **common
     )
     st_tp_bad_scale = adapter._OpStatics(
-        routed_scale=1.0, use_ep=False, prefill_min_tokens=256, **common
+        routed_scale=1.0, use_ep=False, prefill_above=128, **common
     )
     specs = (P("d"), P("d"), P(), P()) + (P("d"),) * 10
 

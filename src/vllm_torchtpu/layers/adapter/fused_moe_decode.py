@@ -62,6 +62,9 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     fused_moe_prefill,
     plan_blocks,
 )
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    fused_moe_prefill_stage_a,
+)
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -186,14 +189,18 @@ def _prefill_layer(
     blocks = plan_blocks(
         x.shape[0], x.shape[1], w2.shape[1], shared_w2.shape[0], w1.dtype
     )
+    # FUSED_MOE_PREFILL_KERNEL_V2: the stage-A build (per-row activation
+    # scales), whole experts only.
+    v2 = envs.FUSED_MOE_PREFILL_KERNEL_V2 and blocks is None
     logger.info(
-        "Fused MoE prefill kernel traced for %d tokens (%s)",
+        "Fused MoE prefill kernel%s traced for %d tokens (%s)",
+        " (V2, stage A)" if v2 else "",
         x.shape[0],
         "whole experts"
         if blocks is None
         else "blocked ib={} ring={} chunk_rows={}".format(*blocks),
     )
-    return fused_moe_prefill(
+    return (fused_moe_prefill_stage_a if v2 else fused_moe_prefill)(
         x,
         w1,
         w2,
@@ -715,9 +722,8 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     if armed and any(_serves_prefill_kernel(s[1]) for s in signature[1]):
         hidden = getattr(runners[0].moe_config, "hidden_dim", None)
         if hidden:
-            _warn_sc_all_reduce_floor(
-                envs.FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS, int(hidden)
-            )
+            # The prefill kernel serves the buckets above the cap.
+            _warn_sc_all_reduce_floor(max_tokens + 1, int(hidden))
     if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
         logger.info(
             "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "

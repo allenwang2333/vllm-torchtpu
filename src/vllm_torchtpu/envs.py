@@ -111,7 +111,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     FUSED_MOE_PREFILL_KERNEL: bool = True
-    FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS: int = 256
+    FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
@@ -1131,18 +1131,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
-    # With FUSED_MOE_DECODE_KERNEL=1, serve the armed TP-expert layers' steps
-    # above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens with the fused MoE prefill
-    # kernel (routed and shared experts, combine and all-reduce) instead of
-    # the GMM MoE path, in the same exported program. EP layers keep the GMM
-    # path for now.
+    # With FUSED_MOE_DECODE_KERNEL=1 (or USE_MOE_TP_DECODE_KERNEL=1), serve the
+    # armed TP-expert layers' steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
+    # tokens with the fused MoE prefill kernel (routed and shared experts,
+    # combine and all-reduce) instead of the GMM MoE path, in the same
+    # exported program. EP layers keep the GMM path for now.
     "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL", default=True),
-    # The token count from which moe_tp_decode's armed TP-expert layers run
-    # the fused MoE prefill kernel (layers/adapter/fused_moe_prefill.py) in
-    # their exported program, with FUSED_MOE_PREFILL_KERNEL.
-    "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS": env_int(
-        "FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS", 256
-    ),
+    # With FUSED_MOE_PREFILL_KERNEL: run the stage-A build of the prefill kernel
+    # (kernels/experimental/fused_moe_prefill/fused_moe_prefill_kernel_v2.py:
+    # four-deep weight ring, both matmuls on the explicit MXU with the down
+    # epilogue per 256-column N-tile, 256-row tiles from 4096 tokens, flat
+    # combine). It quantizes activations per row (one scale per token row),
+    # not per 512 columns as the default build does, so it is not bit-identical
+    # to it. Whole experts only: layers the default build serves in blocked
+    # mode keep it.
+    "FUSED_MOE_PREFILL_KERNEL_V2": env_bool("FUSED_MOE_PREFILL_KERNEL_V2"),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),

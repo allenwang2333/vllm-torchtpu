@@ -31,11 +31,13 @@ op's mesh (the whole EP x TP world), whose partials together cover every
 grouped GEMMs, ragged gather-reduce) plus the shared expert and a psum, so
 prefill and mixed batches keep the EP x TP routed kernels.
 
-Prefill kernel: with TP experts and FUSED_MOE_PREFILL_KERNEL=1, token counts
-of at least FUSED_MOE_PREFILL_KERNEL_MIN_TOKENS run the fused MoE prefill
-kernel (#1823 / #1876) in the same exported program instead of the psum
-path, so one op serves TP16 decode and prefill. fused_moe_decode's own arming
-then finds these layers without a shared expert and leaves them to this op.
+Prefill kernel: with FUSED_MOE_PREFILL_KERNEL=1, a TP-expert layer (no EP)
+runs the steps of more than FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens through
+kernels/experimental/fused_moe_prefill (routed and shared experts, combine and
+all-reduce) instead of the usual path and a psum: the same kernel and the same
+cut-over as under FUSED_MOE_DECODE_KERNEL, which this op stands down for.
+FUSED_MOE_PREFILL_KERNEL_V2 swaps in its stage-A build (per-row activation
+scales) where the layer's experts fit whole.
 """
 
 import dataclasses
@@ -53,23 +55,21 @@ from torch_tpu._internal import pallas
 from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
-from vllm_torchtpu.distributed.ep_mesh import (
-    EP_AXIS_NAME,
-    build_ep_mesh,
-    ep_mesh_index,
-    get_ep_group,
-)
+from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
 from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
+    fused_moe_prefill,
+    plan_blocks,
+)
+from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel_v2 import (  # noqa: E501
+    fused_moe_prefill_stage_a,
+)
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
-from vllm_torchtpu.layers.adapter.fused_moe_prefill import (
-    prefill_layer,
-    prefill_min_tokens,
-)
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -179,10 +179,9 @@ class _OpStatics:
     # TPU_MOE_ROUTER_TOPK_BIAS: the psum path picks experts as the layer does
     # (router_topk.select_bias; same ids and weights as select on scores+bias).
     router_bias: bool = False
-    # FUSED_MOE_PREFILL_KERNEL (TP experts only): token counts from this one
-    # run the fused MoE prefill kernel (layers/adapter/fused_moe_prefill.py)
-    # instead of the psum path; None keeps the psum path for every count.
-    prefill_min_tokens: int | None = None
+    # FUSED_MOE_PREFILL_KERNEL on a TP-expert layer: token counts above this
+    # run the fused MoE prefill kernel instead of the psum path. None = off.
+    prefill_above: int | None = None
     # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
     fast: bool = False
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
@@ -288,6 +287,8 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         return f"activation {qm._tpu_activation_str!r} is not silu"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
         return "a fused EP MoE kernel serves this layer"
+    if envs.FUSED_MOE_DECODE_KERNEL:
+        return "FUSED_MOE_DECODE_KERNEL is set; moe_tp_decode stands down"
     # Same test as apply_monolithic's owns_collectives: those paths run their own
     # collectives, so the layer keeps them.
     if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
@@ -394,10 +395,12 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         onehot_threshold=resolve_onehot_permute_threshold(),
         use_ep=bool(par.use_ep),
         router_bias=bool(moe_routing._ROUTER_TOPK_BIAS),
-        # The prefill kernel's weight ring holds whole experts: TP experts
-        # only, and it quantizes per 512 columns, so the hidden size divides.
-        prefill_min_tokens=(
-            None if par.use_ep or hidden % _PREFILL_Q_BLOCK else prefill_min_tokens()
+        prefill_above=(
+            envs.FUSED_MOE_DECODE_KERNEL_MAX_TOKENS
+            if envs.FUSED_MOE_PREFILL_KERNEL
+            and not par.use_ep
+            and hidden % _PREFILL_Q_BLOCK == 0
+            else None
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )
@@ -426,6 +429,47 @@ def _route(x, scores, bias, is_pad, st):
     w = (w / total).astype(x.dtype)
     w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
     return w, ids
+
+
+def _prefill_chain(
+    x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, st, axis
+):
+    """The layer's output, summed over `axis`, from the fused MoE prefill
+    kernel (FUSED_MOE_PREFILL_KERNEL) on this op's routing, as
+    fused_moe_decode's prefill path calls it. GLM-5.2's shared expert is
+    ungated; routed_scale is folded into the route weights by the kernel.
+    FUSED_MOE_PREFILL_KERNEL_V2: the stage-A build (per-row activation scales)
+    where the experts fit whole."""
+    prefill = fused_moe_prefill
+    if envs.FUSED_MOE_PREFILL_KERNEL_V2 and (
+        plan_blocks(x.shape[0], x.shape[1], w2.shape[1], sw2.shape[0], w13.dtype)
+        is None
+    ):
+        prefill = fused_moe_prefill_stage_a
+    # Trace-time, once per token bucket: the evidence that the kernel serves it.
+    logger.info(
+        "moe_tp_decode: fused MoE prefill kernel%s traced for %d tokens",
+        " (V2, stage A)" if prefill is fused_moe_prefill_stage_a else "",
+        x.shape[0],
+    )
+    w, ids = _route(x, scores, bias, is_pad, st)
+    return prefill(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        sw13,
+        ss13,
+        sw2,
+        ss2,
+        None,
+        w,
+        ids.astype(jnp.int32),
+        axis_name=axis,
+        expert_start=None,
+        routed_scale=st.routed_scale,
+    )
 
 
 def _tp_chain(
@@ -531,29 +575,10 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
                 fast=statics.fast,
                 hbm_operands=statics.hbm_operands,
             )
-        if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
-            # Prefill-sized steps: the fused MoE prefill kernel (shared +
-            # routed_scale * routed, combine and all-reduce over `axis`) on
-            # the same routing the psum path would take. GLM-5.2's shared
-            # expert has no gate.
-            assert axis == EP_AXIS_NAME, (axis, EP_AXIS_NAME)
-            tw, ti = _route(x, scores, bias, is_pad, statics)
-            return prefill_layer(
-                x,
-                w13,
-                w2,
-                s13,
-                s2,
-                sw13,
-                ss13,
-                sw2,
-                ss2,
-                None,
-                tw,
-                ti.astype(jnp.int32),
-                None,
-                statics.routed_scale,
-            )
+        if statics.prefill_above is not None and n > statics.prefill_above:
+            return _prefill_chain(
+                x, scores, bias, is_pad, *weights, statics, axis
+            ).astype(x.dtype)
         partial = _tp_chain(x, scores, bias, is_pad, *weights, statics, e0.reshape(()))
         return lax.psum(partial, axis)
 
