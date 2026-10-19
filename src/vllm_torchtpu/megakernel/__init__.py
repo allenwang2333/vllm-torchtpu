@@ -14,14 +14,17 @@
 """Config-driven composable TPU Pallas megakernel library."""
 
 from . import (
+    comm,
     errors,
     ops,
     planner,
     pool_alias,
     profiles,
     spec,
+    stream,
     vmem,
 )
+from .comm import AllReduceRing
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .ops import rup
 from .planner import encode_ecopy
@@ -42,8 +45,10 @@ from .spec import (
     default_tiles,
     frozen_parity_tiles,
 )
+from .stream import TwoRing
 
 __all__ = [
+    "AllReduceRing",
     "Block",
     "DebugOptions",
     "ExecSpec",
@@ -58,7 +63,9 @@ __all__ = [
     "StateDecl",
     "SwitchSlot",
     "Tiles",
+    "TwoRing",
     "WeightDecl",
+    "comm",
     "default_tiles",
     "encode_ecopy",
     "errors",
@@ -69,5 +76,6 @@ __all__ = [
     "profiles",
     "rup",
     "spec",
+    "stream",
     "vmem",
 ]

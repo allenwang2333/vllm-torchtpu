@@ -46,11 +46,13 @@ def test_megakernel_portability_ast_guard():
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
     required_modules = {
         "__init__.py",
+        "comm.py",
         "errors.py",
         "ops.py",
         "planner.py",
         "pool_alias.py",
         "spec.py",
+        "stream.py",
         "vmem.py",
         "profiles/__init__.py",
         "profiles/default.py",
