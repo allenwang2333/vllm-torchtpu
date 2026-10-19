@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.persistent_scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode_scores import (
     grouped_decode_scores,
 )
 
@@ -177,24 +177,29 @@ def test_long_candidate_union_preserves_membership_and_overflow(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("seed", [71, 72])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("requests,queries", [(1, 1), (2, 6), (3, 3), (7, 5), (8, 8)])
+@pytest.mark.parametrize(
+    "requests,queries", [(1, 1), (2, 6), (3, 3), (7, 5), (7, 6), (8, 4), (8, 8)]
+)
+@pytest.mark.parametrize(
+    "interpret,start,head_stripe",
+    [(True, 0, None), (True, 1, 8), (False, 0, None), (False, 1, 8)],
+)
 def test_candidate_scores_match_independent_per_head_reference(
-    seed, packed, requests, queries
+    seed, requests, queries, interpret, start, head_stripe
 ):
+    if not interpret and jax.default_backend() != "tpu":
+        pytest.skip("Native candidate DMA scoring requires TPU")
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        candidate_scores,
+        _candidate_scores,
         union_metadata,
-        unpack_candidate_words,
     )
 
     rng = np.random.default_rng(seed)
-    heads, width = 4, 128
+    heads, width = max(4, head_stripe or 1), 128
+    start = min(start, requests - 1)
     native = jnp.asarray(rng.normal(size=(requests, width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(native.reshape(requests, -1, 64, 2), jnp.int32)
-    keys = unpack_candidate_words(words.reshape(requests, -1, 128), interpret=True)
     expected_keys = jnp.concatenate((native[..., ::2], native[..., 1::2]), axis=-1)
-    np.testing.assert_array_equal(keys, expected_keys)
     candidate_block_ids = rng.integers(
         -2, 18, size=(requests, queries, 12), dtype=np.int32
     )
@@ -206,29 +211,31 @@ def test_candidate_scores_match_independent_per_head_reference(
         8
     )
     gathered = expected_keys[jnp.arange(requests)[:, None], slots.reshape(requests, -1)]
-    if packed:
-        native_gathered = native[
-            jnp.arange(requests)[:, None], slots.reshape(requests, -1)
-        ]
-        score_keys = jax.lax.bitcast_convert_type(
-            native_gathered.reshape(requests, -1, 64, 2), jnp.int32
-        ).reshape(requests, -1, 128)
-    else:
-        score_keys = gathered
+    ordinary_gathered = native[
+        jnp.arange(requests)[:, None], slots.reshape(requests, -1)
+    ]
+    encoded = layout.encode_records(ordinary_gathered.reshape(-1, 128)).reshape(
+        requests, width, 128
+    )
+    score_keys = (encoded[:, ::2] | (encoded[:, 1::2] << 16)).astype(jnp.int32)
     q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
     lengths = jnp.asarray(rng.integers(0, width + 1, (requests, queries)), jnp.int32)
     lengths = lengths.at[-1, -1].set(0)
-    scores = candidate_scores(
+    scores = _candidate_scores(
         q,
         weights,
         score_keys,
         meta.union_block_ids,
         meta.membership,
         lengths,
+        start_request=jnp.int32(start),
+        request_tile=requests - start,
         block_size=8,
-        key_tile=64,
-        interpret=True,
+        key_tile=64 if interpret else 128,
+        compute_tile=32 if interpret else 128,
+        head_stripe=head_stripe,
+        interpret=interpret,
     )
     logits = jnp.einsum(
         "rqhd,rkd->rqhk", q, gathered, preferred_element_type=jnp.float32
@@ -245,7 +252,10 @@ def test_candidate_scores_match_independent_per_head_reference(
                     or logical >= lengths[r, query]
                 ):
                     expected[r, query, slot] = -np.inf
-    np.testing.assert_allclose(scores, expected, rtol=1e-5, atol=4e-5)
+    assert scores.shape == ((requests - start) * queries, width)
+    np.testing.assert_allclose(
+        scores, expected[start:].reshape(-1, width), rtol=1e-5, atol=4e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,293 +303,17 @@ def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
         assert bool(result.overflow[request]) == (len(expected) > capacity)
 
 
-def _assert_scores_match(actual, reference, *, exact):
-    """Identical -inf masks, no NaN/+inf; finite values exact or within ~ULPs.
-
-    Infinities only come from the explicit -inf masks, so their positions must
-    match exactly. Finite values come from the same FP32 dot + ReLU-weighted
-    head sum, but on the TPU backend (even with interpret=True) XLA lowers
-    each kernel body separately: in-kernel key unpack/bitcast or the flat
-    kernel's per-request loop changes the dot/head-reduction order, giving a
-    few-ULP differences (and +0 vs -0 for all-zero ReLU slots). ``exact``
-    keeps bitwise equality (up to the sign of zero) for identical bodies.
-    """
-    actual, reference = np.asarray(actual), np.asarray(reference)
-    assert not np.isnan(actual).any() and not np.isnan(reference).any()
-    assert not np.isposinf(actual).any() and not np.isposinf(reference).any()
-    masked = np.isneginf(reference)
-    np.testing.assert_array_equal(np.isneginf(actual), masked)
-    if exact:
-        np.testing.assert_array_equal(
-            np.where(actual == 0, np.float32(0), actual).view(np.uint32),
-            np.where(reference == 0, np.float32(0), reference).view(np.uint32),
-        )
-    else:
-        # Head sums cancel, so bound the error by the score scale, not each value.
-        finite = reference[~masked]
-        scale = float(np.abs(finite).max()) if finite.size else 0.0
-        np.testing.assert_allclose(
-            actual[~masked], finite, rtol=1e-5, atol=1e-6 * scale
-        )
-
-
-def _candidate_skip_inputs(seed, requests=4, width=256):
-    """Unions with an empty capacity tail: ordinary/halfplane words and BF16 keys."""
-    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        union_metadata,
-        unpack_candidate_words,
-    )
-
-    rng = np.random.default_rng(seed)
-    queries, heads = 6, 4
-    native = jnp.asarray(rng.integers(-8, 9, (requests, width, 128)), jnp.bfloat16)
-    ordinary = jax.lax.bitcast_convert_type(
-        native.reshape(requests, -1, 64, 2), jnp.int32
-    ).reshape(requests, -1, 128)
-    bits = layout.encode_records(native.reshape(-1, 128))
-    halfplane = (bits[::2] | (bits[1::2] << 16)).astype(jnp.int32)
-    halfplane = halfplane.reshape(requests, -1, 128)
-    candidate_block_ids = rng.integers(
-        -2, 10, size=(requests, queries, 5), dtype=np.int32
-    )
-    candidate_block_ids[1] = -1  # Empty union: every tile is skipped.
-    candidate_block_ids[-1, :, 0] = 31  # Union reaches the last tile.
-    meta = union_metadata(
-        jnp.asarray(candidate_block_ids), logical_blocks=40, capacity_blocks=width // 8
-    )
-    q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
-    weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
-    lengths = jnp.asarray(rng.integers(0, 320, (requests, queries)), jnp.int32)
-    keys = {
-        (False, False): unpack_candidate_words(ordinary, interpret=True),
-        (True, False): ordinary,
-        (False, True): unpack_candidate_words(
-            halfplane, interpret=True, halfplane=True
-        ),
-        (True, True): halfplane,
-    }
-    return q, weights, keys, meta.union_block_ids, meta.membership, lengths
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("seed", [81, 82])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("halfplane", [False, True])
-def test_candidate_scores_skip_matches_default(seed, packed, halfplane):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        candidate_scores,
-    )
-
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(seed)
-    reference = candidate_scores(
-        q,
-        weights,
-        keys[False, False],
-        ids,
-        membership,
-        lengths,
-        block_size=8,
-        key_tile=32,
-        interpret=True,
-    )
-    actual = candidate_scores(
-        q,
-        weights,
-        keys[packed, halfplane],
-        ids,
-        membership,
-        lengths,
-        block_size=8,
-        key_tile=32,
-        interpret=True,
-        halfplane=halfplane,
-        skip=True,
-    )
-    # BF16 keys run the same kernel body as the reference; packed keys add an
-    # in-kernel unpack/bitcast that changes the TPU reduction order.
-    _assert_scores_match(actual, reference, exact=not packed)
-    assert np.isneginf(np.asarray(actual)[1]).all()
-
-
-def _reference_select(scores, lengths, k, *args):
-    width = scores.shape[1]
-    masked = jnp.where(jnp.arange(width)[None] < lengths[:, None], scores, -jnp.inf)
-    values, selected = jax.lax.top_k(masked, k)
-    selected = jnp.sort(jnp.where(values > -jnp.inf, selected, width), axis=1)
-    return jnp.where(selected < width, selected, -1)
-
-
-def _run_candidate_indexer(
-    monkeypatch, inputs, halfplane, overlap, request_tile=2, flat=0, skip=False
-):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
-
-    with monkeypatch.context() as patch:
-        scorer = candidate.candidate_scores_flat
-
-        def score(*args, **kwargs):
-            kwargs.update(interpret=True, skip=skip)
-            return scorer(*args, **kwargs)
-
-        patch.setattr(candidate, "candidate_scores_flat", score)
-        patch.setattr(candidate.decode, "_select", _reference_select)
-        patch.setattr(
-            candidate.tuned_block_sizes,
-            "get_candidate_score_group",
-            lambda requests, queries: flat if flat and requests % flat == 0 else 1,
-        )
-        # The benchmark-only overrides are static; drop prior traces.
-        jax.clear_caches()
-        result = candidate.candidate_indexer(
-            *inputs,
-            block_size=8,
-            key_tile=32,
-            request_tile=request_tile,
-            k=16,
-            overlap=overlap,
-            halfplane=halfplane,
-        )
-    jax.clear_caches()
-    return np.asarray(result)
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("halfplane", [False, True])
-@pytest.mark.parametrize("overlap", [False, True])
-def test_candidate_indexer_skip_is_identical(monkeypatch, packed, halfplane, overlap):
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(83)
-    reference = _run_candidate_indexer(
-        monkeypatch,
-        (q, weights, keys[False, False], ids, membership, lengths),
-        False,
-        overlap,
-    )
-    actual = _run_candidate_indexer(
-        monkeypatch,
-        (q, weights, keys[packed, halfplane], ids, membership, lengths),
-        halfplane,
-        overlap,
-        skip=True,
-    )
-    np.testing.assert_array_equal(actual, reference)
-    assert (reference >= 0).any()
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("halfplane", [False, True])
-@pytest.mark.parametrize("skip", [False, True])
-# Eight-request groups take 2-D [G, W] records; four-request groups [G, 1, W].
-@pytest.mark.parametrize("group_tile", [1, 4, 8])
-def test_candidate_scores_flat_matches_grouped(packed, halfplane, skip, group_tile):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        candidate_scores,
-        candidate_scores_flat,
-    )
-
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(84, requests=8)
-    reference = candidate_scores(
-        q,
-        weights,
-        keys[False, False],
-        ids,
-        membership,
-        lengths,
-        block_size=8,
-        key_tile=32,
-        interpret=True,
-    ).reshape(-1, ids.shape[1] * 8)
-    actual = candidate_scores_flat(
-        q,
-        weights,
-        keys[packed, halfplane],
-        ids,
-        membership,
-        lengths,
-        block_size=8,
-        key_tile=32,
-        group_tile=group_tile,
-        skip=skip,
-        interpret=True,
-        halfplane=halfplane,
-    )
-    _assert_scores_match(actual, reference, exact=False)
-
-
-@pytest.mark.cpu_test
-def test_candidate_scores_flat_rejects_unaligned_request_tile():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        candidate_scores_flat,
-    )
-
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(85)
-    with pytest.raises(ValueError, match="8-row-aligned"):
-        candidate_scores_flat(
-            q,
-            weights,
-            keys[False, False],
-            ids,
-            membership,
-            lengths,
-            block_size=8,
-            key_tile=32,
-            group_tile=2,
-            interpret=True,
-        )
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("halfplane", [False, True])
-@pytest.mark.parametrize("skip", [False, True])
-@pytest.mark.parametrize("flat", [4, 8])
-def test_candidate_indexer_flat_is_identical(
-    monkeypatch, packed, halfplane, skip, flat
-):
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(86, requests=8)
-    reference = _run_candidate_indexer(
-        monkeypatch,
-        (q, weights, keys[False, False], ids, membership, lengths),
-        False,
-        False,
-        request_tile=8,
-    )
-    actual = _run_candidate_indexer(
-        monkeypatch,
-        (q, weights, keys[packed, halfplane], ids, membership, lengths),
-        halfplane,
-        True,
-        request_tile=8,
-        flat=flat,
-        skip=skip,
-    )
-    np.testing.assert_array_equal(actual, reference)
-    assert (reference >= 0).any()
-
-
-@pytest.mark.cpu_test
-def test_candidate_indexer_basic_layout_preserves_unaligned_tiles(monkeypatch):
-    # Two six-query requests per tile cannot fill 8-row flat blocks of 8.
-    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(87)
-    inputs = (q, weights, keys[False, False], ids, membership, lengths)
-    reference = _run_candidate_indexer(monkeypatch, inputs, False, False)
-    actual = _run_candidate_indexer(monkeypatch, inputs, False, True, flat=8)
-    np.testing.assert_array_equal(actual, reference)
-
-
 @pytest.mark.parametrize("block_size", [0, 8])
 @pytest.mark.parametrize(
     "requests,queries", [(3, 6), (7, 6), (9, 1), (3, 4), (9, 5), (3, 8), (3, 12)]
 )
 @pytest.mark.parametrize("key_tile,empty", [(4096, False), (6144, False), (6144, True)])
-def test_persistent_scores_write_flat_rows_with_ragged_lengths(
+def test_decode_scores_write_flat_rows_with_ragged_lengths(
     block_size, requests, queries, key_tile, empty
 ):
     if jax.default_backend() != "tpu":
         pytest.skip("Persistent DMA scoring requires TPU")
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import persistent_scores
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode_scores
 
     rng = np.random.default_rng(949)
     heads, width = 32, 4096
@@ -601,7 +335,7 @@ def test_persistent_scores_write_flat_rows_with_ragged_lengths(
         lengths = jnp.zeros_like(lengths)
     q = jnp.asarray(rng.integers(-2, 3, (requests, queries, heads, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.integers(-2, 3, (requests, queries, heads)), jnp.float32)
-    actual = persistent_scores._grouped_decode_scores(
+    actual = decode_scores._grouped_decode_scores(
         q,
         weights,
         pool,

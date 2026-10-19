@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vllm_torchtpu.logger import init_logger
 
@@ -12,6 +12,14 @@ from vllm_torchtpu.logger import init_logger
 SCORE_WINDOW = 32768
 QUERY_TILE = 128
 KEY_TILE = 2048
+
+# Measured candidate-union and gather policies. Keep these separate from
+# hardware lane widths and the packed-key format.
+CANDIDATE_DENSE_UNION_MAX_BLOCKS = 16384
+CANDIDATE_GATHER_ROWS_PER_SUBCORE = 512
+CANDIDATE_GATHER_MAX_READS = 8
+# (TPU generation, score width, candidate count, records per candidate block).
+PUBLISH_CANDIDATE_SHAPES = frozenset({(7, 16384, 2048, 8)})
 
 
 @dataclass(frozen=True)
@@ -68,7 +76,7 @@ def get_persistent_score_config(key: tuple[int, ...]) -> PersistentScoreConfig:
         # The native ragged-query suite exercises 4K DMA / 1K compute fragments.
         config = PersistentScoreConfig(4096, 1024, 32)
         logger.warning_once(
-            "[persistent_scores] No tuned config for %s; using %s", key, config
+            "[decode_scores] No tuned config for %s; using %s", key, config
         )
     return config
 
@@ -90,33 +98,54 @@ def get_decode_request_tile(key: DecodeTuningKey, requests: int) -> int:
 
 @dataclass(frozen=True)
 class CandidateTuningKey:
+    """Workload key for canonical halfplane int32 candidate caches."""
+
     device_kind: str
-    requests: int
     queries: int
     heads: int
     capacity: int
-    key_tile: int
+    key_tile: int | None
     k: int
-    packed: bool = False
-    halfplane: bool = False
 
 
-# Native two-bank preparation, BF16 reusable union, seeds 824/825, JAX 0.10.2
-# and libtpu 0.0.47. At 40K capacity, smaller groups lose to SC launch overhead.
-CANDIDATE_REQUEST_TILES: dict[CandidateTuningKey, int] = {
-    CandidateTuningKey("TPU7x", 48, 6, 32, 40960, 4096, 512): 48,
-    # Captured C384 candidates, synthetic Q/weights/pages, seeds 825/826.
-    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 4096, 512): 48,
-    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512): 48,
-    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512, True, True): 48,
-}
-# JAX 0.10.2 / libtpu 0.0.47, seeds 825/826 plus tied scores: preparation
-# and four serial reindexes improve 5.8-7.1% with key/request tiles 8192/48.
-# Key: device, request-major Q shape, union capacity, top-k, packed keys.
-CANDIDATE_KEY_TILES: dict[tuple[str, tuple[int, ...], int, int, bool, bool], int] = {
-    ("TPU7x", (48, 6, 32, 128), 49152, 512, False, False): 8192,
-    # Halfplane prepare + four consumers, captured candidate IDs, synthetic Q/K.
-    ("TPU7x", (48, 6, 32, 128), 49152, 512, True, True): 8192,
+@dataclass(frozen=True)
+class CandidateBlockSizes:
+    key_tile: int
+    request_tile: int
+    topk_block_size: int = 8192
+    reconstruct_threshold: int = 8192
+    compute_tile: int | None = None
+    head_stripe: int | None = None
+    fuse_topk_id_mapping: bool = False
+    dma_tile: int | None = None
+
+
+_TPU7X_CACHED_DECODE = CandidateBlockSizes(
+    key_tile=49152,
+    request_tile=16,
+    topk_block_size=16384,
+    reconstruct_threshold=1024,
+    compute_tile=8192,
+    head_stripe=8,
+    fuse_topk_id_mapping=True,
+    dma_tile=24576,
+)
+
+
+# Exact configurations take precedence over the bounded upstream fallback.
+CANDIDATE_BLOCK_SIZES: dict[CandidateTuningKey, CandidateBlockSizes] = {
+    CandidateTuningKey("TPU7x", 6, 32, 40960, None, 512): CandidateBlockSizes(4096, 48),
+    CandidateTuningKey("TPU7x", 6, 32, 40960, 4096, 512): CandidateBlockSizes(4096, 48),
+    CandidateTuningKey("TPU7x", 6, 32, 49152, 4096, 512): CandidateBlockSizes(4096, 48),
+    CandidateTuningKey("TPU7x", 6, 32, 49152, 8192, 512): CandidateBlockSizes(8192, 48),
+    CandidateTuningKey("TPU7x", 6, 32, 49152, 16384, 512): CandidateBlockSizes(
+        16384, 24, 16384, 1024
+    ),
+    CandidateTuningKey("TPU7x", 6, 32, 49152, 24576, 512): CandidateBlockSizes(
+        24576, 24, 16384, 1024, compute_tile=4096
+    ),
+    CandidateTuningKey("TPU7x", 6, 32, 49152, 49152, 512): _TPU7X_CACHED_DECODE,
+    CandidateTuningKey("TPU7x", 6, 32, 49152, None, 512): _TPU7X_CACHED_DECODE,
 }
 # 40K overflowed in 12/48 profiled rank-steps. The 48K bucket covers the
 # captured maximum of 5138 blocks with headroom, at 576 MiB per 48 requests.
@@ -128,58 +157,29 @@ DEFAULT_CANDIDATE_REQUEST_TILE = 16
 CANDIDATE_SCORE_ELEMENTS = 48 * 6 * CANDIDATE_KEY_CAPACITY
 
 
-def get_candidate_key_tile(
-    device_kind: str,
-    query_shape: tuple[int, ...],
-    capacity: int,
-    k: int,
-    packed: bool,
-    halfplane: bool = False,
-) -> int:
-    """Prefer measured tiles, then use the aligned basic configuration."""
-    if capacity < 1:
-        raise ValueError("candidate capacity must be positive")
-    key = (device_kind, query_shape, capacity, k, packed, packed and halfplane)
-    tile = CANDIDATE_KEY_TILES.get(key)
-    if tile is None:
-        tile = math.gcd(DEFAULT_CANDIDATE_KEY_TILE, capacity)
-        logger.warning_once(
-            "[candidate_indexer] No tuned key_tile for %s; using %d", key, tile
-        )
-    if type(tile) is not int or tile < 1 or capacity % tile:
-        raise ValueError(f"Invalid candidate key_tile={tile} for {key}")
-    return tile
-
-
-def get_candidate_request_tile(key: CandidateTuningKey) -> int:
-    """Use whole requests and bound untuned groups by the measured score volume."""
-    if key.requests < 1:
+def get_candidate_block_sizes(
+    key: CandidateTuningKey, requests: int
+) -> CandidateBlockSizes:
+    """Resolve scorer and selector tiles together for the complete pipeline."""
+    if requests < 1:
         raise ValueError("candidate requests must be positive")
     if key.queries < 1 or key.capacity < 1:
         raise ValueError("candidate queries and capacity must be positive")
-    tile = CANDIDATE_REQUEST_TILES.get(key)
-    if tile is None:
+    config = CANDIDATE_BLOCK_SIZES.get(key)
+    if config is None:
+        key_tile = key.key_tile
+        if key_tile is None:
+            key_tile = math.gcd(DEFAULT_CANDIDATE_KEY_TILE, key.capacity)
         limit = min(
             DEFAULT_CANDIDATE_REQUEST_TILE,
             max(1, CANDIDATE_SCORE_ELEMENTS // (key.queries * key.capacity)),
         )
-        tile = next(
-            n for n in range(min(limit, key.requests), 0, -1) if key.requests % n == 0
-        )
+        config = CandidateBlockSizes(key_tile, limit)
         logger.warning_once(
-            "[candidate_indexer] No tuned request_tile for %s; using %d", key, tile
+            "[candidate_indexer] No tuned block sizes for %s; using %s", key, config
         )
-    if type(tile) is not int or tile < 1 or key.requests % tile:
-        raise ValueError(f"Invalid candidate request_tile={tile} for {key}")
-    return tile
-
-
-def get_candidate_score_group(requests: int, queries: int) -> int:
-    """Keep the measured eight-request layout; use one request if unaligned.
-
-    The basic config never pads queries or keys. A singleton major output axis
-    handles batches which cannot fill an eight-row 2D score block.
-    """
-    if requests < 1 or not 1 <= queries <= 8:
-        raise ValueError("candidate scoring requires requests > 0 and 1..8 queries")
-    return 8 if requests % 8 == 0 else 1
+    if config.request_tile < 1:
+        raise ValueError(
+            f"Invalid candidate request_tile={config.request_tile} for {key}"
+        )
+    return replace(config, request_tile=min(config.request_tile, requests))

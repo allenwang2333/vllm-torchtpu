@@ -13,7 +13,6 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_key_layout,
-    index_word_scores,
     indexer,
     tuned_block_sizes,
 )
@@ -21,9 +20,8 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     decode as decode_index_selection,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    scores as prefill_index_scores,
-)
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    packed_scores,
+    prefill_scores,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
@@ -2234,7 +2232,7 @@ _INDEX_MAX_TILE = 16384
 # The packed scorer unrolls its query loop. Keep shared decode groups small;
 # large prefill groups use the existing shared matmul.
 _INDEX_MAX_SHARED_QUERIES = 8
-# Packed word-row scoring (`index_word_scores`) streams pool rows straight into
+# Packed word-row scoring (`packed_scores`) streams pool rows straight into
 # the kernel, so a loop iteration costs one paged gather + one kernel launch +
 # one score write regardless of size. At TP1/DP8 C384 decode (288 rows, ~96K
 # context) the `_INDEX_KEYS_PER_ITER` budget gives 512-key tiles: ~200 tiny
@@ -2284,7 +2282,7 @@ def paged_index_scores_jax(
     )
     word_rows = (
         page_records is not None
-        and dim == index_word_scores.DIM
+        and dim == index_key_layout.DIM
         and q.dtype == jnp.bfloat16
     )
     keys_per_iter = _INDEX_WORD_KEYS_PER_ITER if word_rows else _INDEX_KEYS_PER_ITER
@@ -2376,7 +2374,7 @@ def paged_index_scores_jax(
 
         if (
             pages
-            and dim == index_word_scores.DIM
+            and dim == index_key_layout.DIM
             and q.dtype == jnp.bfloat16
             and records.shape[0] > 1
             and tokens <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
@@ -2411,7 +2409,7 @@ def paged_index_scores_jax(
                         grouped_q,
                         grouped_weights,
                         words.reshape(
-                            groups, tile // index_word_scores.SLOTS, ROW_WORDS
+                            groups, tile // index_key_layout.SLOTS, ROW_WORDS
                         ),
                     )
                     # Sentinel token IDs are dropped, including duplicate
@@ -2433,7 +2431,7 @@ def paged_index_scores_jax(
     trips = jnp.minimum(
         (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, padded_width // tile
     )
-    if pages and dim == index_word_scores.DIM and q.dtype == jnp.bfloat16:
+    if pages and dim == index_key_layout.DIM and q.dtype == jnp.bfloat16:
         # Score the gathered word rows in place: splitting them into
         # BF16 keys and relaying out [rows, 2, 64] -> [keys, 128] cost three
         # HBM passes per tile (8.7 of 17.5 us per 8K-key tile at 2 rows).
@@ -2441,7 +2439,7 @@ def paged_index_scores_jax(
         # result cost 68 us per call to interleave in XLA.
         assert page_records is not None  # implied by `pages`
         page = page_records
-        rows = tile // index_word_scores.SLOTS
+        rows = tile // index_key_layout.SLOTS
 
         def _run_word_loop(rec):
             rec = jnp.pad(rec, ((0, 0), (0, -width % tile)), constant_values=-1)
@@ -2564,7 +2562,7 @@ def _prefill_score(
     )
 
     def score(q, weights, pool, records, limit):
-        return prefill_index_scores.prefill_index_scores(
+        return prefill_scores.prefill_index_scores(
             q,
             weights,
             pool,
@@ -2612,7 +2610,7 @@ def _prefill_top_k(scores, lengths, *, scheduling_group_id: int | None = None):
 
 
 def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
-    """`index_word_scores.score_word_rows` on every device (replicated)."""
+    """`packed_scores.score_word_rows` on every device (replicated)."""
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -2620,7 +2618,7 @@ def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.
     )
 
     score = functools.partial(
-        index_word_scores.score_word_rows,
+        packed_scores.score_word_rows,
         interpret=jax.default_backend() != "tpu",
     )
     try:
@@ -3038,7 +3036,7 @@ def paged_indexer_jax(
             not use_prefill
             and page_records is not None
             and q.dtype == jnp.bfloat16
-            and q.shape[-1] == index_word_scores.DIM
+            and q.shape[-1] == index_key_layout.DIM
             and records.shape[0] > 1
             and 1 < group_tokens <= min(query_tile, _INDEX_MAX_SHARED_QUERIES)
         ):
@@ -3050,7 +3048,7 @@ def paged_indexer_jax(
         return run(False)
 
     def prefill_context():
-        widths = prefill_index_scores.context_buckets(records.shape[1])
+        widths = prefill_scores.context_buckets(records.shape[1])
 
         def run(columns):
             bounded_records = records[:, :columns]
@@ -3176,7 +3174,7 @@ def paged_indexer_jax(
         and not candidate_filter
         and topk == 512
         and records.shape[1] >= topk
-        and prefill_index_scores.supports_chunked_prefill(q, pool, page_records)
+        and prefill_scores.supports_chunked_prefill(q, pool, page_records)
     ):
         live = lengths > 0
         request = requests[jnp.argmax(lengths)]

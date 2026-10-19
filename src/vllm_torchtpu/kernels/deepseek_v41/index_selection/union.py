@@ -4,13 +4,35 @@
 
 import functools
 from collections.abc import Callable
-from typing import cast
+from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
+
+
+class MetadataLayout(NamedTuple):
+    histogram_width: int
+    output_width: int
+    count_width: int
+    scratch_bytes: int
+
+
+def metadata_layout(
+    candidate_shape: tuple[int, ...], logical_blocks: int, capacity: int
+) -> MetadataLayout:
+    """Shared dispatch/allocation geometry for TC-tiled HBM metadata."""
+    _, queries, candidates = candidate_shape
+    alignment = pltpu.get_tpu_info().num_lanes
+    lanes = plsc.get_sparse_core_info().num_lanes
+    histogram = pl.cdiv(logical_blocks, alignment) * alignment
+    output = pl.cdiv(capacity, alignment) * alignment
+    scratch_bytes = jnp.dtype(jnp.int32).itemsize * (
+        queries * histogram + candidates + 2 * (output + lanes) + alignment
+    )
+    return MetadataLayout(histogram, output, alignment, scratch_bytes)
 
 
 @functools.partial(jax.jit, static_argnames=("logical_blocks", "capacity"))
@@ -25,26 +47,20 @@ def sparse_union_metadata(
     requests, queries, candidates_per_query = candidate_block_ids.shape
     info = plsc.get_sparse_core_info()
     lanes = info.num_lanes
-    histogram_width = pl.cdiv(logical_blocks, 128) * 128
-    output_width = pl.cdiv(capacity, 128) * 128
+    layout = metadata_layout(candidate_block_ids.shape, logical_blocks, capacity)
+    histogram_width, output_width = layout.histogram_width, layout.output_width
     if (
         candidate_block_ids.dtype != jnp.int32
-        or candidates_per_query % 128
-        or not 1 <= queries <= 8
+        or candidates_per_query % layout.count_width
+        or not 1 <= queries <= jnp.iinfo(jnp.int32).bits
         or min(requests, candidates_per_query, logical_blocks, capacity) < 1
     ):
         raise ValueError(
-            "Expected nonempty aligned int32 candidate rows and 1..8 queries"
+            "Expected aligned int32 candidates with query memberships fitting int32"
         )
-    scratch = 4 * (
-        queries * histogram_width
-        + candidates_per_query
-        + 2 * (output_width + lanes)
-        + 128
-    )
-    if scratch > info.vmem_capacity_bytes:
+    if layout.scratch_bytes > info.vmem_capacity_bytes:
         raise ValueError(
-            f"Candidate union needs {scratch} bytes per subcore, "
+            f"Candidate union needs {layout.scratch_bytes} bytes per subcore, "
             f"available {info.vmem_capacity_bytes}"
         )
     mesh = plsc.VectorSubcoreMesh(
@@ -55,14 +71,18 @@ def sparse_union_metadata(
     shape = jax.ShapeDtypeStruct((requests, output_width), jnp.int32)
 
     @pl.kernel(
-        out_type=(shape, shape, jax.ShapeDtypeStruct((requests, 128), jnp.int32)),
+        out_type=(
+            shape,
+            shape,
+            jax.ShapeDtypeStruct((requests, layout.count_width), jnp.int32),
+        ),
         mesh=mesh,
         scratch_types=(
             pltpu.VMEM((queries * histogram_width,), jnp.int32),
             pltpu.VMEM((candidates_per_query,), jnp.int32),
             pltpu.VMEM((output_width + lanes,), jnp.int32),
             pltpu.VMEM((output_width + lanes,), jnp.int32),
-            pltpu.VMEM((128,), jnp.int32),
+            pltpu.VMEM((layout.count_width,), jnp.int32),
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
@@ -124,7 +144,7 @@ def sparse_union_metadata(
             )
             count = compact_loop(compact)
 
-            @plsc.parallel_loop(0, 128, lanes)
+            @plsc.parallel_loop(0, layout.count_width, lanes)
             def save_count(i):
                 counts[pl.ds(i, lanes)] = jnp.full(lanes, count, jnp.int32)
 

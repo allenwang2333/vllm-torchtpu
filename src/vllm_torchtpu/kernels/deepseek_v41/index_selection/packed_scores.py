@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Index scores directly from canonical halfplane index-cache word rows.
+"""Index scores directly from gathered packed halfplane key rows.
 
 Each ``int32[128]`` row packs two BF16 records: low16 holds the even
 record and high16 the odd record. Each record uses split feature order
@@ -15,9 +15,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-ROW_WORDS = 128
-DIM = 128  # BF16 elements per key: two keys per word row
-SLOTS = ROW_WORDS // (DIM // 2)
+from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
+
 MAX_BLOCK_ROWS = 4096
 
 

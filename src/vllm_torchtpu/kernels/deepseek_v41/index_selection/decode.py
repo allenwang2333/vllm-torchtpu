@@ -16,7 +16,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    persistent_scores,
+    decode_scores,
+    publication,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
@@ -70,7 +71,7 @@ def supports_decode(
     )
 
 
-def _select(scores, lengths, k, block_size, threshold, fuse_validity=True):
+def _select(scores, lengths, k, block_size, threshold):
     return streaming_topk.streaming_topk(
         scores,
         valid_lengths=lengths,
@@ -98,7 +99,7 @@ def _select(scores, lengths, k, block_size, threshold, fuse_validity=True):
 def decode_indexer(
     q: jax.Array,
     weights: jax.Array,
-    pool: jax.Array | tuple[jax.Array, jax.Array],
+    pool: tuple[jax.Array, jax.Array],
     pages: jax.Array,
     lengths: jax.Array,
     *,
@@ -144,7 +145,7 @@ def decode_indexer(
                 score_capacity=pages.shape[1] * page_records,
                 page_records=page_records,
                 k=k,
-                banks=len(pool) if isinstance(pool, tuple) else 1,
+                banks=len(pool),
             ),
             requests,
         )
@@ -160,7 +161,7 @@ def decode_indexer(
 
     def score(args):
         qr, wr, pr, lr = args
-        return persistent_scores.grouped_decode_scores(
+        return decode_scores.grouped_decode_scores(
             qr,
             wr,
             pool,
@@ -195,6 +196,15 @@ def decode_indexer(
                 group_size * queries, blocks, candidate_block_size
             ).max(-1)
         assert block_scores is not None
+        if publication.is_tuned_for_publish_candidates(
+            block_scores, candidate_count, candidate_block_size
+        ):
+            return selected, publication.publish_candidates(
+                block_scores,
+                row_lengths,
+                k=candidate_count,
+                block_size=candidate_block_size,
+            )
         last = (row_lengths - 1) // candidate_block_size
         block_scores = jnp.where(
             jnp.arange(blocks)[None] == last[:, None],

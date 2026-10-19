@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, index_word_scores
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_scores
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
@@ -52,7 +53,7 @@ def _reference(q, weights, words):
         (6, 1, 16),
         (4, 2, 16),
         (12, 2, 16),
-        (1, 1, 2 * index_word_scores.MAX_BLOCK_ROWS),
+        (1, 1, 2 * packed_scores.MAX_BLOCK_ROWS),
     ],
 )
 def test_score_word_rows_matches_xla(tokens, groups, rows):
@@ -60,8 +61,8 @@ def test_score_word_rows_matches_xla(tokens, groups, rows):
     words = _words(rng, (groups, rows, ROW_WORDS))
     q = jnp.asarray(rng.standard_normal((tokens, 3, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.standard_normal((tokens, 3, 1)), jnp.float32)
-    out = index_word_scores.score_word_rows(q, weights, words, interpret=True)
-    assert out.shape == (tokens, index_word_scores.SLOTS * rows)
+    out = packed_scores.score_word_rows(q, weights, words, interpret=True)
+    assert out.shape == (tokens, index_key_layout.SLOTS * rows)
     # Interpret mode sums on CPU; TPU is bitwise identical.
     np.testing.assert_allclose(
         np.asarray(out), _reference(q, weights, words), rtol=1e-6, atol=1e-5
@@ -82,7 +83,7 @@ def test_score_word_rows_matches_xla(tokens, groups, rows):
 def test_score_word_rows_rejects_shapes(q_shape, words_shape):
     q = jnp.zeros(q_shape, jnp.bfloat16)
     with pytest.raises(ValueError):
-        index_word_scores.score_word_rows(
+        packed_scores.score_word_rows(
             q, jnp.zeros((*q_shape[:2], 1)), jnp.zeros(words_shape, jnp.int32)
         )
 

@@ -8,8 +8,13 @@ import numpy as np
 import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import persistent_scores, scores
-from vllm_torchtpu.kernels.deepseek_v41.index_word_scores import score_word_rows
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    decode_scores,
+    prefill_scores,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_scores import (
+    score_word_rows,
+)
 
 
 def native_pool(keys):
@@ -95,7 +100,7 @@ def test_merge_updates_both_halfplanes_and_preserves_untouched_bits():
 @pytest.mark.parametrize("record_mask", [False, True])
 def test_all_score_routes_match_dense(monkeypatch, prefetch, record_mask):
     # Exercise record masking across score windows as well as within key tiles.
-    monkeypatch.setattr(scores.tuned_block_sizes, "SCORE_WINDOW", 16)
+    monkeypatch.setattr(prefill_scores.tuned_block_sizes, "SCORE_WINDOW", 16)
     rng = np.random.default_rng(71)
     keys = jnp.asarray(rng.integers(-8, 9, (128, 128)), jnp.bfloat16)
     native = native_pool(keys)
@@ -109,7 +114,7 @@ def test_all_score_routes_match_dense(monkeypatch, prefetch, record_mask):
     for function, arguments, kwargs in (
         (score_word_rows, (q[0], weights[0, ..., None]), {}),
         (
-            scores.prefill_index_scores,
+            prefill_scores.prefill_index_scores,
             (q[0], weights[0]),
             dict(
                 pages=pages[:1],
@@ -161,7 +166,7 @@ def test_decode_native_bitcast_on_eight_devices():
     mesh = Mesh(np.asarray(jax.devices()[:8]), ("d",))
 
     def run(q, weights, pool, pages, lengths):
-        return persistent_scores.grouped_decode_scores(
+        return decode_scores.grouped_decode_scores(
             q,
             weights,
             pool,
