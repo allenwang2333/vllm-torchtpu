@@ -48,8 +48,10 @@ def test_megakernel_portability_ast_guard():
         "__init__.py",
         "errors.py",
         "ops.py",
+        "planner.py",
         "pool_alias.py",
         "spec.py",
+        "vmem.py",
         "profiles/__init__.py",
         "profiles/default.py",
     }

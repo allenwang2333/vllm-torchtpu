@@ -16,12 +16,15 @@
 from . import (
     errors,
     ops,
+    planner,
     pool_alias,
     profiles,
     spec,
+    vmem,
 )
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .ops import rup
+from .planner import encode_ecopy
 from .spec import (
     Block,
     DebugOptions,
@@ -57,11 +60,14 @@ __all__ = [
     "Tiles",
     "WeightDecl",
     "default_tiles",
+    "encode_ecopy",
     "errors",
     "frozen_parity_tiles",
     "ops",
+    "planner",
     "pool_alias",
     "profiles",
     "rup",
     "spec",
+    "vmem",
 ]
