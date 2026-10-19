@@ -1961,6 +1961,7 @@ class AttentionCommunicationWorkspace:
     routed_send_vmem: Any = None  # above B32: [8 * lane payload, 128] FP32
     attention_gather_vmem: Any = None  # B4: private final-gather packets
     routed_consumed: Any = None  # routed reduce-scatter: host-mates done reading their slots
+    pair_semaphores: Any = None  # DP MoE-input gather: the rank pair's half-wire swap
 
 
 class _ScopedWait:
@@ -5396,7 +5397,7 @@ def _gather_attention_dp_rows(row, out, local, sends, recvs, shards):
         out[target_group * rows_per_pair : (target_group + 1) * rows_per_pair, :] = group_row
 
 
-def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
+def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards, pair_semaphores=None):
     """``_gather_attention_dp_rows`` and the local pair gather, overlapped.
 
     Each rank holds [batch / (4 * DP), hidden] for its (DP group, local pair)
@@ -5405,7 +5406,8 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     together, so the inter-group exchange does not delay the local one; each
     group's wire is forwarded as soon as it lands. Flat wires use lanes 4..7
     of ``local``: the wire from relative position (group ^ o, pair ^ k) lands
-    in slot (o, k) on every rank.
+    in slot (o, k) on every rank. With ``pair_semaphores`` the pair's two
+    ranks (one chip) each carry half of every wire and then swap halves.
     """
     rank = jax.lax.axis_index("tp")
     group_size = 32 // shards
@@ -5418,9 +5420,16 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
     base = slot_count // 2
     assert base >= 4 * shards
     wires = pool_alias.view(local, (slot_count, stride, 128), jnp.bfloat16)
+    if pair_semaphores is not None:
+        # Halves are whole 16-row tiles; for a payload that is an odd number
+        # of tiles, they share one.
+        half = -(-payload // 32) * 16
+        start = pl.multiple_of((rank % 2) * (payload - half), 16)
 
-    def wire(o, k):
-        return wires.at[base + 4 * o + k, pl.ds(0, payload)]
+    def wire(o, k, *, whole=False):
+        if pair_semaphores is None or whole:
+            return wires.at[base + 4 * o + k, pl.ds(0, payload)]
+        return wires.at[base + 4 * o + k, pl.ds(start, half)]
 
     def send(source, o, k, semaphore):
         # Peer (o, k) sees this rank at the same relative position.
@@ -5432,7 +5441,7 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         copy.start()
         return copy
 
-    wire(0, 0)[...] = row.reshape(payload, 128)
+    wire(0, 0, whole=True)[...] = row.reshape(payload, 128)
     if rows <= 2 and shards == 2:
         # Short wires (DP2 B8/B16) go to every peer directly: one hop.
         direct = [send(wire(0, 0), o, k, 7 if o == 0 else 8)
@@ -5454,6 +5463,17 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards):
         for copy in group_copies:
             copy.wait_send()
         for copy in (*local_copies, *forwarded):
+            copy.wait()
+    if pair_semaphores is not None:
+        swaps = []
+        for slot in range(1, 4 * shards):
+            o, k = divmod(slot, 4)
+            swaps.append(tpu.make_async_remote_copy(
+                wire(o, k), wire(o, k), *pair_semaphores,
+                device_id=(rank ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+            ))
+            swaps[-1].start()
+        for copy in swaps:
             copy.wait()
     for d in range(shards):
         for p in range(4):
@@ -6505,6 +6525,12 @@ def stack(
     # The residual-stream rows a rank holds under DP row ownership: its own r,
     # or with one owner every row.
     dp_held_rows = batch_size if sp_owners == 1 else group_rows_per_pair
+    sp8_residual = (attention_dp_ownership and attention_dp == 2
+                    and batch_size == 128 and sequence_rows == 1)
+    # Plain decode above two rows per rank pair: its two ranks split the
+    # MoE-input gather (DP2 B128's eight residual owners gather their own).
+    pair_split_gather = (attention_dp_ownership and dp_moe_gather == "split" and not sp8_residual
+                         and sp_owners != 1 and dp_held_rows > 2 and sequence_rows == 1)
     default_streams = (
         {**DCP_B32_WEIGHT_STREAMS, **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {})}
         if (batch_size in (32, 64) and attention_dp == 1
@@ -6710,11 +6736,16 @@ def stack(
         gather_wire = None
         if b4_attention_gather:
             *common, gather_wire = common
+        pair_semaphores = None
+        if pair_split_gather:
+            *common, pair_send, pair_receive = common
+            pair_semaphores = (pair_send.at[0], pair_receive.at[0])
         routed_consumed = None
         if moe_routed_reduce_scatter:
             *common, routed_consumed = common
         communication_workspace = AttentionCommunicationWorkspace(
-            *common, attention_gather_vmem=gather_wire, routed_consumed=routed_consumed
+            *common, attention_gather_vmem=gather_wire, routed_consumed=routed_consumed,
+            pair_semaphores=pair_semaphores,
         )
         if compact_outputs:
             # Attention's whole-batch output argument is shape-checked but
@@ -7008,8 +7039,6 @@ def stack(
             hidden_size,
         ) if attention_dp_ownership else None
 
-        sp8_residual = (attention_dp_ownership and attention_dp == 2
-                        and batch_size == 128 and sequence_rows == 1)
         # Expert/projection ABIs retain their existing pair ownership. Only
         # mixture rows and the following gathers use eight independent owners.
         sp8_rows_vmem = dp_owned_vmem if sp8_residual else None
@@ -7158,6 +7187,7 @@ def stack(
                     communication_workspace.send_semaphores,
                     communication_workspace.receive_semaphores,
                     attention_dp,
+                    pair_semaphores=communication_workspace.pair_semaphores,
                 )
                 return
             with _phase("t10a_dp_normalized_gather"):
@@ -9081,6 +9111,7 @@ def stack(
         *projection_staging_scratch(batch_size, attention_dp),
         *routed_send_scratch(batch_size),
         *((tpu.SemaphoreType.REGULAR,) if moe_routed_reduce_scatter else ()),
+        *((tpu.SemaphoreType.DMA((1,)), tpu.SemaphoreType.DMA((1,))) if pair_split_gather else ()),
         # Four 7168-element BF16 wires, padded to 64 BF16 transport rows.
         # Private storage (see B4_ATTENTION_GATHER).
         *((tpu.VMEM((4, 32, 128), jnp.float32),)
@@ -9110,6 +9141,7 @@ def stack(
         "receive_semaphores", "reduction_phase", "latent_gather",
         *(("projection_staging", "routed_send") if batch_size > 32 else ()),
         *(("routed_consumed",) if moe_routed_reduce_scatter else ()),
+        *(("pair_send_semaphore", "pair_receive_semaphore") if pair_split_gather else ()),
         *(("attention_gather",) if b4_attention_gather else ()),
         "headroom_pad",
     )
