@@ -63,6 +63,10 @@ class LoadMeta:
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+    # Landed head-unique Stage-3 loads whose other replicas' pages the
+    # workers gather over the KV-head group before this step's forward:
+    # request id -> destination block ids in transfer order.
+    reqs_to_gather: dict[ReqId, list[int]] = field(default_factory=dict)
     # Producer request id -> transfer uuid whose ahead-of-finish request-block
     # registration every pipeline stage retires.
     reqs_to_release: dict[ReqId, int] = field(default_factory=dict)

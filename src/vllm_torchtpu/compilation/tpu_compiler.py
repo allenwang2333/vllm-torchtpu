@@ -198,6 +198,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_RAIDEN_PREFIX_AWARE_LOAD",
     "TPU_RAIDEN_POOL_STAGING_LEASES",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
+    "TPU_RAIDEN_STAGE3_HEAD_UNIQUE",
     "TPU_RAIDEN_STAGE3_MAX_INFLIGHT_LOADS",
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S",
     "TPU_RAIDEN_STAGE3_STATUS_PROBE_S",
@@ -346,6 +347,8 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
     "vllm_torchtpu/omni/attention.py",
     "vllm_torchtpu/omni/rope.py",
+    # Runs eagerly in the KV connector, never inside a compiled graph.
+    "vllm_torchtpu/distributed/kv_transfer/raiden/gather_kernels.py",
 )
 
 

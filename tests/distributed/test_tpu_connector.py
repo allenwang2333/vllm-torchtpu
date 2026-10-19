@@ -1345,6 +1345,8 @@ class TestTPURaidenConnectorScheduler:
                 "src_engine_id": "producer-engine-9",
                 "src_data_replica_idx": 0,
                 "src_parallelism": 8,
+                "src_pcp_size": 8,
+                "src_tp_size": 1,
                 "dst_tp_size": 1,
                 "dst_dcp_size": 1,
             }
@@ -1702,6 +1704,140 @@ class TestTPURaidenConnectorScheduler:
             ),
         ):
             yield
+
+    # ---- Stage-3 head-unique transfer ----------------------------------
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _stage3_head_unique(dst_shards: int = 4):
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.dist_utils.get_raiden_inline_load", return_value=False),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_STAGE3_HEAD_UNIQUE", True, create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_DST_SHARDS", dst_shards, create=True),
+        ):
+            yield
+
+    def _head_unique_load_request(self, req_id: str, **params):
+        req = self._stage3_load_request(req_id)
+        req.kv_transfer_params.update(
+            {"src_pcp_size": 1, "src_tp_size": 4, "dst_tp_size": 4}
+        )
+        req.kv_transfer_params.update(params)
+        return req
+
+    def test_stage3_head_unique_group_from_the_decode_layout(self):
+        # The fixture's model has 2 KV heads: TP4 holds each on 2 ranks.
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+        assert consumer._stage3_head_unique_group_size == 2
+        consumer = _make_raiden_scheduler(is_producer=False, block_size=1024, tp_size=4)
+        assert consumer._stage3_head_unique_group_size == 1
+
+    def test_stage3_head_unique_refuses_dcp_at_startup(self):
+        with self._stage3_head_unique():
+            scheduler = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            scheduler.vllm_config.parallel_config.decode_context_parallel_size = 2
+            with pytest.raises(ValueError, match="decode_context_parallel_size=1"):
+                scheduler._stage3_head_unique_group()
+
+    def test_stage3_head_unique_marks_loads_and_queues_the_gather(self):
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            long_req = self._head_unique_load_request("load-long")
+            short_req = self._head_unique_load_request("load-short", num_tokens=1000)
+            matched, _ = consumer.get_num_new_matched_tokens(long_req, 0)
+            consumer.update_state_after_alloc(long_req, self._stage3_blocks(), matched)
+            matched, _ = consumer.get_num_new_matched_tokens(short_req, 0)
+            consumer.update_state_after_alloc(
+                short_req, self._stage3_blocks(first=400, count=1), matched
+            )
+        assert consumer.reqs_to_load["load-long"].dst_replica_group_size == 2
+        # One page cannot give every replica a page: replicated.
+        assert consumer.reqs_to_load["load-short"].dst_replica_group_size == 1
+        assert set(consumer._stage3_gather_blocks) == {"load-long"}
+
+        long_req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        output = SimpleNamespace(
+            finished_sending=set(),
+            finished_recving={"load-long", "load-short"},
+            failed_recving=set(),
+        )
+        consumer.update_connector_output(output)
+        assert consumer._stage3_pending_gathers == {
+            "load-long": list(range(200, 264))
+        }
+        assert consumer._stage3_gather_blocks == {}
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
+            meta = consumer.build_connector_meta(None)
+        assert meta.reqs_to_gather == {"load-long": list(range(200, 264))}
+        assert consumer._stage3_pending_gathers == {}
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
+            assert consumer.build_connector_meta(None).reqs_to_gather == {}
+
+    @pytest.mark.parametrize("outcome", ["failed", "aborted"])
+    def test_stage3_head_unique_skips_failed_and_aborted_loads(self, outcome):
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            req = self._head_unique_load_request("load-x")
+            matched, _ = consumer.get_num_new_matched_tokens(req, 0)
+            consumer.update_state_after_alloc(req, self._stage3_blocks(), matched)
+        if outcome == "failed":
+            req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+            failed = {"load-x"}
+        else:
+            req.status = RequestStatus.FINISHED_ABORTED
+            failed = set()
+        consumer.update_connector_output(
+            SimpleNamespace(
+                finished_sending=set(),
+                finished_recving={"load-x"},
+                failed_recving=failed,
+            )
+        )
+        assert consumer._stage3_pending_gathers == {}
+        assert consumer._stage3_gather_blocks == {}
+
+    def test_stage3_head_unique_request_finished_drops_the_gather(self):
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            req = self._head_unique_load_request("load-f")
+            matched, _ = consumer.get_num_new_matched_tokens(req, 0)
+            consumer.update_state_after_alloc(req, self._stage3_blocks(), matched)
+            req.status = RequestStatus.FINISHED_ABORTED
+            consumer.request_finished(req, list(range(200, 264)))
+        assert consumer._stage3_gather_blocks == {}
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"src_pcp_size": 2, "src_tp_size": 4},
+            {"src_pcp_size": 1, "src_tp_size": 8},
+            {"src_pcp_size": None, "src_tp_size": None},
+        ],
+    )
+    def test_stage3_head_unique_refuses_a_mismatched_producer(self, params):
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            req = self._head_unique_load_request("load-p", **params)
+            if params["src_pcp_size"] is None:
+                del req.kv_transfer_params["src_pcp_size"]
+                del req.kv_transfer_params["src_tp_size"]
+            matched, _ = consumer.get_num_new_matched_tokens(req, 0)
+            with pytest.raises(ValueError, match="PCP1 x TP producer"):
+                consumer.update_state_after_alloc(req, self._stage3_blocks(), matched)
 
     def test_stage3_inflight_load_cap_skips_without_allocating(self):
         consumer = _make_raiden_scheduler(is_producer=False, block_size=1024)
@@ -5160,6 +5296,75 @@ class TestTPURaidenConnectorWorker:
             )
             fields = worker._raiden_work_unit_fields(0)
             assert fields["job_replica_id"] == "decode-engine"
+
+    @pytest.mark.parametrize("group_size", [1, 2])
+    def test_leader_names_the_replica_group_only_for_head_unique_loads(
+        self, group_size
+    ):
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=4, is_producer=False, dp_size=1
+        )
+        worker._raiden_work_unit = MagicMock()
+        worker._stage3_head_unique_group_size = 2
+        worker._stage3_source_work_units = MagicMock(return_value=["src"] * 4)
+        worker._new_raiden_controller_facade = MagicMock(return_value=MagicMock())
+        worker._raiden_hbm_memory_type = MagicMock(return_value="HBM")
+        worker._raiden_manifest = SimpleNamespace(
+            tag_counts=lambda: {"fa": 15},
+            pools_of_class=lambda tag: [SimpleNamespace(tag="fa")],
+        )
+        start = MagicMock(return_value=True)
+        worker._start_stage3_transfer_with_d5_retry = start
+        meta = self._make_stage3_load_meta("dst-hu", "src-hu", 77, [7, 8])
+        req_meta = meta.reqs_to_load["dst-hu"]
+        req_meta.dst_replica_group_size = group_size
+        with patch(f"{_MOD}._use_per_layer_pool_tags", return_value=False):
+            outcome = worker._submit_stage3_load_as_leader(
+                req_meta=req_meta,
+                source_req_id="src-hu",
+                destination_req_id="dst-hu",
+                uuid=77,
+                num_tokens=2048,
+                local_blocks=[7, 8],
+                dst_controller_address="decode:28000",
+                dst_units=["d0", "d1", "d2", "d3"],
+            )
+        assert outcome[0] == "accepted"
+        kwargs = start.call_args.kwargs
+        if group_size > 1:
+            assert kwargs["dst_replica_group_size"] == 2
+        else:
+            assert "dst_replica_group_size" not in kwargs
+
+    def test_leader_refuses_a_foreign_replica_group_size(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, is_producer=False)
+        worker._stage3_head_unique_group_size = 2
+        meta = self._make_stage3_load_meta("dst-hu2", "src-hu2", 78, [7, 8])
+        req_meta = meta.reqs_to_load["dst-hu2"]
+        req_meta.dst_replica_group_size = 4
+        with pytest.raises(RuntimeError, match="differs from this worker's"):
+            worker._stage3_head_unique_kwargs(req_meta)
+
+    def test_landed_pages_are_gathered_before_new_loads_are_submitted(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, is_producer=False)
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        calls = []
+        worker._stage3_gather_landed_pages = MagicMock(
+            side_effect=lambda reqs: calls.append(("gather", dict(reqs)))
+        )
+        worker._submit_stage3_loads = MagicMock(
+            side_effect=lambda *a, **k: calls.append(("submit",))
+        )
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_gather["landed"] = [5, 6, 7]
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
+            worker.process_send_load(meta)
+        assert calls == [("gather", {"landed": [5, 6, 7]}), ("submit",)]
+
+    def test_gather_refuses_a_worker_without_the_head_unique_transfer(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, is_producer=False)
+        with pytest.raises(RuntimeError, match="without the head-unique transfer"):
+            worker._stage3_gather_landed_pages({"r": [1, 2]})
 
     @pytest.mark.parametrize("tp_size", [2, 8, 32])
     @pytest.mark.parametrize("tp_rank", [0, 1])

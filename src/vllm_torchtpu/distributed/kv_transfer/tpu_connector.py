@@ -71,6 +71,14 @@ if TYPE_CHECKING:
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer.raiden import gather_kernels
+from vllm_torchtpu.distributed.kv_transfer.raiden.head_unique import (
+    gather_bucket,
+    gather_passes,
+    gather_plan,
+    head_unique_group_size,
+    load_group_size,
+)
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta,
     ReqId,
@@ -433,6 +441,9 @@ class _Stage3LoadMeta:
     report_completion: bool = False
     # The scheduler rejected this load after allocation.
     fail_only: bool = False
+    # Head-unique transfer: the replica group size applied to this load's FA
+    # pages (1 = every destination rank lands every page).
+    dst_replica_group_size: int = 1
 
 
 @dataclass
@@ -730,6 +741,17 @@ def _is_kimi(vllm_config: VllmConfig) -> bool:
         "KimiK3ForConditionalGeneration",
         "KimiLinearForCausalLM",
     )
+
+
+def _model_config_int(vllm_config: VllmConfig, name: str, default: int) -> int:
+    """An integer of the model's text config, or ``default`` when it is unset."""
+    model_config = vllm_config.model_config
+    hf_config = model_config.hf_config
+    if hf_config is None:
+        hf_config = model_config
+    text_config = getattr(hf_config, "text_config", hf_config)
+    value = getattr(text_config, name, None)
+    return int(default if value is None else value)
 
 
 def _uses_tp_stage3_source(vllm_config: VllmConfig) -> bool:
@@ -1547,6 +1569,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # moved its request to WAITING_FOR_REMOTE_KVS and leaves when the
         # status moves on (landed, failed, finished) or the request finishes.
         self._stage3_loads_in_flight: dict[str, _Stage3InFlightLoad] = {}
+        self._stage3_head_unique_group_size = self._stage3_head_unique_group()
+        # Head-unique loads holding allocated blocks: request id -> (request,
+        # destination block ids). A landed one moves to the pending gathers,
+        # which the next connector metadata hands to the workers.
+        self._stage3_gather_blocks: dict[str, tuple["Request", list[int]]] = {}
+        self._stage3_pending_gathers: dict[str, list[int]] = {}
         self._stage3_load_cap_engaged = False
         # Pipeline producer register-ahead state: the scheduled requests and
         # their per-group block tables as accumulated from scheduler output,
@@ -1778,6 +1806,46 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 return count, False
             return count, True
         return 0, False
+
+    def _stage3_head_unique_group(self) -> int:
+        """The KV-head replica group size of this decode's head-unique transfer, or 1 when off."""
+        if self.is_producer or not tpu_envs.TPU_RAIDEN_STAGE3_HEAD_UNIQUE:
+            return 1
+        if not _use_raiden_stage3_transport():
+            raise ValueError(
+                "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 requires the raiden Stage-3 "
+                "transport (TPU_KV_RESHARD_TRANSPORT=raiden)"
+            )
+        parallel_config = self.vllm_config.parallel_config
+        return head_unique_group_size(
+            tp_size=int(parallel_config.tensor_parallel_size or 1),
+            total_num_kv_heads=_model_config_int(
+                self.vllm_config, "num_key_value_heads", 0
+            ),
+            dcp_size=int(parallel_config.decode_context_parallel_size or 1),
+            dst_shards=_raiden_dst_shards(),
+        )
+
+    def _stage3_check_head_unique_source(self, params: dict[str, Any]) -> None:
+        """Refuses a producer whose ranks do not mirror this decode's head groups.
+
+        The owner rule assumes source rank r holds every page of the head
+        decode rank r holds, which is a PCP1 x TP producer of the decode's
+        TP size. A producer that does not publish its layout is refused as
+        well, since the rule cannot be checked against it.
+        """
+        tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size or 1)
+        src_pcp_size = params.get("src_pcp_size")
+        src_tp_size = params.get("src_tp_size")
+        if src_pcp_size == 1 and src_tp_size == tp_size:
+            return
+        raise ValueError(
+            "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 requires a PCP1 x TP producer of "
+            f"the decode's TP size (tp_size={tp_size}); the producer of "
+            f"req_id={params.get('req_id')} published "
+            f"src_pcp_size={src_pcp_size!r}, src_tp_size={src_tp_size!r}, "
+            f"src_parallelism={params.get('src_parallelism')!r}"
+        )
 
     def _stage3_loads_in_flight_count(self) -> int:
         """Loads that hold allocated blocks on this engine and have not landed.
@@ -2040,6 +2108,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             mamba_state_block_ids = _select_committed_mamba_blocks(
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks
             )
+        replica_group_size = 1
+        if self._stage3_head_unique_group_size > 1:
+            self._stage3_check_head_unique_source(params)
+            replica_group_size = load_group_size(
+                len(local_block_ids), self._stage3_head_unique_group_size
+            )
         self.reqs_to_load[request.request_id] = _Stage3LoadMeta(
             uuid=uuid,
             source_req_id=source_req_id,
@@ -2053,8 +2127,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             mamba_state_block_ids=mamba_state_block_ids,
             group_block_ids=group_block_ids,
             skip_tokens=skip_tokens,
+            dst_replica_group_size=replica_group_size,
         )
         self._stage3_loads_in_flight[request.request_id] = _Stage3InFlightLoad(request)
+        if replica_group_size > 1:
+            self._stage3_gather_blocks[request.request_id] = (
+                request,
+                list(local_block_ids),
+            )
         params["_remote_kv_processed"] = True
         logger.info(
             "TPURaidenConnectorScheduler Stage-3 load req_id=%s "
@@ -2196,6 +2276,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         meta = super().build_connector_meta(scheduler_output)
         if self.reqs_to_release:
             meta.reqs_to_release, self.reqs_to_release = self.reqs_to_release, {}
+        if self._stage3_pending_gathers:
+            meta.reqs_to_gather, self._stage3_pending_gathers = (
+                self._stage3_pending_gathers,
+                {},
+            )
         return meta
 
     def _stage3_register_ahead(self, scheduler_output: SchedulerOutput) -> None:
@@ -2305,6 +2390,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     ) -> tuple[bool, dict[str, Any] | None]:
         if not self.is_producer:
             self._stage3_loads_in_flight.pop(request.request_id, None)
+            self._stage3_gather_blocks.pop(request.request_id, None)
+            self._stage3_pending_gathers.pop(request.request_id, None)
             params = request.kv_transfer_params
             if isinstance(params, dict) and params.get(_KV_PARAMS_ADMITTED):
                 source_req_id = params["req_id"]
@@ -2611,6 +2698,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_engine_id": src_engine_id,
             "src_data_replica_idx": src_data_replica_idx,
             "src_parallelism": src_parallelism,
+            "src_pcp_size": pcp_size,
+            "src_tp_size": int(parallel_config.tensor_parallel_size or 1),
             "dst_tp_size": _raiden_dst_shards(),
             "dst_dcp_size": _raiden_dst_dcp_size(self.vllm_config),
         }
@@ -2638,6 +2727,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
             self._stage3_finished_sends.pop(req_id, None)
+        if not self._stage3_gather_blocks:
+            return
+        # A head-unique load that landed on every rank is gathered in the
+        # step that first reads it, which the scheduler builds next (the
+        # request is promoted from WAITING_FOR_REMOTE_KVS in that pass). A
+        # failed load is recomputed instead, and an aborted request's blocks
+        # are freed, so neither is gathered.
+        failed = connector_output.failed_recving
+        for req_id in connector_output.finished_recving or ():
+            entry = self._stage3_gather_blocks.pop(req_id, None)
+            if entry is None or req_id in failed:
+                continue
+            request, block_ids = entry
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            self._stage3_pending_gathers[req_id] = block_ids
 
     def get_finished_count(self) -> int:
         if not _use_raiden_stage3_transport():
@@ -2657,6 +2762,19 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         return int(parallel_config.prefill_context_parallel_size or 1) * int(
             parallel_config.tensor_parallel_size or 1
         )
+
+
+_STAGE3_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _stage3_all_gather_rows(group: Any, buffer: torch.Tensor) -> torch.Tensor:
+    """All-gathers one send buffer over the KV-head group along its row axis.
+
+    fp8 rows travel as int8 so the collective sees a plain byte dtype.
+    """
+    if buffer.dtype in _STAGE3_FP8_DTYPES:
+        return group.all_gather(buffer.view(torch.int8), dim=0).view(buffer.dtype)
+    return group.all_gather(buffer, dim=0)
 
 
 class TPURaidenConnectorWorker:
@@ -2695,6 +2813,13 @@ class TPURaidenConnectorWorker:
         # In-engine store hosting: set only on the engine's rank-0 worker.
         self._reshard_store: Any | None = None
         self._raiden_work_unit: Any | None = None
+        # Head-unique transfer (consumer): the KV-head replica group size,
+        # the GroupCoordinator over this rank's head group, and per FA pool
+        # (storage index, first row, rows per block, kernel pages per block)
+        # in kernel-page rows of the storage.
+        self._stage3_head_unique_group_size = 1
+        self._stage3_kv_head_group: Any = None
+        self._stage3_head_unique_pools: list[tuple[int, int, int, int]] = []
         # Producer request registrations are retained until Raiden itself
         # reports done_sending. Consumer submissions are keyed by UUID so a
         # duplicate connector-metadata delivery cannot launch a second plan.
@@ -2897,14 +3022,213 @@ class TPURaidenConnectorWorker:
             )
         if qwen_admission or kimi_admission:
             self._admit_raiden_hybrid_kv_cache(runner)
-            return
-        if glm_admission:
+        elif glm_admission:
             self._admit_raiden_glm_kv_cache(runner)
-            return
-        if dsv4_admission:
+        elif dsv4_admission:
             self._admit_raiden_dsv4_kv_cache(runner)
+        else:
+            self._ensure_raiden_transfer_engine()
+        self._stage3_head_unique_setup()
+
+    def _stage3_head_unique_setup(self) -> None:
+        """Admits the head-unique transfer on this decode worker and builds its KV-head group.
+
+        Every TP worker reaches this at the same point of its startup, and
+        creating the group is collective, so the ranks of a head group meet
+        here before the first load.
+        """
+        self._stage3_head_unique_group_size = 1
+        if self.is_producer or not tpu_envs.TPU_RAIDEN_STAGE3_HEAD_UNIQUE:
             return
-        self._ensure_raiden_transfer_engine()
+        if not self._raiden_stage3_enabled():
+            raise ValueError(
+                "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 requires the raiden Stage-3 "
+                "transport (TPU_KV_RESHARD_TRANSPORT=raiden)"
+            )
+        if not (self._stage3_sharded_consumer() and _raiden_seq_on_lane_layout()):
+            raise ValueError(
+                "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 requires a head-sharded Qwen3.5 "
+                "decode (tp{N}dcp1_decode, every TP worker a destination unit of "
+                "one coordination) on the seq-on-lane FA layout "
+                "(VLLM_KV_CACHE_LAYOUT=HND)"
+            )
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+
+        # Absent on wheels older than the head-unique planner.
+        if not getattr(_reshard_client, "SUPPORTS_DST_REPLICA_GROUPS", False):
+            raise RuntimeError(
+                "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 needs a raiden wheel whose "
+                "reshard client accepts dst_replica_group_size"
+            )
+        parallel_config = self.vllm_config.parallel_config
+        total_kv_heads = self._model_config_int("num_key_value_heads", 0)
+        group_size = head_unique_group_size(
+            tp_size=int(self.tp_size),
+            total_num_kv_heads=total_kv_heads,
+            dcp_size=int(parallel_config.decode_context_parallel_size or 1),
+            dst_shards=_raiden_dst_shards(),
+        )
+        manifest = self._raiden_manifest
+        if manifest is None:
+            raise RuntimeError("head-unique transfer requires the admitted pool manifest")
+        from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (
+            sol_fa_geometry_from_manifest,
+        )
+
+        kernel_page_bytes = sol_fa_geometry_from_manifest(manifest).kernel_page_bytes
+        pools: list[tuple[int, int, int, int]] = []
+        for pool in manifest.pools_of_class("fa"):
+            storage = manifest.storages[pool.storage_index]
+            if (
+                pool.base_offset_bytes % kernel_page_bytes
+                or pool.block_stride_bytes % kernel_page_bytes
+                or int(storage.shape[0]) * kernel_page_bytes
+                != int(storage.numel()) * int(storage.element_size())
+            ):
+                raise RuntimeError(
+                    "head-unique gather needs FA pools whose storage rows are "
+                    f"kernel pages: {pool.layer_name} base={pool.base_offset_bytes} "
+                    f"stride={pool.block_stride_bytes} shape={tuple(storage.shape)} "
+                    f"kernel_page_bytes={kernel_page_bytes}"
+                )
+            pools.append(
+                (
+                    pool.storage_index,
+                    pool.base_offset_bytes // kernel_page_bytes,
+                    pool.block_stride_bytes // kernel_page_bytes,
+                    int(pool.regions[0].num_units),
+                )
+            )
+        if not pools:
+            raise RuntimeError("head-unique transfer requires FA pools in the manifest")
+        from vllm_torchtpu.distributed.kv_head_group import get_kv_head_group
+
+        group = get_kv_head_group(int(self.tp_size), total_kv_heads)
+        if group is None or int(group.world_size) != group_size:
+            raise RuntimeError(
+                "head-unique transfer could not build the KV-head group: "
+                f"got {None if group is None else int(group.world_size)} ranks, "
+                f"expected {group_size}"
+            )
+        self._stage3_head_unique_pools = pools
+        self._stage3_kv_head_group = group
+        self._stage3_head_unique_group_size = group_size
+        logger.info(
+            "Stage-3 head-unique transfer: replica group of %d ranks (rank %d of "
+            "its group), %d FA pools gathered per load",
+            group_size,
+            int(group.rank_in_group),
+            len(pools),
+        )
+
+    def _stage3_head_unique_kwargs(self, req_meta: _Stage3LoadMeta) -> dict[str, int]:
+        """The coordinate-transfer kwarg of a head-unique load; empty for a replicated one.
+
+        A replicated load leaves the kwarg out so its wire encoding is
+        unchanged.
+        """
+        replica_group_size = int(req_meta.dst_replica_group_size)
+        if replica_group_size <= 1:
+            return {}
+        if replica_group_size != self._stage3_head_unique_group_size:
+            raise RuntimeError(
+                f"Stage-3 load replica group size {replica_group_size} differs "
+                f"from this worker's {self._stage3_head_unique_group_size}"
+            )
+        return {"dst_replica_group_size": replica_group_size}
+
+    def _stage3_gather_landed_pages(self, reqs_to_gather: dict[str, list[int]]) -> None:
+        """Copies the other replicas' landed pages of each request into this rank's pools.
+
+        One FA pool at a time, one pass of at most the largest gather bucket
+        at a time: this rank's own pages are packed into a send buffer with
+        the row-copy kernel, the buffer is all-gathered over the KV-head
+        group, and the other replicas' rows are copied into the pool by the
+        runner's own in-place pool write (donate, then ``copy_`` the aliased
+        output back; ``gather_kernels.copy_rows_into``). The working set is
+        one send buffer and one gathered buffer (about 16 and 63 MB at the
+        largest bucket), freed before the next pool: a decode leg runs with
+        a few hundred MB of HBM free, and a rank blocked on an allocation
+        inside the collective would hang its whole head group.
+        """
+        group = self._stage3_kv_head_group
+        group_size = self._stage3_head_unique_group_size
+        if group is None or group_size <= 1:
+            raise RuntimeError(
+                "head-unique gather requested on a worker without the head-unique "
+                "transfer"
+            )
+        manifest = self._raiden_manifest
+        assert manifest is not None
+        replica = int(group.rank_in_group)
+        for req_id, block_ids in reqs_to_gather.items():
+            if load_group_size(len(block_ids), group_size) != group_size:
+                raise RuntimeError(
+                    f"head-unique gather for req_id={req_id} with {len(block_ids)} "
+                    f"pages, fewer than the group size {group_size}"
+                )
+            start = time.perf_counter()
+            passes = gather_passes(list(block_ids), group_size)
+            buckets = []
+            for pass_blocks in passes:
+                bucket = gather_bucket(len(pass_blocks), group_size)
+                buckets.append(bucket)
+                plans: dict[tuple[int, int, int], Any] = {}
+                for storage_index, base_row, row_stride, kps in (
+                    self._stage3_head_unique_pools
+                ):
+                    key = (base_row, row_stride, kps)
+                    plan = plans.get(key)
+                    if plan is None:
+                        plan = gather_plan(
+                            block_ids=pass_blocks,
+                            group_size=group_size,
+                            replica=replica,
+                            kernel_pages_per_block=kps,
+                            block_row_stride=row_stride,
+                            base_row=base_row,
+                            buffer_blocks=bucket,
+                        )
+                        plans[key] = plan
+                    storage = manifest.storages[storage_index]
+                    device = storage.device
+                    buffer = gather_kernels.copy_rows(
+                        storage,
+                        torch.empty(
+                            (plan.buffer_rows,) + tuple(storage.shape[1:]),
+                            dtype=storage.dtype,
+                            device=device,
+                        ),
+                        gather_kernels.chunk_args(
+                            plan.pack_src_rows, plan.pack_dst_rows, device
+                        ),
+                    )
+                    gathered = _stage3_all_gather_rows(group, buffer)
+                    del buffer
+                    gather_kernels.copy_rows_into(
+                        gathered,
+                        storage,
+                        gather_kernels.chunk_args(
+                            plan.unpack_src_rows, plan.unpack_dst_rows, device
+                        ),
+                    )
+                    del gathered
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_head_unique_gather",
+                        "destination_req_id": req_id,
+                        "destination_pages": len(block_ids),
+                        "replica_group_size": group_size,
+                        "fa_pools": len(self._stage3_head_unique_pools),
+                        "passes": len(passes),
+                        "buckets": buckets,
+                        "gather_ms": (time.perf_counter() - start) * 1000,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
     @staticmethod
     def _raiden_stage3_enabled() -> bool:
@@ -4018,13 +4342,7 @@ class TPURaidenConnectorWorker:
         return f"dp{dp_size}_decode"
 
     def _model_config_int(self, name: str, default: int) -> int:
-        model_config = self.vllm_config.model_config
-        hf_config = model_config.hf_config
-        if hf_config is None:
-            hf_config = model_config
-        text_config = getattr(hf_config, "text_config", hf_config)
-        value = getattr(text_config, name, None)
-        return int(default if value is None else value)
+        return _model_config_int(self.vllm_config, name, default)
 
     def _local_head_count(self, total_heads: int) -> int:
         total_heads = int(total_heads)
@@ -4137,6 +4455,8 @@ class TPURaidenConnectorWorker:
             return
 
         if self._raiden_stage3_enabled():
+            if metadata.reqs_to_gather:
+                self._stage3_gather_landed_pages(metadata.reqs_to_gather)
             # Inline mode waits for the loads below, so the coordination RPCs
             # must have run before the wait loop starts polling.
             self._submit_stage3_loads(metadata, engine, synchronous=wait_for_completion)
@@ -5827,6 +6147,7 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            clip_kwargs.update(self._stage3_head_unique_kwargs(req_meta))
             dst_mem_type = self._raiden_hbm_memory_type()
         except Exception as exc:  # pylint: disable=broad-except
             # Local staging failed before any controller contact, so no
@@ -6393,6 +6714,7 @@ class TPURaidenConnectorWorker:
                 clip_kwargs["dst_skip_bytes"] = [fa_skip_bytes] * fa_tag_count + [0] * (
                     len(transfer_tags) - fa_tag_count
                 )
+            clip_kwargs.update(self._stage3_head_unique_kwargs(req_meta))
             start_submit = time.perf_counter()
             controller_contacted = True
             accepted = self._start_stage3_transfer_with_d5_retry(

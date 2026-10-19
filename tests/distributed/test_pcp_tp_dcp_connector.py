@@ -246,6 +246,7 @@ def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(
         src_controller_address="localhost:27000",
         skip_tokens=384 * dcp - int(misaligned),
         mamba_state_block_ids=None,
+        dst_replica_group_size=1,
     )
     args = dict(
         req_meta=req,
