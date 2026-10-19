@@ -41,7 +41,7 @@ def test_reuse_only_while_values_repeat(monkeypatch):
     a = _call(r)
     b = _call(r)
     assert all(x is y for x, y in zip(a, b))  # steady: no new upload
-    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")  # on by default
     fresh = _call(r)
     for x, y in zip(a, fresh):
         assert x is not y and x.dtype == y.dtype and torch.equal(x, y)
@@ -52,7 +52,7 @@ def test_reuse_only_while_values_repeat(monkeypatch):
     c = _call(r)
     assert c[0] is not a[0] and float(c[0][1, 0]) == 0.25
     assert c[1] is a[1] and c[2] is a[2]  # unchanged tensors still reused
-    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")
     for x, y in zip(c, _call(r)):
         assert torch.equal(x, y)
 
@@ -75,7 +75,7 @@ def test_bfloat16_logits(monkeypatch):
     r.input_batch.temperature_cpu_tensor[0] = 0.71  # differs in bf16 too
     c = _call(r, dtype=torch.bfloat16)
     assert c[0] is not a[0]
-    monkeypatch.delenv("TPU_H2D_REUSE_STEADY")
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")
     for x, y in zip(c, _call(r, dtype=torch.bfloat16)):
         assert x.dtype == y.dtype and torch.equal(x, y)
 

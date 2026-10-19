@@ -121,13 +121,14 @@ def test_negative_control_without_install_reads_clobbered_rows():
     assert not torch.equal(mtp.seen[1], saved)
 
 
-def test_flag_defaults_off(monkeypatch):
+def test_flag_defaults_on(monkeypatch):
+    """On by default since trial 6 (acts only with VLLM_TPU_FUSED_DRAFT_LOOP)."""
     monkeypatch.delenv("VLLM_TPU_MTP_FUSED_INDEXSHARE", raising=False)
     import vllm_torchtpu.envs as envs
 
-    assert envs.VLLM_TPU_MTP_FUSED_INDEXSHARE is False
-    monkeypatch.setenv("VLLM_TPU_MTP_FUSED_INDEXSHARE", "1")
     assert envs.VLLM_TPU_MTP_FUSED_INDEXSHARE is True
+    monkeypatch.setenv("VLLM_TPU_MTP_FUSED_INDEXSHARE", "0")
+    assert envs.VLLM_TPU_MTP_FUSED_INDEXSHARE is False
 
 
 # --- Eagle3Proposer side: rows restored eagerly before a read-only program ---
@@ -161,6 +162,9 @@ def _proposer(monkeypatch, table, program, warm=True):
 
     from vllm_torchtpu.spec_decode import eagle3
 
+    # The eager slice-assignment restore (TPU_MTP_TOPK_INPLACE, on by default,
+    # restores in place with a Pallas index copy on the runner's device).
+    monkeypatch.setenv("TPU_MTP_TOPK_INPLACE", "0")
     for name in (
         "set_forward_context",
         "set_vllm_model_wrapper_context",

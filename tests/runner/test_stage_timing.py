@@ -68,7 +68,7 @@ def test_enabled_still_records(fake_events):
 @pytest.mark.parametrize(
     "flag, kv_transfer_config, expected",
     [
-        (None, None, True),  # default: unchanged behaviour
+        (None, None, False),  # default on (trial 6): nothing consumes them
         ("0", None, True),
         ("1", None, False),  # nothing consumes the samples
         ("1", object(), True),  # a KV connector may consume them

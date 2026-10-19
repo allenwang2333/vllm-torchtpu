@@ -267,7 +267,7 @@ def test_skip_unchanged_keeps_every_mask_and_skips_repeats(monkeypatch):
 
 
 def test_skip_unchanged_off_uploads_every_time(monkeypatch):
-    monkeypatch.delenv("TPU_TOKEN_PADDING_SKIP_UNCHANGED", raising=False)
+    monkeypatch.setenv("TPU_TOKEN_PADDING_SKIP_UNCHANGED", "0")  # on by default
     counting = _CountingMask(8)
     state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
     counting.install(state)
