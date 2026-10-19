@@ -395,6 +395,12 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
     rhs_quant_dtype = jnp.float4_e2m1fn
 
+    def __init__(self, moe: FusedMoEConfig, *, fused_ep: bool | None = None):
+        super().__init__(moe)
+        # None retains other models' legacy admission. DSV41 supplies a
+        # resolved decision before any weights are prepared.
+        self.fused_ep = fused_ep
+
     @property
     def supports_internal_mk(self) -> bool:
         # An armed layer owns its own dispatch and combine, so vLLM must not
@@ -420,16 +426,24 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         Shapes are read off those tensors rather than recomputed so the two
         cannot drift apart. Returns the op, or None to leave this layer on GMM.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import prebuild_fused_moe_ep
+        from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+            FusedEPPolicy,
+            prebuild_fused_moe_ep,
+        )
 
-        if not (
-            envs.USE_MOE_FUSED_EP_KERNEL
-            and envs.MOE_FUSED_EP_ENABLE_W4A8
-            and layer.moe_config.moe_parallel_config.use_ep
-        ):
+        enabled = self.fused_ep
+        if enabled is None:
+            enabled = envs.USE_MOE_FUSED_EP_KERNEL and envs.MOE_FUSED_EP_ENABLE_W4A8
+        if not enabled:
+            return None
+        if not layer.moe_config.moe_parallel_config.use_ep:
+            if self.fused_ep:
+                raise ValueError("Explicit fused EP requires expert parallelism")
             return None
         block = REQUANTIZED_BLOCK_SIZE
         if min(block, orig_intermediate_size) != block:
+            if self.fused_ep:
+                raise ValueError("fused_ep_w4a8 requires matching w1/w2 block sizes")
             # w2 would be quantized at a smaller block than w13, and the op
             # closes over one `rhs_qb` that both matmuls read.
             logger.info_once(
@@ -465,7 +479,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 (experts, inter // block, 1, hidden), dtype=torch.float32, device="meta"
             ),
         )
-        return prebuild_fused_moe_ep(
+        op = prebuild_fused_moe_ep(
             layer,
             topk=layer.moe_config.experts_per_token,
             renormalize=layer.renormalize,
@@ -474,7 +488,14 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             rhs_qb=block,
             weights=weights,
             supplies_hash_ids=True,
+            policy=FusedEPPolicy.REQUIRED if self.fused_ep else FusedEPPolicy.LEGACY,
         )
+        if self.fused_ep and op is None:
+            raise ValueError(
+                "Explicit fused_ep_w4a8 is unsupported for this layer; "
+                "see the admission reason above, or select moe=gmm"
+            )
+        return op
 
     def _resolve_tpu_activation(self, layer) -> str:
         # This variant runs the clamped kernel, so the string is not
@@ -714,18 +735,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         synchronize_tensors(to_sync)
 
         logger.info(
-            "DeepSeek-V4 MXFP4 weights processed and stored as native FP4 "
-            "for GMM kernel."
+            "DeepSeek-V4 MXFP4 weights prepared for %s.",
+            "fused EP W4A8" if op is not None else "GMM",
         )
         if layer.moe_config.moe_parallel_config.use_ep:
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=device)
-        prebuild_fused_moe_kernel(
-            topk=layer.moe_config.experts_per_token,
-            activation=activation_str,
-            use_ep=layer.moe_config.moe_parallel_config.use_ep,
-            rhs_quant_dtype=jnp.float4_e2m1fn,
-        )
+        if op is None:
+            prebuild_fused_moe_kernel(
+                topk=layer.moe_config.experts_per_token,
+                activation=activation_str,
+                use_ep=layer.moe_config.moe_parallel_config.use_ep,
+                rhs_quant_dtype=jnp.float4_e2m1fn,
+            )
 
         setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
@@ -749,20 +771,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # The kernel's row-padded flat scales avoid per-step relayouts.
-            # Clone alone retains higher-rank storage in the pinned runtime;
-            # materialize the static scale buffers before registration.
-            row_padded = envs.TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED
-            if row_padded:
-                w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
-                w2_scale = _row_padded_flat_block_scale(layer.w2_weight_scale)
-            else:
-                w13_scale = materialize_static_scale(
-                    layer.w13_weight_scale.squeeze(2).clone()
-                )
-                w2_scale = materialize_static_scale(
-                    layer.w2_weight_scale.squeeze(2).clone()
-                )
+            # Row-padded scales avoid per-step relayouts; the helper also
+            # materializes their storage under the pinned runtime.
+            w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
+            w2_scale = _row_padded_flat_block_scale(layer.w2_weight_scale)
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
                 w13_scale,
@@ -774,9 +786,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 persistent=False,
             )
             logger.info_once(
-                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d%s",
+                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d, "
+                "row-padded flat scales",
                 REQUANTIZED_BLOCK_SIZE,
-                ", row-padded flat scales" if row_padded else "",
             )
 
     def _forward_monolithic_tpu(
