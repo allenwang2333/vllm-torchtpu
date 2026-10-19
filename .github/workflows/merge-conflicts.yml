@@ -1,0 +1,188 @@
+name: Merge Conflicts
+
+# GitHub shows a merge conflict on the PR page but tells nobody, so an author
+# finds out only when someone tries to merge. After every push to main this
+# workflow asks GitHub which open PRs into main no longer merge cleanly and
+# comments once on each one that is not a draft and has a commit from the last
+# 30 days. A push to a PR checks that PR again and deletes the comment once it
+# merges cleanly, so a rebase clears it without waiting for the next merge to
+# main.
+#
+# A comment, not a label: Buildkite builds a PR again whenever its labels
+# change, so a label would start a TPU build on every PR it touches.
+#
+# pull_request_target, not pull_request: deleting the comment needs a write
+# token, also on fork PRs. Like ready-label.yml it runs this file from main,
+# never checks out the PR, and reads event fields only through env.
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    branches: [main]
+    types: [synchronize]
+  workflow_dispatch:
+
+permissions:
+  # Post and delete the comment.
+  pull-requests: write
+
+concurrency:
+  group: merge-conflicts-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  merge-conflicts:
+    name: Comment on PRs that conflict with main
+    if: github.repository == 'vllm-project/vllm-torchtpu'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check open PRs into main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Set on a push to a PR: check only that PR, and only delete.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+          import subprocess
+          import time
+          from datetime import UTC, datetime, timedelta
+
+          REPO = os.environ["REPO"]
+          OWNER, NAME = REPO.split("/")
+          PR_NUMBER = os.environ.get("PR_NUMBER", "")
+          # DRY_RUN=1 prints what would change; for a trial run outside Actions.
+          DRY_RUN = os.environ.get("DRY_RUN") == "1"
+          MARKER = "<!-- merge-conflicts -->"
+          BOT = "github-actions"
+          # PRs with no commit since then are left alone until someone pushes.
+          ACTIVE_SINCE = datetime.now(UTC) - timedelta(days=30)
+          MESSAGE = (
+              f"{MARKER}\n"
+              "This PR has merge conflicts with `main`, so it cannot be merged. "
+              "Rebase it onto the latest `main` and resolve the conflicts. "
+              "This comment is deleted once the PR merges cleanly again."
+          )
+          PR_FRAGMENT = """
+            fragment pr on PullRequest {
+              number
+              isDraft
+              baseRefName
+              mergeable
+              commits(last: 1) { nodes { commit { committedDate } } }
+              comments(last: 100) { nodes { id author { login } body } }
+            }
+          """
+
+
+          def gh(*args):
+              out = subprocess.run(
+                  ["gh", *args], check=True, capture_output=True, text=True
+              ).stdout
+              return json.loads(out) if out.strip() else None
+
+
+          def graphql(query, **variables):
+              args = ["api", "graphql", "-f", f"query={query}"]
+              for key, value in variables.items():
+                  # -F types numbers; -f passes strings such as cursors as-is.
+                  args += ["-F" if isinstance(value, int) else "-f", f"{key}={value}"]
+              return gh(*args)["data"]
+
+
+          def open_prs():
+              query = (
+                  """
+                query($owner: String!, $name: String!, $cursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequests(states: OPEN, baseRefName: "main", first: 50,
+                                 after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes { ...pr }
+                    }
+                  }
+                }"""
+                  + PR_FRAGMENT
+              )
+              prs, cursor = [], {}
+              while True:
+                  page = graphql(query, owner=OWNER, name=NAME, **cursor)
+                  page = page["repository"]["pullRequests"]
+                  prs += page["nodes"]
+                  if not page["pageInfo"]["hasNextPage"]:
+                      return prs
+                  cursor = {"cursor": page["pageInfo"]["endCursor"]}
+
+
+          def one_pr(number):
+              query = (
+                  """
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) { ...pr }
+                  }
+                }"""
+                  + PR_FRAGMENT
+              )
+              return graphql(query, owner=OWNER, name=NAME, number=number)["repository"][
+                  "pullRequest"
+              ]
+
+
+          prs = [one_pr(int(PR_NUMBER))] if PR_NUMBER else open_prs()
+          # GitHub works out mergeability in the background after a push, and
+          # reports UNKNOWN until it has.
+          for _ in range(6):
+              unknown = [i for i, pr in enumerate(prs) if pr["mergeable"] == "UNKNOWN"]
+              if not unknown:
+                  break
+              time.sleep(20)
+              for i in unknown:
+                  prs[i] = one_pr(prs[i]["number"])
+
+          posted, deleted = [], []
+          for pr in prs:
+              if pr["baseRefName"] != "main":
+                  continue
+              ours = [
+                  c
+                  for c in pr["comments"]["nodes"]
+                  if (c["author"] or {}).get("login") == BOT and MARKER in c["body"]
+              ]
+              last_commit = pr["commits"]["nodes"][0]["commit"]["committedDate"]
+              active = datetime.fromisoformat(last_commit) >= ACTIVE_SINCE
+              if (
+                  pr["mergeable"] == "CONFLICTING"
+                  and not ours
+                  and not pr["isDraft"]
+                  and active
+                  and not PR_NUMBER
+              ):
+                  posted.append(pr["number"])
+                  if not DRY_RUN:
+                      gh(
+                          "api",
+                          f"repos/{REPO}/issues/{pr['number']}/comments",
+                          "-f",
+                          f"body={MESSAGE}",
+                      )
+              elif pr["mergeable"] == "MERGEABLE" and ours:
+                  deleted.append(pr["number"])
+                  for comment in ours:
+                      if not DRY_RUN:
+                          graphql(
+                              "mutation($id: ID!) { deleteIssueComment(input: {id: $id}) "
+                              "{ clientMutationId } }",
+                              id=comment["id"],
+                          )
+
+          still_unknown = [pr["number"] for pr in prs if pr["mergeable"] == "UNKNOWN"]
+          print(f"Checked {len(prs)} PRs into main.")
+          print(f"Commented on {len(posted)}: {posted}")
+          print(f"Deleted the comment on {len(deleted)}: {deleted}")
+          if still_unknown:
+              print(f"GitHub had no answer yet for {still_unknown}; the next run checks them.")
+          EOF
