@@ -163,10 +163,11 @@ _BUDGETS = {
 
 # A 16-frame 336x336 video is 8*12*12 = 1152 vision tokens + ~16 prompt tokens
 # + 48 output tokens (~1216 total), and the 2-video batch (16 + 8 frames) is
-# 1728 vision tokens + ~32 prompt tokens (~1760 prefill tokens). Capping both
-# max_model_len and max_num_batched_tokens at 2048 avoids compiling the 4096
-# and 8192 token buckets that no step in this file reaches.
-MAX_MODEL_LEN = 2048
+# 1728 vision tokens + ~32 prompt tokens (~1760 prefill tokens). Capping
+# max_num_batched_tokens at 2048 avoids compiling the 4096 and 8192 token
+# buckets that no step in this file reaches, while keeping max_model_len=8192
+# preserves the Pallas RPA page size and tuned block sizes.
+MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 2048
 
 
@@ -286,98 +287,6 @@ def _run_with_chunk_budget(
         sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
     )
     return _extract_generation_results(outputs, video_pad_id)
-
-
-def _run_video_generation_worker(
-    prompts: list[str],
-    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
-    chunk_patch_size: int,
-    max_num_seqs: int,
-    cudagraph_mm_encoder: bool,
-    queue: multiprocessing.Queue,
-) -> None:
-    """Instantiates LLM and runs greedy video generation in a child process.
-
-    Args:
-        prompts: Text prompts for generation.
-        videos: Video arrays corresponding to each prompt.
-        chunk_patch_size: Maximum patch size per chunk, or 0 to disable.
-        max_num_seqs: Maximum number of sequences to process in parallel.
-        cudagraph_mm_encoder: Whether to enable `MMEncoderManager`.
-        queue: Multiprocessing queue to send back results or errors.
-    """
-    try:
-        llm = _build_llm(
-            max_num_seqs=max_num_seqs,
-            cudagraph_mm_encoder=cudagraph_mm_encoder,
-            initial_chunk_patch_size=chunk_patch_size,
-        )
-        video_pad_id = llm.get_tokenizer().convert_tokens_to_ids("<|video_pad|>")
-        outputs = llm.generate(
-            _format_video_inputs(prompts, videos),
-            sampling_params=SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS),
-        )
-        results = _extract_generation_results(outputs, video_pad_id)
-        queue.put(("SUCCESS", results))
-    except Exception:
-        queue.put(("ERROR", traceback.format_exc()))
-
-
-def run_video_generation_in_isolated_process(
-    prompts: list[str],
-    videos: list[np.ndarray | tuple[np.ndarray, dict[str, Any]]],
-    chunk_patch_size: int,
-    max_num_seqs: int = 1,
-    cudagraph_mm_encoder: bool = False,
-) -> list[GenerationResult]:
-    """Runs generation in an isolated OS process so TPU devices are released.
-
-    Args:
-        prompts: Text prompts for generation.
-        videos: Video arrays corresponding to each prompt.
-        chunk_patch_size: Maximum patch size per chunk, or 0 to disable.
-        max_num_seqs: Maximum number of sequences to process in parallel.
-        cudagraph_mm_encoder: Whether to enable `MMEncoderManager`.
-
-    Returns:
-        List of GenerationResult for each prompt/video input.
-
-    Raises:
-        RuntimeError: If the worker process times out or encounters an error.
-    """
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_run_video_generation_worker,
-        args=(
-            prompts,
-            videos,
-            chunk_patch_size,
-            max_num_seqs,
-            cudagraph_mm_encoder,
-            queue,
-        ),
-    )
-    proc.start()
-    try:
-        # Drain before join: a child blocks on exit until its queued payload
-        # has been read.
-        status, result = queue.get(timeout=WORKER_TIMEOUT_S)
-    except queue_lib.Empty:
-        proc.kill()
-        proc.join()
-        raise RuntimeError(
-            f"Video generation worker ({CHUNK_ENV}={chunk_patch_size}) sent "
-            f"no result within {WORKER_TIMEOUT_S}s; exit code "
-            f"{proc.exitcode}."
-        ) from None
-    proc.join()
-    if status == "ERROR":
-        raise RuntimeError(
-            f"Video generation worker ({CHUNK_ENV}={chunk_patch_size}) "
-            f"failed:\n{result}"
-        )
-    return result
 
 
 @dataclass(frozen=True)
