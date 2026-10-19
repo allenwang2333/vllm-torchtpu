@@ -11,11 +11,11 @@ answer rather than an error:
    dcp ranks inside TP, so dcp must divide tp / num_kv_heads. Qwen3.5-397B
    (2 KV heads): TP8 admits DCP 1, 2, 4; TP16 up to 8; TP32 up to 16. TP8 with
    DCP8 would attend head-1 queries against head-0 pages on ranks 0..3.
-2. The Qwen3.5 decode megakernel ignores decode_context_parallel_size: it
-   writes and reads a replicated KV pool and splits the KV reads of a head
-   group inside the kernel. With DCP > 1 the scheduler allocates
-   block_size x dcp logical blocks and the KV transfer delivers interleaved
-   pages, which the megakernel then misreads.
+2. The Qwen3.5 decode megakernel reads `MKConfig.dcp` from this size: its
+   KV-head group of tp / num_kv_heads ranks holds dcp page-interleaved shards
+   (page p on DCP rank p % dcp at column p // dcp, the rule of the batched RPA
+   kernels and of Raiden's tp{T}dcp{D}_decode landing), so the head rule above
+   is the whole admission for it as well.
 3. The Raiden Stage-3 admission names consumer layouts tp{T}dcp{D}_decode
    only for dp == 1; with attention-DP it returns dp{N}[tp{T}]_decode without
    reading DCP, so the producer and consumer would disagree on the page owner.
@@ -108,15 +108,6 @@ class DcpStaticSupportValidator:
                     f"ranks, so --decode-context-parallel-size must be one of "
                     f"{list(admissible)}."
                 )
-        if config.megakernel:
-            raise NotImplementedError(
-                f"{MEGAKERNEL_ENV}=1 with --decode-context-parallel-size="
-                f"{config.dcp_size}: the Qwen3.5 decode megakernel keeps a "
-                "replicated KV pool and splits KV reads inside the kernel; it "
-                "does not read DCP-interleaved pages. Unset the megakernel for "
-                "DCP > 1 (stock batched RPA path) or use DCP 1 with the "
-                "megakernel's in-kernel split."
-            )
         if config.dp_size > 1 and config.kv_role is not None and config.pcp_size == 1:
             raise NotImplementedError(
                 f"data_parallel_size={config.dp_size} with "

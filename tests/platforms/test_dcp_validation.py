@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static DCP admission: the three TPU contracts vLLM does not check.
 
-A DCP group must share one KV head, the Qwen3.5 megakernel ignores DCP, and
+A DCP group must share one KV head, the Qwen3.5 megakernel follows that rule, and
 the Raiden admission has no dp x tp x dcp consumer layout. Each violation
 would be a wrong answer at runtime, so what is pinned here is that startup
 refuses it with the admissible set named.
@@ -95,12 +95,14 @@ def test_no_model_config_keeps_only_the_vllm_rule():
     assert config.total_num_kv_heads == 0
 
 
-def test_megakernel_with_dcp_is_refused(monkeypatch):
+def test_megakernel_with_dcp_follows_the_head_rule(monkeypatch):
     monkeypatch.setenv(dcp_validation.MEGAKERNEL_ENV, "1")
-    with pytest.raises(NotImplementedError, match="replicated KV pool"):
-        validate_decode_context_parallel_config(_vllm_config(dcp_size=4))
-    # DCP 1 with the megakernel is the served configuration.
-    validate_decode_context_parallel_config(_vllm_config(dcp_size=1))
+    for dcp in (1, 2, 4):
+        assert validate_decode_context_parallel_config(
+            _vllm_config(dcp_size=dcp)
+        ).megakernel
+    with pytest.raises(ValueError, match="share one KV head"):
+        validate_decode_context_parallel_config(_vllm_config(dcp_size=8))
 
 
 def test_attention_dp_consumer_with_dcp_is_refused_until_admission_names_it():
