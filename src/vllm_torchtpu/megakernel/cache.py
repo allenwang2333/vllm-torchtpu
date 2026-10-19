@@ -21,8 +21,8 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
        and recurrent/conv states in-place into the unified block pools.
 
 2. **Experimental opt-in 1-launch fused pool I/O (`fused_pool_io=True`)**:
-   - Isolated in `cache_experimental.py` and `blocks/fused_pool_io.py` (disabled
-     by default everywhere: `fused_pool_io=False`).
+   - Isolated in `cache_experimental.py` and `experimental/fused_pool_io.py`
+     (disabled by default everywhere: `fused_pool_io=False`).
    - On TPU (`ex.interpret=False`), `ST[pool_state_name]` is declared
      `access="r"` with no Pallas-level alias (avoiding Mosaic's full-pool copy
      on communicating kernels), `GQABlock` and `GDNBlock` issue async HBM DMA

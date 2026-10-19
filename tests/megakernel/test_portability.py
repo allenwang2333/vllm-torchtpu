@@ -44,9 +44,11 @@ def test_megakernel_portability_ast_guard():
         "kernel.py",
         "planner.py",
         "pool_alias.py",
+        "blocks/fused_io_hook.py",
         "blocks/gdn.py",
         "blocks/gqa.py",
         "blocks/moe.py",
+        "experimental/fused_pool_io.py",
         "models/qwen35.py",
         "pool/backend.py",
         "pool/gather.py",
@@ -116,6 +118,34 @@ def test_megakernel_portability_ast_guard():
                         f"{rel}:{node.lineno} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
+
+
+def test_blocks_do_not_import_experimental_code():
+    """Blocks reach fused pool I/O only via `blocks.fused_io_hook`.
+
+    No module under `blocks/` may import `experimental/` (or the fused helpers)
+    at any level, so GQA / GDN can land without the experimental code.
+    """
+    blocks_root = Path(megakernel.__file__).resolve().parent / "blocks"
+    for path in sorted(blocks_root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            # Only the library's own modules matter (relative imports or
+            # `vllm_torchtpu.*`); third-party `jax.experimental` is fine.
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [
+                    a.name for a in node.names if a.name.startswith("vllm_torchtpu")
+                ]
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level > 0 or mod.startswith("vllm_torchtpu"):
+                    names = [mod] + [a.name for a in node.names]
+            for name in names:
+                assert "experimental" not in name and "fused_pool_io" not in name, (
+                    f"blocks/{path.name}:{node.lineno} imports '{name}'; blocks "
+                    "must reach fused pool I/O through blocks.fused_io_hook"
+                )
 
 
 def test_pool_package_is_framework_free():

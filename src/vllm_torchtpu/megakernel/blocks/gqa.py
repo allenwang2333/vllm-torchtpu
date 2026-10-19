@@ -46,7 +46,7 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
-from . import fused_pool_io
+from .fused_io_hook import fused_io
 
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))
@@ -153,7 +153,7 @@ class GQABlock(Block):
                 ),
             ]
             if ex.FUSED:
-                st.extend(fused_pool_io.gqa_fused_states(ex))
+                st.extend(fused_io().gqa_fused_states(ex))
             return st
         return [
             StateDecl("kc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
@@ -162,7 +162,7 @@ class GQABlock(Block):
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if ex.FUSED:
-            return fused_pool_io.gqa_fused_outputs(g, ex)
+            return fused_io().gqa_fused_outputs(g, ex)
         kv_dt = FP8 if ex.paged_kv else F32
         return [
             StateDecl("knew", (ex.MR, g.HD), kv_dt, access="w"),
@@ -335,7 +335,7 @@ class GQABlock(Block):
         if not ex.FUSED:
             scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
         else:
-            scr.update(fused_pool_io.gqa_fused_scratch(ex, ap.HD))
+            scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
         if ex.paged_kv:
             if not ap.KVE:
                 scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
@@ -425,7 +425,7 @@ class GQABlock(Block):
             scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
             scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
         if ex.FUSED:
-            fused_pool_io.gqa_fused_init_buffers(ctx)
+            fused_io().gqa_fused_init_buffers(ctx)
         if ap.SPLIT and not ap.GQ:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
         if ap.PACK or ap.QV:
@@ -673,7 +673,7 @@ class GQABlock(Block):
                         d.start()
             if ex.FUSED:
                 with sc("att_kvrd"):
-                    fused_pool_io.gqa_fused_kvrd_issue(ctx, a)
+                    fused_io().gqa_fused_kvrd_issue(ctx, a)
             with sc("att_kvnew"):
                 if QV:
                     cos = scr["rope"][0, :B, :half]
@@ -984,7 +984,7 @@ class GQABlock(Block):
                 pri = scr["pri"]
                 if ex.FUSED:
                     with sc("att_kvwr"):
-                        fused_pool_io.gqa_fused_kv_rmw(ctx, ap, a)
+                        fused_io().gqa_fused_kv_rmw(ctx, ap, a)
                 with sc("att_gate"):
                     scr["gate"][0:B, :] = rnd(jax.nn.sigmoid(scr["gate"][0:B, :]))
                 with sc("att_merge"):
@@ -1150,7 +1150,7 @@ class GQABlock(Block):
 
             with sc("att_out"):
                 if ex.FUSED and not SPLIT:
-                    fused_pool_io.gqa_fused_kv_rmw(ctx, ap, a)
+                    fused_io().gqa_fused_kv_rmw(ctx, ap, a)
                 elif not ex.FUSED:
                     for d in kv_out:
                         d.wait()
@@ -1162,7 +1162,7 @@ class GQABlock(Block):
 
     def epilogue(self, ctx: Any) -> None:
         if ctx.ex.FUSED:
-            fused_pool_io.gqa_fused_epilogue(ctx)
+            fused_io().gqa_fused_epilogue(ctx)
 
     def host_update_states(
         self,

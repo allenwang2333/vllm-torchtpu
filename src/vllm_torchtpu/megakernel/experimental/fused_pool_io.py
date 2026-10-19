@@ -13,6 +13,10 @@
 # limitations under the License.
 """Experimental in-kernel fused KV and GDN pool I/O helpers (`ex.FUSED=True`).
 
+`GQABlock` / `GDNBlock` reach these helpers only through the block hook
+(`blocks.fused_io_hook.fused_io()`); this module registers itself there on
+import, so the blocks carry no import-time dependency on experimental code.
+
 Contract & Aliasing Model (TPU vs. CPU `interpret=True`):
 ---------------------------------------------------------
 Mosaic TPU rejects `input_output_aliases` on large HBM pool operands inside a
@@ -66,6 +70,7 @@ numerics); compare it against the split path with that flag enabled.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import jax
@@ -74,6 +79,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..blocks.fused_io_hook import register_fused_io
 from ..errors import MegakernelConfigError
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
 from ..pool.layout import LANES, PoolLayout
@@ -974,3 +980,6 @@ def gdn_fused_epilogue(ctx: Any, gp: Any) -> None:
     if gp.NGDN > 0 and "gdn_state" not in ctx.skip:
         for slot_o in range(min(ctx.ex.NS, gp.NGO)):
             gdn_wait_out(ctx, gp, slot_o)
+
+
+register_fused_io(sys.modules[__name__])

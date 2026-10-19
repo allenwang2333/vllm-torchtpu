@@ -12,8 +12,9 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
    - The communicating `decode_megakernel` declares `ST[pool_state_name]` with
      `access="r"` and sets **no** `pallas_call` `input_output_aliases` on the
      pools.
-   - `GQABlock` and `GDNBlock` (via `blocks/fused_pool_io.py`) issue async HBM
-     DMA reads and writes directly against `ST[pool_state_name]`.
+   - `GQABlock` and `GDNBlock` (via `experimental/fused_pool_io.py`, reached
+     through `blocks.fused_io_hook`) issue async HBM DMA reads and writes
+     directly against `ST[pool_state_name]`.
    - The outer `jax.jit` (`donate_argnums` on `raw_pools`) returns the donated
      input `raw_pools` references directly as outputs, relying on XLA buffer
      donation (`jax.buffer_donor = true` / `HloModule input_output_alias`) to

@@ -41,7 +41,7 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
-from . import fused_pool_io
+from .fused_io_hook import fused_io
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -491,7 +491,7 @@ class GDNBlock(Block):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]
         if ex.FUSED:
-            return fused_pool_io.gdn_fused_scratch(ex, gp, plan)
+            return fused_io().gdn_fused_scratch(ex, gp, plan)
         scr: dict[str, Any] = {
             "recb": (
                 pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), BF16)
@@ -528,7 +528,7 @@ class GDNBlock(Block):
         if not ctx.ex.FUSED:
             return
         gp: GDNParams = ctx.block_params(self.name)
-        fused_pool_io.gdn_fused_init_buffers(ctx, gp)
+        fused_io().gdn_fused_init_buffers(ctx, gp)
 
     def _is_seq_active(self, ctx: Any, gp: GDNParams, s: Any) -> Any:
         ex, ST = ctx.ex, ctx.ST
@@ -879,7 +879,7 @@ class GDNBlock(Block):
         gp: GDNParams = ctx.block_params(self.name)
         o = ctx.stream.sp.block_ord(l, self.name)
         if ex.FUSED:
-            return fused_pool_io.gdn_fused_emit(ctx, gp, o, slot)
+            return fused_io().gdn_fused_emit(ctx, gp, o, slot)
         scr, ST, O = ctx.scr, ctx.ST, ctx.O  # noqa: E741
         raw_refs = ctx.raw_refs
         skip, sc, stream = ctx.skip, ctx.sc, ctx.stream
@@ -1047,7 +1047,7 @@ class GDNBlock(Block):
     def epilogue(self, ctx: Any) -> None:
         gp: GDNParams = ctx.block_params(self.name)
         if ctx.ex.FUSED:
-            fused_pool_io.gdn_fused_epilogue(ctx, gp)
+            fused_io().gdn_fused_epilogue(ctx, gp)
             return
         if gp.NGDN > 0 and "gdn_state" not in ctx.skip:
             conv_out_key = "conv_ckpt" if ctx.ex.VER else "conv"
