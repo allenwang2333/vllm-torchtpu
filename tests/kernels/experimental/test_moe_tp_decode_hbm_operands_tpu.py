@@ -33,7 +33,9 @@ def _staged(hlo: str) -> int:
     return sum(
         1
         for ln in hlo.splitlines()
-        if " copy-start(" in ln and "S(1)" in ln and ("f32[256,1,1," in ln or "f8e4m3fn[" in ln)
+        if " copy-start(" in ln
+        and "S(1)" in ln
+        and ("f32[256,1,1," in ln or "f8e4m3fn[" in ln)
     )
 
 
@@ -64,12 +66,23 @@ def test_hbm_operands_bitwise(rows, n_valid):
         def body(x, s, b, nv, rank, *w):
             assert kernel.can_use_moe_tp_decode(x, s, b, *w, topk=c["topk"], n_ranks=n)
             return kernel.moe_tp_decode(
-                x, s, b, nv[0], rank.reshape(()), *w, routed_scale=ROUTED_SCALE,
-                topk=c["topk"], n_ranks=n, fast=True, hbm_operands=hbm,
+                x,
+                s,
+                b,
+                nv[0],
+                rank.reshape(()),
+                *w,
+                routed_scale=ROUTED_SCALE,
+                topk=c["topk"],
+                n_ranks=n,
+                fast=True,
+                hbm_operands=hbm,
             )
 
         return jax.jit(
-            jax.shard_map(body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False)
+            jax.shard_map(
+                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
         )
 
     def put(ws):
@@ -89,8 +102,10 @@ def test_hbm_operands_bitwise(rows, n_valid):
     got = np.asarray(f1(*args)).view(np.uint16)
     s0 = _staged(f0.lower(*args).compile().as_text())
     s1 = _staged(f1.lower(*args).compile().as_text())
-    print(f"RESULT rows {rows} n_valid {n_valid}: bitwise {np.array_equal(got, want)}; "
-          f"whole-weight S(1) copy-starts default {s0} hbm {s1}")
+    print(
+        f"RESULT rows {rows} n_valid {n_valid}: bitwise {np.array_equal(got, want)}; "
+        f"whole-weight S(1) copy-starts default {s0} hbm {s1}"
+    )
     assert np.array_equal(got, want)
     if n_valid:
         bad = list(stacked)

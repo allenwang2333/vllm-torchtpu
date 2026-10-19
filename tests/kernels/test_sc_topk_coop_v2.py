@@ -61,7 +61,10 @@ def _same(a, b) -> str | None:
         d = np.argwhere(x != y)
         if d.size:
             r, c = d[0]
-            return f"output {i}: {len(set(d[:, 0]))} rows differ, first [{r},{c}] {x[r, c]} != {y[r, c]}"
+            return (
+                f"output {i}: {len(set(d[:, 0]))} rows differ, "
+                f"first [{r},{c}] {x[r, c]} != {y[r, c]}"
+            )
     return None
 
 
@@ -69,10 +72,47 @@ def _local_case(b, kind, seed):
     rng = np.random.default_rng(seed)
     s = np.full((b, N), -np.inf, np.float32)
     if kind == "short":
-        lens = np.array([0, 1, 17, 2047, 2048, 2049, 12900, 47600, 74500, 130000, N, 15, 16, 4095, 4097, 9400])
+        lens = np.array(
+            [
+                0,
+                1,
+                17,
+                2047,
+                2048,
+                2049,
+                12900,
+                47600,
+                74500,
+                130000,
+                N,
+                15,
+                16,
+                4095,
+                4097,
+                9400,
+            ]
+        )
     else:
-        lens = np.array([12900, 12900, 12900, 12901, 15100, 15100, 15100, 15101, 9400, 9400, 9400, 9401,
-                         130000, 74500, 47600, 13600])
+        lens = np.array(
+            [
+                12900,
+                12900,
+                12900,
+                12901,
+                15100,
+                15100,
+                15100,
+                15101,
+                9400,
+                9400,
+                9400,
+                9401,
+                130000,
+                74500,
+                47600,
+                13600,
+            ]
+        )
     lens = lens[np.arange(b) % lens.size].astype(np.int32)
     for r, ln in enumerate(lens):
         if kind == "ties":
@@ -100,18 +140,32 @@ def test_coop_v2_local_is_bitwise(b, kind):
 
 def test_coop_v2_engages_on_single_wave_only():
     _require_sparsecore()
-    for b, engaged in ((1, False), (2, False), (4, True), (16, True), (32, False), (64, False)):
+    for b, engaged in (
+        (1, False),
+        (2, False),
+        (4, True),
+        (16, True),
+        (32, False),
+        (64, False),
+    ):
         scores = jnp.zeros((b, N), jnp.float32)
         lens = jnp.full((b,), 4096, jnp.int32)
         txt = (
-            jax.jit(lambda s, l: sc_topk.sparsecore_topk(s, K, l, return_scores=True, coop_v2=True))
+            jax.jit(
+                lambda s, ln: sc_topk.sparsecore_topk(
+                    s, K, ln, return_scores=True, coop_v2=True
+                )
+            )
             .lower(scores, lens)
             .as_text()
         )
-        assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged, b
+        assert (
+            bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged
+        ), b
 
 
-N_A2A = 16384  # the a2a merge's stage 2 (TPU_DCP_INDEXER_A2A_MERGE): rows of dcp * k = 8 * 2048
+# The a2a merge's stage 2 (TPU_DCP_INDEXER_A2A_MERGE): rows of dcp * k = 8 * 2048.
+N_A2A = 16384
 
 
 def _a2a_case(b, kind, seed):
@@ -167,11 +221,17 @@ def test_coop_v2_engages_through_the_a2a_dispatcher(monkeypatch):
         scores = jnp.zeros((b, N_A2A), jnp.float32)
         lens = jnp.full((b,), N_A2A, jnp.int32)
         txt = (
-            jax.jit(lambda s, l: sc_topk.sparsecore_topk.__wrapped__(s, K, l, write_empty_rows=True))
+            jax.jit(
+                lambda s, ln: sc_topk.sparsecore_topk.__wrapped__(
+                    s, K, ln, write_empty_rows=True
+                )
+            )
             .lower(scores, lens)
             .as_text()
         )
-        assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged, b
+        assert (
+            bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_v2", txt)) is engaged
+        ), b
 
 
 def _merge_case(b, dcp, k, seed, kind):
@@ -202,7 +262,9 @@ def test_coop_merge_is_bitwise(b, dcp, k, kind):
         want = sc_topk.sparsecore_topk_dcp_merge(
             flat, idxs, k, dcp_rank=r, dcp_size=dcp, rank_major=True
         )
-        got = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, k, dcp_rank=r, dcp_size=dcp)
+        got = sc_topk.sparsecore_topk_dcp_merge_coop(
+            flat, idxs, k, dcp_rank=r, dcp_size=dcp
+        )
         assert _same((got,), (want,)) is None, (rank, _same((got,), (want,)))
 
 
@@ -220,7 +282,9 @@ def test_coop_merge_route(monkeypatch):
             .lower(flat, idxs)
             .as_text()
         )
-        assert bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_coop", txt)) is routed, b
+        assert (
+            bool(re.search(r"sc_topk_direct_b\d+_n\d+_k\d+_p\d+_coop", txt)) is routed
+        ), b
     assert sc_topk.coop_merge_fits(16, 8, K) and not sc_topk.coop_merge_fits(32, 8, K)
     assert not sc_topk.coop_merge_fits(4, 6, K)
 
@@ -232,6 +296,10 @@ def test_comparison_detects_a_corrupted_row():
     bad = (want[0].at[2, 100].set(want[0][2, 101]), want[1])
     assert _same(bad, want) is not None
     flat, idxs = _merge_case(4, 8, K, seed=5, kind="ties")
-    m = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(5), dcp_size=8)
-    m_wrong_rank = sc_topk.sparsecore_topk_dcp_merge_coop(flat, idxs, K, dcp_rank=jnp.int32(4), dcp_size=8)
+    m = sc_topk.sparsecore_topk_dcp_merge_coop(
+        flat, idxs, K, dcp_rank=jnp.int32(5), dcp_size=8
+    )
+    m_wrong_rank = sc_topk.sparsecore_topk_dcp_merge_coop(
+        flat, idxs, K, dcp_rank=jnp.int32(4), dcp_size=8
+    )
     assert _same((m,), (m_wrong_rank,)) is not None

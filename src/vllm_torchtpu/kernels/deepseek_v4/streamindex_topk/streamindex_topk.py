@@ -1903,9 +1903,7 @@ def streamindex_topk(
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
             )
-            mixed_only = tuple(
-                p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED
-            )
+            mixed_only = tuple(p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED)
             if (
                 skip_empty_decode_chunked
                 and num_chunks > 1

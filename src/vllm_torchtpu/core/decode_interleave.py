@@ -84,8 +84,7 @@ class DecodeInterleavePolicy:
                 raise ValueError(f"{name} must not be negative: {v}")
         if finish_tokens and finish_max_steps < 1:
             raise ValueError(
-                "TPU_SCHED_DECODE_FINISH_MAX_STEPS must be >= 1: "
-                f"{finish_max_steps}"
+                f"TPU_SCHED_DECODE_FINISH_MAX_STEPS must be >= 1: {finish_max_steps}"
             )
         self.steps = steps
         self.adaptive = adaptive
@@ -113,13 +112,11 @@ class DecodeInterleavePolicy:
             return False
         if self.steps and self._left > 0:
             return True
-        if (
+        return bool(
             self.finish_tokens
             and self._finish_streak < self.finish_max_steps
             and any(_remaining_tokens(r) <= self.finish_tokens for r in decodes)
-        ):
-            return True
-        return False
+        )
 
     def observe(self, scheduler: Any, out: Any, deferred: bool, decode_ids) -> None:
         scheduled = out.num_scheduled_tokens

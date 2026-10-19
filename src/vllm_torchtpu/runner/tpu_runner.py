@@ -128,6 +128,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
 from vllm_torchtpu.runner import utils as runner_utils
+from vllm_torchtpu.runner.host_sched_diag import HostSchedDiag
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -138,8 +139,6 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
-from vllm_torchtpu.runner.host_sched_diag import HostSchedDiag
-from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
@@ -171,6 +170,7 @@ from vllm_torchtpu.tracing.utils import (
     extract_request_ids_for_tracing,
 )
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.worker.cpu_pin import WorkerCpuPinner
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -1160,11 +1160,13 @@ class TPUModelRunner(GPUModelRunner):
             return 0
         roots = [getattr(self, "model", None)]
         if self.drafter is not None:
-            roots += [v for v in vars(self.drafter).values() if isinstance(v, torch.nn.Module)]
+            roots += [
+                v for v in vars(self.drafter).values() if isinstance(v, torch.nn.Module)
+            ]
         seen: set[int] = set()
         n = 0
         for root in roots:
-            if not isinstance(root, torch.nn.Module):
+            if root is None or not isinstance(root, torch.nn.Module):
                 continue
             for m in root.modules():
                 fn = m.__dict__.get("aot_compiled_fn")
@@ -6385,7 +6387,7 @@ class TPUModelRunner(GPUModelRunner):
         ):
             trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
         rng_kwargs: dict[str, Any] = {}
-        default_gen_state = None
+        default_gen = default_gen_state = None
         if self._sampler_graph_rng:
             # The served calls draw in-graph; warm that program. Its draws
             # advance the default generator: restore it after, so warmup never
@@ -6418,7 +6420,7 @@ class TPUModelRunner(GPUModelRunner):
                     **rng_kwargs,
                 )
                 synchronize_tensors(out)
-        if default_gen_state is not None:
+        if default_gen is not None and default_gen_state is not None:
             default_gen.set_state(default_gen_state)
 
     def _precompile_rejection_sampler(self) -> None:

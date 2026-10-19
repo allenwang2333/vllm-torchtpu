@@ -21,17 +21,14 @@ across a verify-trim variant and with eager draws interleaved (the stream stays
 shared). Positive control: a different seed changes some output.
 """
 
-import pytest
-import torch
-
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-
 from types import SimpleNamespace
 
+import pytest
+import torch
 from test_sampler_verify_trim import (  # noqa: F401
-    K,
     PADDED_NUM_REQS,
     VARIANTS,
+    K,
     _fused,
     _inputs,
     _raise_dynamo_recompile_limit,
@@ -40,36 +37,50 @@ from test_sampler_verify_trim import (  # noqa: F401
     dev,
 )
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
+
 CASES = [[3], [3, 3], [2, 1], [1, 1, 3], [3, 3, 2]]
 
 
-def _run_graph(fn, dev, logits, md, temps, top_k, top_p, **kw):
+def _run_graph(fn, dev, logits, md, temps, top_k, top_p, **kw):  # noqa: F811 - imported fixture
     self_ = SimpleNamespace(rejection_sampler=RejectionSampler())
     return fn(
-        self_, logits.to(dev), md.bonus_logits_indices, md.target_logits_indices,
-        temps.to(dev), top_k.to(dev), top_p.to(dev), md.draft_token_ids,
-        md.draft_lengths, md.segment_ids, md.group_indices, None, None, None, K,
-        graph_rng=True, **kw,
+        self_,
+        logits.to(dev),
+        md.bonus_logits_indices,
+        md.target_logits_indices,
+        temps.to(dev),
+        top_k.to(dev),
+        top_p.to(dev),
+        md.draft_token_ids,
+        md.draft_lengths,
+        md.segment_ids,
+        md.group_indices,
+        None,
+        None,
+        None,
+        K,
+        graph_rng=True,
+        **kw,
     ).cpu()
 
 
-def _default_gen(dev):
+def _default_gen(dev):  # noqa: F811 - imported fixture
     return getattr(torch, dev.type).default_generators[dev.index or 0]
 
 
-def _eager_draws(gen, padded, vocab, dev):
-    b = torch.rand((PADDED_NUM_REQS, vocab), dtype=torch.float32, device=dev, generator=gen)
+def _eager_draws(gen, padded, vocab, dev):  # noqa: F811 - imported fixture
+    b = torch.rand(
+        (PADDED_NUM_REQS, vocab), dtype=torch.float32, device=dev, generator=gen
+    )
     a = torch.rand((padded,), dtype=torch.float32, device=dev, generator=gen)
     r = torch.rand((padded, vocab), dtype=torch.float32, device=dev, generator=gen)
     return b, a, r
 
 
-def _steps(dev, seed, graph, interleave):
+def _steps(dev, seed, graph, interleave):  # noqa: F811 - imported fixture
     vocab, fn = _vocab(dev), _fused(dev)
-    if graph:
-        gen = _default_gen(dev)
-    else:
-        gen = torch.Generator(device=dev)
+    gen = _default_gen(dev) if graph else torch.Generator(device=dev)
     gen.manual_seed(seed)
     outs = []
     for i, case in enumerate(CASES):
@@ -89,7 +100,7 @@ def _steps(dev, seed, graph, interleave):
 
 
 @pytest.mark.parametrize("interleave", [False, True])
-def test_graph_rng_is_exact(dev, interleave):
+def test_graph_rng_is_exact(dev, interleave):  # noqa: F811 - imported fixture
     if dev.type != "tpu":
         pytest.skip("default-generator equivalence is a TPU property")
     eager = _steps(dev, 7, False, interleave)
@@ -98,7 +109,7 @@ def test_graph_rng_is_exact(dev, interleave):
         assert torch.equal(e, g), (i, e, g)
 
 
-def test_positive_control_seed_is_caught(dev):
+def test_positive_control_seed_is_caught(dev):  # noqa: F811 - imported fixture
     if dev.type != "tpu":
         pytest.skip("TPU only")
     a = _steps(dev, 7, True, False)

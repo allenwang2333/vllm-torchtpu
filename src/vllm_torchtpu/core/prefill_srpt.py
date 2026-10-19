@@ -328,6 +328,6 @@ def patch_scheduler_prefill_srpt() -> None:
 
     # The decode-interleave wrapper calls the unwrapped schedule on a
     # decode-only step, so a deferred step never counts as a hold.
-    schedule._tpu_orig = orig
+    schedule._tpu_orig = orig  # pyrefly: ignore[missing-attribute]
     Scheduler.schedule = schedule
     Scheduler._tpu_prefill_srpt = True

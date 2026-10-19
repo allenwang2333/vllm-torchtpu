@@ -45,9 +45,8 @@ def test_disabled_records_nothing_and_starts_no_thread(monkeypatch, fake_events)
 
 def test_disabled_stage_propagates_exceptions(fake_events):
     timing = st_mod.RunnerStageTiming(0, enabled=False)
-    with pytest.raises(ValueError):
-        with timing.stage("sample"):
-            raise ValueError("boom")
+    with pytest.raises(ValueError), timing.stage("sample"):
+        raise ValueError("boom")
 
 
 def test_enabled_still_records(fake_events):
@@ -69,10 +68,10 @@ def test_enabled_still_records(fake_events):
 @pytest.mark.parametrize(
     "flag, kv_transfer_config, expected",
     [
-        (None, None, True),          # default: unchanged behaviour
+        (None, None, True),  # default: unchanged behaviour
         ("0", None, True),
-        ("1", None, False),          # nothing consumes the samples
-        ("1", object(), True),       # a KV connector may consume them
+        ("1", None, False),  # nothing consumes the samples
+        ("1", object(), True),  # a KV connector may consume them
     ],
 )
 def test_runner_consumer_gate(monkeypatch, flag, kv_transfer_config, expected):

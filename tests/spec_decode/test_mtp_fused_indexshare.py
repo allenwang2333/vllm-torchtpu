@@ -34,8 +34,9 @@ class _FakeMtp(nn.Module):
         self.vocab = vocab
         self.seen: list[torch.Tensor] = []
 
-    def forward(self, input_ids, positions, hidden_states, it=None, emb=None, *,
-                spec_step_idx=0):
+    def forward(
+        self, input_ids, positions, hidden_states, it=None, emb=None, *, spec_step_idx=0
+    ):
         p = input_ids.shape[0]
         self.seen.append(self.table[:p].clone())
         self.table.fill_(-7)
@@ -83,13 +84,22 @@ def test_rows_required_exactly_when_built_with_a_table():
     table = torch.zeros(4, 8, dtype=torch.int32)
     loop, _ = _loop(table)
     with pytest.raises(ValueError):
-        loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
-             torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
+        loop(
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, 16),
+            torch.ones(2, dtype=torch.int32),
+            None,
+        )
     loop.topk_indices_buffer = None
     with pytest.raises(ValueError):
-        loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
-             torch.zeros(2, 16), torch.ones(2, dtype=torch.int32),
-             torch.zeros(2, 8, dtype=torch.int32))
+        loop(
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+            torch.zeros(2, 16),
+            torch.ones(2, dtype=torch.int32),
+            torch.zeros(2, 8, dtype=torch.int32),
+        )
 
 
 def test_negative_control_without_install_reads_clobbered_rows():
@@ -100,8 +110,13 @@ def test_negative_control_without_install_reads_clobbered_rows():
     loop._install_shared_topk = lambda step, rows: None
     saved = torch.ones(2, 8, dtype=torch.int32)
     table[:2] = saved
-    loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
-         torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), saved)
+    loop(
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, 16),
+        torch.ones(2, dtype=torch.int32),
+        saved,
+    )
     assert torch.equal(mtp.seen[0], saved)
     assert not torch.equal(mtp.seen[1], saved)
 
@@ -135,7 +150,9 @@ class _RecordingProgram:
         if self.clobber:
             self.table.fill_(-9)
         seq_lens.add_(self.num_steps - 1)
-        return tuple(torch.full((p,), i, dtype=torch.int32) for i in range(self.num_steps))
+        return tuple(
+            torch.full((p,), i, dtype=torch.int32) for i in range(self.num_steps)
+        )
 
 
 def _proposer(monkeypatch, table, program, warm=True):
@@ -144,7 +161,11 @@ def _proposer(monkeypatch, table, program, warm=True):
 
     from vllm_torchtpu.spec_decode import eagle3
 
-    for name in ("set_forward_context", "set_vllm_model_wrapper_context", "set_model_tag"):
+    for name in (
+        "set_forward_context",
+        "set_vllm_model_wrapper_context",
+        "set_model_tag",
+    ):
         monkeypatch.setattr(eagle3, name, lambda *a, **k: contextlib.nullcontext())
     prop = eagle3.Eagle3Proposer.__new__(eagle3.Eagle3Proposer)
     skips = []
@@ -249,13 +270,23 @@ def test_fused_loop_takes_the_vocab_parallel_argmax(monkeypatch):
     loop, _ = _loop(table)
     loop.topk_indices_buffer = None
     loop.vocab_parallel_argmax = "INFO"
-    toks = loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
-                torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
+    toks = loop(
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, 16),
+        torch.ones(2, dtype=torch.int32),
+        None,
+    )
     assert [t.tolist() for t in toks] == [[42, 42], [42, 42]]
     assert len(seen) == 2 and all(info == "INFO" for _, info in seen)
     loop.vocab_parallel_argmax = None
-    toks = loop(torch.zeros(2, dtype=torch.int32), torch.zeros(2, dtype=torch.int32),
-                torch.zeros(2, 16), torch.ones(2, dtype=torch.int32), None)
+    toks = loop(
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, dtype=torch.int32),
+        torch.zeros(2, 16),
+        torch.ones(2, dtype=torch.int32),
+        None,
+    )
     assert all(t.dtype == torch.int32 for t in toks) and len(seen) == 2
 
 
@@ -277,7 +308,9 @@ def _traced_argmax_graph(info, onehot):
 
     torch._dynamo.reset()
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(vd, "tensor_model_parallel_all_gather", lambda x, dim=0: x.repeat(2, 1))
+        mp.setattr(
+            vd, "tensor_model_parallel_all_gather", lambda x, dim=0: x.repeat(2, 1)
+        )
         mp.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: x)
         fn = torch.compile(
             lambda logits: su.vocab_parallel_argmax(logits, info),
@@ -332,25 +365,41 @@ def test_device_vocab_start_gives_the_same_ids(monkeypatch, onehot):
         infos = []
         for r in range(tp):
             i = su.VocabParallelArgmax(
-                r * width, width, tp, slot=su.rank_slot(r, tp, "cpu") if onehot else None
+                r * width,
+                width,
+                tp,
+                slot=su.rank_slot(r, tp, "cpu") if onehot else None,
             )
             infos.append(su.with_device_vocab_start(i, "cpu") if device_start else i)
         sent = []
         monkeypatch.setattr(
-            vd, "tensor_model_parallel_all_gather", lambda x, dim=0: sent.append(x) or x.repeat(tp, 1)
+            vd,
+            "tensor_model_parallel_all_gather",
+            lambda x, dim=0, sent=sent: sent.append(x) or x.repeat(tp, 1),
         )
-        monkeypatch.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: sent.append(x) or x)
+        monkeypatch.setattr(
+            vd,
+            "tensor_model_parallel_all_reduce",
+            lambda x, sent=sent: sent.append(x) or x,
+        )
         for r in range(tp):
             su.vocab_parallel_argmax(shards[r], infos[r])
         total = (
             sum(s.float() for s in sent).to(dtype) if onehot else torch.cat(sent, dim=0)
         )
-        monkeypatch.setattr(vd, "tensor_model_parallel_all_gather", lambda x, dim=0: total)
-        monkeypatch.setattr(vd, "tensor_model_parallel_all_reduce", lambda x: total)
+        monkeypatch.setattr(
+            vd, "tensor_model_parallel_all_gather", lambda x, dim=0, t=total: t
+        )
+        monkeypatch.setattr(
+            vd, "tensor_model_parallel_all_reduce", lambda x, t=total: t
+        )
         expected = torch.argmax(full, dim=-1).to(torch.int32)
         for r in range(tp):
             out = su.vocab_parallel_argmax(shards[r], infos[r])
-            assert out.dtype == torch.int32 and torch.equal(out, expected), (device_start, r)
+            assert out.dtype == torch.int32 and torch.equal(out, expected), (
+                device_start,
+                r,
+            )
 
 
 def _bucket_runner(max_num_reqs=8):
@@ -401,7 +450,9 @@ def test_fused_loop_compiles_at_the_loop_buckets_only(monkeypatch, mns, expected
     prop = eagle3.Eagle3Proposer.__new__(eagle3.Eagle3Proposer)
     prop.runner = _bucket_runner(mns)
     prop.draft_model = types.SimpleNamespace(_dynamic_arg_dims={"input_ids": 0})
-    prop.speculative_config = types.SimpleNamespace(method="mtp", num_speculative_tokens=3)
+    prop.speculative_config = types.SimpleNamespace(
+        method="mtp", num_speculative_tokens=3
+    )
     prop._draft_kv_shared = False
     prop._share_mtp_indices = True
     prop._mtp_topk_buffers = [torch.zeros(16, 4, dtype=torch.int32)]

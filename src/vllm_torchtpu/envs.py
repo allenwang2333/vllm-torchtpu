@@ -586,9 +586,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # backbone once per step, the MTP drafter once per draft pass). The
     # bounds are < 2**31, so the masks and the shifted ids are the same
     # values; the ids are widened to int64 for the lookup as before.
-    "TPU_VOCAB_EMBED_I32_BOUNDS": env_bool(
-        "TPU_VOCAB_EMBED_I32_BOUNDS", default=True
-    ),
+    "TPU_VOCAB_EMBED_I32_BOUNDS": env_bool("TPU_VOCAB_EMBED_I32_BOUNDS", default=True),
     # With TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and TPU_MLA_DECODE_PROLOGUE: on
     # decode buckets the DCP MLA kernel writes the packed real-rows exchange's
     # send buffer itself (partials destination-major, lse words in place), so
@@ -1186,7 +1184,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # drafter's one-layer program: ~7 us/pass exposed). Same output bits.
     "TPU_MOE_TP_DECODE_HBM_OPERANDS": lambda: os.getenv(
         "TPU_MOE_TP_DECODE_HBM_OPERANDS", "drafter"
-    ).strip().lower(),
+    )
+    .strip()
+    .lower(),
     # Decode-sized residual RMSNorm (rows below the Pallas threshold): pin the
     # f32 sum x + residual and the bf16 residual it returns behind an
     # optimization barrier, so XLA materializes each once instead of
@@ -1256,7 +1256,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its padding rows are unchanged since the last write (steady decode at a
     # fixed bucket). The device mask is then already what the upload would
     # write.
-    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool("TPU_TOKEN_PADDING_SKIP_UNCHANGED", default=True),
+    "TPU_TOKEN_PADDING_SKIP_UNCHANGED": env_bool(
+        "TPU_TOKEN_PADDING_SKIP_UNCHANGED", default=True
+    ),
     # Record runner stage timings (TpuEvent pairs + a collector thread) only
     # when a KV connector can consume them; without a KV transfer config the
     # samples are dropped every step, so the stages become no-ops.
@@ -1282,7 +1284,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Write the inputs a compiled graph mutates (the KV caches) back with one
     # torch._foreach_copy_ instead of one copy_ per input in AOTAutograd's
     # epilogue (compilation/foreach_epilogue.py). Same pairs, same order.
-    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool("TPU_FOREACH_MUTATION_EPILOGUE", default=True),
+    "TPU_FOREACH_MUTATION_EPILOGUE": env_bool(
+        "TPU_FOREACH_MUTATION_EPILOGUE", default=True
+    ),
     # Reuse the previous device copy of per-step host tensors whose values
     # repeat in steady decode -- the padded sampling params (temperature,
     # top_k, top_p) and the drafter loop's query_start_loc / request

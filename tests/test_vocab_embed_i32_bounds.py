@@ -32,20 +32,38 @@ def test_i32_bounds_match_i64(shard):
     pad = 0
     added_start, added_end = 154880 + shard * 4, 154880 + shard * 4 + 4
     g = torch.Generator().manual_seed(shard)
-    ids = torch.cat([
-        torch.randint(0, 154880 + 64, (4096,), generator=g),
-        torch.tensor([start, end - 1, end, start - 1 if start else 0,
-                      added_start, added_end - 1, added_end]),
-    ]).to(torch.int32)
+    ids = torch.cat(
+        [
+            torch.randint(0, 154880 + 64, (4096,), generator=g),
+            torch.tensor(
+                [
+                    start,
+                    end - 1,
+                    end,
+                    start - 1 if start else 0,
+                    added_start,
+                    added_end - 1,
+                    added_end,
+                ]
+            ),
+        ]
+    ).to(torch.int32)
     out = {}
     for dt in (torch.int64, torch.int32):
-        b = [torch.tensor(v, dtype=dt) for v in (start, end, pad, added_start, added_end)]
+        b = [
+            torch.tensor(v, dtype=dt) for v in (start, end, pad, added_start, added_end)
+        ]
         out[dt] = vpe_fn(ids, *b)
     (m64, k64), (m32, k32) = out[torch.int64], out[torch.int32]
     assert m32.dtype == torch.int32
     assert torch.equal(m32.long(), m64.long())
     assert torch.equal(k32, k64)
     # fault control: an off-by-one start must differ
-    bad = vpe_fn(ids, *[torch.tensor(v, dtype=torch.int32)
-                        for v in (start + 1, end, pad, added_start, added_end)])
+    bad = vpe_fn(
+        ids,
+        *[
+            torch.tensor(v, dtype=torch.int32)
+            for v in (start + 1, end, pad, added_start, added_end)
+        ],
+    )
     assert not torch.equal(bad[0].long(), m64.long())

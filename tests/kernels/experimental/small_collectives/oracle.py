@@ -92,7 +92,9 @@ def custom_call_operands_in_vmem(hlo_text, kernel_prefix):
 
     def in_vmem(name):
         rhs = defs.get(name, "")
-        shape = rhs.split(" ", 1)[0]  # an array shape with its layout, e.g. s32[8192]{0:T(1024)S(1)}
+        shape = rhs.split(" ", 1)[
+            0
+        ]  # an array shape with its layout, e.g. s32[8192]{0:T(1024)S(1)}
         if "S(1)" in shape:
             return True
         m = re.search(r" bitcast\(%([\w.\-]+)", rhs)

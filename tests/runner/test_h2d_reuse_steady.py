@@ -20,15 +20,19 @@ def _runner(temps, top_k, top_p):
         _h2d_reuse={},
         device=torch.device("cpu"),
     )
-    r._upload_unless_unchanged = lambda slot, host, device=None: TPUModelRunner._upload_unless_unchanged(
-        r, slot, host, device
+    r._upload_unless_unchanged = (
+        lambda slot, host, device=None: TPUModelRunner._upload_unless_unchanged(
+            r, slot, host, device
+        )
     )
     return r
 
 
 def _call(r, n=3, padded=8, dtype=torch.float32):
     logits = torch.zeros(padded, 4, dtype=dtype)
-    return TPUModelRunner._build_padded_sampling_params(r, 0, n, logits, padded_num_reqs=padded)
+    return TPUModelRunner._build_padded_sampling_params(
+        r, 0, n, logits, padded_num_reqs=padded
+    )
 
 
 def test_reuse_only_while_values_repeat(monkeypatch):
@@ -77,15 +81,23 @@ def test_bfloat16_logits(monkeypatch):
 
 
 def test_key_bytes_match_numpy_for_numpy_dtypes():
-    for t in (torch.arange(9, dtype=torch.int32), torch.arange(6, dtype=torch.int64)[::2],
-              torch.tensor([True, False]), torch.rand(3, 2).t()):
+    for t in (
+        torch.arange(9, dtype=torch.int32),
+        torch.arange(6, dtype=torch.int64)[::2],
+        torch.tensor([True, False]),
+        torch.rand(3, 2).t(),
+    ):
         assert t.contiguous().view(torch.uint8).numpy().tobytes() == t.numpy().tobytes()
 
 
 def test_zero_dim_host_key():
     r = _runner([0.7], [1], [0.9])
-    a = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
-    b = TPUModelRunner._upload_unless_unchanged(r, "s", torch.tensor(5, dtype=torch.int32))
+    a = TPUModelRunner._upload_unless_unchanged(
+        r, "s", torch.tensor(5, dtype=torch.int32)
+    )
+    b = TPUModelRunner._upload_unless_unchanged(
+        r, "s", torch.tensor(5, dtype=torch.int32)
+    )
     assert a is b and int(a) == 5
 
 
@@ -96,11 +108,19 @@ def test_target_device_is_part_of_the_key(monkeypatch):
     r = _runner([0.7, 1.0, 0.5], [20, 0, 5], [0.9, 1.0, 0.8])
     host = torch.tensor([1, 2, 3], dtype=torch.int32)
     a = TPUModelRunner._upload_unless_unchanged(r, "s", host, torch.device("cpu"))
-    m = TPUModelRunner._upload_unless_unchanged(r, "s", host.clone(), torch.device("meta"))
+    m = TPUModelRunner._upload_unless_unchanged(
+        r, "s", host.clone(), torch.device("meta")
+    )
     assert a.device.type == "cpu" and m.device.type == "meta"
-    m2 = TPUModelRunner._upload_unless_unchanged(r, "s", host.clone(), torch.device("meta"))
+    m2 = TPUModelRunner._upload_unless_unchanged(
+        r, "s", host.clone(), torch.device("meta")
+    )
     assert m2 is m
     probe = _call(r)  # logits on cpu
     meta_logits = torch.zeros(8, 4, dtype=torch.float32, device="meta")
-    p = TPUModelRunner._build_padded_sampling_params(r, 0, 3, meta_logits, padded_num_reqs=8)
-    assert all(x.device.type == "meta" for x in p[:3]) and all(x.device.type == "cpu" for x in probe[:3])
+    p = TPUModelRunner._build_padded_sampling_params(
+        r, 0, 3, meta_logits, padded_num_reqs=8
+    )
+    assert all(x.device.type == "meta" for x in p[:3]) and all(
+        x.device.type == "cpu" for x in probe[:3]
+    )

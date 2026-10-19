@@ -133,7 +133,6 @@ def test_slab_geometry():
     assert sparse_mla.SEND_EXCHANGE_COLLECTIVE_ID == 13
 
 
-
 def test_bucket_config():
     from vllm_torchtpu.layers.core import attention_interface as ai
 

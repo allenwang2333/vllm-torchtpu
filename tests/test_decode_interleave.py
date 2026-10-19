@@ -15,9 +15,7 @@ from vllm_torchtpu.core import decode_interleave, prefill_srpt
 from vllm_torchtpu.core.decode_interleave import DecodeInterleavePolicy
 
 
-def _install(
-    monkeypatch, steps=0, adaptive=False, finish=0, finish_max=32, srpt=False
-):
+def _install(monkeypatch, steps=0, adaptive=False, finish=0, finish_max=32, srpt=False):
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -170,9 +168,7 @@ def test_finish_holds_prefill_until_the_near_done_decode_finishes(
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_finish_cap_bounds_consecutive_decode_only_steps(
-    monkeypatch, async_scheduling
-):
+def test_finish_cap_bounds_consecutive_decode_only_steps(monkeypatch, async_scheduling):
     arrivals = {
         0: [_request("d", 32, max_tokens=60)],
         1: [_request("L", 2000)],
@@ -208,7 +204,9 @@ def test_patch_is_a_no_op_when_off(monkeypatch):
 
     monkeypatch.setattr(Scheduler, "_tpu_decode_interleave", False, raising=False)
     for k in ("STEPS", "FINISH_TOKENS"):
-        monkeypatch.setenv(f"TPU_SCHED_DECODE_{'INTERLEAVE_' if k == 'STEPS' else ''}{k}", "0")
+        monkeypatch.setenv(
+            f"TPU_SCHED_DECODE_{'INTERLEAVE_' if k == 'STEPS' else ''}{k}", "0"
+        )
     before = Scheduler.schedule
     decode_interleave.patch_scheduler_decode_interleave()
     assert Scheduler.schedule is before

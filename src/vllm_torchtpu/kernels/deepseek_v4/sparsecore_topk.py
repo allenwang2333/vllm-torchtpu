@@ -228,7 +228,8 @@ def _topk_body(
             plsc.parallel_loop(1, p, unroll=1)(add_peer)
 
     def exchange_hist(slot, active_hist):
-        """The histogram exchange alone: own histogram out, barrier, the group's p in."""
+        """The histogram exchange alone: own histogram out, barrier, the group's
+        p in."""
 
         @pl.when(active_hist)
         def _():
@@ -368,7 +369,9 @@ def _topk_body(
         shift = jnp.int32(L0_SHIFT)
         done = keep_all | (quota == cnt)
 
-        def level(lvl_shift, slot, prefix, shift, c_hi, quota, cnt, done, lvl_mask=0xFF):
+        def level(
+            lvl_shift, slot, prefix, shift, c_hi, quota, cnt, done, lvl_mask=0xFF
+        ):
             hist_bound = jnp.where(done, 0, NUM_BUCKETS // LANES)
             zero_hist(hist_bound)
             active_walk = jnp.where(done, 0, walk_chunks)
@@ -415,6 +418,7 @@ def _topk_body(
         if level_loop:
             # One copy of the level code; shifts 16, 8, 0 and exchange slots 1, 0, 1.
             assert REFINEMENT_LEVELS == ((16, 0xFF), (8, 0xFF), (0, 0xFF))
+
             def lvl_iter(i, c):
                 return level(
                     jnp.int32(16) - jnp.int32(8) * i, jnp.bitwise_and(i + 1, 1), *c
@@ -636,6 +640,7 @@ def _topk_body(
                 # gather) at its prefix offset; after the second barrier subcore 0
                 # copies the slot out. Same order: the parts are in column order.
                 grp_out = (w_slot * num_subcores + group_base) * k
+                assert oidx_vmem is not None and gather_sems is not None
                 plsc.subcore_barrier()
 
                 @pl.when(active)
@@ -649,7 +654,9 @@ def _topk_body(
                     )
 
                     def before(t, acc):
-                        return acc + jnp.where(t < s, vec_at(peer_hist_vmem, t * LANES), 0)
+                        return acc + jnp.where(
+                            t < s, vec_at(peer_hist_vmem, t * LANES), 0
+                        )
 
                     pfx = plsc.parallel_loop(0, p, unroll=1, carry=jnp.int32(0))(before)
 
@@ -663,10 +670,15 @@ def _topk_body(
                     @pl.when(m_s > 0)
                     def _():
                         dst_idx = oidx_vmem.at[pl.ds(0, m_s)]
-                        pairs = [(rowbuf_vmem.at[pl.ds(0, m_s)], shared_idx_vmem.at[dst_idx])]
+                        pairs = [
+                            (rowbuf_vmem.at[pl.ds(0, m_s)], shared_idx_vmem.at[dst_idx])
+                        ]
                         if return_scores:
                             pairs.append(
-                                (keybuf_vmem.at[pl.ds(0, m_s)], shared_key_vmem.at[dst_idx])
+                                (
+                                    keybuf_vmem.at[pl.ds(0, m_s)],
+                                    shared_key_vmem.at[dst_idx],
+                                )
                             )
                         copies(pairs, gather_sems)
 
@@ -676,10 +688,18 @@ def _topk_body(
                 def _():
                     out_off = pl.multiple_of(row * k, LANES)
                     go = pl.multiple_of(grp_out, LANES)
-                    pairs = [(shared_idx_vmem.at[pl.ds(go, k)], out_hbm.at[pl.ds(out_off, k)])]
+                    pairs = [
+                        (
+                            shared_idx_vmem.at[pl.ds(go, k)],
+                            out_hbm.at[pl.ds(out_off, k)],
+                        )
+                    ]
                     if return_scores:
                         pairs.append(
-                            (shared_key_vmem.at[pl.ds(go, k)], keys_hbm.at[pl.ds(out_off, k)])
+                            (
+                                shared_key_vmem.at[pl.ds(go, k)],
+                                keys_hbm.at[pl.ds(out_off, k)],
+                            )
                         )
                     copies(pairs, gather_sems)
 
@@ -774,14 +794,15 @@ def _topk_body(
                                 peer_key_vmem.at[pl.ds(dst_off, aligned_m_t)],
                             )
                         )
-                    cps = (
-                        None
-                        if sem_base is None
-                        else [
-                            pltpu.make_async_copy(src, dst, gather_sems.at[sem_base + i])
+                    cps = None
+                    if sem_base is not None:
+                        assert gather_sems is not None
+                        cps = [
+                            pltpu.make_async_copy(
+                                src, dst, gather_sems.at[sem_base + i]
+                            )
                             for i, (src, dst) in enumerate(pairs)
                         ]
-                    )
                     return m_t, chunks_t, pairs, cps
 
                 if gather_mode == "async":
@@ -793,6 +814,8 @@ def _topk_body(
                         _, chunks_t, _, cps = peer_copy(
                             t, pl.multiple_of(t * stride, LANES), 2 * t
                         )
+
+                        assert cps is not None
 
                         @pl.when(chunks_t > 0)
                         def _():
@@ -806,6 +829,7 @@ def _topk_body(
                     def append_peer(t, woff):
                         dst = pl.multiple_of(t * stride, LANES)
                         m_t, chunks_t, _, cps = peer_copy(t, dst, 2 * t)
+                        assert cps is not None
 
                         @pl.when(chunks_t > 0)
                         def _():
@@ -930,6 +954,7 @@ def _topk_body(
         row = core * groups_per_core + group_id
         active_row = row < b
         safe_row = jnp.minimum(row, b - 1)
+        assert lidx_vmem is not None
         rank_copy = pltpu.make_async_copy(
             lengths_hbm.at[pl.ds(pl.multiple_of(safe_row * LANES, LANES), LANES)],
             meta_vmem.at[pl.ds(0, LANES)],
@@ -1364,7 +1389,6 @@ def _sc_topk_direct(
         mesh=mesh,
         cost_estimate=cost,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}{'_v2' if coop_v2 else ''}",
-
     )(words.reshape(-1), lengths_in, *extra_inputs)
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
@@ -1548,7 +1572,8 @@ def coop_merge_fits(b: int, dcp_size: int, k: int) -> bool:
     static_argnames=("k", "dcp_size", "scheduling_group_id"),
 )
 def sparsecore_topk_dcp_merge_coop(
-    scores: jax.Array,  # i32[dcp_size * b * k] (or f32 bits), rank-major flat all-gather
+    # i32[dcp_size * b * k] (or f32 bits), rank-major flat all-gather
+    scores: jax.Array,
     local_idxs: jax.Array,  # i32[b, k]
     k: int,
     *,
@@ -1575,7 +1600,10 @@ def sparsecore_topk_dcp_merge_coop(
             f" {scores.shape} and {local_idxs.shape}"
         )
     if not coop_merge_fits(b, dcp_size, k):
-        raise ValueError(f"coop merge needs b <= 16 and a power-of-two dcp_size; got {b=}, {dcp_size=}")
+        raise ValueError(
+            "coop merge needs b <= 16 and a power-of-two dcp_size; "
+            f"got {b=}, {dcp_size=}"
+        )
     p = min(dcp_size, 32 // b)
     n = dcp_size * k
     slice_len = (dcp_size // p) * k
@@ -1602,11 +1630,15 @@ def sparsecore_topk_dcp_merge_coop(
         pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32),  # peer_hist_vmem
         None,  # peer_idx_vmem
         None,  # peer_key_vmem
-        pltpu.VMEM_SHARED((2 * sc.num_subcores * NUM_BUCKETS,), jnp.int32),  # shared_hist
+        pltpu.VMEM_SHARED(
+            (2 * sc.num_subcores * NUM_BUCKETS,), jnp.int32
+        ),  # shared_hist
         None,  # shared_counts_vmem
         None,  # shared_idx_vmem
         None,  # shared_key_vmem
-        pltpu.VMEM((2 * LANES,), jnp.int32),  # meta_vmem: rank, then the owner's segment
+        pltpu.VMEM(
+            (2 * LANES,), jnp.int32
+        ),  # meta_vmem: rank, then the owner's segment
         pltpu.VMEM((slice_len + LANES,), jnp.int32),  # slices_vmem
         pltpu.SemaphoreType.DMA((3,)),  # slice_sems: [segments, rank, local slots]
         None,  # gather_sems
@@ -1627,7 +1659,9 @@ def sparsecore_topk_dcp_merge_coop(
     )
 
     def body_fn(scores_hbm, lengths_hbm, idx_hbm, out_hbm, *rest):
-        return body(scores_hbm, lengths_hbm, out_hbm, None, *rest, local_idxs_hbm=idx_hbm)
+        return body(
+            scores_hbm, lengths_hbm, out_hbm, None, *rest, local_idxs_hbm=idx_hbm
+        )
 
     out = pl.kernel(
         body_fn,

@@ -18,7 +18,9 @@ def test_off_reads_nothing(monkeypatch):
 def test_line_every_n_steps_with_sane_values():
     d = diag_mod.HostSchedDiag(7, 3, fwd_timers=False)
     stop = threading.Event()
-    worker = threading.Thread(target=lambda: [sum(range(1000)) for _ in iter(stop.is_set, True)])
+    worker = threading.Thread(
+        target=lambda: [sum(range(1000)) for _ in iter(stop.is_set, True)]
+    )
     worker.start()
     try:
         lines = []
@@ -28,11 +30,17 @@ def test_line_every_n_steps_with_sane_values():
     finally:
         stop.set()
         worker.join()
-    assert [i for i, l in enumerate(lines) if l] == [2, 5, 8]
+    assert [i for i, ln in enumerate(lines) if ln] == [2, 5, 8]
     line = lines[-1]
     assert line.startswith("HOSTDIAG rank=7 steps=3 ")
     vals = dict(re.findall(r"(\w[\w/]*)=([-\d.]+)\b", line))
-    for k in ("wall_ms/step", "main_run_ms/step", "main_wait_ms/step", "proc_run_ms/step", "proc_wait_ms/step"):
+    for k in (
+        "wall_ms/step",
+        "main_run_ms/step",
+        "main_wait_ms/step",
+        "proc_run_ms/step",
+        "proc_wait_ms/step",
+    ):
         assert float(vals[k]) >= 0, (k, line)
     assert float(vals["main_run_ms/step"]) > 0
     # the process total includes the serving thread
@@ -75,11 +83,17 @@ def test_install_fwd_timers_is_idempotent(monkeypatch):
 
     # restore the classes after the test (monkeypatch undoes these setattrs)
     for attr in ("__call__", "guard_check"):
-        monkeypatch.setattr(AOTCompiledFunction, attr, AOTCompiledFunction.__dict__[attr])
+        monkeypatch.setattr(
+            AOTCompiledFunction, attr, AOTCompiledFunction.__dict__[attr]
+        )
     try:
         from vllm.compilation.caching import VllmSerializableFunction
 
-        monkeypatch.setattr(VllmSerializableFunction, "__call__", VllmSerializableFunction.__dict__["__call__"])
+        monkeypatch.setattr(
+            VllmSerializableFunction,
+            "__call__",
+            VllmSerializableFunction.__dict__["__call__"],
+        )
     except ImportError:
         pass
     first = diag_mod.install_fwd_timers()
