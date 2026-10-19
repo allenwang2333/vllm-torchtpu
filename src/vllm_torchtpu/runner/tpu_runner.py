@@ -1377,6 +1377,7 @@ class TPUModelRunner(GPUModelRunner):
         self.batch_counter = 0
         self._qwen35_mk: Any = None
         self._qwen35_mtp_mk: Any = None
+        self._qwen35_prefill_mk: Any = None
         self._in_precompile_backbone: bool = False
 
         # Pipeline parallelism: this worker runs one stage's layer slice.
@@ -6823,6 +6824,12 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.kernels.qwen35_megakernel import Qwen35Megakernel
 
             self._qwen35_mk = Qwen35Megakernel.maybe_create(self)
+        if os.environ.get("VLLM_TPU_QWEN35_PREFILL_MK", "0") == "1":
+            from vllm_torchtpu.kernels.qwen35_prefill_mk.vllm_adapter import (
+                Qwen35PrefillMegakernel,
+            )
+
+            self._qwen35_prefill_mk = Qwen35PrefillMegakernel.maybe_create(self)
         if os.environ.get("VLLM_TPU_QWEN35_MTP_MK", "0") == "1" and hasattr(
             self.drafter, "attach_mtp_megakernel"
         ):
@@ -8444,6 +8451,9 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, self.max_num_tokens, self._pp_intermediate_template
             )
             self._pp_wave.warmup()
+        if getattr(self, "_qwen35_prefill_mk", None) is not None:
+            with self._precompile_timed("Qwen3.5 prefill megakernel"):
+                self._qwen35_prefill_mk.bind_caches(self)
         if getattr(self, "_qwen35_mk", None) is not None:
             with self._precompile_timed("Qwen3.5 megakernel"):
                 self._qwen35_mk.bind_caches(self)
@@ -9629,6 +9639,15 @@ class TPUModelRunner(GPUModelRunner):
             )
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        pmk = getattr(self, "_qwen35_prefill_mk", None)
+        if (
+            pmk is not None
+            and not in_precompile
+            and pmk.can_run(input_ids, positions, intermediate_tensors, runner=self)
+        ):
+            # A prefill step of this pipeline stage, all layers in one kernel.
+            self._step_last_dispatch = (True, int(positions.shape[-1]))
+            return pmk(input_ids, positions, intermediate_tensors, runner=self), None
         if not in_precompile:
             self._step_last_dispatch = (False, int(positions.shape[-1]))
         out = self.model(

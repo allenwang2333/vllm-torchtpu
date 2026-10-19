@@ -13,20 +13,32 @@ k = types.ModuleType("vllm_torchtpu.kernels"); k.__path__ = [SRC + "/vllm_torcht
 from vllm_torchtpu.kernels.qwen35_prefill_mk import reference as R, megakernel as MK, harness as Hn, pool_plan
 
 TYPES = tuple(os.environ.get("TYPES", "gdn,attn").split(","))
-c = R.StageConfig(layer_types=TYPES, H=256, NH=4, NKV=2, HD=128, ROT=32, KH=2, VH=4,
-                  E=16, TOPK=4, I=128, IS=128)
+REAL = "--real" in sys.argv                     # full Qwen3.5 dimensions (run with --tpu)
+if REAL:
+    c = R.StageConfig(layer_types=TYPES)
+else:
+    c = R.StageConfig(layer_types=TYPES, H=256, NH=4, NKV=2, HD=128, ROT=32, KH=2, VH=4,
+                      E=16, TOPK=4, I=128, IS=128)
 layout = MK.StageLayout(layer_types=c.layer_types, layer_region=(0,) * len(TYPES),
                         layer_group=(0,) * len(TYPES))
 HAS_GDN = "gdn" in TYPES
-lens, ctxs, BT_TOK, PPS, MAXS = [150, 200], [256, 0], 384, 8, 4
-tiles = MK.MKTiles(tm_norm=64, tm_prep=64, tm_gate=128, tm=64, tn=128, chunk=64, bq=64, bkv=128,
-                   att_sub=2, rt=16, tm_route=64, tm_combine=64, inflight=8, vmem_mib=64)
+if REAL:
+    lens, ctxs, BT_TOK, PPS, MAXS = [600, 300], [2176, 0], 2176, 64, 4
+    tiles = MK.MKTiles(tm=256, tn=512)
+else:
+    lens, ctxs, BT_TOK, PPS, MAXS = [150, 200], [256, 0], 384, 8, 4
+    tiles = MK.MKTiles(tm_norm=64, tm_prep=64, tm_gate=128, tm=64, tn=128, chunk=64, bq=64,
+                       bkv=128, att_sub=2, rt=16, tm_route=64, tm_combine=64, inflight=8,
+                       vmem_mib=64)
 case = Hn.make_case(c, layout, lens, ctxs, max_seqs=MAXS, pps=PPS, block_tokens=BT_TOK)
 T, split = case.t, BT_TOK // Hn.PAGE
 plan, stride = pool_plan.build_gdn_plan(case.pools[0].shape, case.pools[0].dtype, conv_dim=c.QKV,
                                         n_v=c.VH, d_k=c.KD, d_v=c.VD, kernel_size=c.CONV,
                                         pool_block_tokens=BT_TOK)
-_, ws, _, h, r = R.random_stage(c, T, 0)
+if REAL:
+    ws, _, h, r = jax.jit(lambda k: R.random_stage_device(c, T, 0, k))(jax.random.PRNGKey(0))
+else:
+    _, ws, _, h, r = R.random_stage(c, T, 0)
 rng = np.random.default_rng(3)
 # Per-sequence states: GDN (zeros for a sequence without context) and attention context K/V.
 gstates, astates = [], []
@@ -48,13 +60,14 @@ if HAS_GDN:
     print("state pack/unpack round trip: conv", rel(cv[0], gstates[0]["conv"]), "rec", rel(rc[0], gstates[0]["rec"]))
 
 states = [gstates if lt == "gdn" else astates for lt in TYPES]
-hr, rr, sr = Hn.reference_step(c, layout, ws, h, r, case, states, flash_bkv=tiles.bkv)
+hr, rr, sr = Hn.reference_step(c, layout, ws, h, r, case, states, flash_bkv=tiles.bkv,
+                               moe_fn=R.moe_ragged if REAL else None)
 ai = TYPES.index("attn") if "attn" in TYPES else None
 gi = TYPES.index("gdn") if HAS_GDN else None
 kw = [MK.kernel_weight_layout(c, w, lt) for w, lt in zip(ws, c.layer_types)]
 step = MK.build_stage(c, layout, T, max_seqs=MAXS, pps=PPS, pool_shape=pool.shape, plan=plan,
                       stride=stride, tiles=tiles, interpret=INTERP)
-h2, r2, pools2 = jax.jit(step)(case.meta, h, r, kw, [pool], MK.rope_table(c, 1024))
+h2, r2, pools2 = jax.jit(step)(case.meta, h, r, kw, [pool], MK.rope_table(c, PPS * Hn.PAGE))
 pool2 = np.asarray(pools2[0])
 for s, (st, n, cx) in enumerate(zip(case.starts, lens, ctxs)):
     print(f"seq {s} (len {n}, ctx {cx}): hidden rel {rel(h2[st:st + n], hr[st:st + n]):.2e} residual rel {rel(r2[st:st + n], rr[st:st + n]):.2e}")
