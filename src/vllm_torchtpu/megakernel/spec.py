@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import jax.numpy as jnp
 
 from . import pool_alias
 from .ops import rup
+
+if TYPE_CHECKING:
+    from .pool.layout import PoolLayout
 
 
 @dataclass(frozen=True)
@@ -476,22 +479,45 @@ class LayerType:
     slots: tuple[Block | SwitchSlot, ...]
 
 
+# State name of the unified raw-pool tuple (`ST[...]` / `O[...]`). This is the
+# single definition: blocks, the kernel builder and the cache pipes reach it via
+# `PoolBackend.pool_state_name`, `KernelContext.raw_refs`, or this constant.
+POOL_STATE_NAME = "raw"
+
+
 @dataclass(frozen=True)
 class PoolBackend:
-    """Model-injected unified pool layout and gather/scatter callbacks."""
+    """Model-injected unified pool layout and gather/scatter callbacks.
 
-    num_pools: int
-    has_recurrent_pool: bool
-    recurrent_slots_per_pool: int = 1
-    ckpt_pages_per_slot: int = 5
-    pool_state_name: str = "raw"
-    page_table_state_name: str = "page_table"
-    kernel_names: tuple[str, str] = ("gather_gdn_states", "scatter_pool_states")
+    Built by `pool.make_pool_backend(layout, ...)`. Pool count, recurrent-slot
+    count and checkpoint slot stride are derived from `layout`.
+    """
+
+    layout: PoolLayout
+    kernel_names: tuple[str, str]
     gather_states: Any = None
     scatter_states: Any = None
     can_pool_gather: Any = None
+    pool_state_name: str = POOL_STATE_NAME
+    page_table_state_name: str = "page_table"
     supports_fused_io: bool = False
     supports_pool_gather: bool = False
+
+    @property
+    def num_pools(self) -> int:
+        return self.layout.num_pools
+
+    @property
+    def has_recurrent_pool(self) -> bool:
+        return self.layout.has_recurrent
+
+    @property
+    def recurrent_slots_per_pool(self) -> int:
+        return self.layout.recurrent_slots_per_pool
+
+    @property
+    def ckpt_pages_per_slot(self) -> int:
+        return self.layout.pages_per_slot
 
 
 @dataclass(frozen=True)

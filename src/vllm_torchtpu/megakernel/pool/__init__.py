@@ -11,14 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic raw-pool layout, packing, and Pallas gather / scatter kernels."""
+"""Generic raw-pool layout, packing, and Pallas gather / scatter kernels.
+
+Framework-free (jax + numpy only) and model-agnostic: everything is driven by a
+`PoolLayout` (see `pool/layout.py`). Models build their layout and wrap it in a
+`PoolBackend` with `make_pool_backend(layout)`.
+"""
 
 from __future__ import annotations
 
+from .backend import (
+    GATHER_KERNEL_NAME,
+    POOL_KERNEL_NAMES,
+    SCATTER_KERNEL_NAME,
+    can_pool_gather,
+    check_ckpt_bounds,
+    make_pool_backend,
+)
 from .gather import gather_gdn_states
+from .layout import PoolLayout
 from .pack import (
+    allocate_test_layout,
     conv_to_raw_page,
-    default_pool_layout,
     kv_to_raw_page,
     pool_to_states,
     raw_page_to_conv,
@@ -30,10 +44,17 @@ from .pack import (
 from .scatter import scatter_pool_states
 
 __all__ = [
+    "GATHER_KERNEL_NAME",
+    "POOL_KERNEL_NAMES",
+    "SCATTER_KERNEL_NAME",
+    "PoolLayout",
+    "allocate_test_layout",
+    "can_pool_gather",
+    "check_ckpt_bounds",
     "conv_to_raw_page",
-    "default_pool_layout",
     "gather_gdn_states",
     "kv_to_raw_page",
+    "make_pool_backend",
     "pool_to_states",
     "raw_page_to_conv",
     "raw_page_to_kv",

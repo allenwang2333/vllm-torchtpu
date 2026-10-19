@@ -34,7 +34,7 @@ from .planner import (
     state_shapes,
     weight_shapes,
 )
-from .spec import ExecSpec, ModelSpec, SwitchSlot
+from .spec import POOL_STATE_NAME, ExecSpec, ModelSpec, SwitchSlot
 from .stream import TwoRing
 from .vmem import CorePlan, build_scratch
 
@@ -143,7 +143,7 @@ def build(
         pool_key = (
             model_spec.pool_backend.pool_state_name
             if model_spec.pool_backend is not None
-            else "raw"
+            else POOL_STATE_NAME
         )
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])
@@ -352,7 +352,7 @@ def build(
     pool_key = (
         model_spec.pool_backend.pool_state_name
         if model_spec.pool_backend is not None
-        else "raw"
+        else POOL_STATE_NAME
     )
     aliases: dict[int, int] = {}
     if ex.FUSED and bool(ex.interpret) and pool_key in st_names and pool_key in o_names:

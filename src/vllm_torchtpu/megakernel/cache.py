@@ -42,12 +42,12 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from . import cache_experimental, kernel
 from .cache_experimental import should_fuse_pool_io
 from .errors import MegakernelConfigError
+from .pool import POOL_KERNEL_NAMES, PoolLayout, check_ckpt_bounds
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
 
@@ -99,64 +99,6 @@ def _resolve_active_seqs_mode(
             "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
         )
     return "ref", jnp.asarray(active_seqs, dtype=jnp.int32)
-
-
-def _validate_ckpt_bounds(
-    ckpt_indices: Any,
-    num_pages: int,
-    g_per_att: int,
-    *,
-    pages_per_slot: int = 5,
-    act_mode: str = "from_ckpt",
-    active_mask: Any = None,
-) -> None:
-    if (
-        ckpt_indices is None
-        or g_per_att <= 0
-        or isinstance(ckpt_indices, jax.core.Tracer)
-    ):
-        return
-    ckpt_np = np.asarray(ckpt_indices)
-    if ckpt_np.ndim == 4:
-        ckpt_np = ckpt_np[0]
-    is_3d = ckpt_np.ndim == 3
-    ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
-    mask_np = (
-        None
-        if (active_mask is None or isinstance(active_mask, jax.core.Tracer))
-        else np.asarray(active_mask).reshape(-1)
-    )
-    pps = int(pages_per_slot)
-    for s in range(ns):
-        if act_mode == "from_ckpt":
-            active = int(ckpt_np[0, s, 0] if is_3d else ckpt_np[s, 0]) > 0
-        elif act_mode == "ref" and mask_np is not None:
-            active = int(mask_np[s]) != 0
-        else:
-            active = True
-        if not active:
-            continue
-        seen_sub_slots: dict[int, int] = {}
-        for sub in range(g_per_att):
-            slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
-            for slot in np.ravel(slots):
-                slot_i = int(slot)
-                pb = slot_i * pps if is_3d else slot_i * (pps * g_per_att) + sub * pps
-                if pb < 0 or pb + pps > num_pages:
-                    raise ValueError(
-                        f"GDN checkpoint slot {slot_i} (sub={sub}, s={s}) "
-                        f"maps to pages [{pb}, {pb + pps}), which exceeds pool "
-                        f"capacity [0, {num_pages})"
-                    )
-                if is_3d and g_per_att > 1:
-                    prev_sub = seen_sub_slots.get(slot_i)
-                    if prev_sub is not None and prev_sub != sub:
-                        raise ValueError(
-                            f"3D ckpt_indices for active sequence s={s} reuses "
-                            f"slot {slot_i} across sub={prev_sub} and sub={sub} "
-                            f"(both map to pages [{pb}, {pb + pps}))"
-                        )
-                    seen_sub_slots[slot_i] = sub
 
 
 def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
@@ -216,21 +158,33 @@ class _PooledStepFn:
 
 def check_pooled_step_hlo(
     hlo_text: str,
-    page_size: int = 128,
+    page_size: int | None = None,
     *,
-    kvh: int = 1,
-    hd: int = 256,
+    kvh: int | None = None,
+    hd: int | None = None,
+    layout: PoolLayout | None = None,
     min_pool_pages: int = 16,
     require_scatter: bool = True,
     fused_pool_io: bool = False,
-    kernel_names: tuple[str, str] = ("gather_gdn_states", "scatter_pool_states"),
+    kernel_names: tuple[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Verify that a compiled pooled step HLO has no full-pool HBM or VMEM copies.
 
-    `min_pool_pages` (default 16) filters out small per-token KV (1-page) or GDN
-    checkpoint (5-page) staging slices materialized in CPU interpret mode while
-    flagging any full-pool HBM copy (`num_pages >= min_pool_pages`).
+    The pool page shape (`page_size`, `kvh`, `hd`) defaults to `layout` (or the
+    validated `PoolLayout()` page geometry); explicit arguments override it.
+    `kernel_names` defaults to the generic pool kernel names.
+
+    `min_pool_pages` (default 16) filters out small per-token KV (1-page) or
+    checkpoint-slot (`pages_per_slot`-page) staging slices materialized in CPU
+    interpret mode while flagging any full-pool HBM copy
+    (`num_pages >= min_pool_pages`).
     """
+    lay = PoolLayout() if layout is None else layout
+    page_size = lay.page_size if page_size is None else page_size
+    kvh = lay.kvh if kvh is None else kvh
+    hd = lay.hd if hd is None else hd
+    if kernel_names is None:
+        kernel_names = POOL_KERNEL_NAMES
     n_tpu_cc = hlo_text.count("tpu_custom_call")
     n_cpu_cc = hlo_text.count("xla_ffi_python_cpu_callback")
     is_cpu_interp = n_cpu_cc > 0
@@ -339,6 +293,7 @@ def make_flat_pooled_step(
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
+    pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(
         ms,
         ex,
@@ -382,7 +337,6 @@ def make_flat_pooled_step(
     wsh = info["wshape"]
     num_pools = pb.num_pools
     has_rec = pb.has_recurrent_pool
-    rec_slots = pb.recurrent_slots_per_pool
 
     w_tuple_lens = [
         len(wsh[k]) if kernel.is_tupled_weight(wsh[k]) else 1 for k in w_names
@@ -452,12 +406,11 @@ def make_flat_pooled_step(
         if use_fused or use_gpr:
             act_mode_l = "from_ckpt" if has_rec else "all"
             if has_rec and ex_paged.debug.check_ckpt_bounds:
-                _validate_ckpt_bounds(
+                check_ckpt_bounds(
                     ckpt_indices,
                     ex_paged.num_pages,
-                    rec_slots,
+                    pb.layout,
                     act_mode=act_mode_l,
-                    pages_per_slot=pb.ckpt_pages_per_slot,
                 )
             ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
             ckpt_k_l = (
@@ -567,6 +520,7 @@ def make_pooled_step(
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
+    pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(
         ms,
         ex,
@@ -668,13 +622,12 @@ def make_pooled_step(
                 active_seqs, default_mode="from_ckpt" if has_rec else "all"
             )
             if has_rec and ex_paged.debug.check_ckpt_bounds:
-                _validate_ckpt_bounds(
+                check_ckpt_bounds(
                     ckpt_indices,
                     ex_paged.num_pages,
-                    rec_slots,
+                    pb.layout,
                     act_mode=act_mode_l,
                     active_mask=active_mask_l,
-                    pages_per_slot=pb.ckpt_pages_per_slot,
                 )
             ckpt_2d_l = bool(ckpt_indices is not None and ckpt_indices.ndim == 2)
             ckpt_k_l = (
@@ -920,13 +873,12 @@ def make_pooled_step(
                 _unwrap_active_seqs(active_seqs),
                 default_mode="from_ckpt",
             )
-            _validate_ckpt_bounds(
+            check_ckpt_bounds(
                 ckpt_indices,
                 ex_paged.num_pages,
-                rec_slots,
+                pb.layout,
                 act_mode=act_m,
                 active_mask=act_arr,
-                pages_per_slot=pb.ckpt_pages_per_slot,
             )
         hid, new_raw = _jitted_step(
             pos,

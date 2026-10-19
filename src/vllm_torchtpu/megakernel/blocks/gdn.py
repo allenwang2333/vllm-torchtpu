@@ -491,7 +491,7 @@ class GDNBlock(Block):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]
         if ex.FUSED:
-            return fused_pool_io.gdn_fused_scratch(ex, gp)
+            return fused_pool_io.gdn_fused_scratch(ex, gp, plan)
         scr: dict[str, Any] = {
             "recb": (
                 pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), BF16)
@@ -579,7 +579,7 @@ class GDNBlock(Block):
         first: int,
         npages: int,
     ) -> None:
-        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+        raw_refs = ctx.raw_refs
         sub = lax.rem(o, gp.G_PER_ATT)
         g_pool = lax.div(o, gp.G_PER_ATT)
 
@@ -603,7 +603,7 @@ class GDNBlock(Block):
         sem: Any,
         npages: int,
     ) -> None:
-        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+        raw_refs = ctx.raw_refs
 
         @pl.when(self._has_gpr_input(ctx, gp, o, sq))
         def _():
@@ -617,7 +617,7 @@ class GDNBlock(Block):
         )
 
     def _gpr_conv_start(self, ctx: Any, gp: GDNParams, o: Any) -> None:
-        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+        raw_refs = ctx.raw_refs
         sub = lax.rem(o, gp.G_PER_ATT)
         g_pool = lax.div(o, gp.G_PER_ATT)
 
@@ -881,7 +881,7 @@ class GDNBlock(Block):
         if ex.FUSED:
             return fused_pool_io.gdn_fused_emit(ctx, gp, o, slot)
         scr, ST, O = ctx.scr, ctx.ST, ctx.O  # noqa: E741
-        raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST.get("raw")
+        raw_refs = ctx.raw_refs
         skip, sc, stream = ctx.skip, ctx.sc, ctx.stream
         B, T, NS, VER = ex.B, ex.T, ex.NS, ex.VER
         vh, QKV, Z, NLI, H = gp.vh, gp.QKV, gp.Z, gp.NLI, gp.H

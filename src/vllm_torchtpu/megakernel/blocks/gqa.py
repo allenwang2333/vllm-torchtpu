@@ -39,6 +39,7 @@ from ..ops import (
     rup,
 )
 from ..spec import (
+    POOL_STATE_NAME,
     Block,
     ExecSpec,
     SmallField,
@@ -134,7 +135,7 @@ class GQABlock(Block):
         if ex.paged_kv:
             st = [
                 StateDecl(
-                    "raw",
+                    POOL_STATE_NAME,
                     (ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
                     FP8,
                     access="r",
@@ -483,7 +484,7 @@ class GQABlock(Block):
         kbuf: Any = None
         vbuf: Any = None
         if ex.paged_kv:
-            raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
+            raw_refs = ctx.raw_refs
             P_BLK = BLK // ex.page_size
 
             if KVE:
@@ -1173,8 +1174,8 @@ class GQABlock(Block):
     ) -> dict[str, Any]:
         """Scatter `knew` and `vnew` into `kc` and `vc` inside `shard_map`."""
         if ex.FUSED:
-            if "raw" in raw_outputs:
-                return {"raw": raw_outputs["raw"]}
+            if POOL_STATE_NAME in raw_outputs:
+                return {POOL_STATE_NAME: raw_outputs[POOL_STATE_NAME]}
             return {}
         knew, vnew = raw_outputs["knew"], raw_outputs["vnew"]
         if ex.paged_kv or "kc" not in states:

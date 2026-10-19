@@ -23,17 +23,21 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.gdn import GDNBlock
 from ..ops import BF16, F32, FP8, I32, U32, rup
 from ..spec import ExecSpec
-from .backend import _check_ckpt_bounds, _kernel_debug_check, _resolve_active_seqs
+from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
+from .layout import LANES, PoolLayout
+
+# Pallas kernel name (unchanged from the Qwen3.5-only module so TPU traces and
+# profiles stay comparable); `GATHER_KERNEL_NAME` is a substring of it.
+_PALLAS_NAME = "qwen3_5_gather_gdn_states"
 
 
 # ---------------------------------------------------------------------------
 # Pallas GDN Gather Kernel
 # ---------------------------------------------------------------------------
 def gather_gdn_states(
-    g: Any,
+    layout: PoolLayout,
     ex: ExecSpec,
     raw_pools: tuple[jax.Array, ...] | list[jax.Array],
     ckpt_indices: jax.Array,
@@ -45,13 +49,14 @@ def gather_gdn_states(
     """Gather per-rank GDN `conv` and `rec` states from per-attention `raw_pools`.
 
     Args:
-      g: Model geometry (`NATT`, `NGDN`, `att_every`, `H`, `K`, `KD`, `VD`, `V`).
+      layout: Pool layout (`num_pools`, `slots_per_pool`, page and slot geometry,
+        recurrent / conv state geometry).
       ex: Execution spec (`B`, `T`, `NS`, `R`, `page_size`, `num_pages`).
-      raw_pools: Tuple of `g.NATT` per-rank raw pool arrays, each of shape
-        `(num_pages, 2, 64, 4, page_size) fp8_e4m3fn`.
+      raw_pools: Tuple of `layout.num_pools` per-rank raw pool arrays, each of
+        shape `(num_pages, *layout.kv_page_shape) fp8_e4m3fn`.
       ckpt_indices: `int32` checkpoint slot table, shape `(G_PER_ATT, NS, K_ckpt)`
-        or `(NS, K_ckpt)`. For 3D `ckpt_indices`, `page_base = slot * 5`; for 2D,
-        `page_base = slot * (5 * G_PER_ATT) + sub * 5`.
+        or `(NS, K_ckpt)`, mapped to pages by `layout.page_base` (3D:
+        `slot * pps`; 2D: `slot * (pps * G_PER_ATT) + sub * pps`).
       read_offsets: `int32` index into `ckpt_indices` axis `-1` for the input
         checkpoint slot per sequence, shape `(G_PER_ATT, NS)` or `(NS,)`. A
         negative offset (`read_offsets < 0`) indicates a cold-start sequence
@@ -65,36 +70,39 @@ def gather_gdn_states(
     Returns:
       `(conv, rec)` matching `GDNBlock.states(g, ex)` per-rank shapes.
     """
-    if hasattr(g, "check"):
-        g.check(ex)
+    layout.validate(ex)
     if interpret is None:
         interpret = ex.interpret
-    assert len(raw_pools) == g.NATT, (len(raw_pools), g.NATT)
-    AE = g.att_every
-    G_PER_ATT = AE - 1
-    act_mode, active_mask = _resolve_active_seqs(
+    NATT = layout.num_pools
+    assert len(raw_pools) == NATT, (len(raw_pools), NATT)
+    G_PER_ATT = layout.slots_per_pool
+    act_mode, active_mask = resolve_active_seqs(
         active_seqs, default_mode="from_ckpt" if G_PER_ATT > 0 else "all"
     )
-    _check_ckpt_bounds(
+    check_ckpt_bounds(
         ckpt_indices,
         ex.num_pages,
-        G_PER_ATT,
+        layout,
         act_mode=act_mode,
         active_mask=active_mask,
     )
 
-    lay = GDNBlock.lin_in_layout(g, ex)
-    vh, KD, VD, QKV = lay.vh, lay.KD, lay.VD, lay.QKV
+    vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
+    QKV = layout.qkv_per_rank(ex.R)
     NS, B, T = ex.NS, ex.B, ex.T
     CR = rup(3 * B, 8)
     HR = rup(3 + T, 8)
-    ngdn = max(1, g.NGDN)
+    ngdn = max(1, layout.num_recurrent_layers)
     conv_shape = (ngdn, CR, QKV) if T == 1 else (ngdn, NS, HR, QKV)
     conv_dt = F32
     rec_shape = (ngdn, NS * vh, KD, VD)
     rec_dt = BF16
 
-    page_size = ex.page_size
+    pps = layout.pages_per_slot
+    rec_pages = layout.rec_pages_per_slot
+    rec_u32_cap = layout.rec_u32_rows
+    conv_page = layout.conv_page
+    conv_page_rows = layout.conv_page_rows
     ssm_u32_rows = (vh * KD) // 2
     conv_rows = (3 * QKV) // 128
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
@@ -111,7 +119,7 @@ def gather_gdn_states(
     rec_coal = max(1, G_PER_ATT) if coal_rec else 1
 
     scratch = {
-        "page_buf": pltpu.VMEM((2, 5, 2, 64, 4, page_size), FP8),
+        "page_buf": pltpu.VMEM((2, pps, *layout.kv_page_shape), FP8),
         "rec_buf": pltpu.VMEM((2, rec_coal, *rec_shape[1:]), rec_dt),
         "conv_buf": pltpu.VMEM(
             (2, max(1, G_PER_ATT), *conv_raw_shape[1:]), conv_raw_dt
@@ -123,14 +131,14 @@ def gather_gdn_states(
     n_smem = 3 if act_mode == "ref" else 2
 
     def _kernel(*refs):
-        raw_refs = refs[: g.NATT]
+        raw_refs = refs[:NATT]
         act_ref: Any = None
         if act_mode == "ref":
-            ckpt_ref, roff_ref, act_ref = refs[g.NATT : g.NATT + 3]
+            ckpt_ref, roff_ref, act_ref = refs[NATT : NATT + 3]
         else:
-            ckpt_ref, roff_ref = refs[g.NATT : g.NATT + 2]
-        conv_out_ref, rec_out_ref = refs[g.NATT + n_smem : g.NATT + n_smem + 2]
-        scr = dict(zip(s_names, refs[g.NATT + n_smem + 2 :]))
+            ckpt_ref, roff_ref = refs[NATT : NATT + 2]
+        conv_out_ref, rec_out_ref = refs[NATT + n_smem : NATT + n_smem + 2]
+        scr = dict(zip(s_names, refs[NATT + n_smem + 2 :]))
         page_buf = scr["page_buf"]
         rec_buf = scr["rec_buf"]
         conv_buf = scr["conv_buf"]
@@ -159,25 +167,21 @@ def gather_gdn_states(
             roff = jnp.maximum(
                 roff_ref[sub, s] if roff_is_2d else roff_ref[s], jnp.int32(0)
             )
-            if ckpt_is_3d:
-                slot = ckpt_ref[sub, s, roff]
-                pb = slot * 5
-            else:
-                slot = ckpt_ref[s, roff]
-                pb = slot * (5 * G_PER_ATT) + sub * 5
-            _kernel_debug_check(
-                jnp.logical_and(pb >= 0, pb + 5 <= ex.num_pages),
+            slot = ckpt_ref[sub, s, roff] if ckpt_is_3d else ckpt_ref[s, roff]
+            pb = layout.page_base(slot, sub, ckpt_indices.ndim)
+            kernel_debug_check(
+                jnp.logical_and(pb >= 0, pb + pps <= ex.num_pages),
                 "GDN gather checkpoint slot maps outside [0, num_pages)",
                 interpret=bool(interpret),
             )
-            return jnp.clip(pb, 0, ex.num_pages - 5)
+            return jnp.clip(pb, 0, ex.num_pages - pps)
 
         def start_page_read(raw_ref, sub, s, p_slot):
             @pl.when(has_input_state(sub, s))
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, 5)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    raw_ref.at[pl.ds(pb, pps)], page_buf.at[p_slot], sem_in.at[p_slot]
                 ).start()
 
         def finish_page_read(raw_ref, sub, s, p_slot, g_slot, r_slot, r_sub):
@@ -188,22 +192,22 @@ def gather_gdn_states(
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, 5)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    raw_ref.at[pl.ds(pb, pps)], page_buf.at[p_slot], sem_in.at[p_slot]
                 ).wait()
 
                 u32_val = (
-                    page_buf.at[p_slot, pl.ds(0, 4)]
+                    page_buf.at[p_slot, pl.ds(0, rec_pages)]
                     .bitcast(U32)
-                    .reshape(512, 128)[:ssm_u32_rows, :]
+                    .reshape(rec_u32_cap, LANES)[:ssm_u32_rows, :]
                 )
                 s_km = pltpu.bitcast(u32_val, BF16).reshape(vh, KD, VD)
                 rec_buf[r_slot, r_sub, pl.ds(h0, vh)] = s_km
 
                 if direct_conv:
                     raw_hr = (
-                        page_buf.at[p_slot, 4]
+                        page_buf.at[p_slot, conv_page]
                         .bitcast(BF16)
-                        .reshape(256, 128)[:hr_rows_128, :]
+                        .reshape(conv_page_rows, LANES)[:hr_rows_128, :]
                         .reshape(HR, QKV)
                         .astype(conv_dt)
                     )
@@ -215,9 +219,9 @@ def gather_gdn_states(
                         else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
                     )
                     conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = (
-                        page_buf.at[p_slot, 4]
+                        page_buf.at[p_slot, conv_page]
                         .bitcast(BF16)
-                        .reshape(256, 128)[:conv_rows_pad, :]
+                        .reshape(conv_page_rows, LANES)[:conv_rows_pad, :]
                     )
 
             @pl.when(jnp.logical_not(has_st))
@@ -235,11 +239,11 @@ def gather_gdn_states(
                         (conv_rows_pad, 128), conv_raw_dt
                     )
 
-        total_gdn = g.NATT * G_PER_ATT
+        total_gdn = NATT * G_PER_ATT
         if total_gdn > 0 and NS >= 1:
             start_page_read(raw_refs[0], 0, 0, 0)
 
-        for g_idx in range(g.NATT):
+        for g_idx in range(NATT):
             raw_ref = raw_refs[g_idx]
             g_slot = g_idx & 1
             if G_PER_ATT > 0 and g_idx >= 2:
@@ -379,7 +383,7 @@ def gather_gdn_states(
                     ).start()
 
         if G_PER_ATT > 0:
-            for g_tail in range(max(0, g.NATT - 2), g.NATT):
+            for g_tail in range(max(0, NATT - 2), NATT):
                 tail_slot = g_tail & 1
                 o_tail = g_tail * G_PER_ATT
                 pltpu.make_async_copy(
@@ -413,7 +417,7 @@ def gather_gdn_states(
             cp_c.wait()
             cp_r.wait()
 
-    in_specs = [pl.BlockSpec(memory_space=pltpu.HBM)] * g.NATT + [
+    in_specs = [pl.BlockSpec(memory_space=pltpu.HBM)] * NATT + [
         pl.BlockSpec(memory_space=pltpu.SMEM)
     ] * n_smem
     out_shape = (
@@ -443,7 +447,7 @@ def gather_gdn_states(
             vmem_limit_bytes=ex.resolved_tiles.vmem_mib << 20,
         ),
         interpret=bool(interpret),
-        name="qwen3_5_gather_gdn_states",
+        name=_PALLAS_NAME,
     )
     smem_args = (
         (ckpt_indices, read_offsets, active_mask)

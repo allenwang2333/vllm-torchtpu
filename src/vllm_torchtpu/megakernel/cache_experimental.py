@@ -40,6 +40,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MegakernelConfigError
+from .pool import POOL_KERNEL_NAMES
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
 
@@ -126,10 +127,12 @@ def should_fuse_pool_io(
 def check_fused_pooled_step_hlo(
     hlo_text: str,
     *,
-    kernel_names: tuple[str, str] = ("gather_gdn_states", "scatter_pool_states"),
+    kernel_names: tuple[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Verify that a 1-launch `fused_pool_io` HLO has no separate gather/scatter."""
-    gather_name, scatter_name = kernel_names
+    gather_name, scatter_name = (
+        POOL_KERNEL_NAMES if kernel_names is None else kernel_names
+    )
     if (gather_name and gather_name in hlo_text) or (
         scatter_name and scatter_name in hlo_text
     ):

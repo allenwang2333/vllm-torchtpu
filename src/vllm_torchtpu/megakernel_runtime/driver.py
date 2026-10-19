@@ -1596,7 +1596,14 @@ class MegakernelDriver:
         dev = self.raw_pools[0].device
         ckpt_cols = max(1, int(self._ckpt_window))
         # Sentinel pages for kernel variant index v (see the warmup loop): KV page
-        # v and GDN pages [5 * (1 + 12 v), 5 * (1 + 12 v + 3 T)); snapshot them all.
+        # v and GDN pages [pps * (1 + spv * v), pps * (1 + spv * v + spp * T)),
+        # with pps / spp the pool layout's pages and slots per pool and
+        # spv = spp * max T slots per variant; snapshot them all.
+        pool_lay = self.spec.pool_backend.layout
+        pps = pool_lay.pages_per_slot
+        spp = pool_lay.slots_per_pool
+        rpp = pool_lay.rec_pages_per_slot
+        spv = spp * _MTP_VERIFY_TOKENS
         n_variants = len(
             {
                 (
@@ -1608,7 +1615,7 @@ class MegakernelDriver:
                 for b in b_list
             }
         )
-        n_sent = 5 * (1 + 12 * max(n_variants - 1, 0) + 3 * _MTP_VERIFY_TOKENS)
+        n_sent = pps * (1 + spv * max(n_variants - 1, 0) + spp * _MTP_VERIFY_TOKENS)
         n_save = min(self.num_pages, max(80, n_sent))
         # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
         # slice writes on a 2.30 GiB pool to as_strided_copy_inverse, allocating
@@ -1718,35 +1725,37 @@ class MegakernelDriver:
                         # (`as_strided_copy_inverse`) on the 2.30 GiB pools.
                         v_idx = len(sentinel_checked_variants)
                         kv_page = v_idx
-                        gdn_base = 1 + v_idx * 12
-                        if kv_page >= self.num_pages or self.num_pages < 5 * (
-                            gdn_base + 3 * T
+                        gdn_base = 1 + v_idx * spv
+                        if kv_page >= self.num_pages or self.num_pages < pps * (
+                            gdn_base + spp * T
                         ):
                             has_t1 = any(k[0] == 1 for k in sentinel_checked_variants)
                             kv_page = 1 if (T > 1 and has_t1) else 0
-                            gdn_base = 4 if (T > 1 and has_t1) else 1
-                        disjoint_subs = self.num_pages >= 5 * (gdn_base + 3 * T)
+                            gdn_base = 1 + spp if (T > 1 and has_t1) else 1
+                        disjoint_subs = self.num_pages >= pps * (gdn_base + spp * T)
                         if not disjoint_subs:
                             kv_page = 0
                             gdn_base = 1
                         do_sentinel = (
                             variant_key not in sentinel_checked_variants
-                            and self.num_pages >= 5 * (gdn_base + T)
+                            and self.num_pages >= pps * (gdn_base + T)
                         )
-                        gdn_p0 = 5 * gdn_base
+                        gdn_p0 = pps * gdn_base
                         sent_kv: list[torch.Tensor] | None = None
                         sent_gdn: list[torch.Tensor] | None = None
                         if do_sentinel:
                             if dev.type != "tpu":
                                 for p in self.raw_pools:
                                     p[kv_page].view(torch.uint8).fill_(0x7F)
-                                    p[gdn_p0 : gdn_p0 + 5].view(torch.uint8).fill_(0xFF)
+                                    p[gdn_p0 : gdn_p0 + pps].view(torch.uint8).fill_(
+                                        0xFF
+                                    )
                             sent_kv = [
                                 p[kv_page].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
                             ]
                             sent_gdn = [
-                                p[gdn_p0 : gdn_p0 + 4].view(torch.uint8).cpu().clone()
+                                p[gdn_p0 : gdn_p0 + rpp].view(torch.uint8).cpu().clone()
                                 for p in self.raw_pools
                             ]
                             ids_b[:T] = 1
@@ -1796,7 +1805,7 @@ class MegakernelDriver:
                                     p[kv_page].view(torch.uint8).cpu(), sent_kv[idx]
                                 )
                                 gdn_ok = not torch.equal(
-                                    p[gdn_p0 : gdn_p0 + 4].view(torch.uint8).cpu(),
+                                    p[gdn_p0 : gdn_p0 + rpp].view(torch.uint8).cpu(),
                                     sent_gdn[idx],
                                 )
                                 if not (kv_ok and gdn_ok and out_fin_ok):
@@ -1815,7 +1824,7 @@ class MegakernelDriver:
                                             ),
                                             int(
                                                 (
-                                                    rp[gdn_p0 : gdn_p0 + 4]
+                                                    rp[gdn_p0 : gdn_p0 + rpp]
                                                     .view(torch.uint8)
                                                     .cpu()
                                                     != 0

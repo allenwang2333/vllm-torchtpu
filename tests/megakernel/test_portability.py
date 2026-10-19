@@ -48,6 +48,11 @@ def test_megakernel_portability_ast_guard():
         "blocks/gqa.py",
         "blocks/moe.py",
         "models/qwen35.py",
+        "pool/backend.py",
+        "pool/gather.py",
+        "pool/layout.py",
+        "pool/pack.py",
+        "pool/scatter.py",
     }
     assert required_modules <= rel_paths, required_modules - rel_paths
 
@@ -110,4 +115,54 @@ def test_megakernel_portability_ast_guard():
                     assert rel in jax_src_allowlist, (
                         f"{rel}:{node.lineno} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
+                    )
+
+
+def test_pool_package_is_framework_free():
+    """`megakernel/pool/` imports only stdlib, jax, numpy and core spec modules.
+
+    The generic pool package must not depend on `models/` (no per-model code),
+    nor on blocks, the kernel builder or the cache pipes; its only internal
+    dependencies are `ops`, `errors`, `spec` and its own modules.
+    """
+    pool_root = Path(megakernel.__file__).resolve().parent / "pool"
+    py_files = sorted(pool_root.rglob("*.py"))
+    rel_paths = {p.name for p in py_files}
+    assert {
+        "__init__.py",
+        "layout.py",
+        "pack.py",
+        "gather.py",
+        "scatter.py",
+        "backend.py",
+    } <= rel_paths, rel_paths
+    allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
+    allowed_core = {"ops", "errors", "spec"}
+    for path in py_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".")[0]
+                    assert root in allowed_external_roots, (
+                        f"pool/{path.name}:{node.lineno} imports '{alias.name}'"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0:
+                    assert mod.split(".")[0] in allowed_external_roots, (
+                        f"pool/{path.name}:{node.lineno} imports '{mod}'"
+                    )
+                elif node.level == 2:
+                    names = [mod] if mod else [a.name for a in node.names]
+                    for name in names:
+                        assert name.split(".")[0] in allowed_core, (
+                            f"pool/{path.name}:{node.lineno} imports '..{name}'; "
+                            f"pool/ may only use {sorted(allowed_core)} from core "
+                            "(never models/, blocks/, kernel or cache)"
+                        )
+                else:
+                    assert node.level == 1, (
+                        f"pool/{path.name}:{node.lineno} relative import level "
+                        f"{node.level} leaves the megakernel package"
                     )

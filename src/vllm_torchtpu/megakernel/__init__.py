@@ -22,6 +22,7 @@ from . import (
     models,
     ops,
     planner,
+    pool,
     pool_alias,
     profile,
     profiles,
@@ -68,6 +69,7 @@ from .models.qwen35_pool import (
     kv_to_raw_page,
     pool_to_states,
     qwen35_pool_backend,
+    qwen35_pool_layout,
     raw_page_to_conv,
     raw_page_to_kv,
     raw_pages_to_ssm,
@@ -77,6 +79,7 @@ from .models.qwen35_pool import (
 )
 from .ops import rup
 from .planner import encode_ecopy
+from .pool import PoolLayout, allocate_test_layout, make_pool_backend
 from .profile import (
     DEFAULT_PROFILE,
     Baseline,
@@ -86,6 +89,7 @@ from .profile import (
     register_profile,
 )
 from .spec import (
+    POOL_STATE_NAME,
     Block,
     DebugOptions,
     ExecSpec,
@@ -106,6 +110,7 @@ from .stream import TwoRing
 
 __all__ = [
     "DEFAULT_PROFILE",
+    "POOL_STATE_NAME",
     "AllReduceRing",
     "Baseline",
     "Block",
@@ -127,6 +132,7 @@ __all__ = [
     "ModelSpec",
     "PallasWriter",
     "PoolBackend",
+    "PoolLayout",
     "Profile",
     "ScratchReq",
     "SmallField",
@@ -137,6 +143,7 @@ __all__ = [
     "TwoRing",
     "WeightDecl",
     "blocks",
+    "allocate_test_layout",
     "build",
     "cache",
     "cache_experimental",
@@ -157,16 +164,19 @@ __all__ = [
     "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
     "make_fused_pooled_step",
+    "make_pool_backend",
     "make_pooled_step",
     "make_step",
     "models",
     "ops",
     "planner",
+    "pool",
     "pool_alias",
     "pool_to_states",
     "profile",
     "profiles",
     "qwen35_pool_backend",
+    "qwen35_pool_layout",
     "raw_page_to_conv",
     "raw_page_to_kv",
     "raw_pages_to_ssm",

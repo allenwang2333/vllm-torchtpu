@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared pool checks: active-sequence modes and checkpoint-slot bounds."""
+"""`make_pool_backend(layout)` plus the shared pool checks.
+
+`check_ckpt_bounds` is the single host-side checkpoint-slot bounds check, used by
+the pool kernels, the host packers and the pooled-step cache pipes.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import jax
@@ -22,10 +27,16 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
-from ..ops import I32
+from ..ops import I32, rup
+from ..spec import POOL_STATE_NAME, ExecSpec, PoolBackend
+from .layout import PoolLayout
+
+GATHER_KERNEL_NAME = "gather_gdn_states"
+SCATTER_KERNEL_NAME = "scatter_pool_states"
+POOL_KERNEL_NAMES = (GATHER_KERNEL_NAME, SCATTER_KERNEL_NAME)
 
 
-def _resolve_active_seqs(
+def resolve_active_seqs(
     active_seqs: jax.Array | str | None,
     *,
     default_mode: str = "from_ckpt",
@@ -43,20 +54,24 @@ def _resolve_active_seqs(
     return "ref", jnp.asarray(active_seqs, dtype=I32)
 
 
-def _check_ckpt_bounds(
+def check_ckpt_bounds(
     ckpt_indices: Any,
     num_pages: int,
-    g_per_att: int,
+    layout: PoolLayout,
     *,
     act_mode: str = "from_ckpt",
     active_mask: Any = None,
 ) -> None:
-    """Validate concrete (eager) active GDN checkpoint slots fit in `[0, num_pages)`.
+    """Validate concrete (eager) active checkpoint slots fit in `[0, num_pages)`.
 
-    Under `jax.jit` (`Tracer` inputs), this eager host check is a no-op and bounds
-    are checked inside the Pallas kernel via `pl.debug_check` when Pallas debug
-    checks are enabled (`jax_pallas_enable_debug_checks=True`).
+    Accepts 2D `[NS, K]`, 3D `[slots_per_pool, NS, K]` or rank-leading 4D
+    `ckpt_indices` (see `PoolLayout.page_base`). 3D indices must use disjoint
+    slots across sub-layers of an active sequence. Under `jax.jit` (`Tracer`
+    inputs), this eager host check is a no-op and bounds are checked inside the
+    Pallas kernels via `pl.debug_check` when Pallas debug checks are enabled
+    (`jax_pallas_enable_debug_checks=True`).
     """
+    g_per_att = layout.slots_per_pool
     if (
         ckpt_indices is None
         or g_per_att <= 0
@@ -64,13 +79,16 @@ def _check_ckpt_bounds(
     ):
         return
     ckpt_np = np.asarray(ckpt_indices)
+    if ckpt_np.ndim == 4:
+        ckpt_np = ckpt_np[0]
     is_3d = ckpt_np.ndim == 3
     ns = ckpt_np.shape[1] if is_3d else ckpt_np.shape[0]
     mask_np = (
         None
         if (active_mask is None or isinstance(active_mask, jax.core.Tracer))
-        else np.asarray(active_mask)
+        else np.asarray(active_mask).reshape(-1)
     )
+    pps = layout.pages_per_slot
     for s in range(ns):
         if act_mode == "from_ckpt":
             active = int(ckpt_np[0, s, 0] if is_3d else ckpt_np[s, 0]) > 0
@@ -85,11 +103,11 @@ def _check_ckpt_bounds(
             slots = ckpt_np[sub, s] if is_3d else ckpt_np[s]
             for slot in np.ravel(slots):
                 slot_i = int(slot)
-                pb = slot_i * 5 if is_3d else slot_i * (5 * g_per_att) + sub * 5
-                if pb < 0 or pb + 5 > num_pages:
+                pb = layout.page_base(slot_i, sub, ckpt_np.ndim)
+                if pb < 0 or pb + pps > num_pages:
                     raise ValueError(
                         f"GDN checkpoint slot {slot_i} (sub={sub}, s={s}) "
-                        f"maps to pages [{pb}, {pb + 5}), which exceeds pool "
+                        f"maps to pages [{pb}, {pb + pps}), which exceeds pool "
                         f"capacity [0, {num_pages})"
                     )
                 if is_3d:
@@ -105,7 +123,7 @@ def _check_ckpt_bounds(
                     seen_slots[slot_i] = sub
 
 
-def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
+def kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
     """Emit `pl.debug_check` and enforce it in CPU `interpret` mode when enabled."""
     pl.debug_check(cond, msg)
     if interpret and pl.enable_debug_checks.value:
@@ -115,3 +133,132 @@ def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
                 raise RuntimeError(msg)
 
         jax.debug.callback(_cb, cond)
+
+
+def can_pool_gather(layout: PoolLayout, ex: ExecSpec) -> bool:
+    """Whether verify bucket `ex` can gather recurrent state in-kernel (`GPR`).
+
+    Depends only on the pool layout and the GDN chunk tiles: `GPR` needs the
+    chunked (`gdn_rows`) verify path and a conv window that fits the K half of
+    one pool page as `(rows, 4, page_size)` fp8 rows.
+    """
+    if not layout.has_recurrent or ex.page_size != layout.page_size or ex.T <= 1:
+        return False
+    if ex.pool_gather in (False, "split"):
+        return False
+    if ex.pool_gather is None and not ex.WIDE:
+        return False
+    tiles = ex.resolve_tiles()
+    cb = tiles.gdn_rows
+    if cb <= 0 or cb % 8 != 0 or cb % ex.T != 0:
+        return False
+    _, tr = divmod(ex.B, cb)
+    nch = ex.B // cb + int(tr > 0)
+    nrb = min(tiles.gdn_bufs, nch)
+    if nch > 1 and nrb < 2:
+        return False
+    hr = rup(layout.conv_taps + ex.T, 8)
+    conv_bytes = hr * layout.qkv_per_rank(ex.R) * 2
+    row_bytes = 4 * layout.page_size
+    if conv_bytes % row_bytes != 0:
+        return False
+    gconv_rows = conv_bytes // row_bytes
+    return gconv_rows <= layout.kv_page_shape[1]
+
+
+def make_pool_backend(
+    layout: PoolLayout,
+    *,
+    check: Callable[[ExecSpec], None] | None = None,
+    supports_fused_io: bool = True,
+    supports_pool_gather: bool = True,
+) -> PoolBackend:
+    """Build the `PoolBackend` (gather / scatter callbacks) for `layout`.
+
+    `check(ex)`, if given, runs before each gather / scatter launch (e.g. the
+    model geometry's `check`).
+    """
+    # Local imports: the kernels import the shared checks from this module.
+    from .gather import gather_gdn_states
+    from .scatter import scatter_pool_states
+
+    has_rec = layout.has_recurrent
+
+    def _gather(
+        ex_paged: ExecSpec,
+        raw_pools: tuple[jax.Array, ...],
+        ckpt_indices: jax.Array | None,
+        read_offsets: jax.Array | None,
+        active_seqs: Any,
+    ) -> dict[str, Any]:
+        if not has_rec or ex_paged.GPR:
+            return {}
+        assert ckpt_indices is not None and read_offsets is not None
+        if check is not None:
+            check(ex_paged)
+        conv, rec = gather_gdn_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            ckpt_indices,
+            read_offsets,
+            active_seqs,
+            interpret=ex_paged.interpret,
+        )
+        return {"conv": conv, "rec": rec}
+
+    def _scatter(
+        ex_paged: ExecSpec,
+        raw_pools: tuple[jax.Array, ...],
+        pos: jax.Array,
+        page_table: jax.Array,
+        out_map: dict[str, Any],
+        ckpt_indices: jax.Array | None,
+        active_seqs: Any,
+    ) -> tuple[jax.Array, ...]:
+        if check is not None:
+            check(ex_paged)
+        conv_out = out_map.get("conv_ckpt" if ex_paged.VER else "conv")
+        rec_out = out_map.get("rec_ckpt" if ex_paged.VER else "rec")
+        return scatter_pool_states(
+            layout,
+            ex_paged,
+            raw_pools,
+            pos,
+            page_table,
+            out_map["knew"],
+            out_map["vnew"],
+            conv_out if has_rec else None,
+            rec_out if has_rec else None,
+            ckpt_indices if has_rec else None,
+            active_seqs,
+            interpret=ex_paged.interpret,
+            conv_partial=ex_paged.GPR,
+        )
+
+    def _can_pool_gather(ex_paged: ExecSpec) -> bool:
+        return can_pool_gather(layout, ex_paged)
+
+    return PoolBackend(
+        layout=layout,
+        kernel_names=POOL_KERNEL_NAMES,
+        gather_states=_gather,
+        scatter_states=_scatter,
+        can_pool_gather=_can_pool_gather,
+        pool_state_name=POOL_STATE_NAME,
+        page_table_state_name="page_table",
+        supports_fused_io=supports_fused_io,
+        supports_pool_gather=supports_pool_gather,
+    )
+
+
+__all__ = [
+    "GATHER_KERNEL_NAME",
+    "POOL_KERNEL_NAMES",
+    "SCATTER_KERNEL_NAME",
+    "can_pool_gather",
+    "check_ckpt_bounds",
+    "kernel_debug_check",
+    "make_pool_backend",
+    "resolve_active_seqs",
+]

@@ -21,10 +21,10 @@ HBM copy before the kernel. Therefore, `ex.FUSED` uses two backend-specific
 aliasing contracts:
 
 1. **TPU (`ex.interpret == False`)**:
-   - The pool tuple `ST["raw"]` is declared `access="r"` on the communicating
-     `pallas_call` (`O["raw"]` is omitted, and `pallas_call` sets no pool
-     `input_output_aliases`).
-   - Inside the kernel, `ctx.raw_refs = ST["raw"]`; `GQABlock` and `GDNBlock`
+   - The pool tuple `ST[pool]` (`pool = PoolBackend.pool_state_name`) is
+     declared `access="r"` on the communicating `pallas_call` (`O[pool]` is
+     omitted, and `pallas_call` sets no pool `input_output_aliases`).
+   - Inside the kernel, `ctx.raw_refs = ST[pool]`; `GQABlock` and `GDNBlock`
      issue async HBM DMA reads and writes directly against `ctx.raw_refs`.
    - The outer `jax.jit` (`donate_argnums` on `raw_pools`) returns the donated
      `raw_pools` input references directly as outputs, so XLA aliases the outer
@@ -37,9 +37,9 @@ aliasing contracts:
 2. **CPU interpret mode (`ex.interpret != False`)**:
    - CPU `interpret=True` does not mutate `access="r"` inputs in-place across the
      `pallas_call` boundary unless aliased to an output.
-   - `GQABlock.outputs` declares `O["raw"]` (`access="w"`), `kernel.build`
-     aliases `ST["raw"] -> O["raw"]` in `pallas_call(input_output_aliases=...)`,
-     and `ctx.raw_refs = O["raw"]`.
+   - `GQABlock.outputs` declares `O[pool]` (`access="w"`), `kernel.build`
+     aliases `ST[pool] -> O[pool]` in `pallas_call(input_output_aliases=...)`,
+     and `ctx.raw_refs = O[pool]`.
 
 CPU vs TPU code-path differences (beyond aliasing):
 ---------------------------------------------------
@@ -55,7 +55,8 @@ tests cover the arithmetic but not every TPU lowering:
   page at t=0, else from the previous token's output page) and per-head writes.
 - GDN input refill: CPU issues the next sequence's gather before the recurrence;
   TPU issues it after (DMA scheduling only).
-- Conv checkpoint page: CPU zero-pads the staged taps to the full 256-row page;
+- Conv checkpoint page: CPU zero-pads the staged taps to the full conv page
+  (`PoolLayout.conv_page_rows`);
   TPU writes the live rows only and relies on the zero-initialized staging page.
 Only the TPU paths are exercised by the TPU benches (`test_tpu_v7x8_bench.py`).
 
@@ -73,8 +74,20 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..errors import MegakernelConfigError
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
-from ..spec import ExecSpec, StateDecl
+from ..pool.layout import LANES, PoolLayout
+from ..spec import POOL_STATE_NAME, ExecSpec, StateDecl
+
+
+def _pool_layout(model_spec: Any) -> PoolLayout:
+    """The `PoolLayout` of `model_spec`'s pool backend (required by `ex.FUSED`)."""
+    pb = model_spec.pool_backend
+    if pb is None:
+        raise MegakernelConfigError(
+            f"fused_pool_io needs a pool_backend on ModelSpec {model_spec.name!r}"
+        )
+    return pb.layout
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -113,7 +126,7 @@ def gqa_fused_outputs(g: Any, ex: ExecSpec) -> list[StateDecl]:
     if bool(ex.interpret):
         return [
             StateDecl(
-                "raw",
+                POOL_STATE_NAME,
                 (ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
                 FP8,
                 access="w",
@@ -202,7 +215,7 @@ def gqa_fused_kvrd_issue(ctx: Any, a_cur: Any) -> None:
     if "kv" in ctx.skip:
         return
     ex, scr, ST, pos_ref = ctx.ex, ctx.scr, ctx.ST, ctx.pos_ref
-    raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
+    raw_refs = ctx.raw_refs
     NS, T = ex.NS, ex.T
     pt_ref = ST["page_table"]
     kv_scat = scr["kv_scat_page"]
@@ -236,7 +249,7 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     if "kv" in ctx.skip:
         return
     ex, scr, ST, pos_ref = ctx.ex, ctx.scr, ctx.ST, ctx.pos_ref
-    raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
+    raw_refs = ctx.raw_refs
     NS, T = ex.NS, ex.T
     HD = ap.HD
     h4 = HD // 4
@@ -403,8 +416,8 @@ def gqa_fused_epilogue(ctx: Any) -> None:
     """Drain any in-flight KV page RMW DMA writes at the end of the layer loop."""
     if "kv" in ctx.skip:
         return
-    ex, scr, ST = ctx.ex, ctx.scr, ctx.ST
-    raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
+    ex, scr = ctx.ex, ctx.scr
+    raw_refs = ctx.raw_refs
     for s in range(ex.NS):
         _gqa_wait_kv_wr(raw_refs, scr, ctx.skip, s)
 
@@ -412,14 +425,28 @@ def gqa_fused_epilogue(ctx: Any) -> None:
 # ---------------------------------------------------------------------------
 # GDN Fused Pool I/O (`GDNBlock` when `ex.FUSED=True`)
 # ---------------------------------------------------------------------------
-def gdn_fused_scratch(ex: ExecSpec, gp: Any) -> dict[str, Any]:
-    """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`ex.FUSED=True`)."""
+def gdn_fused_scratch(ex: ExecSpec, gp: Any, plan: Any) -> dict[str, Any]:
+    """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`ex.FUSED=True`).
+
+    The staged checkpoint pages follow the pool backend's `PoolLayout`; the GDN
+    block's slot geometry (`GDN_PAGES` / `REC_PAGES`) must match it.
+    """
+    layout = _pool_layout(plan.model_spec)
+    layout.validate(ex)
+    if (
+        layout.pages_per_slot,
+        layout.rec_pages_per_slot,
+    ) != (gp.GDN_PAGES, gp.REC_PAGES):
+        raise MegakernelConfigError(
+            f"GDN checkpoint slot ({gp.GDN_PAGES} pages, {gp.REC_PAGES} recurrent) "
+            f"does not match the pool layout ({layout.pages_per_slot} pages, "
+            f"{layout.rec_pages_per_slot} recurrent)"
+        )
+    page = layout.kv_page_shape
     return {
         "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
-        "gdn_in_page": pltpu.VMEM((gp.NGI, gp.GDN_PAGES, 2, 64, 4, ex.page_size), FP8),
-        "gdn_out_page": pltpu.VMEM(
-            (gp.NGO, ex.T * gp.GDN_PAGES, 2, 64, 4, ex.page_size), FP8
-        ),
+        "gdn_in_page": pltpu.VMEM((gp.NGI, gp.GDN_PAGES, *page), FP8),
+        "gdn_out_page": pltpu.VMEM((gp.NGO, ex.T * gp.GDN_PAGES, *page), FP8),
         "gdn_in_sem": pltpu.SemaphoreType.DMA((gp.NGI,)),
         "gdn_out_sem": pltpu.SemaphoreType.DMA((gp.NGO, ex.T)),
         "gdn_in_pend": pltpu.SMEM((gp.NGI,), I32),
@@ -441,7 +468,7 @@ def gdn_wait_out(ctx: Any, gp: Any, slot_o: int) -> None:
     """Wait for any in-flight fused GDN checkpoint write on `slot_o`."""
     ex = ctx.ex
     scr = ctx.scr
-    raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ctx.ST["raw"]
+    raw_refs = ctx.raw_refs
     GDN_PAGES, T = gp.GDN_PAGES, ex.T
     out_page = scr["gdn_out_page"]
     out_sem = scr["gdn_out_sem"]
@@ -474,7 +501,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     """Fused in-kernel GDN checkpoint gather + recurrence + checkpoint scatter."""
     ex = ctx.ex
     scr, ST = ctx.scr, ctx.ST
-    raw_refs = ctx.raw_refs if ctx.raw_refs is not None else ST["raw"]
+    raw_refs = ctx.raw_refs
     skip, sc, stream = ctx.skip, ctx.sc, ctx.stream
     B, T, NS = ex.B, ex.T, ex.NS
     kh, vh, KD, VD = gp.kh, gp.vh, gp.KD, gp.VD
@@ -485,6 +512,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     A_conv, qkv_128, conv8_rows = gp.A_conv, gp.qkv_128, gp.conv8_rows
     l2_eps = gp.l2_eps
     interpret = bool(ex.interpret)
+    layout = _pool_layout(ctx.core_plan.plan.model_spec)
+    page = layout.kv_page_shape
+    CPR = layout.conv_page_rows
 
     in_page = scr["gdn_in_page"]
     out_page = scr["gdn_out_page"]
@@ -692,7 +722,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                 s_bf16 = pltpu.bitcast(u32_in, BF16).reshape(vh, KD, VD)
                 raw_conv = (
                     pltpu.bitcast(in_page[slot_i, REC_PAGES], BF16)
-                    .reshape(256, 128)[:conv8_rows, :]
+                    .reshape(CPR, LANES)[:conv8_rows, :]
                     .reshape(A_conv, QKV)
                     .astype(F32)
                 )
@@ -705,7 +735,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                 raw_conv = (
                     in_page.at[slot_i, REC_PAGES]
                     .bitcast(BF16)
-                    .reshape(256, 128)[:conv8_rows, :]
+                    .reshape(CPR, LANES)[:conv8_rows, :]
                     .reshape(A_conv, QKV)
                     .astype(F32)
                 )
@@ -826,7 +856,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                             ] = (
                                 lax.bitcast_convert_type(u32_p, FP8)
                                 .swapaxes(1, 2)
-                                .reshape(REC_PAGES, 2, 64, 4, 128)
+                                .reshape(REC_PAGES, *page)
                             )
                             if conv_fast:
                                 cst = sb.at[0]
@@ -844,9 +874,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                 conv_p = (
                                     jnp.pad(
                                         conv_taps,
-                                        ((0, 256 - conv_live), (0, 0)),
+                                        ((0, CPR - conv_live), (0, 0)),
                                     )
-                                    if conv_live < 256
+                                    if conv_live < CPR
                                     else conv_taps
                                 )
                             else:
@@ -869,17 +899,20 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                                 conv_p = (
                                     jnp.pad(
                                         w_conv,
-                                        ((0, 256 - conv8_rows), (0, 0)),
+                                        ((0, CPR - conv8_rows), (0, 0)),
                                     )
-                                    if conv8_rows < 256
+                                    if conv8_rows < CPR
                                     else w_conv
                                 )
                             out_page[slot_o, t * GDN_PAGES + REC_PAGES] = (
                                 lax.bitcast_convert_type(
-                                    conv_p.reshape(2, 64, 2, 128), FP8
+                                    conv_p.reshape(
+                                        page[0], page[1], page[2] // 2, page[3]
+                                    ),
+                                    FP8,
                                 )
                                 .swapaxes(3, 4)
-                                .reshape(2, 64, 4, 128)
+                                .reshape(page)
                             )
                         else:
                             conv_head: Any = None
@@ -913,10 +946,10 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
                             cv = (
                                 out_page.at[slot_o, t * GDN_PAGES + REC_PAGES]
                                 .bitcast(BF16)
-                                .reshape(256, 128)
+                                .reshape(CPR, LANES)
                             )
                             if conv_fast:
-                                # Rows [conv_live, 256) stay zero: `gdn_out_page`
+                                # Rows [conv_live, CPR) stay zero: `gdn_out_page`
                                 # is zero-filled in `gdn_fused_init_buffers` and
                                 # only this conv write touches the conv page, so
                                 # the HBM page matches split's zero-padded page.
