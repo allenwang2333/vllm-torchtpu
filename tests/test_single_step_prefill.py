@@ -394,6 +394,34 @@ def test_supported_and_paw_split_records_plan():
     assert arm.mm._tpu_seg_plan["conv_2"] == (93_952, 96_000, 96_256)
 
 
+def _chunk_scheduler(arm):
+    from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
+
+    s = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
+    for k, v in vars(arm.sched).items():
+        setattr(s, k, v)
+    s._cost, s._step_limit, s._pp_size, s._mamba_split = None, None, 8, True
+    s._step_tokens, s._step_pairs, s._step_squares = 0, 0.0, 0.0
+    s._step_prefill_tokens, s._step_schedule, s._seeded = 0, 0, set()
+    s._retention, s._single_step, s._n_single_step_reqs = arm.ret, True, 0
+    return s
+
+
+def test_pipeline_chunk_split_records_the_same_plan():
+    arm = Arm(True, smart_fork=False)
+    rng = np.random.default_rng(5)
+    base = list(rng.integers(1, 30000, size=94_050))
+    arm.run(_request("conv_1", base), decode_steps=1)
+    turn2 = base[:93_952] + list(rng.integers(1, 30000, size=96_300 - 93_952))
+    req = _request("conv_2", turn2)
+    sched = _chunk_scheduler(arm)
+    ssp.begin_step(arm.kvm)
+    got = sched._mamba_block_aligned_split(req, 96_300 - 93_952, 93_952, 0)
+    assert got == 96_300 - 93_952
+    assert arm.mm._tpu_seg_plan["conv_2"] == (93_952, 96_000, 96_256)
+    assert sched._step_tokens == 96_300 - 93_952
+
+
 def test_supported_mirrors_worker_pool_preconditions(monkeypatch):
     """The scheduler refuses the feature whenever the workers cannot write
     in-chunk checkpoints (TPUModelRunner._mamba_seg_enabled raises on the

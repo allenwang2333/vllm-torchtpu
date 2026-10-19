@@ -25,7 +25,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -71,6 +71,12 @@ if TYPE_CHECKING:
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.kv_transfer import kv_scatter
+from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
+    LoadMeta,
+    ReqId,
+    SendMeta,
+    TPUConnectorMetadata,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden import gather_kernels
 from vllm_torchtpu.distributed.kv_transfer.raiden.head_unique import (
     gather_bucket,
@@ -78,12 +84,6 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.head_unique import (
     gather_plan,
     head_unique_group_size,
     load_group_size,
-)
-from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
-    LoadMeta,
-    ReqId,
-    SendMeta,
-    TPUConnectorMetadata,
 )
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
@@ -620,6 +620,17 @@ def _use_raiden_stage3_transport() -> bool:
 
 def _use_per_layer_pool_tags() -> bool:
     return bool(tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER)
+
+
+def _planner_pairs_pools_by_ordinal() -> bool:
+    """Whether the raiden planner pairs a source unit's pools with the
+    destination's by ``dst_pool_ordinal`` (item7d), which lets a pipeline
+    stage register its layers under the unified tags."""
+    try:
+        from tpu_sync.api.torch import reshard_client as _reshard_client
+    except ImportError:
+        return False
+    return bool(getattr(_reshard_client, "SUPPORTS_POOL_ORDINALS", False))
 
 
 def _pipeline_parallel_size(vllm_config: VllmConfig) -> int:
@@ -1573,7 +1584,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         # Head-unique loads holding allocated blocks: request id -> (request,
         # destination block ids). A landed one moves to the pending gathers,
         # which the next connector metadata hands to the workers.
-        self._stage3_gather_blocks: dict[str, tuple["Request", list[int]]] = {}
+        self._stage3_gather_blocks: dict[str, tuple[Request, list[int]]] = {}
         self._stage3_pending_gathers: dict[str, list[int]] = {}
         self._stage3_load_cap_engaged = False
         # Pipeline producer register-ahead state: the scheduled requests and
@@ -1837,13 +1848,20 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size or 1)
         src_pcp_size = params.get("src_pcp_size")
         src_tp_size = params.get("src_tp_size")
+        src_pp_size = params.get("src_pp_size")
         if src_pcp_size == 1 and src_tp_size == tp_size:
+            return
+        # A TP1 pipeline stage holds every page of every head of its layers
+        # and routes each page to every decode shard, so the owner rule
+        # filters its spans like a TP producer's.
+        if src_pcp_size == 1 and src_tp_size == 1 and (src_pp_size or 1) > 1:
             return
         raise ValueError(
             "TPU_RAIDEN_STAGE3_HEAD_UNIQUE=1 requires a PCP1 x TP producer of "
-            f"the decode's TP size (tp_size={tp_size}); the producer of "
-            f"req_id={params.get('req_id')} published "
+            f"the decode's TP size (tp_size={tp_size}) or a PCP1 x TP1 pipeline "
+            f"producer; the producer of req_id={params.get('req_id')} published "
             f"src_pcp_size={src_pcp_size!r}, src_tp_size={src_tp_size!r}, "
+            f"src_pp_size={src_pp_size!r}, "
             f"src_parallelism={params.get('src_parallelism')!r}"
         )
 
@@ -2700,6 +2718,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             "src_parallelism": src_parallelism,
             "src_pcp_size": pcp_size,
             "src_tp_size": int(parallel_config.tensor_parallel_size or 1),
+            "src_pp_size": _pipeline_parallel_size(self.vllm_config),
             "dst_tp_size": _raiden_dst_shards(),
             "dst_dcp_size": _raiden_dst_dcp_size(self.vllm_config),
         }
@@ -3070,7 +3089,9 @@ class TPURaidenConnectorWorker:
         )
         manifest = self._raiden_manifest
         if manifest is None:
-            raise RuntimeError("head-unique transfer requires the admitted pool manifest")
+            raise RuntimeError(
+                "head-unique transfer requires the admitted pool manifest"
+            )
         from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (
             sol_fa_geometry_from_manifest,
         )
@@ -3174,9 +3195,12 @@ class TPURaidenConnectorWorker:
                 bucket = gather_bucket(len(pass_blocks), group_size)
                 buckets.append(bucket)
                 plans: dict[tuple[int, int, int], Any] = {}
-                for storage_index, base_row, row_stride, kps in (
-                    self._stage3_head_unique_pools
-                ):
+                for (
+                    storage_index,
+                    base_row,
+                    row_stride,
+                    kps,
+                ) in self._stage3_head_unique_pools:
                     key = (base_row, row_stride, kps)
                     plan = plans.get(key)
                     if plan is None:
@@ -3320,6 +3344,7 @@ class TPURaidenConnectorWorker:
                 ),
                 conv_kernel_size=self._model_config_int("linear_conv_kernel_dim", 4),
             )
+            pool_ordinals = self._stage_pool_ordinals(layer_index_by_name)
             if _raiden_seq_on_lane_layout():
                 if runner.bm_pool_layout is not None:
                     raise NotImplementedError(
@@ -3335,6 +3360,7 @@ class TPURaidenConnectorWorker:
                     per_layer_tags=_use_per_layer_pool_tags(),
                     gdn_geometry=gdn_geometry,
                     layer_index_by_name=layer_index_by_name,
+                    pool_ordinals=pool_ordinals,
                 )
             else:
                 manifest = rpm.build_qwen35_pool_manifest(
@@ -3343,6 +3369,7 @@ class TPURaidenConnectorWorker:
                     gdn_geometry=gdn_geometry,
                     block_major=runner.bm_pool_layout,
                     layer_index_by_name=layer_index_by_name,
+                    pool_ordinals=pool_ordinals,
                 )
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.
@@ -3902,10 +3929,12 @@ class TPURaidenConnectorWorker:
                     f"parallelism={transfer_parallelism}, pp_size={pp_size}, "
                     f"pcp_size={stage_pcp}"
                 )
-            if not _use_per_layer_pool_tags():
+            if not _use_per_layer_pool_tags() and not _planner_pairs_pools_by_ordinal():
                 raise ValueError(
-                    "A pipeline-parallel producer pairs pools by layer; set "
-                    "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers"
+                    "A pipeline-parallel producer pairs pools by layer: set "
+                    "TPU_RAIDEN_POOL_TAGS_PER_LAYER=1 on both peers, or run a "
+                    "raiden wheel whose planner pairs pools by ordinal "
+                    "(reshard_client.SUPPORTS_POOL_ORDINALS) under the unified tags"
                 )
             return
         pcp_size = int(
@@ -5364,6 +5393,32 @@ class TPURaidenConnectorWorker:
                 f"GDN state pools tagged {tag!r} disagree on live regions"
             )
         return tuple(matching[0].regions)
+
+    def _stage_pool_ordinals(self, layer_index_by_name: Mapping[str, int]) -> Any:
+        """A pipeline producer stage's pool ordinals under the unified tags
+        (``PoolOrdinals``): the planner pairs the stage's pools with the
+        destination's by layer. None for a single-stage engine, a consumer,
+        or per-layer tags."""
+        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+        if (
+            not self.is_producer
+            or not _engine_is_pipeline(self.vllm_config)
+            or _use_per_layer_pool_tags()
+        ):
+            return None
+        config = self.vllm_config.model_config.hf_text_config
+        layer_types = list(getattr(config, "layer_types", None) or ())
+        if not layer_types:
+            raise ValueError(
+                "a pipeline producer under the unified pool tags needs the "
+                "model's layer_types to order its pools"
+            )
+        return rpm.PoolOrdinals.from_layer_types(
+            layer_types,
+            draft_layer_indices=sorted(layer_index_by_name.values()),
+            state_groups=max(1, int(self._stage3_state_group_count)),
+        )
 
     def _stage3_fa_registration_tags(self) -> list[str]:
         """FA pool tags this rank declares spans for: the class tag, or one

@@ -254,6 +254,170 @@ def test_per_layer_tags_name_each_layer_and_fold_into_class_geometry():
     assert manifest.geometry_by_tag() == plain.geometry_by_tag()
 
 
+# Qwen3.5-397B: 60 layers, full attention on every fourth from 3.
+LAYER_TYPES_397B = [
+    "full_attention" if i % 4 == 3 else "linear_attention" for i in range(60)
+]
+
+
+def test_pool_ordinals_count_each_class_in_layer_order():
+    ordinals = rpm.PoolOrdinals.from_layer_types(
+        LAYER_TYPES_397B, draft_layer_indices=[60]
+    )
+    assert [ordinals.ordinal("fa", i) for i in (3, 7, 55, 59, 60)] == [0, 1, 13, 14, 15]
+    assert [ordinals.ordinal("gdn.conv.g0", i) for i in (0, 1, 2, 4, 58)] == [
+        0,
+        1,
+        2,
+        3,
+        44,
+    ]
+    assert ordinals.ordinal("gdn.ssm.g0", 58) == 44
+    with pytest.raises(rpm.ManifestError, match="no pool of class 'fa'"):
+        ordinals.ordinal("fa", 4)
+    with pytest.raises(rpm.ManifestError, match="unknown layer type"):
+        rpm.PoolOrdinals.from_layer_types(["sliding"])
+
+
+def test_stage_manifest_stamps_pool_ordinals_under_the_unified_tags():
+    # The 8,8,8,8,8,8,8,4 partition's stage 0: layers 0..7, FA at 3 and 7
+    # (ordinals 0, 1), six GDN layers (ordinals 0..5), unified tags.
+    named_all = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    stage_layers = {f"model.layers.{i}." for i in range(8)}
+    named = {
+        name: tensor
+        for name, tensor in named_all.items()
+        if any(name.startswith(prefix) for prefix in stage_layers)
+    }
+    groups = _qwen35_groups(named, block_size=4096, num_kv_heads=2, head_size=256)
+    ordinals = rpm.PoolOrdinals.from_layer_types(LAYER_TYPES_397B)
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0 for name in named if "linear_attn" in name
+        },
+        pool_ordinals=ordinals,
+    )
+    by_tag = {}
+    for pool in manifest.pools:
+        by_tag.setdefault(pool.tag, []).append(pool.dst_pool_ordinal)
+    assert by_tag == {
+        "fa": [0, 1],
+        "gdn.conv.g0": [0, 1, 2, 3, 4, 5],
+        "gdn.ssm.g0": [0, 1, 2, 3, 4, 5],
+    }
+    stamped = manifest.pools[0].to_pool_dict()
+    assert stamped["dst_pool_ordinal"] == 0
+    # Without ordinals the wire dict is unchanged.
+    plain = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0 for name in named if "linear_attn" in name
+        },
+    )
+    assert "dst_pool_ordinal" not in plain.pools[0].to_pool_dict()
+    assert all(pool.dst_pool_ordinal == -1 for pool in plain.pools)
+    with pytest.raises(rpm.ManifestError, match="unified tags only"):
+        rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(),
+            gdn_geometry=PCP8_GEOMETRY,
+            per_layer_tags=True,
+            pool_ordinals=ordinals,
+        )
+
+
+def test_pool_ordinals_follow_the_round_robin_mamba_groups():
+    # vLLM deals the 45 GDN layers to 3 groups as layers[i::3]: the k-th GDN
+    # layer sits in group k % 3 at position k // 3, so each state tag counts
+    # 0..14 and a layer named under the wrong group is refused.
+    ordinals = rpm.PoolOrdinals.from_layer_types(
+        LAYER_TYPES_397B, draft_layer_indices=[60], state_groups=3
+    )
+    assert [ordinals.ordinal("gdn.conv.g0", i) for i in (0, 4, 56)] == [0, 1, 14]
+    assert [ordinals.ordinal("gdn.conv.g1", i) for i in (1, 5, 57)] == [0, 1, 14]
+    assert [ordinals.ordinal("gdn.ssm.g2", i) for i in (2, 6, 58)] == [0, 1, 14]
+    # Layer 21 is the 16th GDN layer: group 1, position 5 (the j-ed387bbf case).
+    assert ordinals.ordinal("gdn.conv.g1", 21) == 5
+    assert ordinals.ordinal("fa", 60) == 15
+    with pytest.raises(rpm.ManifestError, match="belongs to mamba group 1"):
+        ordinals.ordinal("gdn.conv.g0", 21)
+
+
+def _stage_named(named_all, first, count, *, mtp=False):
+    layers = {f"model.layers.{i}." for i in range(first, first + count)}
+    named = {
+        name: tensor
+        for name, tensor in named_all.items()
+        if any(name.startswith(prefix) for prefix in layers)
+    }
+    return _with_mtp_draft_layer(named) if mtp else named
+
+
+def test_pp8_cell_manifests_claim_every_destination_pool_once():
+    # The PP8xTP1 gate cell: partition 8,8,8,8,8,8,8,4, the MTP draft layer on
+    # the last stage, 3 mamba groups dealt round-robin, unified tags. Across
+    # the eight stage manifests every destination tag's ordinals must be
+    # exactly 0..n-1 (fa: 16 pools, each state tag: 15).
+    named_all = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    gdn_index = {layer: k for k, layer in enumerate(QWEN35_GDN_LAYERS)}
+    ordinals = rpm.PoolOrdinals.from_layer_types(
+        LAYER_TYPES_397B, draft_layer_indices=[60], state_groups=3
+    )
+    partition = [8, 8, 8, 8, 8, 8, 8, 4]
+    claimed: dict[str, list[int]] = {}
+    first = 0
+    for stage, count in enumerate(partition):
+        named = _stage_named(named_all, first, count, mtp=stage == 7)
+        groups = _qwen35_groups(named, block_size=4096, num_kv_heads=2, head_size=256)
+        manifest = rpm.build_qwen35_pool_manifest(
+            named_kv_caches=named,
+            kv_cache_groups=groups,
+            raw_tensors=(),
+            gdn_geometry=PCP8_GEOMETRY,
+            mamba_group_ordinal_by_layer={
+                name: gdn_index[rpm.layer_index_from_name(name)] % 3
+                for name in named
+                if "linear_attn" in name
+            },
+            layer_index_by_name={"mtp.layers.0.self_attn.attn": 60},
+            pool_ordinals=ordinals,
+        )
+        for pool in manifest.pools:
+            claimed.setdefault(pool.tag, []).append(pool.dst_pool_ordinal)
+        first += count
+    assert set(claimed) == {
+        "fa",
+        *(f"gdn.{kind}.g{g}" for kind in ("conv", "ssm") for g in range(3)),
+    }
+    for tag, got in claimed.items():
+        expected = list(range(16 if tag == "fa" else 15))
+        assert sorted(got) == expected, (tag, sorted(got))
+
+
 def test_layer_tag_helpers_round_trip():
     from vllm_torchtpu.distributed.kv_transfer.raiden import tags
 

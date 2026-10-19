@@ -39,6 +39,7 @@ env.json (environment id), plus a ``P3_P_LEG_RESULT {...}`` line on stdout.
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import json
 import os
@@ -217,6 +218,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="empty: vLLM's scheduler (no cold-chunk cap or step cap)",
     )
     p.add_argument("--no-async-scheduling", action="store_true")
+    p.add_argument("--engine-arg", action="append", default=[],
+                   help="KEY=VALUE set on EngineArgs after the CLI parse, before the engine is "
+                   "built; VALUE is a Python literal (True, 3, {...}) or else a string")
+    p.add_argument(
+        "--pp-draft", action="store_true",
+        help="under PP, run the prefill-only MTP draft on the last stage as a KV "
+        "producer would (the sitecustomize lifts the validator's producer check)",
+    )
     p.add_argument("--tensor-parallel-size", type=int, default=8)
     p.add_argument(
         "--pipeline-parallel-size", type=int, default=1,
@@ -271,7 +280,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         a.mode = ["warm"]
     if a.routing == "trace" and not a.routing_file:
         p.error("--routing trace needs --routing-file")
+    for item in a.engine_arg:
+        if "=" not in item or not item.split("=", 1)[0]:
+            p.error(f"--engine-arg {item!r}: expected KEY=VALUE")
     return a
+
+
+def engine_arg_overrides(items: list[str]) -> dict:
+    """Parses --engine-arg KEY=VALUE items into EngineArgs field values."""
+    out = {}
+    for item in items:
+        key, raw = item.split("=", 1)
+        try:
+            out[key] = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            out[key] = raw
+    return out
 
 
 def layout_tag(a: argparse.Namespace) -> str:
@@ -297,15 +321,15 @@ def build_env(a: argparse.Namespace, out_dir: str) -> tuple[dict[str, str], list
     if pp:
         # TP1 per stage: no TP collectives, so SP and the fused EP kernel have
         # nothing to shard, and the tp8_ep8 placement table does not apply.
-        # Hybrid-state retention is untested under PP; dynamic GDN tiling is
-        # what the PP8 leg needed (agentx-pp-p).
+        # Dynamic GDN tiling is what the PP8 leg needed (agentx-pp-p).
         env.update(
             TPU_MOE_SEQUENCE_PARALLEL="0",
             TPU_SP_FP8_GATHER="0",
             USE_MOE_FUSED_EP_KERNEL="0",
-            TPU_HYBRID_STATE_RETENTION="0",
             TPU_ENABLE_GDN_DYNAMIC_TILING="1",
         )
+        if a.pp_draft:
+            env["P3_PP_MTP_OFFLINE"] = "1"
         env.pop("TPU_EXPERT_PLACEMENT", None)
         unset.append("TPU_EXPERT_PLACEMENT")
     if a.tensor_parallel_size != 8 or not a.expert_parallel:
@@ -324,6 +348,7 @@ def build_env(a: argparse.Namespace, out_dir: str) -> tuple[dict[str, str], list
     src = common.source_identity()
     key = common.cache_key([
         *sorted(a.env),
+        *("engine_arg=" + x for x in sorted(a.engine_arg)),
         "routing=" + a.routing,
         "routing_file=" + (os.path.basename(a.routing_file) if a.routing_file else ""),
         "source=" + src["source_sha"] + "+" + src["source_dirty_sha"],
@@ -402,9 +427,10 @@ def engine_argv(a: argparse.Namespace, profile_dir: str) -> list[str]:
         argv.append("--no-async-scheduling")
     else:
         argv.append("--async-scheduling")
-    if a.mtp > 0 and not pp:
+    if a.mtp > 0 and (not pp or a.pp_draft):
         # pp_validation admits only producer MTP K=1 with a kv_transfer_config,
-        # which this offline engine has not, so PP runs without a draft.
+        # which this offline engine has not, so PP runs without a draft unless
+        # --pp-draft lifts that check.
         argv += ["--speculative-config", json.dumps({"method": "mtp", "num_speculative_tokens": a.mtp})]
     if a.scheduler_cls:
         argv += ["--scheduler-cls", a.scheduler_cls]
@@ -491,9 +517,20 @@ def run(a: argparse.Namespace, out_dir: str, timeline: common.Timeline) -> dict:
     if isinstance(ns.fault_tolerance_config, dict):
         ns.fault_tolerance_config = FaultToleranceConfig()
     engine_args = EngineArgs.from_cli_args(ns)
+    fields = {f.name for f in dataclasses.fields(engine_args)}
+    for key, value in engine_arg_overrides(a.engine_arg).items():
+        if key not in fields:
+            raise SystemExit(f"--engine-arg {key}: not an EngineArgs field")
+        if key == "kv_transfer_config" and isinstance(value, dict):
+            from vllm.config import KVTransferConfig
+
+            value = KVTransferConfig(**value)
+        setattr(engine_args, key, value)
     step_log = os.environ["P3_STEP_LOG"]
     # A retried pod reuses the run directory; start the log afresh.
     open(step_log, "w").close()
+    if a.pipeline_parallel_size > 1 and a.pp_draft:
+        common.lift_pp_draft_validator()
     timeline.mark("engine_init_start")
     llm = LLM.from_engine_args(engine_args)
     timeline.mark("engine_ready")

@@ -98,6 +98,49 @@ def test_rejects_kv_transfer_connectors_other_than_raiden():
         validate_pipeline_parallel_config(_config(pp=2, kv_transfer=other))
 
 
+def _multi(*names):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": name} for name in names]
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_transfer",
+    [
+        SimpleNamespace(
+            kv_connector="TPURaidenOffloadingConnector", is_kv_producer=False
+        ),
+        _multi("TPURaidenConnector", "TPURaidenOffloadingConnector"),
+    ],
+)
+def test_accepts_the_raiden_offloading_connector_and_a_multi_connector_of_raiden(
+    kv_transfer,
+):
+    validate_pipeline_parallel_config(
+        _config(pp=2, kv_transfer=kv_transfer, layer_types=HYBRID_24)
+    )
+
+
+@pytest.mark.parametrize(
+    "kv_transfer",
+    [
+        _multi("TPURaidenConnector", "TPUConnectorHMA"),
+        SimpleNamespace(
+            kv_connector="TPUMultiConnector",
+            is_kv_producer=True,
+            kv_connector_extra_config={"connectors": []},
+        ),
+    ],
+)
+def test_rejects_a_multi_connector_with_a_foreign_or_no_child(kv_transfer):
+    with pytest.raises(NotImplementedError, match="TPURaidenOffloadingConnector"):
+        validate_pipeline_parallel_config(_config(pp=2, kv_transfer=kv_transfer))
+
+
 def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
 

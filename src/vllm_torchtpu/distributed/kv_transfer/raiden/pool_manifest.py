@@ -126,6 +126,11 @@ class PoolEntry:
     num_blocks: int
     regions: tuple[RegionSpec, ...]
     dtype_tag: str
+    # The pool's ordinal among its tag's pools in the full model, when a
+    # pipeline stage registers a subset of them under the unified tag; the
+    # planner pairs it with the destination pool of that ordinal. -1 keeps
+    # positional pairing.
+    dst_pool_ordinal: int = -1
 
     @property
     def live_bytes_per_block(self) -> int:
@@ -133,7 +138,7 @@ class PoolEntry:
 
     def to_pool_dict(self) -> dict[str, Any]:
         """Shape consumed by raiden's ``register_pools`` (coerce_pool_spec)."""
-        return {
+        pool = {
             "tag": self.tag,
             "storage_index": self.storage_index,
             "base_offset_bytes": self.base_offset_bytes,
@@ -142,6 +147,9 @@ class PoolEntry:
             "regions": [region.to_dict() for region in self.regions],
             "dtype_tag": self.dtype_tag,
         }
+        if self.dst_pool_ordinal >= 0:
+            pool["dst_pool_ordinal"] = self.dst_pool_ordinal
+        return pool
 
 
 @dataclasses.dataclass
@@ -773,6 +781,79 @@ class FaLayoutHook:
         raise NotImplementedError
 
 
+@dataclasses.dataclass(frozen=True)
+class PoolOrdinals:
+    """Each pool's ordinal among its tag's pools in the full model.
+
+    A pipeline stage holds a subset of the layers; under the unified tags
+    its pools pair with the destination's by this ordinal, which is the
+    pool's position among the destination's pools of the same tag in layer
+    order. FA pools count the full-attention layers, the MTP draft layers
+    after them. GDN pools count the linear-attention layers within their
+    mamba KV cache group: vLLM deals the type's layers to ``state_groups``
+    groups round-robin (``layers[i::num_groups]`` in
+    ``_get_kv_cache_groups_uniform_page_size``), so the layer with ordinal
+    ``k`` among the GDN layers sits in group ``k % state_groups`` at position
+    ``k // state_groups``; conv and ssm share it.
+    """
+
+    fa_by_layer: Mapping[int, int]
+    gdn_by_layer: Mapping[int, int]
+    state_groups: int = 1
+
+    @classmethod
+    def from_layer_types(
+        cls,
+        layer_types: Sequence[str],
+        *,
+        draft_layer_indices: Sequence[int] = (),
+        state_groups: int = 1,
+    ) -> "PoolOrdinals":
+        """``layer_types`` is the full model's ``hf_text_config.layer_types``;
+        ``draft_layer_indices`` the MTP draft layers' indices (after the
+        target's layers); ``state_groups`` the number of mamba KV cache
+        groups."""
+        if state_groups < 1:
+            raise ManifestError(f"state_groups must be positive: {state_groups}")
+        fa: dict[int, int] = {}
+        gdn: dict[int, int] = {}
+        for index, kind in enumerate(layer_types):
+            if kind == "full_attention":
+                fa[index] = len(fa)
+            elif kind == "linear_attention":
+                gdn[index] = len(gdn)
+            else:
+                raise ManifestError(f"unknown layer type {kind!r} at layer {index}")
+        for index in sorted(draft_layer_indices):
+            fa[index] = len(fa)
+        return cls(fa_by_layer=fa, gdn_by_layer=gdn, state_groups=state_groups)
+
+    def ordinal(self, tag: str, layer_index: int) -> int:
+        """The ordinal of layer ``layer_index``'s pool under class ``tag``
+        (``fa``, or a state class with its group suffix, ``gdn.conv.g1``)."""
+        if tag == TAG_FA:
+            table = self.fa_by_layer
+            group = 0
+            groups = 1
+        else:
+            table = self.gdn_by_layer
+            head, sep, tail = tag.rpartition(".g")
+            group = int(tail) if sep and tail.isdigit() else 0
+            groups = self.state_groups
+        try:
+            position = table[layer_index]
+        except KeyError:
+            raise ManifestError(
+                f"layer {layer_index} holds no pool of class {tag!r} in the full model"
+            ) from None
+        if position % groups != group:
+            raise ManifestError(
+                f"layer {layer_index} is the {position}th GDN layer and belongs to "
+                f"mamba group {position % groups} of {groups}, not to {tag!r}"
+            )
+        return position // groups
+
+
 def build_qwen35_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -784,6 +865,7 @@ def build_qwen35_pool_manifest(
     fa_layout: FaLayoutHook | None = None,
     block_major: BlockMajorPoolLayout | None = None,
     layer_index_by_name: Mapping[str, int] | None = None,
+    pool_ordinals: PoolOrdinals | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -800,6 +882,12 @@ def build_qwen35_pool_manifest(
     name. An MTP draft layer (``mtp.layers.0``) is given an index after the
     target's layers, so it orders and tags after them instead of colliding
     with the target's layer of the same local index.
+
+    ``pool_ordinals`` (a pipeline stage under the unified tags) stamps every
+    pool with its ordinal among the tag's pools of the full model
+    (``PoolEntry.dst_pool_ordinal``), so the planner pairs the stage's pools
+    with the destination's by layer rather than by position. Exclusive with
+    ``per_layer_tags``.
 
     ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
     suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
@@ -819,6 +907,8 @@ def build_qwen35_pool_manifest(
             "the block-major pool manifest describes exactly one raw pool: "
             f"got {len(raw_tensors)}"
         )
+    if pool_ordinals is not None and per_layer_tags:
+        raise ManifestError("pool ordinals apply to the unified tags only")
 
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
@@ -887,6 +977,12 @@ def build_qwen35_pool_manifest(
 
     entries: list[tuple[Any, PoolEntry]] = []
     for tag, layer_name, tensor in flat:
+        ordinal = -1
+        if pool_ordinals is not None:
+            layer_index = _pool_layer_index(layer_name, layer_index_by_name)
+            if layer_index is None:
+                raise ManifestError(f"pool ordinals need a layer index in {layer_name}")
+            ordinal = pool_ordinals.ordinal(class_tag(tag), layer_index)
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
         itemsize = _element_size(tensor)
@@ -967,6 +1063,7 @@ def build_qwen35_pool_manifest(
                     num_blocks=num_blocks,
                     regions=regions,
                     dtype_tag=dtype_tag,
+                    dst_pool_ordinal=ordinal,
                 ),
             )
         )

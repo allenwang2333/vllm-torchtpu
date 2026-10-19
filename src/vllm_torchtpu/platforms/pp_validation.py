@@ -50,6 +50,27 @@ def _stage_without_full_attention(vllm_config: Any) -> str | None:
     return None
 
 
+_STAGE_LOCAL_CONNECTORS = frozenset(
+    {"TPURaidenConnector", "TPURaidenOffloadingConnector"}
+)
+
+
+def _stage_local_connectors(kv_transfer_config: Any) -> bool:
+    """Whether every connector in the config moves a stage's own layers only:
+    the raiden connector, the raiden offloading connector, or a
+    TPUMultiConnector made of those."""
+    name = kv_transfer_config.kv_connector
+    if name in _STAGE_LOCAL_CONNECTORS:
+        return True
+    if name != "TPUMultiConnector":
+        return False
+    extra = kv_transfer_config.kv_connector_extra_config or {}
+    children = extra.get("connectors") or ()
+    return bool(children) and all(
+        child.get("kv_connector") in _STAGE_LOCAL_CONNECTORS for child in children
+    )
+
+
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
@@ -120,13 +141,17 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             " Use method=mtp with num_speculative_tokens=1 on an engine whose "
             "kv_transfer_config has kv_role kv_producer."
         )
-    elif (
-        vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    elif vllm_config.kv_transfer_config is not None and not _stage_local_connectors(
+        vllm_config.kv_transfer_config
     ):
-        # The raiden connector transfers each stage's own layers; the
-        # other connectors assume every worker holds every layer.
-        unsupported = "KV transfer connectors other than TPURaidenConnector"
+        # The raiden connector transfers each stage's own layers and the
+        # raiden offloading connector registers each worker's own pool as
+        # its shard; the other connectors assume every worker holds every
+        # layer.
+        unsupported = (
+            "KV transfer connectors other than TPURaidenConnector and "
+            "TPURaidenOffloadingConnector"
+        )
     elif vllm_config.kv_transfer_config is not None and (
         stage := _stage_without_full_attention(vllm_config)
     ):

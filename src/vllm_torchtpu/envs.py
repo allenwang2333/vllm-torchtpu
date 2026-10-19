@@ -190,6 +190,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
+    TPU_HYBRID_STATE_RETENTION: bool | None = None
     TPU_HYBRID_RETENTION_MAX_CONVS: int = 96
     TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS: int = 360
     TPU_HYBRID_RETENTION_KEEP_PRIOR_TURNS: int = 1
@@ -1364,6 +1365,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Host-side 5-point TTFT stage telemetry periodic summary interval in
     # seconds; 0 disables (default, zero overhead).
     "QX_TTFT_STAGE_LOG_PERIOD_S": env_float("QX_TTFT_STAGE_LOG_PERIOD_S", 0.0),
+    # Hybrid-state retention (core/hybrid_retention.py): keeps the GDN state
+    # snapshots a later turn hits on. Unset: on, except on a KV consumer.
+    "TPU_HYBRID_STATE_RETENTION": env_optional_bool("TPU_HYBRID_STATE_RETENTION"),
     "TPU_HYBRID_RETENTION_MAX_CONVS": env_nonnegative_int(
         "TPU_HYBRID_RETENTION_MAX_CONVS", 96
     ),

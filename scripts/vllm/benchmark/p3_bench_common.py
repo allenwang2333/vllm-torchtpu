@@ -583,11 +583,53 @@ def _patch_routing(module):
     module.fused_ep_moe = fused_ep_moe
 
 
+def _patch_gmm_routing(module):
+    # The GMM MoE path (no fused EP kernel: TP1 pipeline stages, the MTP draft
+    # layer) routes through moe_routing.route. "hash" feeds it the same hash
+    # of the logits and the row sum as the fused EP patch, in f32 so 512
+    # experts do not tie in bf16; "model" and "trace" leave it alone.
+    if os.environ.get("P3_ROUTING", "hash") != "hash":
+        return
+    import torch
+
+    original = module.route
+
+    def route(layer, hidden_states, router_logits, input_ids=None):
+        row = hidden_states.float().sum(dim=-1, keepdim=True)
+        u = torch.sin((router_logits.float() + row) * 7919.0) * 43758.5453
+        return original(layer, hidden_states, u - torch.floor(u), input_ids)
+
+    module.route = route
+    print(f"[p3] hash routing on moe_routing.route (pid {os.getpid()})", flush=True)
+
+
+def _patch_pp_validation(module):
+    # The platform binds the validator by name, so the wrap goes on
+    # tpu_platform (see lift_pp_draft_validator; the bench driver, which runs
+    # the config check, calls that directly).
+    if os.environ.get("P3_PP_MTP_OFFLINE", "0") != "1":
+        return
+    original = module.validate_pipeline_parallel_config
+
+    def validate_pipeline_parallel_config(vllm_config):
+        spec = vllm_config.speculative_config
+        vllm_config.speculative_config = None
+        try:
+            original(vllm_config)
+        finally:
+            vllm_config.speculative_config = spec
+
+    module.validate_pipeline_parallel_config = validate_pipeline_parallel_config
+    print(f"[p3] pp_validation runs without the speculative config (pid {os.getpid()})", flush=True)
+
+
 _PATCHES = {
     "vllm.model_executor.model_loader.dummy_loader": _patch_dummy_loader,
     "vllm.v1.core.sched.scheduler": _patch_scheduler,
     "vllm_torchtpu.runner.tpu_runner": _patch_runner,
     "vllm_torchtpu.layers.adapter.fused_moe_ep_v3": _patch_routing,
+    "vllm_torchtpu.layers.adapter.moe_routing": _patch_gmm_routing,
+    "vllm_torchtpu.platforms.tpu_platform": _patch_pp_validation,
 }
 
 
@@ -626,6 +668,34 @@ for _entry in sys.path:
 if _self is not None:
     sys.modules[__name__] = _self
 '''
+
+
+def lift_pp_draft_validator() -> None:
+    """Lets the offline engine run the prefill-only MTP draft under a pipeline.
+
+    pp_validation admits the draft on a KV producer alone (it reads
+    kv_transfer_config); the bench engine has no connector, so the validator
+    runs without the speculative config and the runner then runs the draft as
+    a producer would (_mtp_prefill_only is mtp and pp > 1). The platform
+    binds the validator by name at import, so the wrap goes on both modules.
+    The config check runs in this process; P3_PP_MTP_OFFLINE makes the
+    sitecustomize do the same in any child that validates again.
+    """
+    from vllm_torchtpu.platforms import pp_validation, tpu_platform
+
+    original = pp_validation.validate_pipeline_parallel_config
+
+    def validate_pipeline_parallel_config(vllm_config):
+        spec = vllm_config.speculative_config
+        vllm_config.speculative_config = None
+        try:
+            original(vllm_config)
+        finally:
+            vllm_config.speculative_config = spec
+
+    pp_validation.validate_pipeline_parallel_config = validate_pipeline_parallel_config
+    tpu_platform.validate_pipeline_parallel_config = validate_pipeline_parallel_config
+    print(f"[p3] pp_validation runs without the speculative config (pid {os.getpid()})", flush=True)
 
 
 def install_sitecustomize(out_dir: str) -> str:

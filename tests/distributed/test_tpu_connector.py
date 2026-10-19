@@ -1347,6 +1347,7 @@ class TestTPURaidenConnectorScheduler:
                 "src_parallelism": 8,
                 "src_pcp_size": 8,
                 "src_tp_size": 1,
+                "src_pp_size": 1,
                 "dst_tp_size": 1,
                 "dst_dcp_size": 1,
             }
@@ -1770,9 +1771,7 @@ class TestTPURaidenConnectorScheduler:
             failed_recving=set(),
         )
         consumer.update_connector_output(output)
-        assert consumer._stage3_pending_gathers == {
-            "load-long": list(range(200, 264))
-        }
+        assert consumer._stage3_pending_gathers == {"load-long": list(range(200, 264))}
         assert consumer._stage3_gather_blocks == {}
         with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
             meta = consumer.build_connector_meta(None)
@@ -1818,11 +1817,27 @@ class TestTPURaidenConnectorScheduler:
             consumer.request_finished(req, list(range(200, 264)))
         assert consumer._stage3_gather_blocks == {}
 
+    def test_stage3_head_unique_accepts_a_tp1_pipeline_producer(self):
+        # A TP1 stage holds every page of every head of its layers and routes
+        # each page to every decode shard, so the owner rule applies to it.
+        with self._stage3_head_unique():
+            consumer = _make_raiden_scheduler(
+                is_producer=False, block_size=1024, tp_size=4
+            )
+            req = self._head_unique_load_request(
+                "load-pp", src_pcp_size=1, src_tp_size=1
+            )
+            req.kv_transfer_params["src_pp_size"] = 8
+            matched, _ = consumer.get_num_new_matched_tokens(req, 0)
+            consumer.update_state_after_alloc(req, self._stage3_blocks(), matched)
+            assert consumer._stage3_head_unique_group_size == 2
+
     @pytest.mark.parametrize(
         "params",
         [
             {"src_pcp_size": 2, "src_tp_size": 4},
             {"src_pcp_size": 1, "src_tp_size": 8},
+            {"src_pcp_size": 1, "src_tp_size": 1},
             {"src_pcp_size": None, "src_tp_size": None},
         ],
     )
@@ -5301,9 +5316,7 @@ class TestTPURaidenConnectorWorker:
     def test_leader_names_the_replica_group_only_for_head_unique_loads(
         self, group_size
     ):
-        worker = _make_raiden_worker(
-            tp_rank=0, tp_size=4, is_producer=False, dp_size=1
-        )
+        worker = _make_raiden_worker(tp_rank=0, tp_size=4, is_producer=False, dp_size=1)
         worker._raiden_work_unit = MagicMock()
         worker._stage3_head_unique_group_size = 2
         worker._stage3_source_work_units = MagicMock(return_value=["src"] * 4)
@@ -6935,6 +6948,53 @@ class TestPipelineParallelProducer:
             pytest.raises(ValueError, match="TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
         ):
             worker._validate_stage3_transfer_parallelism(4)
+
+    def test_unified_tags_need_a_planner_that_pairs_pools_by_ordinal(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        with (
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", False, create=True
+            ),
+            patch(f"{_MOD}._planner_pairs_pools_by_ordinal", return_value=True),
+        ):
+            worker._validate_stage3_transfer_parallelism(8)
+            with pytest.raises(ValueError, match="PP stage count"):
+                worker._validate_stage3_transfer_parallelism(1)
+        with (
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", False, create=True
+            ),
+            patch(f"{_MOD}._planner_pairs_pools_by_ordinal", return_value=False),
+            pytest.raises(ValueError, match="SUPPORTS_POOL_ORDINALS"),
+        ):
+            worker._validate_stage3_transfer_parallelism(8)
+
+    def test_stage_pool_ordinals_come_from_the_full_model_layer_types(self):
+        layer_types = [
+            "full_attention" if i % 4 == 3 else "linear_attention" for i in range(60)
+        ]
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        worker.vllm_config.model_config.hf_text_config.layer_types = layer_types
+        with patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", False, create=True
+        ):
+            ordinals = worker._stage_pool_ordinals({"mtp.layers.0.self_attn.attn": 60})
+            assert [ordinals.ordinal("fa", i) for i in (3, 59, 60)] == [0, 14, 15]
+            assert ordinals.ordinal("gdn.conv.g0", 58) == 44
+            # Per-layer tags, a single stage and a consumer keep positional pairing.
+            with patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", True, create=True
+            ):
+                assert worker._stage_pool_ordinals({}) is None
+            single = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=1)
+            assert single._stage_pool_ordinals({}) is None
+            consumer = _make_raiden_worker(
+                tp_rank=0, tp_size=1, is_producer=False, pp_size=8
+            )
+            assert consumer._stage_pool_ordinals({}) is None
+            worker.vllm_config.model_config.hf_text_config.layer_types = []
+            with pytest.raises(ValueError, match="layer_types"):
+                worker._stage_pool_ordinals({})
 
     def test_registration_tags_follow_the_stage_manifest(self):
         worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
