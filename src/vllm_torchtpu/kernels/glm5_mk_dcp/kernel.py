@@ -36,7 +36,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 import types
 
-from . import dsa_batched, pool_alias, topk2
+from . import dsa_batched, dsa_batched_v1, pool_alias, topk2
 from .layout import rup, smalls_layout
 
 FP8 = jnp.float8_e4m3fn
@@ -129,10 +129,10 @@ class Tiles:
     scan_np: int = 16           # batched: pages per scan ring slot
     pv: str = "bf16"            # batched: PV matmul operands "bf16" (p rounded) | "f32" (served)
     kscale: float = 1.0         # batched: KV cache k_scale (served: scores and PV), static like the served kernel
-    thr_switch: int = 512       # batched: sum of a wave's local pages above which the threshold uses 2-bit digits
+    thr_switch: int = 2048      # batched: wave rank-0 pages above which the threshold uses 2-bit digits (j-aaf95c3f: 2-bit was 153 us at 1288 pages, 4-bit modelled ~138)
     fault: str = ""             # batched: oracle fault controls (dsa_batched.FAULTS); timing / tests only
     gunroll: int = 16           # batched: gather issue manual unroll
-    xkc: int = 256              # batched: union extraction chunk
+    xkc: int = 512              # batched: union extraction chunk (one chunk for a union <= 512)
 
     def tk(self, K, N, dtype):
         """Largest 128-multiple divisor of K whose (tk, N) tile fits one bank."""
@@ -342,7 +342,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     assert set(skip) <= set(ABLATIONS), skip
     assert not draft or cfg.V > 0
     DSA = "legacy" if draft else tiles.dsa
-    assert DSA in ("legacy", "batched"), DSA
+    assert DSA in ("legacy", "batched", "batched_v1"), DSA
+    DSAM = {"batched": dsa_batched, "batched_v1": dsa_batched_v1}.get(DSA)
     assert not (probe and (draft or debug))
     R, L, H = cfg.R, cfg.L, cfg.H
     TMAX, RPR = cfg.TMAX, cfg.RPR
@@ -506,13 +507,13 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
     for nm in ("ag", "q", "k", "a2a", "rso", "rsm"):
         scratch[nm + "_send"] = pltpu.SemaphoreType.DMA(())
         scratch[nm + "_recv"] = pltpu.SemaphoreType.DMA(())
-    if DSA == "batched":
+    if DSAM is not None:
         for k_ in ("keys", "kpre", "tk_acc", "tk_cc", "cidx", "ksend", "kall", "gk", "gmk", "oslot", "oslot_s",
                    "cand_v", "own_s", "own_v", "fb_s", "ipage", "ip_sem", "k_send", "k_recv", "rec_s",
                    "own_u", "own_uv", "g_nope", "g_rope", "g_sem", "kvb", "qb", "q0b", "q1b", "att_acc",
                    "m_s", "l_s", "nu_s", "uo_s", "nuo_s", "nown_s"):
             scratch.pop(k_)
-        scratch.update(dsa_batched.scratch(cfg, tiles, max_pages, BMAX))
+        scratch.update(DSAM.scratch(cfg, tiles, max_pages, BMAX))
     if probe:
         scratch["p_sem"] = pltpu.SemaphoreType.DMA((4,))
         scratch["p_req"] = pltpu.SMEM((4, BMAX), I32)
@@ -1141,7 +1142,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             else:
                 stage_rows(l)
 
-            if DSA == "batched":
+            if DSAM is not None:
                 # 7: indexer (fresh top-k layers); 9: all-request gather ring + attention (IndexShare
                 # layers issue the ring before the q all-gather wait)
                 ph.mark("L_index")
@@ -1257,7 +1258,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             pi = Phases(tiles.trace)
             if proj:
                 indexer_proj(l, slot, pi)
-            if DSA == "batched":
+            if DSAM is not None:
                 core["indexer_tail"](l)
                 if proj:
                     pi.mark("I_recw")
@@ -2239,7 +2240,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             osend -> p_osend[l] (every layer if scal[3] else the last), fresh layers' union / owned lists
             -> p_dbg_uv[l], p_dbg_req[l]."""
             scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
-            if DSA == "batched":
+            if DSAM is not None:
                 core["step_init"]()
             else:
                 legacy_step_init()
@@ -2276,7 +2277,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
                 def _():
                     indexer(l, None, proj=False)
                 ph.mark("P_attn")
-                if DSA == "batched":
+                if DSAM is not None:
                     core["attention"](l, full, lambda: None)
                 else:
                     attn_first(l)
@@ -2292,7 +2293,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
                 @pl.when(jnp.logical_and(wr, full))
                 def _():
-                    if DSA == "batched":
+                    if DSAM is not None:
                         src_ = scr["own_uv"]
                         for b_ in range(BMAX):
                             for k_ in range(3):
@@ -2311,14 +2312,14 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             lax.fori_loop(0, n_it, it, jnp.int32(-1))
 
         # ---------------- batched DSA core ----------------
-        if DSA == "batched":
+        if DSAM is not None:
             E_ = types.SimpleNamespace(
                 cfg=cfg, tiles=tiles, scr=scr, max_pages=max_pages, BMAX=BMAX, me=me, scal=scal, rmeta=rmeta,
                 qmeta=qmeta, bt=bt, rvec=rvec, skip=skip, MB_SH=MB_SH, SRC_MASK=SRC_MASK, QA=QA, QH=QH, OH=OH,
                 sm_scale=sm_scale, Phases=Phases, csel=csel, mxu=mxu, fp8_decode_hw=fp8_decode_hw,
                 mono_key=mono_key, pack2=pack2, unpack_lo=unpack_lo, unpack_hi=unpack_hi, bf=bf,
                 misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M, debug=debug, nb=nb)
-            core.update(dsa_batched.make(E_))
+            core.update(DSAM.make(E_))
 
         if probe:
             run_probe()
@@ -2340,7 +2341,7 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
             scr["h"][...] = own_rows_pad(jnp.concatenate(h_rows, axis=0))
             scr["res"][...] = jnp.zeros((RO8, H), F32)
         scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
-        if DSA == "batched":
+        if DSAM is not None:
             core["step_init"]()
         else:
             legacy_step_init()
@@ -2361,8 +2362,8 @@ def build(cfg, *, nb, max_pages, bmax=None, tiles=Tiles(), interpret=False, debu
 
     # ---------------- pallas_call ----------------
     if probe:
-        bg = dsa_batched.geometry(cfg, tiles, max_pages, BMAX)
-        uv_shape = (L, bg["UR2"], 128) if DSA == "batched" else (L, TMAX, KR_, 128)
+        bg = (DSAM or dsa_batched).geometry(cfg, tiles, max_pages, BMAX)
+        uv_shape = (L, bg["UR2"], 128) if DSAM is not None else (L, TMAX, KR_, 128)
         call = pl.pallas_call(
             kernel,
             name=f"glm5_mk_dsa_probe_{DSA}",
