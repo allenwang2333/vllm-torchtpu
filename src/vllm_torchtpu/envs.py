@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     TPU_FUSED_QK_NORM_ROPE: bool = True
     TPU_FUSED_QK_NORM_ROPE_MIN_ROWS: int = 0
     TPU_RPA_DECODE_BATCHED: bool = False
+    TPU_RPA_DECODE_V2: bool = False
     TPU_RPA_KV_SPLIT: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -136,6 +137,7 @@ if TYPE_CHECKING:
     USE_PIPELINED_DMA_STAGING: bool = False
     VLLM_TPU_BLOCK_MAJOR_KV: bool = False
     TPU_EVICT_WEIGHTS_PAGE_CACHE: bool = False
+    TPU_TCMALLOC_RELEASE_FREE_MEMORY: bool = False
     TPU_SPARSE_MLA_NOPE_LAYOUT: str = "sparsecore"
     TPU_SPARSE_MLA_ROPE_LAYOUT: str = "sparsecore"
     TPU_KV_TRANSFER_PORT: str = "9100"
@@ -180,6 +182,8 @@ if TYPE_CHECKING:
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
     TPU_DRAFT_LOAD_BARRIER: bool = True
+    TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S: int | None = None
+    TPU_DIST_CPU_TIMEOUT_S: int | None = None
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
     RAIDEN_STORAGE_PATH: str = ""
@@ -229,6 +233,10 @@ if TYPE_CHECKING:
     TPU_SCHED_WARM_STREAK: int = 0
     TPU_SCHED_WARM_MIN_DECODERS: int = 24
     TPU_SCHED_MK_MAX_RUNNING: int = 0
+    TPU_SCHED_KV_PREFETCH_WAITING: int = 0
+    TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS: int = 512
+    TPU_SCHED_PAW_SORT_WAITING: bool = False
+    TPU_SCHED_PAW_SORT_WINDOW: int = 128
     TPU_SCHED_SKIP_MIDBLOCK_ALIGN_STOP: bool = False
     TPU_SCHED_SINGLE_STEP_PREFILL: bool = True
     TPU_SCHED_FINISH_DECODE_STEPS: int = 64
@@ -241,6 +249,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QWEN35_MEGAKERNEL: bool = False
     VLLM_TPU_QWEN35_MK_WIDE_MB: int = 0
     VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS: int = 160
+    VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM: bool = False
+    TPU_RAIDEN_PP_MAX_CPU_BYTES: int | None = None
 
 
 def env_with_choices(
@@ -882,6 +892,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run batched RPA in token buckets of up to 64 rows with half the chip's
     # VMEM and a decode batch of min(8, max_num_seqs), at max_model_len <= 16k.
     "TPU_RPA_DECODE_BATCHED": env_bool("TPU_RPA_DECODE_BATCHED"),
+    # The DCP CACHE_ONLY pass of a decode step runs the streaming kernel
+    # batched_rpa/decode_v2.py (f32 softmax and LSE); steps with prefill or
+    # mixed sequences keep the batched RPA kernel.
+    "TPU_RPA_DECODE_V2": env_bool("TPU_RPA_DECODE_V2", default=False),
     # Decode steps split the KV read over the tensor-parallel ranks that share
     # a KV head (layers/adapter/kv_split_attention.py).
     "TPU_RPA_KV_SPLIT": env_bool("TPU_RPA_KV_SPLIT"),
@@ -1041,6 +1055,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_EVICT_WEIGHTS_PAGE_CACHE": env_bool(
         "TPU_EVICT_WEIGHTS_PAGE_CACHE", default=False
     ),
+    # Return freed host heap through tcmalloc's MallocExtension_ReleaseFreeMemory
+    # when a gperftools tcmalloc is preloaded (the serving image does that),
+    # under which glibc's malloc_trim(0) releases nothing. Off, the loader
+    # calls malloc_trim(0) only.
+    "TPU_TCMALLOC_RELEASE_FREE_MEMORY": env_bool(
+        "TPU_TCMALLOC_RELEASE_FREE_MEMORY", default=False
+    ),
     # KV transfer / Raiden knobs. Each getter in distributed/utils.py
     # documents what its knob does; this is the parsing and the default.
     # TCP port the KV wire transfer listens on.
@@ -1164,6 +1185,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # new_group waits a fixed 300 s for every rank's store key, and the ranks
     # can finish streaming the target weights further apart than that.
     "TPU_DRAFT_LOAD_BARRIER": env_bool("TPU_DRAFT_LOAD_BARRIER", default=True),
+    # Seconds the draft load barrier waits. Set, the barrier is a
+    # monitored_barrier with this timeout instead of the CPU group's own (30
+    # min under gloo), so a rank still streaming weights under model-store
+    # contention does not take the others down.
+    "TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S": env_optional_int(
+        "TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S"
+    ),
+    # Seconds every CPU (gloo) collective waits. Set, it is passed to
+    # init_distributed_environment and fills the parallel config's
+    # cpu_distributed_timeout_seconds when that is unset; unset keeps
+    # gloo's 30 min default.
+    "TPU_DIST_CPU_TIMEOUT_S": env_optional_int("TPU_DIST_CPU_TIMEOUT_S"),
     # Raiden library switch, on by default. The TPU offloading connector
     # cannot run next to the raiden singleton worker, so it rejects an
     # explicit off and exports the variable as on for the raiden library.
@@ -1333,6 +1366,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_TPU_QWEN35_MEGAKERNEL=1 and dcp == 1 (128 rows under
     # VLLM_TPU_QWEN35_MK_SPLIT_WIDE, so 32 at MTP=3); >0 = explicit cap.
     "TPU_SCHED_MK_MAX_RUNNING": env_int("TPU_SCHED_MK_MAX_RUNNING", 0),
+    # KV consumer: while the running set is full, start the remote KV pull
+    # of up to this many waiting requests so a freed slot is refilled on the
+    # same step (PrefixAwareScheduler._kv_prefetch_begin_step). 0 = off.
+    "TPU_SCHED_KV_PREFETCH_WAITING": env_nonnegative_int(
+        "TPU_SCHED_KV_PREFETCH_WAITING", 0
+    ),
+    # Free blocks kept for the running set when a prefetched pull is
+    # admitted at the cap, on top of the stock async-load reservation.
+    "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS": env_nonnegative_int(
+        "TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", 512
+    ),
+    # Sort the head of the waiting queue by estimated uncached prompt tokens
+    # (minus TPU_SCHED_PAW_AGING_TOK_PER_S per second waited) at the start of
+    # every schedule() (PrefixAwareScheduler._sort_waiting_queue).
+    "TPU_SCHED_PAW_SORT_WAITING": env_bool("TPU_SCHED_PAW_SORT_WAITING", default=False),
+    # Waiting requests the sort covers, from the head of the queue.
+    "TPU_SCHED_PAW_SORT_WINDOW": env_nonnegative_int("TPU_SCHED_PAW_SORT_WINDOW", 128),
     # Mamba "align" prefill split: let a chunk that starts mid-block (a
     # 128-token partial-tail prefix hit) run past the next block boundary.
     # Under sparse retention (prefix_cache_retention_interval=0) the state at
@@ -1402,6 +1452,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Smallest verify bucket (rows) the wide step applies to when it is on; smaller
     # buckets above 80 rows keep the split plan of 80-row calls.
     "VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS": env_nonnegative_int("VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS", 160),
+    # Qwen3.5-397B with the megakernel under DCP > 1 and more than 16
+    # sequences: size the auto KV budget with the DCP 1 headroom (1 GiB less
+    # KV than the DCP > 1 budget) for the program-load scratch of wide steps.
+    "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM": env_bool(
+        "VLLM_TPU_QWEN35_MK_DCP_KV_HEADROOM", default=False
+    ),
+    # Host bytes of the Raiden offload tier on a pipeline-parallel engine,
+    # replacing the connector's cpu_bytes_to_use (which TPU_RAIDEN_MAX_CPU_BYTES
+    # only caps). Unset: the cap applies as on a TP engine.
+    "TPU_RAIDEN_PP_MAX_CPU_BYTES": env_optional_int("TPU_RAIDEN_PP_MAX_CPU_BYTES"),
 }
 
 
