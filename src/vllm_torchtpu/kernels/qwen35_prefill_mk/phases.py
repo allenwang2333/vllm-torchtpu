@@ -1249,7 +1249,8 @@ def att_qk_norm_rope_kv_paged(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, pool_hbm, b
 
 
 def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, bkv, sub=8,
-                    k_scale=1.0, v_scale=1.0, interpret=False, vt=False, vmask_edge=False):
+                    k_scale=1.0, v_scale=1.0, interpret=False, vt=False, vmask_edge=False,
+                    split=True):
     """Causal GQA attention of each sequence's new tokens over its pages of the serving pool
     (see att_qk_norm_rope_kv_paged), per kv head with its nh / nkv q heads folded into the rows.
     The KV tiles (bkv tokens = bkv / 128 pages of K^T and V^T) are DMA'd by hand, double
@@ -1303,7 +1304,7 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
             def _():
                 fetch(g, sg, 0, 0)
 
-            def kv_step(jt, carry):
+            def kv_step(jt, carry, static_masked=None):
                 slot = jt % 2
 
                 @pl.when(jt + 1 < n_kv)
@@ -1313,7 +1314,9 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
                 kk = _page_t(kbuf.at[slot], interpret)                    # [hd, bkv] fp8
                 vv = _page_t(vbuf.at[slot], interpret)
                 col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1) + jt * bkv
-                if vmask_edge:                 # only the tile holding kv_len has stale lanes
+                if static_masked is False:     # whole tile below the diagonal and kv_len
+                    vv = vv.astype(BF16)
+                elif vmask_edge:               # only the tile holding kv_len has stale lanes
                     edge = (jt + 1) * bkv > kv_len
                     vv = jnp.where(edge & (col >= kv_len), 0.0, vv.astype(BF16)).astype(BF16)
                 else:
@@ -1337,7 +1340,10 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
                     s = (s * (k_scale if fold else scale * k_scale)).astype(BF16)
                     row = jax.lax.broadcasted_iota(jnp.int32, (rc, 1), 0) + c * rc
                     pos = ctx + local + row % bq                    # rows are (head, token)
-                    s = jnp.where(masked & (col > pos), -jnp.inf, s)
+                    if static_masked is None:
+                        s = jnp.where(masked & (col > pos), -jnp.inf, s)
+                    elif static_masked:
+                        s = jnp.where(col > pos, -jnp.inf, s)
                     m_prev = m_ref[r, :1]
                     m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True).astype(F32))
                     alpha = jnp.exp(m_prev - m_new)
@@ -1351,7 +1357,14 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
                 pv(*prev)
                 return carry
 
-            jax.lax.fori_loop(0, n_kv, kv_step, 0)
+            if split:
+                # Tiles wholly below the diagonal (and so below kv_len) need no mask at all; the
+                # rest (the diagonal band, which holds kv_len) take the causal and V masks.
+                n_full = jnp.minimum((ctx + local + 1) // bkv, n_kv)
+                jax.lax.fori_loop(0, n_full, functools.partial(kv_step, static_masked=False), 0)
+                jax.lax.fori_loop(n_full, n_kv, functools.partial(kv_step, static_masked=True), 0)
+            else:
+                jax.lax.fori_loop(0, n_kv, kv_step, 0)
             o_ref[...] = jnp.where(live_q, acc_ref[...] / jnp.maximum(l_ref[:, :1], 1e-30),
                                    0.0).reshape(grp, bq, hd)
 

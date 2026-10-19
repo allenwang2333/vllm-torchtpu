@@ -74,6 +74,7 @@ class MKTiles:
     vmem_mib: int = 63
     att_vt: int = 0             # paged flash: transpose V once per tile (NN PV matmul)
     att_vmask_edge: int = 0     # paged flash: mask V only in the tile holding kv_len
+    att_split: int = 1          # paged flash: unmasked loop below the diagonal, masked loop after
 
 
 def kernel_weight_layout(c, w, lt):
@@ -420,7 +421,8 @@ def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, p
                                       hd=c.HD, bq=tl.bq, bkv=tl.bkv, sub=tl.att_sub,
                                       k_scale=k_scales[ai], v_scale=v_scales[ai],
                                       interpret=interpret, vt=bool(tl.att_vt),
-                                      vmask_edge=bool(tl.att_vmask_edge))
+                                      vmask_edge=bool(tl.att_vmask_edge),
+                                      split=bool(tl.att_split))
                 with jax.named_scope(f"L{li}_att_gate_quant"):
                     P.att_gate_quant(W["ao"], W["att"], W["aq"], W["as"], nh=c.NH, hd=c.HD,
                                      tm=tl.tm_gate)
