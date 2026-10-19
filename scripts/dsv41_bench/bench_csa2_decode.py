@@ -7,7 +7,7 @@ Run on a TPU in the project environment:
 
 For tracing and compiler inspection, add:
     --trace-mode TRACE_COMPUTE --dump-llo /tmp/csa2-compiler
-This selects libtpu's trace mode; it does not insert kernel-internal markers.
+Profiling enables libtpu custom-call region tracing for the kernel's named scopes.
 Compiler dumps are in /tmp/csa2-compiler/rank0, indexed by compiler-dumps.json
 in the output directory. Search those files for csa2_swa_csa_inverse_rope.
 
@@ -61,6 +61,13 @@ def main() -> None:
             " --xla_jf_dump_to_filter=module=.*csa2_swa_csa_inverse_rope.*"
         )
         os.environ.update(dump_env)
+
+    if args.profile or args.trace_mode is not None:
+        os.environ["LIBTPU_INIT_ARGS"] = (
+            os.environ.get("LIBTPU_INIT_ARGS", "")
+            + " --xla_enable_custom_call_region_trace=true"
+            + " --xla_xprof_enable_custom_call_tracing=true"
+        ).strip()
 
     import jax
     import jax.numpy as jnp

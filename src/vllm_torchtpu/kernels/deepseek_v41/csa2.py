@@ -93,12 +93,13 @@ def main_kernel(
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
     window_size = 128
-    sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
-    sink_dma.start()
-    # Incomplete groups still participate in the grouped SWA QK.
-    q_buffer_ref[...] = jnp.zeros(q_buffer_ref.shape, q_buffer_ref.dtype)
-    sink_dma.wait()
-    sink = jnp.broadcast_to(sink_ref[...][None, :], (128, num_heads)).T[:, :1]
+    with jax.named_scope("initialize"):
+        sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
+        sink_dma.start()
+        # Incomplete groups still participate in the grouped SWA QK.
+        q_buffer_ref[...] = jnp.zeros(q_buffer_ref.shape, q_buffer_ref.dtype)
+        sink_dma.wait()
+        sink = jnp.broadcast_to(sink_ref[...][None, :], (128, num_heads)).T[:, :1]
 
     def next_nonempty(request_index):
         def empty(index):
@@ -195,14 +196,15 @@ def main_kernel(
         return tuple(copies)
 
     def transfer_block(wanted, request_index, destination, semaphore, *, wait=False):
-        for copy, own in block_dmas(wanted, request_index, destination, semaphore):
+        with jax.named_scope("swa_dma_wait" if wait else "swa_dma_start"):
+            for copy, own in block_dmas(wanted, request_index, destination, semaphore):
 
-            @pl.when(own)
-            def transfer(*, copy=copy):
-                if wait:
-                    copy.wait()
-                else:
-                    copy.start()
+                @pl.when(own)
+                def transfer(*, copy=copy):
+                    if wait:
+                        copy.wait()
+                    else:
+                        copy.start()
 
     def request_window(request_index, *, wait=False):
         for offset in range(2):
@@ -255,27 +257,28 @@ def main_kernel(
         )
 
     def transfer_group(request_index, t0, bank, *, wait=False):
-        def per_query():
-            @pl.loop(0, group_count(request_index, t0))
-            def transfer(i):
-                for dma in query_dmas(t0, i, bank):
-                    if wait:
-                        dma.wait()
-                    else:
-                        dma.start()
+        with jax.named_scope("query_kv_dma_wait" if wait else "query_kv_dma_start"):
+            def per_query():
+                @pl.loop(0, group_count(request_index, t0))
+                def transfer(i):
+                    for dma in query_dmas(t0, i, bank):
+                        if wait:
+                            dma.wait()
+                        else:
+                            dma.start()
 
-        if q_hbm_ref.shape[0] >= bq:
+            if q_hbm_ref.shape[0] >= bq:
 
-            def bulk():
-                for dma in bulk_dmas(t0, bank):
-                    if wait:
-                        dma.wait()
-                    else:
-                        dma.start()
+                def bulk():
+                    for dma in bulk_dmas(t0, bank):
+                        if wait:
+                            dma.wait()
+                        else:
+                            dma.start()
 
-            lax.cond(group_count(request_index, t0) == bq, bulk, per_query)
-        else:
-            per_query()
+                lax.cond(group_count(request_index, t0) == bq, bulk, per_query)
+            else:
+                per_query()
 
     first_request = next_nonempty(jnp.int32(0))
     first_t0 = starts_ref[first_request]
@@ -318,50 +321,51 @@ def main_kernel(
         )
 
         def store_block(wanted, slot, source_ref):
-            source_q = jnp.minimum(
-                end - 1,
-                start
-                + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
-            )
-            rows = pl.ds(slot * 128, 128)
-            keep = jnp.ones((128, 1), jnp.bool_)
-            if swa_metadata_ref is not None:
-                left = jnp.maximum(0, first_query_position - 127)
-                right = positions_ref[jnp.maximum(start, end - 1)] + 1
-                if swa_bounds_ref is not None:
-                    left, right = (
-                        swa_bounds_ref[request_index, 0],
-                        swa_bounds_ref[request_index, 1],
-                    )
-                left = jnp.maximum(left, swa_metadata_ref[request_index, 1])
-                columns = 128 if swa_kv_hbm_ref.dtype == jnp.int32 else 512
-                absolute = (
-                    anchor
-                    + wanted * 128
-                    + lax.broadcasted_iota(jnp.int32, (128, columns), 0)
+            with jax.named_scope("swa_unpack_mask"):
+                source_q = jnp.minimum(
+                    end - 1,
+                    start
+                    + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
                 )
-                keep = (absolute >= left) & (absolute < right)
-            if swa_kv_hbm_ref.dtype == jnp.int32:
-                for plane in range(2):
-                    bits = jnp.where(keep, source_ref[plane], 0)
-                    low = lax.bitcast_convert_type(bits << 16, jnp.float32)
-                    high = lax.bitcast_convert_type(
-                        bits & jnp.int32(-65536), jnp.float32
+                rows = pl.ds(slot * 128, 128)
+                keep = jnp.ones((128, 1), jnp.bool_)
+                if swa_metadata_ref is not None:
+                    left = jnp.maximum(0, first_query_position - 127)
+                    right = positions_ref[jnp.maximum(start, end - 1)] + 1
+                    if swa_bounds_ref is not None:
+                        left, right = (
+                            swa_bounds_ref[request_index, 0],
+                            swa_bounds_ref[request_index, 1],
+                        )
+                    left = jnp.maximum(left, swa_metadata_ref[request_index, 1])
+                    columns = 128 if swa_kv_hbm_ref.dtype == jnp.int32 else 512
+                    absolute = (
+                        anchor
+                        + wanted * 128
+                        + lax.broadcasted_iota(jnp.int32, (128, columns), 0)
                     )
-                    swa_shared_ref[rows, pl.ds(plane * 256, 128)] = jnp.where(
-                        keep, low, 0
-                    ).astype(jnp.bfloat16)
-                    swa_shared_ref[rows, pl.ds(plane * 256 + 128, 128)] = jnp.where(
-                        keep, high, 0
-                    ).astype(jnp.bfloat16)
-            else:
-                swa_shared_ref[rows, :] = jnp.where(keep, source_ref[...], 0)
-            swa_cache_ids[slot] = wanted
-            swa_cache_bases[slot] = (
-                jnp.maximum(0, positions_ref[source_q] - 127)
-                if swa_metadata_ref is None
-                else anchor + wanted * 128
-            )
+                    keep = (absolute >= left) & (absolute < right)
+                if swa_kv_hbm_ref.dtype == jnp.int32:
+                    for plane in range(2):
+                        bits = jnp.where(keep, source_ref[plane], 0)
+                        low = lax.bitcast_convert_type(bits << 16, jnp.float32)
+                        high = lax.bitcast_convert_type(
+                            bits & jnp.int32(-65536), jnp.float32
+                        )
+                        swa_shared_ref[rows, pl.ds(plane * 256, 128)] = jnp.where(
+                            keep, low, 0
+                        ).astype(jnp.bfloat16)
+                        swa_shared_ref[rows, pl.ds(plane * 256 + 128, 128)] = jnp.where(
+                            keep, high, 0
+                        ).astype(jnp.bfloat16)
+                else:
+                    swa_shared_ref[rows, :] = jnp.where(keep, source_ref[...], 0)
+                swa_cache_ids[slot] = wanted
+                swa_cache_bases[slot] = (
+                    jnp.maximum(0, positions_ref[source_q] - 127)
+                    if swa_metadata_ref is None
+                    else anchor + wanted * 128
+                )
 
         @pl.when(t0 == start)
         def reset_request_window():
@@ -407,28 +411,29 @@ def main_kernel(
 
         def dequant(i):
             # Byte g of each word holds feature g * 128 + lane.
-            words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
-            for row in range(0, 512, 128):
-                rows = pl.ds(row, 128)
-                words = words_ref[rows, :]
-                scales = main_scale_ref[i, 0, rows][:, None]
-                for group in range(4):
-                    if interpret:
-                        # unpack_elementwise has no CPU lowering.
-                        bits = (words >> (8 * group)) & 0xFF
-                    else:
-                        bits = pltpu.unpack_elementwise(
-                            words,
-                            index=group,
-                            packed_dtype=jnp.uint8,
-                            unpacked_dtype=jnp.uint32,
-                        )
-                    values = lax.bitcast_convert_type(
-                        bits.astype(jnp.uint8), jnp.float8_e4m3fn
-                    ).astype(jnp.float32)
-                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
-                        values * scales
-                    ).astype(jnp.bfloat16)
+            with jax.named_scope("csa_dequant"):
+                words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
+                for row in range(0, 512, 128):
+                    rows = pl.ds(row, 128)
+                    words = words_ref[rows, :]
+                    scales = main_scale_ref[i, 0, rows][:, None]
+                    for group in range(4):
+                        if interpret:
+                            # unpack_elementwise has no CPU lowering.
+                            bits = (words >> (8 * group)) & 0xFF
+                        else:
+                            bits = pltpu.unpack_elementwise(
+                                words,
+                                index=group,
+                                packed_dtype=jnp.uint8,
+                                unpacked_dtype=jnp.uint32,
+                            )
+                        values = lax.bitcast_convert_type(
+                            bits.astype(jnp.uint8), jnp.float8_e4m3fn
+                        ).astype(jnp.float32)
+                        main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
+                            values * scales
+                        ).astype(jnp.bfloat16)
 
         transfer_group(request_index, t0, bank, wait=True)
 
@@ -441,53 +446,54 @@ def main_kernel(
 
             transfer_group(next_request, next_t0, 1 - bank)
 
-        if interpret:
-            swa_score_ref[...] = jnp.dot(
-                q_ref[...].reshape(bq * num_heads, 512),
-                swa_shared_ref[...].T,
-                preferred_element_type=jnp.float32,
-            ).reshape(bq, num_heads, 256)
-        else:
-            # Split legal head domains; a sub-16-row head tail is indivisible.
-            first_heads = min(num_heads, ((num_heads + 16) // 32) * 16)
-            partitions = [(0, 0, first_heads)] if first_heads else []
-            if num_heads > first_heads:
-                partitions.append(
-                    (len(partitions), first_heads, num_heads - first_heads)
-                )
+        with jax.named_scope("swa_qk"):
+            if interpret:
+                swa_score_ref[...] = jnp.dot(
+                    q_ref[...].reshape(bq * num_heads, 512),
+                    swa_shared_ref[...].T,
+                    preferred_element_type=jnp.float32,
+                ).reshape(bq, num_heads, 256)
+            else:
+                # Split legal head domains; a sub-16-row head tail is indivisible.
+                first_heads = min(num_heads, ((num_heads + 16) // 32) * 16)
+                partitions = [(0, 0, first_heads)] if first_heads else []
+                if num_heads > first_heads:
+                    partitions.append(
+                        (len(partitions), first_heads, num_heads - first_heads)
+                    )
 
-            def compute_swa_qk(*accumulators):
-                for k in range(2):
-                    ks = pl.ds(k * 256, 256)
-                    rhs = swa_shared_ref[:, ks]
-                    for mxu, head_start, heads in partitions:
-                        rows = pl.cdiv(heads, 16) * 16
-                        pltpu.matmul_push_rhs(
-                            rhs, staging_register=0, mxu_index=mxu, transpose=True
-                        )
-                        for i in range(bq):
-                            lhs = q_ref[i, pl.ds(head_start, heads), ks]
-                            lhs = jnp.pad(lhs, ((0, rows - heads), (0, 0)))
-                            pltpu.matmul_acc_lhs(
-                                accumulators[mxu * bq + i],
-                                lhs,
-                                load_staged_rhs=0 if i == 0 else None,
+                def compute_swa_qk(*accumulators):
+                    for k in range(2):
+                        ks = pl.ds(k * 256, 256)
+                        rhs = swa_shared_ref[:, ks]
+                        for mxu, head_start, heads in partitions:
+                            rows = pl.cdiv(heads, 16) * 16
+                            pltpu.matmul_push_rhs(
+                                rhs, staging_register=0, mxu_index=mxu, transpose=True
                             )
-                for i in range(bq):
-                    for mxu, head_start, heads in partitions:
-                        rows = pl.cdiv(heads, 16) * 16
-                        swa_score_ref[i, pl.ds(head_start, heads), :] = (
-                            pltpu.matmul_pop(accumulators[mxu * bq + i])[:heads]
-                        )
+                            for i in range(bq):
+                                lhs = q_ref[i, pl.ds(head_start, heads), ks]
+                                lhs = jnp.pad(lhs, ((0, rows - heads), (0, 0)))
+                                pltpu.matmul_acc_lhs(
+                                    accumulators[mxu * bq + i],
+                                    lhs,
+                                    load_staged_rhs=0 if i == 0 else None,
+                                )
+                    for i in range(bq):
+                        for mxu, head_start, heads in partitions:
+                            rows = pl.cdiv(heads, 16) * 16
+                            swa_score_ref[i, pl.ds(head_start, heads), :] = (
+                                pltpu.matmul_pop(accumulators[mxu * bq + i])[:heads]
+                            )
 
-            pl.run_scoped(
-                compute_swa_qk,
-                *(
-                    pltpu.ACC(mxu)((pl.cdiv(heads, 16) * 16, 256), jnp.float32)
-                    for mxu, _, heads in partitions
-                    for _ in range(bq)
-                ),
-            )
+                pl.run_scoped(
+                    compute_swa_qk,
+                    *(
+                        pltpu.ACC(mxu)((pl.cdiv(heads, 16) * 16, 256), jnp.float32)
+                        for mxu, _, heads in partitions
+                        for _ in range(bq)
+                    ),
+                )
 
         accumulator_slots = 10 if 10 * mrb_stride <= 256 else 6
 
@@ -496,34 +502,36 @@ def main_kernel(
                 return accumulators[mxu * accumulator_slots + address // mrb_stride]
 
             def csa_launch(i, addr, *, pv):
-                for k in range(2):
-                    ks = pl.ds(k * 256, 256)
-                    for mxu in range(2):
-                        ns = pl.ds(mxu * 256, 256)
-                        rhs = (
-                            main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
-                        )
-                        pltpu.matmul_push_rhs(
-                            rhs, staging_register=0, mxu_index=mxu, transpose=not pv
-                        )
-                        lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
-                        lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
-                        pltpu.matmul_acc_lhs(
-                            accumulator(mxu, addr), lhs, load_staged_rhs=0
-                        )
+                with jax.named_scope("csa_pv_launch" if pv else "csa_qk_launch"):
+                    for k in range(2):
+                        ks = pl.ds(k * 256, 256)
+                        for mxu in range(2):
+                            ns = pl.ds(mxu * 256, 256)
+                            rhs = (
+                                main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
+                            )
+                            pltpu.matmul_push_rhs(
+                                rhs, staging_register=0, mxu_index=mxu, transpose=not pv
+                            )
+                            lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
+                            lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
+                            pltpu.matmul_acc_lhs(
+                                accumulator(mxu, addr), lhs, load_staged_rhs=0
+                            )
 
             def csa_pop(i, addr, *, pv):
-                if interpret:
-                    lhs = main_p_ref[i] if pv else q_ref[i]
-                    rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
-                    return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
-                return jnp.concatenate(
-                    tuple(
-                        pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
-                        for mxu in range(2)
-                    ),
-                    axis=1,
-                )
+                with jax.named_scope("csa_pv_pop" if pv else "csa_qk_pop"):
+                    if interpret:
+                        lhs = main_p_ref[i] if pv else q_ref[i]
+                        rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
+                        return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+                    return jnp.concatenate(
+                        tuple(
+                            pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
+                            for mxu in range(2)
+                        ),
+                        axis=1,
+                    )
 
             dequant(0)
             if not interpret:
@@ -535,43 +543,44 @@ def main_kernel(
                 if not interpret and has_next:
                     csa_launch(i + 1, mrb_stride - addr, pv=False)
                 main_logits = csa_pop(i, addr, pv=False) * scale
-                main_count = main_lengths_ref[t0 + i]
-                main_logits = jnp.where(
-                    jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
-                )
-                lanes = jnp.arange(128)
-                key_positions = jnp.concatenate(
-                    (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
-                )
-                # Concatenate integer boundaries before constructing the boolean mask.
-                unique = key_positions >= jnp.concatenate(
-                    tuple(
-                        jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
-                        for slot in range(2)
+                with jax.named_scope("softmax"):
+                    main_count = main_lengths_ref[t0 + i]
+                    main_logits = jnp.where(
+                        jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
                     )
-                )
-                swa_valid = (
-                    key_positions >= jnp.maximum(0, p0 + i - window_size + 1)
-                ) & (key_positions <= p0 + i)
-                if swa_bounds_ref is not None:
-                    swa_valid = (key_positions >= swa_bounds_ref[request_index, 0]) & (
-                        key_positions < swa_bounds_ref[request_index, 1]
+                    lanes = jnp.arange(128)
+                    key_positions = jnp.concatenate(
+                        (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
                     )
-                if swa_metadata_ref is not None:
-                    swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
-                swa_logits = jnp.where(
-                    (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
-                )
-                # Keep both branches in one FP32 softmax tile; round only P.
-                logits = jnp.concatenate((main_logits, swa_logits), axis=1)
-                maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
-                exponentials = jnp.exp(logits - maximum)
-                denominator = jnp.exp(sink - maximum) + jnp.sum(
-                    exponentials, axis=1, keepdims=True
-                )
-                probabilities = (exponentials / denominator).astype(jnp.bfloat16)
-                main_p_ref[i] = probabilities[:, :512]
-                swa_p_ref[i] = probabilities[:, 512:]
+                    # Concatenate integer boundaries before constructing the boolean mask.
+                    unique = key_positions >= jnp.concatenate(
+                        tuple(
+                            jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
+                            for slot in range(2)
+                        )
+                    )
+                    swa_valid = (
+                        key_positions >= jnp.maximum(0, p0 + i - window_size + 1)
+                    ) & (key_positions <= p0 + i)
+                    if swa_bounds_ref is not None:
+                        swa_valid = (key_positions >= swa_bounds_ref[request_index, 0]) & (
+                            key_positions < swa_bounds_ref[request_index, 1]
+                        )
+                    if swa_metadata_ref is not None:
+                        swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
+                    swa_logits = jnp.where(
+                        (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
+                    )
+                    # Keep both branches in one FP32 softmax tile; round only P.
+                    logits = jnp.concatenate((main_logits, swa_logits), axis=1)
+                    maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+                    exponentials = jnp.exp(logits - maximum)
+                    denominator = jnp.exp(sink - maximum) + jnp.sum(
+                        exponentials, axis=1, keepdims=True
+                    )
+                    probabilities = (exponentials / denominator).astype(jnp.bfloat16)
+                    main_p_ref[i] = probabilities[:, :512]
+                    swa_p_ref[i] = probabilities[:, 512:]
 
             # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
             if 10 * mrb_stride <= 256:
@@ -587,60 +596,64 @@ def main_kernel(
                             csa_launch(
                                 first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
                             )
-                    if not interpret:
-                        for mxu in range(2):
-                            pltpu.matmul_push_rhs(
-                                swa_shared_ref[:, pl.ds(mxu * 256, 256)],
-                                staging_register=0,
-                                mxu_index=mxu,
-                            )
-                            for row in range(size):
-                                lhs = jnp.pad(
-                                    swa_p_ref[first + row],
-                                    ((0, mxu_heads - num_heads), (0, 0)),
+                    with jax.named_scope("swa_pv_launch"):
+                        if not interpret:
+                            for mxu in range(2):
+                                pltpu.matmul_push_rhs(
+                                    swa_shared_ref[:, pl.ds(mxu * 256, 256)],
+                                    staging_register=0,
+                                    mxu_index=mxu,
                                 )
-                                pltpu.matmul_acc_lhs(
-                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride),
-                                    lhs,
-                                    load_staged_rhs=0 if row == 0 else None,
-                                )
+                                for row in range(size):
+                                    lhs = jnp.pad(
+                                        swa_p_ref[first + row],
+                                        ((0, mxu_heads - num_heads), (0, 0)),
+                                    )
+                                    pltpu.matmul_acc_lhs(
+                                        accumulator(mxu, (6 + 2 * slot + row) * mrb_stride),
+                                        lhs,
+                                        load_staged_rhs=0 if row == 0 else None,
+                                    )
 
                 def finish_tile_output(i, slot, row):
                     main_output = csa_pop(i, (2 + 2 * slot + row) * mrb_stride, pv=True)
-                    if interpret:
-                        swa_output = jnp.dot(
-                            swa_p_ref[i],
-                            swa_shared_ref[...],
-                            preferred_element_type=jnp.float32,
+                    with jax.named_scope("swa_pv_pop"):
+                        if interpret:
+                            swa_output = jnp.dot(
+                                swa_p_ref[i],
+                                swa_shared_ref[...],
+                                preferred_element_type=jnp.float32,
+                            )
+                        else:
+                            swa_output = jnp.concatenate(
+                                tuple(
+                                    pltpu.matmul_pop(
+                                        accumulator(mxu, (6 + 2 * slot + row) * mrb_stride)
+                                    )[:num_heads]
+                                    for mxu in range(2)
+                                ),
+                                axis=1,
+                            )
+                    with jax.named_scope("merge_inverse_rope"):
+                        output = main_output + swa_output
+                        tail = output[:, 384:]
+                        partner = jnp.where(
+                            (jnp.arange(128) % 2 == 0)[None, :],
+                            pltpu.roll(tail, 127, axis=1),
+                            pltpu.roll(tail, 1, axis=1),
                         )
-                    else:
-                        swa_output = jnp.concatenate(
-                            tuple(
-                                pltpu.matmul_pop(
-                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride)
-                                )[:num_heads]
-                                for mxu in range(2)
-                            ),
-                            axis=1,
+                        rotated = (
+                            tail * rope_ref[i, 0][None, :]
+                            + partner * rope_ref[i, 1][None, :]
                         )
-                    output = main_output + swa_output
-                    tail = output[:, 384:]
-                    partner = jnp.where(
-                        (jnp.arange(128) % 2 == 0)[None, :],
-                        pltpu.roll(tail, 127, axis=1),
-                        pltpu.roll(tail, 1, axis=1),
-                    )
-                    rotated = (
-                        tail * rope_ref[i, 0][None, :]
-                        + partner * rope_ref[i, 1][None, :]
-                    )
-                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                    pltpu.make_async_copy(
-                        output_ref.at[i],
-                        output_hbm_ref.at[t0 + i],
-                        dma_sem.at[2 + 8 * bq + i],
-                    ).start()
+                        output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                        output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+                    with jax.named_scope("output_dma_start"):
+                        pltpu.make_async_copy(
+                            output_ref.at[i],
+                            output_hbm_ref.at[t0 + i],
+                            dma_sem.at[2 + 8 * bq + i],
+                        ).start()
 
                 def finish_tile(first, slot, *, size=2):
                     for row in range(size):
@@ -698,57 +711,61 @@ def main_kernel(
                     # Keep QK, CSA PV and SWA PV in disjoint MRB ranges. Each side
                     # owns N=256, so H<=128 needs at most 6*32 of 256 addresses.
                     csa_launch(i, (2 + slot) * mrb_stride, pv=True)
-                    for mxu in range(2):
-                        pltpu.matmul_push_rhs(
-                            swa_shared_ref[:, pl.ds(mxu * 256, 256)],
-                            staging_register=0,
-                            mxu_index=mxu,
-                        )
-                        lhs = jnp.pad(
-                            swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0))
-                        )
-                        pltpu.matmul_acc_lhs(
-                            accumulator(mxu, (4 + slot) * mrb_stride),
-                            lhs,
-                            load_staged_rhs=0,
-                        )
+                    with jax.named_scope("swa_pv_launch"):
+                        for mxu in range(2):
+                            pltpu.matmul_push_rhs(
+                                swa_shared_ref[:, pl.ds(mxu * 256, 256)],
+                                staging_register=0,
+                                mxu_index=mxu,
+                            )
+                            lhs = jnp.pad(
+                                swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0))
+                            )
+                            pltpu.matmul_acc_lhs(
+                                accumulator(mxu, (4 + slot) * mrb_stride),
+                                lhs,
+                                load_staged_rhs=0,
+                            )
 
                 def finish_output(i, slot):
                     main_output = csa_pop(i, (2 + slot) * mrb_stride, pv=True)
-                    if interpret:
-                        swa_output = jnp.dot(
-                            swa_p_ref[i],
-                            swa_shared_ref[...],
-                            preferred_element_type=jnp.float32,
+                    with jax.named_scope("swa_pv_pop"):
+                        if interpret:
+                            swa_output = jnp.dot(
+                                swa_p_ref[i],
+                                swa_shared_ref[...],
+                                preferred_element_type=jnp.float32,
+                            )
+                        else:
+                            swa_output = jnp.concatenate(
+                                tuple(
+                                    pltpu.matmul_pop(
+                                        accumulator(mxu, (4 + slot) * mrb_stride)
+                                    )[:num_heads]
+                                    for mxu in range(2)
+                                ),
+                                axis=1,
+                            )
+                    with jax.named_scope("merge_inverse_rope"):
+                        output = main_output + swa_output
+                        tail = output[:, 384:]
+                        partner = jnp.where(
+                            (jnp.arange(128) % 2 == 0)[None, :],
+                            pltpu.roll(tail, 127, axis=1),
+                            pltpu.roll(tail, 1, axis=1),
                         )
-                    else:
-                        swa_output = jnp.concatenate(
-                            tuple(
-                                pltpu.matmul_pop(
-                                    accumulator(mxu, (4 + slot) * mrb_stride)
-                                )[:num_heads]
-                                for mxu in range(2)
-                            ),
-                            axis=1,
+                        rotated = (
+                            tail * rope_ref[i, 0][None, :]
+                            + partner * rope_ref[i, 1][None, :]
                         )
-                    output = main_output + swa_output
-                    tail = output[:, 384:]
-                    partner = jnp.where(
-                        (jnp.arange(128) % 2 == 0)[None, :],
-                        pltpu.roll(tail, 127, axis=1),
-                        pltpu.roll(tail, 1, axis=1),
-                    )
-                    rotated = (
-                        tail * rope_ref[i, 0][None, :]
-                        + partner * rope_ref[i, 1][None, :]
-                    )
-                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                    pltpu.make_async_copy(
-                        output_ref.at[i],
-                        output_hbm_ref.at[t0 + i],
-                        dma_sem.at[2 + 8 * bq + i],
-                    ).start()
+                        output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                        output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+                    with jax.named_scope("output_dma_start"):
+                        pltpu.make_async_copy(
+                            output_ref.at[i],
+                            output_hbm_ref.at[t0 + i],
+                            dma_sem.at[2 + 8 * bq + i],
+                        ).start()
 
                 def advance(i, slot, *, has_next=True):
                     softmax(i, slot * mrb_stride, has_next=has_next)
@@ -798,9 +815,10 @@ def main_kernel(
 
         @pl.loop(0, count)
         def wait_output(i):
-            pltpu.make_async_copy(
-                output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
-            ).wait()
+            with jax.named_scope("output_dma_wait"):
+                pltpu.make_async_copy(
+                    output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
+                ).wait()
 
         @pl.when((next_request != request_index) & (swa_prefetched_id[0] >= 0))
         def drain_request_prefetch():
@@ -816,28 +834,29 @@ def main_kernel(
     )
 
     def clear_padding():
-        end = starts_ref[request_limit]
-        output_ref[...] = jnp.zeros(output_ref.shape, jnp.bfloat16)
+        with jax.named_scope("clear_padding"):
+            end = starts_ref[request_limit]
+            output_ref[...] = jnp.zeros(output_ref.shape, jnp.bfloat16)
 
-        @pl.loop(end, q_hbm_ref.shape[0], step=bq)
-        def padding_group(t0):
-            count = jnp.minimum(bq, q_hbm_ref.shape[0] - t0)
+            @pl.loop(end, q_hbm_ref.shape[0], step=bq)
+            def padding_group(t0):
+                count = jnp.minimum(bq, q_hbm_ref.shape[0] - t0)
 
-            @pl.loop(0, count)
-            def start_zero(i):
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
+                @pl.loop(0, count)
+                def start_zero(i):
+                    pltpu.make_async_copy(
+                        output_ref.at[i],
+                        output_hbm_ref.at[t0 + i],
+                        dma_sem.at[2 + 8 * bq + i],
+                    ).start()
 
-            @pl.loop(0, count)
-            def wait_zero(i):
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).wait()
+                @pl.loop(0, count)
+                def wait_zero(i):
+                    pltpu.make_async_copy(
+                        output_ref.at[i],
+                        output_hbm_ref.at[t0 + i],
+                        dma_sem.at[2 + 8 * bq + i],
+                    ).wait()
 
     clear_padding()
 
