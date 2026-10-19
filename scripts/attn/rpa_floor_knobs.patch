@@ -1,0 +1,50 @@
+diff --git a/src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py b/src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py
+index d35b7b25b..bab684173 100644
+--- a/src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py
++++ b/src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py
+@@ -23,6 +23,13 @@ from jax.experimental.pallas import tpu as pltpu
+ from vllm_torchtpu.kernels.experimental.batched_rpa import configs
+ 
+ 
++def _DBG_NODMA() -> bool:
++    """Measurement-only knob: skip the KV cache page DMAs (compute floor)."""
++    import os
++
++    return os.environ.get("TPU_RPA_DBG_NODMA", "0") == "1"
++
++
+ class _BaseBufferedRef(pltpu.BufferedRef):
+     def __post_init__(self):
+         # pallas doesn't allow you to set buffer_count > 2 for output refs, so
+@@ -180,6 +187,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
+                 p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
+                 hbm_p_idx = page_indices_ref[p_idx]
+                 sz = jnp.where(is_no_op, 0, sz)
++                if _DBG_NODMA():
++                    sz = sz * 0
+                 dst_off = pl.multiple_of(dst_off, num_lanes)
+                 sz = pl.multiple_of(sz, num_lanes)
+                 # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
+@@ -248,6 +257,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
+         sem = self.sem_recvs.at[slot]
+         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
+         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
++        if _DBG_NODMA():
++            wait_lanes = wait_lanes * 0
+ 
+         vmem_dst = self.window_ref.at[slot]
+         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
+diff --git a/src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py b/src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py
+index 689c179c1..818d92f73 100644
+--- a/src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py
++++ b/src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py
+@@ -779,6 +779,9 @@ def rpa_body(
+         cfgs=cfgs,
+     )
+ 
++    # Measurement-only knob: skip the attention math (DMA + pipeline floor).
++    if os.environ.get("TPU_RPA_DBG_NOCOMPUTE", "0") == "1":
++        return
+     _rpa_step(
+         q_vref,
+         kv_in_vref,
