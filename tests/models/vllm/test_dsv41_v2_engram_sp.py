@@ -343,6 +343,8 @@ def test_sp_sharded_attention_input_projections_match_tp(monkeypatch, has_source
         attn._split_qkv_and_norm = (
             v2_attn.DeepseekV41Attention._split_qkv_and_norm.__get__(attn)
         )
+        # forward() ends in the real _finish_sp; without gemm_rs it is a pass-through.
+        attn._finish_sp = v2_attn.DeepseekV41Attention._finish_sp.__get__(attn)
         return attn
 
     tp_attn = _make_attn(sp_sharded=False)
@@ -885,10 +887,10 @@ def test_stage_attention_cache_scope_shares_addressing(monkeypatch):
     req_row_slots_calls = 0
     orig_req_row_slots = v2_attn._request_row_slots
 
-    def _counting_req_row_slots(cache, table, width):
+    def _counting_req_row_slots(*args, **kwargs):
         nonlocal req_row_slots_calls
         req_row_slots_calls += 1
-        return orig_req_row_slots(cache, table, width)
+        return orig_req_row_slots(*args, **kwargs)
 
     monkeypatch.setattr(v2_attn, "_row_slots", _counting_row_slots)
     monkeypatch.setattr(v2_attn, "_request_row_slots", _counting_req_row_slots)

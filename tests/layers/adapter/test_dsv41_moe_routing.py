@@ -26,6 +26,18 @@ from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import DeepseekV41Attention
 
+
+def _attention_double(**attrs):
+    """SimpleNamespace stand-in for DeepseekV41Attention.forward's ``self``.
+
+    forward() ends in the real ``_finish_sp``; without ``gemm_rs`` set it is a
+    pass-through, so bind it rather than stubbing it.
+    """
+    obj = SimpleNamespace(**attrs)
+    obj._finish_sp = DeepseekV41Attention._finish_sp.__get__(obj)
+    return obj
+
+
 # ==============================================================================
 # Helpers & Mocks
 # ==============================================================================
@@ -569,7 +581,7 @@ def test_forward_sp_sharded_with_indexer_weights(monkeypatch):
     kv_score = torch.randn(num_tokens, 2, dtype=torch.float32)
 
     attn_fn_mock = MagicMock()
-    self_obj = SimpleNamespace(
+    self_obj = _attention_double(
         num_local_heads=2,
         n_local_heads=2,
         head_dim=head_dim,
@@ -600,7 +612,7 @@ def test_forward_sp_sharded_indexer_weights_dtype_mismatch_raises():
     kv = torch.randn(num_tokens, 16, dtype=torch.bfloat16)
     indexer_w = torch.randn(num_tokens, 4, dtype=torch.float32)  # mismatched!
 
-    self_obj = SimpleNamespace(
+    self_obj = _attention_double(
         num_local_heads=2,
         n_local_heads=2,
         head_dim=16,
@@ -636,7 +648,7 @@ def test_forward_sp_sharded_without_indexer_weights(monkeypatch):
     kv = torch.randn(num_tokens, head_dim, dtype=torch.bfloat16)
 
     attn_fn_mock = MagicMock()
-    self_obj = SimpleNamespace(
+    self_obj = _attention_double(
         num_local_heads=2,
         n_local_heads=2,
         head_dim=head_dim,
@@ -665,7 +677,7 @@ def test_forward_sp_sharded_qr_kv_dtype_mismatch_raises():
     qr = torch.randn(num_tokens, 8, dtype=torch.bfloat16)
     kv = torch.randn(num_tokens, 16, dtype=torch.float32)  # mismatched!
 
-    self_obj = SimpleNamespace(
+    self_obj = _attention_double(
         num_local_heads=2,
         n_local_heads=2,
         head_dim=16,
@@ -692,7 +704,7 @@ def test_forward_unsharded_bypasses_sp_gathers(monkeypatch):
     kv = torch.randn(num_tokens, 16)
 
     attn_fn_mock = MagicMock()
-    self_obj = SimpleNamespace(
+    self_obj = _attention_double(
         num_local_heads=2,
         n_local_heads=2,
         head_dim=16,

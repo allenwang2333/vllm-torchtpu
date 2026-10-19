@@ -228,11 +228,25 @@ def test_stage_and_take_draft_token_ids_snapshots_req_ids():
     assert manager.take_draft_token_ids() is None
 
 
-def test_stage_draft_token_ids_rejects_row_mismatch():
+def test_stage_draft_token_ids_rejects_fewer_rows_than_requests():
     manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
     mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
     with pytest.raises(AssertionError):
-        manager.stage_draft_token_ids_for_host(torch.zeros((3, 2), dtype=torch.int32))
+        manager.stage_draft_token_ids_for_host(torch.zeros((1, 2), dtype=torch.int32))
+
+
+def test_stage_draft_token_ids_slices_padded_rows():
+    """Static spec-decode buckets pad drafts past num_reqs; take() must return
+    exactly the live requests' rows."""
+    manager, mock_runner, _ = _make_manager_with_eagle3_drafter(num_reqs=2)
+    mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
+    drafts = torch.tensor([[1, 2], [3, 4], [0, 0]], dtype=torch.int32)
+    manager.stage_draft_token_ids_for_host(drafts)
+
+    result = manager.take_draft_token_ids()
+    assert result is not None
+    assert result.req_ids == ["req-a", "req-b"]
+    assert result.draft_token_ids == [[1, 2], [3, 4]]
 
 
 def test_propose_draft_token_ids_ngram_dispatches_correctly():

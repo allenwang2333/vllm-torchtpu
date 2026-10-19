@@ -549,16 +549,17 @@ class TestInitLocalQWeightsCedDecoderAndCompressRatio:
         assert not hasattr(attn, "_wq_b_full")
         assert not hasattr(attn, "_wo_a_full")
 
-    def test_zero_compress_ratio_full_swa_skips_allocation(
+    def test_zero_compress_ratio_full_swa_allocates_under_fp8_kv(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """Full-SWA layers L0, L1 (compress_ratio=0) skip allocating full weights."""
+        """Full-SWA layers L0, L1 (compress_ratio=0) take the token-parallel
+        local-q path under FP8 KV, so they allocate the replicated weights."""
         attn = _setup_mock_attn(
             monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=0
         )
         v2_attn.DeepseekV41Attention._init_local_q_weights(attn)
-        assert not hasattr(attn, "_wq_b_full")
-        assert not hasattr(attn, "_wo_a_full")
+        assert hasattr(attn, "_wq_b_full")
+        assert hasattr(attn, "_wo_a_full")
 
     def test_happy_path_allocates_full_weights(self, monkeypatch: pytest.MonkeyPatch):
         """Compressed encoder layers allocate full weights."""
@@ -782,12 +783,16 @@ class TestAttentionKernelsKvOnlySp:
 
         try:
             main_records = torch.ones(2, 4, dtype=torch.long)
+            # Real PagedCacheRows always carry the hi-bank slots (None when
+            # single-bank); the kernels read them unconditionally.
             main = SimpleNamespace(
                 rope=torch.zeros(1),
+                rope_hi=None,
                 raw=torch.zeros(8, 64, 128),
+                raw_hi=None,
                 shape=(16, 64, 128),
             )
-            swa = SimpleNamespace(raw=torch.zeros(8, 64, 128))
+            swa = SimpleNamespace(raw=torch.zeros(8, 64, 128), raw_hi=None)
             # Test positions.shape[0] != qr.shape[0] to verify line 1224
             qr = torch.zeros(64, 16)
             qr_local = torch.zeros(32, 16)
