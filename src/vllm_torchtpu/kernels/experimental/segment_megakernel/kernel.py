@@ -13,7 +13,8 @@ following skip layer N+1 (a layer with no indexer, reusing the shared top-k):
    -> o_proj, fp8_skinny numerics (4 column tiles through 2 VMEM slots)
    -> AR1: attention TP all-reduce (moe_tp_decode's in-kernel all-reduce)
    -> post_attention_layernorm (fused add, `fused_add_rmsnorm.reference`)
-   -> router bf16 x bf16 -> f32, sigmoid; top-k as argmax-and-mask
+   -> router as GateLinear: bf16 x bf16 -> bf16 logits, f32 sigmoid;
+      top-k as argmax-and-mask
    -> moe_tp_decode's body: compaction, ring of `nb` expert slots, shared
       expert, combine
    -> AR2: FFN all-reduce (own scratch; the barrier AR1 waited covers it)
@@ -269,7 +270,10 @@ def _ar_epilogue(spec, rank, n_valid, partial, out_ref, scr, *, wait_barrier):
 # =====================================================================================
 def rms_add(x32, res32, w, eps):
     """fused_add_rmsnorm.reference in f32 terms: s = x + res; new_res = bf16(s);
-    y = bf16(bf16(s * rsqrt(mean(s^2) + eps)) * w)."""
+    y = bf16(bf16(s * rsqrt(mean(s^2) + eps)) * w). Both roundings are what the
+    served model computes: torch_tpu compiles with allow_excess_precision off,
+    so vllm.ir's RMSNorm keeps the middle bf16 cast (jax.jit, with excess
+    precision on, would fold it away -- not the production numerics)."""
     s = x32 if res32 is None else x32 + res32
     var = jnp.mean(s * s, axis=-1, keepdims=True)
     y = (s * lax.rsqrt(var + eps)).astype(BF16).astype(F32) * w.astype(F32)
@@ -329,6 +333,27 @@ def fp8_code_u32(v):
     code = jnp.where(a == 0, 0, code)
     code = jnp.where(a != a, 0x7F, code)
     return pltpu.bitcast(code | (sign << 7), U32)
+
+
+def router_scores(h, gate):
+    """The production router up to the scores, [rows, E] f32: GateLinear on TPU
+    is F.linear in bf16 (f32 accumulation, ONE rounding of the logits to bf16,
+    kept because torch_tpu compiles with allow_excess_precision off), then
+    `moe_routing._apply_scoring_fn` takes .float().sigmoid(). The bf16
+    rounding is load-bearing: with e_score_correction_bias (mean ~4-10, std
+    ~0.04 on GLM-5.2) f32 logits pick a different top-k set on 2-3% of rows
+    per layer. The sigmoid is written 1 / (1 + exp(-x)): in Mosaic that is bit
+    for bit XLA's jax.nn.sigmoid over every bf16 input, where Mosaic's own
+    logistic differs on 4612 of them (by up to 1 f32 ulp)."""
+    logits = lax.dot_general(h, gate, _NT, preferred_element_type=F32)
+    x = logits.astype(BF16).astype(F32)
+    return 1.0 / (1.0 + jnp.exp(-x))
+
+
+def route_weights(h, gate, bias, n_valid, *, topk):
+    """router_scores + _route_argmax: the kernel's routing table [rows, E] f32
+    (exposed so the test can compare the top-k sets with production's)."""
+    return _route_argmax(router_scores(h, gate), bias, n_valid, topk=topk)
 
 
 def _route_argmax(scores, bias, n_valid, *, topk):
@@ -628,12 +653,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     r["res1_v"][...] = s1.astype(BF16).astype(F32)
     r["h_v"][...] = h
 
-    # ---- 7. router: bf16 x bf16 -> f32, sigmoid
+    # ---- 7. router: GateLinear's bf16 logits, f32 sigmoid
     pre["gate"].wait()
-    logits = lax.dot_general(
-        r["h_v"][...], r["gate_v"][...], _NT, preferred_element_type=F32
-    )
-    scores = jax.nn.sigmoid(logits)
+    scores = router_scores(r["h_v"][...], r["gate_v"][...])
 
     # ---- 8a. routing
     vec["bias"].wait()
