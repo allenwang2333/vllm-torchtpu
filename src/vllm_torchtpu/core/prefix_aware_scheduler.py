@@ -351,8 +351,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     #     (_reserve_prefill_lookahead returns 0, the loop breaks);
     #   * a new load is refused once N requests are held (in
     #     ``_inflight_prefills`` and not RUNNING), and must otherwise fit in
-    #     the free blocks minus the stock async-load reservation (which still
-    #     applies TPU_SCHED_DECODE_MAX_STAGE3_INFLIGHT) minus
+    #     the free blocks minus the stock async-load reservation minus
     #     TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS kept for the running set
     #     (_inflight_prefill_reserved_blocks).
     # Below the cap the loop is unchanged. When a slot frees, the stock loop
@@ -363,16 +362,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     _KV_PREFETCH_LOG_INTERVAL_S = 60.0
 
     def _init_kv_prefetch(self) -> None:
-        try:
-            n = int(os.environ.get("TPU_SCHED_KV_PREFETCH_WAITING", "0") or 0)
-        except ValueError:
-            n = 0
-        try:
-            reserve = int(
-                os.environ.get("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "512") or 0
-            )
-        except ValueError:
-            reserve = 512
+        n = int(envs.TPU_SCHED_KV_PREFETCH_WAITING)
+        reserve = int(envs.TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS)
         consumer = bool(getattr(self, "_is_kv_consumer", False)) and (
             getattr(self, "connector", None) is not None
         )
@@ -497,16 +488,13 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
 
     # ------------------------------------------------------------------
-    # Waiting-queue SRPF sort (TPU_SCHED_PAW_SORT_WAITING, default off).
+    # Waiting-queue sort (TPU_SCHED_PAW_SORT_WAITING, default off).
     #
-    # vLLM v0.31.0's waiting loop reads ``self.kv_holding_waiting or
-    # self.waiting`` directly; it no longer calls
-    # ``_select_waiting_queue_for_scheduling``, so ``_promote_warmest`` (and
-    # the TPU_SCHED_PAW_AGING_TOK_PER_S aging inside ``_rank_and_warmth``)
-    # never runs and admission is first-come-first-served. With the flag on,
-    # ``schedule()`` sorts the head of ``self.waiting`` itself before the
-    # base scheduler admits from it, so every admission of the step follows
-    # the order. The key is the request's estimated uncached prompt tokens
+    # ``_promote_warmest`` moves one request per queue to the head. With the
+    # flag on, ``schedule()`` also stable-sorts the first
+    # TPU_SCHED_PAW_SORT_WINDOW requests of ``waiting`` before the base
+    # scheduler admits from it, so every admission of the step follows the
+    # order. The key is the request's estimated uncached prompt tokens
     # (prompt minus local HBM hit minus a loadable external hit) minus
     # TPU_SCHED_PAW_AGING_TOK_PER_S x seconds waited, which bounds how long a
     # large prompt can be overtaken. Requests that already hold computed
@@ -516,19 +504,8 @@ class PrefixAwareScheduler(AsyncScheduler):
     _PAW_SORT_LOG_INTERVAL_S = 60.0
 
     def _init_paw_sort(self) -> None:
-        self._paw_sort = _env_on("TPU_SCHED_PAW_SORT_WAITING", "0")
-        try:
-            self._paw_sort_window = max(
-                2, int(os.environ.get("TPU_SCHED_PAW_SORT_WINDOW", "128"))
-            )
-        except ValueError:
-            self._paw_sort_window = 128
-        try:
-            self._paw_aging_tok_per_s = max(
-                0.0, float(os.environ.get("TPU_SCHED_PAW_AGING_TOK_PER_S", "0") or 0)
-            )
-        except ValueError:
-            self._paw_aging_tok_per_s = 0.0
+        self._paw_sort = bool(envs.TPU_SCHED_PAW_SORT_WAITING)
+        self._paw_sort_window = max(2, int(envs.TPU_SCHED_PAW_SORT_WINDOW))
         self._paw_sort_steps = 0
         self._paw_sort_reordered = 0
         self._paw_sort_moved = 0
@@ -539,32 +516,8 @@ class PrefixAwareScheduler(AsyncScheduler):
                 "PrefixAwareScheduler: waiting-queue SRPF sort ACTIVE "
                 "(window=%d, aging_tok_per_s=%g)",
                 self._paw_sort_window,
-                self._paw_aging_tok_per_s,
+                self._get_paw_aging_knobs()[0],
             )
-        elif not self._base_calls_waiting_hook():
-            logger.warning(
-                "PrefixAwareScheduler: this vLLM's waiting loop does not call "
-                "_select_waiting_queue_for_scheduling, so warmest-first "
-                "promotion and TPU_SCHED_PAW_AGING_TOK_PER_S are inactive and "
-                "admission is FCFS; set TPU_SCHED_PAW_SORT_WAITING=1 to sort "
-                "the waiting queue in schedule()."
-            )
-
-    @staticmethod
-    def _base_calls_waiting_hook() -> bool:
-        """Whether the installed vLLM scheduler still calls
-        ``_select_waiting_queue_for_scheduling`` (v0.30.0 did, v0.31.0 does
-        not). True when it cannot be determined."""
-        try:
-            import inspect
-
-            from vllm.v1.core.sched.scheduler import Scheduler
-
-            return "_select_waiting_queue_for_scheduling" in inspect.getsource(
-                Scheduler.schedule
-            )
-        except Exception:
-            return True
 
     def _paw_sort_key(
         self,
@@ -593,7 +546,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             ext_warmth = 0
         uncached = max(num_tokens - local_warmth - ext_warmth, 0)
         arrival = float(getattr(request, "arrival_time", now) or now)
-        aged = uncached - self._paw_aging_tok_per_s * max(0.0, now - arrival)
+        rate, _ = self._get_paw_aging_knobs()
+        aged = uncached - rate * max(0.0, now - arrival)
         started = (
             getattr(request, "num_preemptions", 0) > 0
             or getattr(request, "num_computed_tokens", 0) > 0
@@ -621,8 +575,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             free_blocks_for_ext = max(0, free_blocks - reserved)
         now = time.time()
         keys = [
-            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext)
-            for r in window
+            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
         ]
         order = sorted(range(len(window)), key=lambda i: (keys[i], i))
         self._paw_sort_steps += 1
@@ -815,7 +768,10 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     def _inflight_prefill_reserved_blocks(self) -> int:
         reserved = super()._inflight_prefill_reserved_blocks()
-        if getattr(self, "_kv_prefetch_in_waiting", False) and self._kv_prefetch_at_cap():
+        if (
+            getattr(self, "_kv_prefetch_in_waiting", False)
+            and self._kv_prefetch_at_cap()
+        ):
             # The stock loop calls this only for an async load, right before
             # allocating it. At the cap that load is a prefetch.
             if self._kv_prefetch_num_held() >= self._kv_prefetch_n:
@@ -1722,7 +1678,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
-        if getattr(self, "_kv_prefetch_in_waiting", False) and self._kv_prefetch_at_cap():
+        if (
+            getattr(self, "_kv_prefetch_in_waiting", False)
+            and self._kv_prefetch_at_cap()
+        ):
             # KV prefetch: this waiting request would join ``running`` without
             # an async load, past the cap. 0 stops the stock waiting loop.
             return 0
