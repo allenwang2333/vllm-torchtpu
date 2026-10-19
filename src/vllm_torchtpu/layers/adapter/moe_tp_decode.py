@@ -397,9 +397,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         # The prefill kernel's weight ring holds whole experts: TP experts
         # only, and it quantizes per 512 columns, so the hidden size divides.
         prefill_min_tokens=(
-            None
-            if par.use_ep or hidden % _PREFILL_Q_BLOCK
-            else prefill_min_tokens()
+            None if par.use_ep or hidden % _PREFILL_Q_BLOCK else prefill_min_tokens()
         ),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
     )

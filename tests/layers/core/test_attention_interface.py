@@ -286,8 +286,8 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
 class DcpMlaTopkCapTest(parameterized.TestCase):
     """The capped sparse-MLA defaults #1510 shipped for GLM-5.2 AgentX: a
     512 cap (from DCP16 there; from DCP8 since the trial-4 E2E served DCP8
-    with it) and a 256-token gather chunk (512 since trial 6). The port first kept main's 0
-    (off), which left the DCP16 path slower than #1510."""
+    with it) and a 256-token gather chunk (512 since trial 6). The port first
+    kept main's 0 (off), which left the DCP16 path slower than #1510."""
 
     def _env(self, **values):
         """Patch the real environment: `envs` reads it lazily, so setting the

@@ -1531,17 +1531,16 @@ def sparsecore_topk_dcp_merge(
         )
     if rank_major and not rank_major_merge_fits(b):
         raise ValueError(f"rank_major merge needs b <= 32, got {b}")
-    if rank_major and envs.TPU_SC_TOPK_COOP_MERGE:
-        # T <= 16 (one wave of p >= 2 subcores per row); T > 16 stays below.
-        if coop_merge_fits(b, dcp_size, k):
-            return sparsecore_topk_dcp_merge_coop.__wrapped__(
-                scores,
-                local_idxs,
-                k,
-                dcp_rank=dcp_rank,
-                dcp_size=dcp_size,
-                scheduling_group_id=scheduling_group_id,
-            )
+    # T <= 16 (one wave of p >= 2 subcores per row); T > 16 stays below.
+    if rank_major and envs.TPU_SC_TOPK_COOP_MERGE and coop_merge_fits(b, dcp_size, k):
+        return sparsecore_topk_dcp_merge_coop.__wrapped__(
+            scores,
+            local_idxs,
+            k,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
+            scheduling_group_id=scheduling_group_id,
+        )
     ranks = jnp.full((b,), jnp.reshape(dcp_rank.astype(jnp.int32), ()), jnp.int32)
     out = _sc_topk_direct(
         scores,

@@ -598,7 +598,6 @@ def test_streamidx_block_sizes_decode_pack():
     )
 
 
-
 @pytest.mark.parametrize(
     "prefix, num_layers, expected",
     [

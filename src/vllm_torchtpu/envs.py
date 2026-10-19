@@ -1578,8 +1578,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copy of 32 * dcp * k words, plus relayouts of the local slots and the
     # output slice). T > 32 keeps the padded path. Bitwise identical output.
     "TPU_SC_TOPK_DCP_MERGE_FLAT": env_bool("TPU_SC_TOPK_DCP_MERGE_FLAT", default=True),
-    # `sparsecore_topk` at P > 1: the refinement levels as one runtime loop (the SparseCore call's startup grows with its
-    # program size), each level's peer reduce + scan + bucket search as one
+    # `sparsecore_topk` at P > 1: the refinement levels as one runtime loop
+    # (the SparseCore call's startup grows with its program size), each
+    # level's peer reduce + scan + bucket search as one
     # loop, and no serial winner gather -- P >= 4 (T <= 8 at the DCP8
     # decode shapes): each subcore scatters its winners into the group's
     # staging slot at its prefix offset; P = 2: all peer copies in flight

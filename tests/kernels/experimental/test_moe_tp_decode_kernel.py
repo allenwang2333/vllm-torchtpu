@@ -28,9 +28,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as kernel_impl
 
 F8, BF16, F32 = jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32
 FP8_MAX = float(jnp.finfo(F8).max)
