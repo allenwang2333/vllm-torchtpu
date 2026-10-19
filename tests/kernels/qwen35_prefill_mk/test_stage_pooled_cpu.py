@@ -30,6 +30,9 @@ else:
     tiles = MK.MKTiles(tm_norm=64, tm_prep=64, tm_gate=128, tm=64, tn=128, chunk=64, bq=64,
                        bkv=128, att_sub=2, rt=16, tm_route=64, tm_combine=64, inflight=8,
                        vmem_mib=64)
+import dataclasses
+tiles = dataclasses.replace(tiles, **{k: int(v) for k, v in (
+    x.split("=") for x in filter(None, os.environ.get("MK_TILES", "").split(",")))})
 case = Hn.make_case(c, layout, lens, ctxs, max_seqs=MAXS, pps=PPS, block_tokens=BT_TOK)
 T, split = case.t, BT_TOK // Hn.PAGE
 plan, stride = pool_plan.build_gdn_plan(case.pools[0].shape, case.pools[0].dtype, conv_dim=c.QKV,
@@ -104,3 +107,17 @@ if HAS_GDN:
     cv2, rc2 = Hn.load_states(pools2[0], plan, stride, case.gdn_slots[0], (c.CONV - 1, c.QKV), (c.VH, c.KD, c.VD), interpret=INTERP)
     for s in range(2):
         print(f"   gdn seq {s}: conv rel {rel(cv2[s], sr[gi][s]['conv']):.2e} rec rel {rel(rc2[s], sr[gi][s]['rec']):.2e}")
+if os.environ.get("MK_TILES2"):                 # compare two tile settings' attention outputs
+    outs = []
+    for spec in (os.environ.get("MK_TILES", ""), os.environ["MK_TILES2"]):
+        tl2 = dataclasses.replace(tiles, **{k: int(v) for k, v in (
+            x.split("=") for x in filter(None, spec.split(",")))})
+        st2 = MK.build_stage(c, layout, T, max_seqs=MAXS, pps=PPS, pool_shape=pool.shape,
+                             plan=plan, stride=stride, n_buf=N_BUF, first=FIRST, last=LAST,
+                             tiles=tl2, interpret=INTERP, debug=True)
+        outs.append(jax.jit(st2)(meta, x_in, r_in, norm_w, MK.rope_table(c, PPS * Hn.PAGE), kw,
+                                 [jnp.asarray(pool)]))
+    for name in ("qn", "ao"):
+        a, b = outs[0][3][name], outs[1][3][name]
+        d = jnp.abs(a.astype(R.F32) - b.astype(R.F32))
+        print(name, "rel", rel(b, a), "max", float(d.max()), "argmax", np.unravel_index(int(jnp.argmax(d)), d.shape))

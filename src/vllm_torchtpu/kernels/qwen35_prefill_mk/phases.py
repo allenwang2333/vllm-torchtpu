@@ -1247,7 +1247,7 @@ def att_qk_norm_rope_kv_paged(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, pool_hbm, b
 
 
 def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, bkv, sub=8,
-                    k_scale=1.0, v_scale=1.0, interpret=False):
+                    k_scale=1.0, v_scale=1.0, interpret=False, vt=False, vmask_edge=False):
     """Causal GQA attention of each sequence's new tokens over its pages of the serving pool
     (see att_qk_norm_rope_kv_paged), per kv head with its nh / nkv q heads folded into the rows.
     The KV tiles (bkv tokens = bkv / 128 pages of K^T and V^T) are DMA'd by hand, double
@@ -1311,13 +1311,19 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
                 kk = _page_t(kbuf.at[slot], interpret)                    # [hd, bkv] fp8
                 vv = _page_t(vbuf.at[slot], interpret)
                 col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1) + jt * bkv
-                vv = jnp.where(col < kv_len, vv.astype(BF16), 0.0).astype(BF16)
+                if vmask_edge:                 # only the tile holding kv_len has stale lanes
+                    edge = (jt + 1) * bkv > kv_len
+                    vv = jnp.where(edge & (col >= kv_len), 0.0, vv.astype(BF16)).astype(BF16)
+                else:
+                    vv = jnp.where(col < kv_len, vv.astype(BF16), 0.0).astype(BF16)
+                if vt:                         # once per tile: PV as a plain NN matmul
+                    vv = vv.T                                              # [bkv, hd]
                 kk = kk.astype(BF16)
                 masked = (jt + 1) * bkv - 1 > ctx + local          # crosses the diagonal
 
                 def pv(c, p, alpha):
                     r = slice(c * rc, (c + 1) * rc)
-                    y = jax.lax.dot_general(p, vv, (((1,), (1,)), ((), ())),
+                    y = jax.lax.dot_general(p, vv, (((1,), (0 if vt else 1,)), ((), ())),
                                             preferred_element_type=F32) * v_scale
                     acc_ref[r, :] = alpha * acc_ref[r, :] + y
 
