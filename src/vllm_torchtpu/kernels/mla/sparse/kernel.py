@@ -4145,6 +4145,7 @@ def sparse_ragged_paged_attention(
             send_peer=send_peer,
             send_recv_in=send_recv_in,
             union_gather=(
+                # pyrefly: ignore[bad-argument-type]
                 (
                     group_num_live,
                     mixed_union_gather_fault,
@@ -4725,6 +4726,7 @@ def sparse_attention_chunk(
                         else vmem_limit_bytes
                     ),
                     disable_bounds_checks=True,
+                    # pyrefly: ignore[bad-argument-type]
                     **(
                         {"collective_id": SEND_EXCHANGE_COLLECTIVE_ID}
                         if send_exchange is not None

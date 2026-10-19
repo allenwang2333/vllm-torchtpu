@@ -1641,6 +1641,7 @@ def sparse_mla_attention_dcp(
                     lse.reshape(dcp_size * block, lse.shape[-1]),
                     rows,
                     jnp.reshape(dcp_rank, (1,)).astype(jnp.int32),
+                    # pyrefly: ignore[bad-argument-type]
                     jnp.reshape(dcp_lane, (1,)).astype(jnp.int32),
                     world=dcp_size,
                     axis_name=dcp_axis_name,

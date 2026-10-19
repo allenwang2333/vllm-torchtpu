@@ -2381,6 +2381,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             lane_ids: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
+            # pyrefly: ignore[bad-return]
             return sparse_mla_attention_dcp(
                 ql_nope,
                 q_pe,

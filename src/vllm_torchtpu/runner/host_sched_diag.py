@@ -65,12 +65,14 @@ def install_fwd_timers() -> list[str]:
     with contextlib.suppress(Exception):
         from vllm.compilation.caching import VllmSerializableFunction
 
+        # pyrefly: ignore[bad-argument-type]
         targets.append((VllmSerializableFunction, "__call__", "graph"))
     with contextlib.suppress(Exception):
         from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
             TorchTpuCompiledExecutable,
         )
 
+        # pyrefly: ignore[bad-argument-type]
         targets.append((TorchTpuCompiledExecutable, "__call__", "exe"))
     done = []
     for cls, attr, name in targets:

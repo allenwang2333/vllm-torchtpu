@@ -308,6 +308,7 @@ def _route_fast(scores, bias, n_valid, *, topk):
     w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
     valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
     # The last pick's rank is 0 iff it (and so some pick) lay beyond the window.
+    assert km is not None  # topk >= 1
     last_bits = lax.bitcast_convert_type(km, jnp.int32)
     beyond = last_bits < KEY_BASE + (1 << lb)
     valid_row = lax.broadcasted_iota(jnp.int32, (rows, 1), 0) < n_valid

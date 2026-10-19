@@ -1304,8 +1304,10 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
+        # pyrefly: ignore[bad-argument-type]
         indexer._qprep_op = None
         if envs.TPU_INDEXER_QPREP_FUSED:
+            # pyrefly: ignore[bad-argument-type]
             indexer._qprep_op = _get_indexer_qprep_op(
                 indexer.n_head,
                 indexer.rope_dim,

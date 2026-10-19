@@ -658,10 +658,12 @@ def _topk_body(
                             t < s, vec_at(peer_hist_vmem, t * LANES), 0
                         )
 
+                    # pyrefly: ignore[bad-argument-type]
                     pfx = plsc.parallel_loop(0, p, unroll=1, carry=jnp.int32(0))(before)
 
                     def offsets(c):
                         oidx_vmem[pl.ds(c * LANES, LANES)] = (
+                            # pyrefly: ignore[unsupported-operation]
                             grp_out + pfx + c * LANES + lane_iota
                         )
 
@@ -1533,6 +1535,7 @@ def sparsecore_topk_dcp_merge(
         raise ValueError(f"rank_major merge needs b <= 32, got {b}")
     # T <= 16 (one wave of p >= 2 subcores per row); T > 16 stays below.
     if rank_major and envs.TPU_SC_TOPK_COOP_MERGE and coop_merge_fits(b, dcp_size, k):
+        # pyrefly: ignore[missing-attribute]
         return sparsecore_topk_dcp_merge_coop.__wrapped__(
             scores,
             local_idxs,
@@ -1671,6 +1674,7 @@ def sparsecore_topk_dcp_merge_coop(
         scratch_types=scratch_types,
         mesh=mesh,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}_coop",
+        # pyrefly: ignore[bad-argument-count]
     )(words.reshape(-1), lengths_in, local_idxs.astype(jnp.int32).reshape(-1))
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(

@@ -360,6 +360,7 @@ class Eagle3Proposer:
                 # program and peer replay (TPU_PRECOMPILE_PEER_REPLAY) refused
                 # every other rank's artifact -- each rank compiled every
                 # bucket itself.
+                # pyrefly: ignore[bad-argument-type]
                 self._mtp_fused_loop.vocab_parallel_argmax = with_device_vocab_start(
                     self._vocab_parallel_argmax, self.runner.device
                 )
@@ -848,7 +849,9 @@ class Eagle3Proposer:
         loop_step = step_idx > 0
         self._mtp_set_skip_topk(loop_step)
         if self._mtp_loop_model is None:
+            # pyrefly: ignore[bad-return]
             return self.draft_model
+        # pyrefly: ignore[bad-return]
         return self._mtp_loop_model if loop_step else self.draft_model
 
     def _mtp_set_skip_topk(self, skip: bool) -> None:
