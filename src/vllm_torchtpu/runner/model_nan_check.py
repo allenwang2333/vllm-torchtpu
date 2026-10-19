@@ -92,7 +92,7 @@ class ModelNaNChecker:
         paths = _stats_paths(connector_cls, vllm_config)
         if len(paths) > 1:
             raise ValueError(
-                "TPU_CHECK_NAN reporting requires at most one TPU stats leaf"
+                "NaN summary reporting requires at most one TPU stats leaf"
             )
         return cls(rank, paths[0] if paths else None, engine_idx=engine_idx)
 

@@ -2,16 +2,17 @@
 
 ## TL;DR
 
-在 Decode worker 启动前设置 `TPU_KV_CACHE_NAN_LOG=1`，每轮调度检查当前 batch
+在 Decode worker 启动前设置 `TPU_NAN_LOG_LEVEL=4`（`ALL`），每轮调度检查当前 batch
 请求在 Target forward 前已有的有效 FA KV / GDN 输入状态。按层输出布尔数组；
 异常轮打印完整数组和本轮 request IDs，正常轮保持静默。只读缓存，不保存完整 tensor。
 
 ```bash
-export TPU_KV_CACHE_NAN_LOG=1
+export TPU_NAN_LOG_LEVEL=4
 ```
 
-该开关独立于 `TPU_HIDDEN_NAN_LOG` 和 `TPU_CHECK_NAN`，可分别开启，也可同时开启。
-关闭时不安装检测器、不分配诊断 flags、不执行扫描或回读。
+`ALL` 累计启用其他三个等级的诊断，完整配置见
+[NaN 诊断等级](model-nan-check.md#启用和输出)。旧 `TPU_KV_CACHE_NAN_LOG` 不再读取。
+等级低于 `ALL` 时不安装本检测器、不分配诊断 flags、不执行缓存扫描或回读。
 
 ## 检测时机与数组
 

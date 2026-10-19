@@ -963,7 +963,7 @@ class TPUModelRunner(GPUModelRunner):
         self._stage_timing = RunnerStageTiming(profiler_rank)
         self._nan_checker = (
             ModelNaNChecker.from_vllm_config(profiler_rank, self.vllm_config)
-            if envs.TPU_CHECK_NAN
+            if envs.TPU_NAN_LOG_LEVEL >= envs.NanLogLevel.SUMMARY
             else None
         )
 
@@ -5849,13 +5849,13 @@ class TPUModelRunner(GPUModelRunner):
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
         self._add_pipeline_chunk_buckets()
-        if envs.TPU_KV_CACHE_NAN_LOG:
+        if envs.TPU_NAN_LOG_LEVEL >= envs.NanLogLevel.ALL:
             from vllm_torchtpu.runner.kv_cache_nan_flags import (
                 install_kv_cache_nan_detector,
             )
 
             self._kv_cache_nan_detector = install_kv_cache_nan_detector(self)
-        if envs.TPU_HIDDEN_NAN_LOG:
+        if envs.TPU_NAN_LOG_LEVEL >= envs.NanLogLevel.DETAIL:
             from vllm_torchtpu.runner.hidden_nan_flags import (
                 install_hidden_nan_detector,
             )

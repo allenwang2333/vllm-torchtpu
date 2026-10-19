@@ -123,7 +123,7 @@ def test_async_multirank_flags_require_output_aggregation(monkeypatch, tp, pcp):
     runner.vllm_config = SimpleNamespace(
         kv_transfer_config=None, parallel_config=runner.parallel_config
     )
-    monkeypatch.setattr(envs, "TPU_HIDDEN_NAN_LOG", True, raising=False)
+    monkeypatch.setattr(envs, "TPU_NAN_LOG_LEVEL", envs.NanLogLevel.DETAIL)
     with pytest.raises(ValueError, match="all-rank output consumption"):
         runner.capture_model()
 

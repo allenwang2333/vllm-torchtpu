@@ -4,7 +4,19 @@
 import functools
 import os
 from collections.abc import Callable
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any
+
+
+class NanLogLevel(IntEnum):
+    """Cumulative diagnostic scope shared with TPU Sync."""
+
+    OFF = 0
+    SUMMARY = 1
+    DETAIL = 2
+    DUMP = 3
+    ALL = 4
+
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
@@ -18,8 +30,7 @@ if TYPE_CHECKING:
     HOST_TRACER_LEVEL: int = 2
     DEVICE_TRACER_LEVEL: int = 1
     TPU_TRACE_MODE: str = "TRACE_COMPUTE"
-    TPU_HIDDEN_NAN_LOG: bool = False
-    TPU_KV_CACHE_NAN_LOG: bool = False
+    TPU_NAN_LOG_LEVEL: NanLogLevel = NanLogLevel.OFF
     TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
     TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
@@ -141,7 +152,6 @@ if TYPE_CHECKING:
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
-    TPU_CHECK_NAN: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
 
 
@@ -349,8 +359,17 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
     return _get_positive_int_or_none_env
 
 
+def _get_nan_log_level() -> NanLogLevel:
+    value = os.getenv("TPU_NAN_LOG_LEVEL", "0")
+    if value not in ("0", "1", "2", "3", "4"):
+        raise ValueError(
+            f"Invalid TPU_NAN_LOG_LEVEL '{value}': expected 0, 1, 2, 3 or 4."
+        )
+    return NanLogLevel(int(value))
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
-    "TPU_CHECK_NAN": env_bool("TPU_CHECK_NAN", default=False),
+    "TPU_NAN_LOG_LEVEL": _get_nan_log_level,
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
@@ -404,8 +423,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "DEVICE_TRACER_LEVEL": lambda: int(os.getenv("DEVICE_TRACER_LEVEL") or "1"),
     # TPU trace mode (e.g. TRACE_COMPUTE, TRACE_COMPUTE_AND_SYNC)
     "TPU_TRACE_MODE": lambda: os.getenv("TPU_TRACE_MODE", "TRACE_COMPUTE"),
-    "TPU_HIDDEN_NAN_LOG": env_bool("TPU_HIDDEN_NAN_LOG"),
-    "TPU_KV_CACHE_NAN_LOG": env_bool("TPU_KV_CACHE_NAN_LOG"),
     # Number of sparse cores to trace
     "TPU_NUM_SPARSE_CORES_TO_TRACE": lambda: int(
         os.getenv("TPU_NUM_SPARSE_CORES_TO_TRACE") or "1"

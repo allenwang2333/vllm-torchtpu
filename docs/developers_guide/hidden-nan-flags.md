@@ -2,18 +2,22 @@
 
 ## TL;DR
 
-设置 `TPU_HIDDEN_NAN_LOG=1` 后，每个 worker 对 Target / Draft 分别检查 decoder
+设置 `TPU_NAN_LOG_LEVEL=2`（`DETAIL`）或更高等级后，每个 worker 对 Target / Draft
+分别检查 decoder
 layer 的 rank-local hidden 输出。一轮首次发现 NaN 时保留该层的完整 hidden 和该次
 forward 的实际输入 token；每 100 次异常轮只保存前 3 次，即第 1–3、101–103 次，
 正常轮不推进异常计数。日志提示快照文件位置，不再输出逐层 true/false 数组。
 
 ```bash
-export TPU_HIDDEN_NAN_LOG=1
+export TPU_NAN_LOG_LEVEL=2
 ```
 
 当前支持 PP=1 的 causal LM 和异步 MTP / hidden-state Draft。异步 TP/PCP 多 rank
 需要 KV connector，以保证每个 rank 的 AsyncOutput 被消费。关闭开关时不安装诊断
 hook、不分配诊断 buffer、不提交诊断回读。
+
+等级累计启用，`DETAIL` 同时开启最后 hidden / logits 检查；完整配置见
+[NaN 诊断等级](model-nan-check.md#启用和输出)。旧 `TPU_HIDDEN_NAN_LOG` 不再读取。
 
 ## 文件与内容
 

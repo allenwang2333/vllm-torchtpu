@@ -2,9 +2,10 @@
 
 ## TL;DR
 
-设置 `TPU_CHECK_NAN=1`，检查每个真实主模型 forward chunk 的最后一层 hidden
+设置 `TPU_NAN_LOG_LEVEL=1`（`SUMMARY`）或更高等级，检查每个真实主模型 forward
+chunk 的最后一层 hidden
 和采样前 logits。默认关闭。命中时记录 ERROR 并继续执行，检测器返回布尔结果，
-不修改 tensor、不替换 token，也不触发 dump。
+本检测不修改 tensor、不替换 token，也不触发 dump。
 
 配置唯一 TPU connector stats leaf 且启用 stats logger 时，每轮结果还通过现有
 connector metrics 通道上报。只保留异常轮数一个 Counter，发现 NaN 的轮次增加 1，
@@ -18,12 +19,26 @@ host 同步，适用于诊断，吞吐与延迟开销需要在实际部署中测
 在 worker 启动前设置环境变量；runner 构造时读取，修改后需要重启 worker。
 
 ```bash
-export TPU_CHECK_NAN=1
+export TPU_NAN_LOG_LEVEL=1
 # 使用原有 vllm serve 或服务启动命令。
 ```
 
-不设置变量或设置 `TPU_CHECK_NAN=0` 即关闭。沿用 `env_bool` 的解析规则，支持
-`true/false`、`yes/no`、`on/off`；非法值在启动时抛出 `ValueError`。
+`TPU_NAN_LOG_LEVEL` 是 vllm-torchtpu 与 TPU Sync 共用的累计诊断等级，默认 `0`。
+只接受单个数字 `0`–`4`，其他值（包括空字符串、空格和等级名称）报配置错误。
+在所有 worker 启动前设置，修改后重启进程；两个包均需升级到支持该协议的版本。
+
+| 枚举 | 值 | 累计启用的诊断 |
+| --- | --- | --- |
+| `OFF` | 0 | 全部关闭 |
+| `SUMMARY` | 1 | 最后 hidden / logits NaN 日志与异常轮数指标 |
+| `DETAIL` | 2 | 加上逐层 hidden 检查与现有现场快照 |
+| `DUMP` | 3 | 加上 TPU Sync 接收 FA KV 检查与限频 dump |
+| `ALL` | 4 | 加上 Decode batch 逐层 KV cache 检查 |
+
+该等级控制诊断范围，沿用各诊断原有采样、限频和能力边界。旧变量
+`TPU_CHECK_NAN`、`TPU_HIDDEN_NAN_LOG`、`TPU_RAIDEN_CHECK_RECV_FA_NAN`、
+`TPU_KV_CACHE_NAN_LOG` 已停用，不再读取。KV 保存保护的 `check_nan_on_save`
+保持独立，不受该等级控制。
 
 异常日志示例：
 
@@ -74,8 +89,8 @@ jnp.isnan(tensor).any(where=valid_rows[:, None])
 [CHECK_NAN 开关](https://github.com/alibaba/rtp-llm/blob/97fbaaaf41ca0f4ebfabdd2d7647f81b2737a88e/rtp_llm/server/server_args/profile_debug_logging_group_args.py#L115)。
 此实现按所需服务策略记录 ERROR 并继续，RTP-LLM 的原检查会报错中止。
 
-本检测独立于 `TPU_HIDDEN_NAN_LOG` 的逐层检查和 KV 保存检查。NaN 被观测到只能说明该
-输出已异常，不能据此定位最先产生 NaN 的层或算子。
+本检测在 `SUMMARY` 及以上启用，逐层检查在 `DETAIL` 及以上启用，KV 保存检查保持独立。
+NaN 被观测到只能说明该输出已异常，不能据此定位最先产生 NaN 的层或算子。
 
 ## 指标和历史折线
 

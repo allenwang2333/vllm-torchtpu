@@ -10,8 +10,6 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu import envs
-
 pytestmark = [pytest.mark.cpu_test, pytest.mark.usefixtures("model_nan_cpu")]
 
 
@@ -40,15 +38,6 @@ def test_jax_nan_reduction_returns_one_bool_and_excludes_padding(real_nan):
     result = model_nan_check._has_nan_jax(values, jnp.array([real_nan, True]))
     assert result.shape == () and result.dtype == jnp.bool_
     assert bool(result) is real_nan
-
-
-@pytest.mark.parametrize("value,enabled", [(None, False), ("0", False), ("1", True)])
-def test_check_nan_is_opt_in(monkeypatch, value, enabled):
-    if value is None:
-        monkeypatch.delenv("TPU_CHECK_NAN", raising=False)
-    else:
-        monkeypatch.setenv("TPU_CHECK_NAN", value)
-    assert envs.environment_variables["TPU_CHECK_NAN"]() is enabled
 
 
 @pytest.mark.parametrize("stage", ["last_hidden", "logits"])
