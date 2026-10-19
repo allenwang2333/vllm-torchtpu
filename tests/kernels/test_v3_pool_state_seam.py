@@ -29,6 +29,7 @@ CONV_TOK0 = SSM_NTOK
 CONV_NTOK = 16
 CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
 CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
+CONV_LIVE_NTOK = -(-CONV_ROWS * 2 * LANES // TOK_BYTES)  # 9
 NUM_MGR = 5  # null block + 4 slots
 POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES,)
 
@@ -64,7 +65,7 @@ class TestV3StateSourcePlan:
     def test_conv_region_rows_of_last_kernel_block(self):
         plan = _plan()
         c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
+        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_LIVE_NTOK)
         assert c.view_dtype == jnp.dtype(jnp.bfloat16)
         assert c.lane_split == 1
         assert c.rows_used == CONV_ROWS
@@ -83,7 +84,7 @@ class TestV3StateSourcePlan:
         r = plan.recurrent
         assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, SSM_NTOK)
         c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0, CONV_NTOK)
+        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0, CONV_LIVE_NTOK)
         assert plan.stride == 1
 
     def test_one_byte_pool_keeps_regions_and_view_dtypes(self):

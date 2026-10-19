@@ -588,6 +588,9 @@ def v3_state_source(
         conv_ntok,
         tok_bytes,
     )
+    # Copy only the tokens the conv rows occupy; the rest of conv_ntok is
+    # power-of-two padding that no load reads.
+    conv_live_ntok = -(-conv_rows * 2 * lanes // tok_bytes)
     conv_rows_perm = None
     if qk_pair_layout:
         conv_rows_perm = _conv_qk_pair_rows_perm(
@@ -597,7 +600,7 @@ def v3_state_source(
         kb0=kb0,
         nblocks=1,
         row0=row0,
-        nrows=conv_ntok,
+        nrows=conv_live_ntok,
         view_dtype=jnp.dtype(jnp.bfloat16),
         lane_split=1,
         rows_used=conv_rows,
