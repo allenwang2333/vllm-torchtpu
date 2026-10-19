@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Probe 1: HBM DMA roofline under RPA-like page patterns, and the current
 batched-RPA DCP decode kernel's time split into DMA-only / compute-only floors.
 
@@ -8,7 +9,6 @@ import functools
 import json
 import os
 import sys
-import time
 import types
 
 REPO = os.environ.get("REPO", "/workspace/vllm-torchtpu/src")
@@ -32,7 +32,9 @@ def emit(**kw):
     print("PROBE " + json.dumps(kw), flush=True)
 
 
-print("jax", jax.__version__, "jaxlib", getattr(jax, "__version_info__", None), flush=True)
+print(
+    "jax", jax.__version__, "jaxlib", getattr(jax, "__version_info__", None), flush=True
+)
 try:
     import jaxlib
 
@@ -41,7 +43,10 @@ except Exception as e:  # noqa: BLE001
     print("jaxlib?", e)
 print("devices", jax.devices(), flush=True)
 info = pltpu.get_tpu_info()
-emit(kind="tpu_info", **{k: str(getattr(info, k)) for k in dir(info) if not k.startswith("_")})
+emit(
+    kind="tpu_info",
+    **{k: str(getattr(info, k)) for k in dir(info) if not k.startswith("_")},
+)
 
 SECTIONS = os.environ.get("PROBE_SECTIONS", "dma,rpa").split(",")
 
@@ -140,14 +145,24 @@ def dma_section():
         else:
             nruns = npg // run
             starts = rng.permutation(P // run)[:nruns] * run
-            pidx = (starts[:, None] + np.arange(run)[None, :]).reshape(-1).astype(np.int32)
+            pidx = (
+                (starts[:, None] + np.arange(run)[None, :]).reshape(-1).astype(np.int32)
+            )
         try:
             f = gather_call(n_steps, lanes, ppi, layout, run, slots)
             t, _, _ = devtime.device_times(f, (jnp.asarray(pidx), kv), iters=8)
             us, cnt = devtime.summarize(t, r"^gather_")
             nbytes = npg * PAGE_BYTES
-            emit(kind="dma", case=name, us=round(us, 1), n=cnt, MB=round(nbytes / 1e6, 1),
-                 GBps=round(nbytes / us / 1e3, 1), dmas=npg // run, steps=n_steps)
+            emit(
+                kind="dma",
+                case=name,
+                us=round(us, 1),
+                n=cnt,
+                MB=round(nbytes / 1e6, 1),
+                GBps=round(nbytes / us / 1e3, 1),
+                dmas=npg // run,
+                steps=n_steps,
+            )
         except Exception as e:  # noqa: BLE001
             emit(kind="dma", case=name, error=f"{type(e).__name__}: {str(e)[:600]}")
 
@@ -166,33 +181,72 @@ def rpa_section():
         local = -(-CTX // DCP)
         per = -(-local // PAGE) + 1
         num_pages = n * per * 2 + 64
-        shape = W.get_kv_cache_shape(num_pages, PAGE, 1, D, jnp.float8_e4m3fn,
-                                     kv_layout=C.KVLayout.SEQ_ALONG_LANE)
+        shape = W.get_kv_cache_shape(
+            num_pages,
+            PAGE,
+            1,
+            D,
+            jnp.float8_e4m3fn,
+            kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+        )
         k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(0), 4)
         kv = (jax.random.normal(k1, shape, jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
         q = jax.random.normal(k2, (n * T, QH, D), jnp.float32).astype(jnp.bfloat16)
-        knew = (jax.random.normal(k3, (n * T, 1, D), jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
-        vnew = (jax.random.normal(k4, (n * T, 1, D), jnp.float32) * 0.5).astype(jnp.float8_e4m3fn)
+        knew = (jax.random.normal(k3, (n * T, 1, D), jnp.float32) * 0.5).astype(
+            jnp.float8_e4m3fn
+        )
+        vnew = (jax.random.normal(k4, (n * T, 1, D), jnp.float32) * 0.5).astype(
+            jnp.float8_e4m3fn
+        )
         kv_lens = jnp.full((n,), CTX + T, jnp.int32)
         pages = np.zeros((n, max_pages), np.int32)
         R = run
         nruns = -(-per // R)
         slots = (num_pages - 1) // R
-        starts = np.random.default_rng(0).permutation(slots)[: n * nruns].reshape(n, nruns) * R + 1
-        allp = (starts[:, :, None] + np.arange(R)[None, None, :]).reshape(n, nruns * R)[:, :per]
+        starts = (
+            np.random.default_rng(0).permutation(slots)[: n * nruns].reshape(n, nruns)
+            * R
+            + 1
+        )
+        allp = (starts[:, :, None] + np.arange(R)[None, None, :]).reshape(n, nruns * R)[
+            :, :per
+        ]
         pages[:, :per] = allp
         cu = jnp.arange(n + 1, dtype=jnp.int32) * T
         dist = jnp.array([n, n, n], jnp.int32)
-        return kv, q, knew, vnew, kv_lens, jnp.asarray(pages.reshape(-1)), cu, dist, n * local * 2 * D
+        return (
+            kv,
+            q,
+            knew,
+            vnew,
+            kv_lens,
+            jnp.asarray(pages.reshape(-1)),
+            cu,
+            dist,
+            n * local * 2 * D,
+        )
 
     @functools.partial(jax.jit, donate_argnums=(0,))
     def f(kv, q, knew, vnew, kv_lens, pidx, cu, dist):
         out, new_kv, lse = W.ragged_paged_attention(
-            q, knew, vnew, kv, kv_lens, pidx, cu, dist,
-            sm_scale=1 / 16, k_scale=1.0, v_scale=1.0,
-            cp_group_size=DCP, cp_rank=jnp.array([0], jnp.int32),
-            attention_scope=C.AttentionScope.CACHE_ONLY, decode_query_size=T,
-            return_lse=True, kv_layout=C.KVLayout.SEQ_ALONG_LANE)
+            q,
+            knew,
+            vnew,
+            kv,
+            kv_lens,
+            pidx,
+            cu,
+            dist,
+            sm_scale=1 / 16,
+            k_scale=1.0,
+            v_scale=1.0,
+            cp_group_size=DCP,
+            cp_rank=jnp.array([0], jnp.int32),
+            attention_scope=C.AttentionScope.CACHE_ONLY,
+            decode_query_size=T,
+            return_lse=True,
+            kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+        )
         return new_kv, out, lse
 
     def carry(out, args):
@@ -202,7 +256,9 @@ def rpa_section():
         data = build(n)
         nbytes = data[-1]
         args = data[:-1]
-        for mode in os.environ.get("PROBE_RPA_MODES", "base,nocompute,nodma").split(","):
+        for mode in os.environ.get("PROBE_RPA_MODES", "base,nocompute,nodma").split(
+            ","
+        ):
             os.environ["TPU_RPA_DBG_NOCOMPUTE"] = "1" if mode == "nocompute" else "0"
             os.environ["TPU_RPA_DBG_NODMA"] = "1" if mode == "nodma" else "0"
             jax.clear_caches()
@@ -211,12 +267,27 @@ def rpa_section():
                 t, out, args = devtime.device_times(f, args, iters=8, carry=carry)
                 us, cnt = devtime.summarize(t, r"^RPAd")
                 sus, scnt = devtime.summarize(t, r"rpa_metadata_schedule")
-                top = sorted(((k, round(sum(v) / len(v), 1), len(v)) for k, v in t.items()),
-                             key=lambda r: -r[1] * r[2])[:8]
-                emit(kind="rpa", n=n, mode=mode, us=round(us, 1), cnt=cnt,
-                     GBps=round(nbytes / us / 1e3, 1), sched_us=sus, top=top)
+                top = sorted(
+                    ((k, round(sum(v) / len(v), 1), len(v)) for k, v in t.items()),
+                    key=lambda r: -r[1] * r[2],
+                )[:8]
+                emit(
+                    kind="rpa",
+                    n=n,
+                    mode=mode,
+                    us=round(us, 1),
+                    cnt=cnt,
+                    GBps=round(nbytes / us / 1e3, 1),
+                    sched_us=sus,
+                    top=top,
+                )
             except Exception as e:  # noqa: BLE001
-                emit(kind="rpa", n=n, mode=mode, error=f"{type(e).__name__}: {str(e)[:600]}")
+                emit(
+                    kind="rpa",
+                    n=n,
+                    mode=mode,
+                    error=f"{type(e).__name__}: {str(e)[:600]}",
+                )
         os.environ["TPU_RPA_DBG_NOCOMPUTE"] = "0"
         os.environ["TPU_RPA_DBG_NODMA"] = "0"
 

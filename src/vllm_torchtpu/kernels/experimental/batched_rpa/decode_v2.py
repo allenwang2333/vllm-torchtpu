@@ -100,9 +100,13 @@ def build_run_lengths(page_indices: jax.Array, num_seqs: int, ppb: int) -> jax.A
     pg = page_indices.reshape(num_seqs, pps)
     p = jnp.arange(pps, dtype=jnp.int32)
     cont = (pg[:, 1:] == pg[:, :-1] + 1) & ((p[1:] % ppb) != 0)[None, :]
-    start = jnp.concatenate([jnp.ones((num_seqs, 1), jnp.bool_), jnp.logical_not(cont)], axis=1)
+    start = jnp.concatenate(
+        [jnp.ones((num_seqs, 1), jnp.bool_), jnp.logical_not(cont)], axis=1
+    )
     idx = jnp.where(start, p[None, :], pps)
-    after = jnp.concatenate([idx[:, 1:], jnp.full((num_seqs, 1), pps, jnp.int32)], axis=1)
+    after = jnp.concatenate(
+        [idx[:, 1:], jnp.full((num_seqs, 1), pps, jnp.int32)], axis=1
+    )
     nxt = lax.cummin(after, axis=1, reverse=True)
     return jnp.where(start, nxt - p[None, :], 0).reshape(-1).astype(jnp.int32)
 
@@ -122,7 +126,8 @@ def build_block_runs(page_indices: jax.Array, num_seqs: int, ppb: int):
     pg = page_indices.reshape(num_seqs, nb, ppb)
     p = jnp.arange(ppb, dtype=jnp.int32)
     start = jnp.concatenate(
-        [jnp.ones((num_seqs, nb, 1), jnp.bool_), pg[..., 1:] != pg[..., :-1] + 1], axis=2
+        [jnp.ones((num_seqs, nb, 1), jnp.bool_), pg[..., 1:] != pg[..., :-1] + 1],
+        axis=2,
     )
     rid = jnp.cumsum(start.astype(jnp.int32), axis=2) - 1  # [N, nb, ppb]
     r = jnp.arange(RUNS_PER_BLOCK, dtype=jnp.int32)
@@ -237,7 +242,12 @@ def _kernel(
             base = s * pages_per_seq + j * ppb
             for p in range(ppb):
                 n = jnp.where(p < npg, 1, 0)
-                copy_pages(pages_ref[base + jnp.minimum(p, jnp.maximum(npg - 1, 0))], p, n, slot)
+                copy_pages(
+                    pages_ref[base + jnp.minimum(p, jnp.maximum(npg - 1, 0))],
+                    p,
+                    n,
+                    slot,
+                )
         else:  # "runs"
             rb = (s * nb + j) * RUNS_PER_BLOCK
             for r in range(RUNS_PER_BLOCK):
@@ -268,7 +278,9 @@ def _kernel(
             return
         rows = npg * rows_per_page
         flat = kv_buf.at[slot].bitcast(jnp.uint32).reshape(-1, _LANES)
-        pltpu.make_async_copy(flat.at[pl.ds(0, rows)], flat.at[pl.ds(0, rows)], sem.at[slot]).wait()
+        pltpu.make_async_copy(
+            flat.at[pl.ds(0, rows)], flat.at[pl.ds(0, rows)], sem.at[slot]
+        ).wait()
 
     def page_ref(slot, p, h):
         """u32 [Dp, page] view of K (h=0) or V (h=1) of page p in a slot."""
@@ -299,18 +311,23 @@ def _kernel(
             else:
                 lane = lax.broadcasted_iota(jnp.int32, (pack_dim, page), 1)
                 r = page_ref(slot, p_last, h)
-                r[...] = jnp.where(lane < rem, r[...], jnp.zeros((pack_dim, page), jnp.uint32))
+                r[...] = jnp.where(
+                    lane < rem, r[...], jnp.zeros((pack_dim, page), jnp.uint32)
+                )
 
     def load_kv(slot):
         """K and V of a slot as fp8 [D, bkv] (dim = dp * pack + j)."""
         if "fp8native" in flags:  # measurement only: KV already as fp8 [D, bkv]
+            assert dbg_kv is not None
             return dbg_kv[slot, 0], dbg_kv[slot, 1]
         if _INTERPRET:
             kk = jnp.concatenate(
-                [kv_buf[slot, p, 0].reshape(pack_dim * pack, page) for p in range(ppb)], axis=1
+                [kv_buf[slot, p, 0].reshape(pack_dim * pack, page) for p in range(ppb)],
+                axis=1,
             )
             vv = jnp.concatenate(
-                [kv_buf[slot, p, 1].reshape(pack_dim * pack, page) for p in range(ppb)], axis=1
+                [kv_buf[slot, p, 1].reshape(pack_dim * pack, page) for p in range(ppb)],
+                axis=1,
             )
             return kk, vv
         k_u32 = jnp.concatenate([page_ref(slot, p, 0)[...] for p in range(ppb)], axis=1)
@@ -323,11 +340,15 @@ def _kernel(
         # Online softmax over `chunk`-token pieces of the block (smaller score tiles).
         s, _, valid, _ = geom(it)
         q = q_ref[s]
-        m = l = acc = None
+        m = lsum = acc = None
         cp = chunk // page
         for c in range(bkv // chunk):
-            k_u32 = jnp.concatenate([page_ref(slot, c * cp + p, 0)[...] for p in range(cp)], axis=1)
-            v_u32 = jnp.concatenate([page_ref(slot, c * cp + p, 1)[...] for p in range(cp)], axis=1)
+            k_u32 = jnp.concatenate(
+                [page_ref(slot, c * cp + p, 0)[...] for p in range(cp)], axis=1
+            )
+            v_u32 = jnp.concatenate(
+                [page_ref(slot, c * cp + p, 1)[...] for p in range(cp)], axis=1
+            )
             k = pltpu.bitcast(k_u32, kv_dtype)
             v = pltpu.bitcast(v_u32, kv_dtype)
             sc = lax.dot(q, k, preferred_element_type=F32)
@@ -340,14 +361,14 @@ def _kernel(
             l_c = jnp.sum(p_, axis=-1, keepdims=True)
             pv = lax.dot_general(p_.astype(BF16), v, _NT, preferred_element_type=F32)
             if m is None:
-                l, acc = l_c, pv
+                lsum, acc = l_c, pv
             else:
                 a = jnp.exp(jnp.where(m == -jnp.inf, 0.0, m) - m_safe)
                 a = jnp.where(m == -jnp.inf, 0.0, a)
-                l = a * l + l_c
+                lsum = a * lsum + l_c
                 acc = a * acc + pv
             m = m_new
-        return m, l, acc
+        return m, lsum, acc
 
     def partial_block(it, slot):
         """Independent softmax partial of one item: (m [R,1], l [R,1], acc [R,D])."""
@@ -365,7 +386,7 @@ def _kernel(
             # P in [0, 1] scaled by 2^8 straight out of the exp, split into fp8
             # hi + lo / 16 (about bf16 precision); V stays fp8 on the MXU.
             pf = jnp.exp(sc - (m_safe - _LN_P_SCALE))
-            l = jnp.sum(pf, axis=-1, keepdims=True) * (1.0 / _P_SCALE)
+            lsum = jnp.sum(pf, axis=-1, keepdims=True) * (1.0 / _P_SCALE)
             ph = pf.astype(kv_dtype)
             plo = ((pf - ph.astype(F32)) * _SPLIT).astype(kv_dtype)
             pv2 = lax.dot_general(
@@ -373,13 +394,13 @@ def _kernel(
             )
             rows = q.shape[0]
             acc = (pv2[:rows] + pv2[rows:] * (1.0 / _SPLIT)) * (1.0 / _P_SCALE)
-            return m, l, acc
+            return m, lsum, acc
         p = jnp.exp(sc - m_safe)
-        l = jnp.sum(p, axis=-1, keepdims=True)
+        lsum = jnp.sum(p, axis=-1, keepdims=True)
         if "qkonly" in flags:
-            return m, l, p[:, : acc_sc.shape[1]]
+            return m, lsum, p[:, : acc_sc.shape[1]]
         acc = lax.dot_general(p.astype(BF16), v, _NT, preferred_element_type=F32)
-        return m, l, acc
+        return m, lsum, acc
 
     def merge(it, part):
         s, j, valid, live = geom(it)
@@ -464,7 +485,9 @@ def _kernel(
                     issue_inblock(nxt[g], nslot[g])
             if "nocompute" in flags:
                 return
-            parts = [partial(base + g, lax.rem(base + g, num_slots)) for g in range(group)]
+            parts = [
+                partial(base + g, lax.rem(base + g, num_slots)) for g in range(group)
+            ]
             for g in range(group):
                 merge(base + g, parts[g])
 
@@ -488,7 +511,14 @@ class DecodeMeta:
 
 
 @functools.partial(
-    jax.jit, static_argnames=("num_tokens", "cp_group_size", "decode_query_size", "page_size", "bkv")
+    jax.jit,
+    static_argnames=(
+        "num_tokens",
+        "cp_group_size",
+        "decode_query_size",
+        "page_size",
+        "bkv",
+    ),
 )
 def prepare(
     kv_lens: jax.Array,
@@ -509,7 +539,9 @@ def prepare(
     page_indices = page_indices.reshape(-1)
     pps = page_indices.shape[0] // N
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    local = _local_cache_len(kv_lens - q_lens, cp_group_size, cp_rank[0], page).astype(jnp.int32)
+    local = _local_cache_len(kv_lens - q_lens, cp_group_size, cp_rank[0], page).astype(
+        jnp.int32
+    )
     if num_decode_seqs is not None:
         # Sequences past the decode range (padding) may carry stale lengths and
         # page tables: give them no work.
@@ -517,7 +549,9 @@ def prepare(
     if pps % ppb:
         # Whole blocks of page-table entries (the padding is never fetched).
         pad = ppb - pps % ppb
-        page_indices = jnp.pad(page_indices.reshape(N, pps), ((0, 0), (0, pad))).reshape(-1)
+        page_indices = jnp.pad(
+            page_indices.reshape(N, pps), ((0, 0), (0, pad))
+        ).reshape(-1)
         pps += pad
     local = jnp.minimum(local, pps * page)
     rsrc, rdl, rcov = build_block_runs(page_indices, N, ppb)
@@ -526,7 +560,9 @@ def prepare(
     q_idx = jnp.clip(tok, 0, T - 1).reshape(-1).astype(jnp.int32)
     q_ok = (t_idx[None, :] < q_lens[:, None]).reshape(-1)
     r_idx = jnp.arange(T, dtype=jnp.int32)
-    seq_of_tok = jnp.sum((cu_q_lens[None, 1:] <= r_idx[:, None]).astype(jnp.int32), axis=1)
+    seq_of_tok = jnp.sum(
+        (cu_q_lens[None, 1:] <= r_idx[:, None]).astype(jnp.int32), axis=1
+    )
     seq_of_tok = jnp.minimum(seq_of_tok, N - 1)
     t_of_tok = jnp.clip(r_idx - cu_q_lens[seq_of_tok], 0, Tq - 1)
     row = (seq_of_tok * Tq + t_of_tok).astype(jnp.int32)
@@ -581,7 +617,10 @@ def run(
     # VMEM: K/V slots plus the resident q / out / lse blocks; halve the group
     # until it fits (large batch buckets).
     io_bytes = N * R * D * 2 * jnp.dtype(queries.dtype).itemsize + N * R * _LANES * 4
-    while group > 1 and group * depth * bkv * dp * pack * 2 + io_bytes > (vmem_limit_bytes * 3) // 4:
+    while (
+        group > 1
+        and group * depth * bkv * dp * pack * 2 + io_bytes > (vmem_limit_bytes * 3) // 4
+    ):
         group //= 2
 
     # Queries per sequence: row t * H + h of sequence s is token cu[s] + t, head h.
@@ -620,7 +659,10 @@ def run(
                 pl.BlockSpec(memory_space=vmem),
                 pl.BlockSpec(memory_space=pltpu.HBM),
             ],
-            out_specs=(pl.BlockSpec(memory_space=vmem), pl.BlockSpec(memory_space=vmem)),
+            out_specs=(
+                pl.BlockSpec(memory_space=vmem),
+                pl.BlockSpec(memory_space=vmem),
+            ),
             scratch_shapes=[
                 vmem((num_slots, ppb, 2, dp, pack, page), kv_cache.dtype),
                 pltpu.SemaphoreType.DMA((num_slots,)),
@@ -630,7 +672,11 @@ def run(
                 vmem((R, _LANES), F32),
                 vmem((R, D), F32),
             ]
-            + ([vmem((num_slots, 2, dp * pack, bkv), kv_cache.dtype)] if "fp8native" in dbg else []),
+            + (
+                [vmem((num_slots, 2, dp * pack, bkv), kv_cache.dtype)]
+                if "fp8native" in dbg
+                else []
+            ),
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=vmem_limit_bytes,
@@ -638,7 +684,16 @@ def run(
         ),
         name=f"RPAd2-{pv_mode}-p{page}-k{bkv}-g{group}-d{depth}",
         **_interpret_kwargs(),
-    )(meta.local, meta.page_indices, one, meta.rsrc, meta.rdl, meta.rcov, q_seq, kv_cache)
+    )(
+        meta.local,
+        meta.page_indices,
+        one,
+        meta.rsrc,
+        meta.rdl,
+        meta.rcov,
+        q_seq,
+        kv_cache,
+    )
 
     # Back to token rows; rows of padding tokens or of sequences without cache
     # get out 0 and lse -inf.
@@ -682,8 +737,17 @@ def decode_cache_pass(
         page_size=kv_cache.shape[-1],
         bkv=bkv,
     )
-    run_kwargs.pop("issue_mode", None)  # always "runs" (the others were measurement variants)
-    return run(queries, kv_cache, meta, decode_query_size=decode_query_size, bkv=bkv, **run_kwargs)
+    run_kwargs.pop(
+        "issue_mode", None
+    )  # always "runs" (the others were measurement variants)
+    return run(
+        queries,
+        kv_cache,
+        meta,
+        decode_query_size=decode_query_size,
+        bkv=bkv,
+        **run_kwargs,
+    )
 
 
 def supported(

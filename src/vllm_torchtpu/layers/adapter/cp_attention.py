@@ -27,10 +27,9 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
-import os
-
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
 )
@@ -86,13 +85,18 @@ def merge_attn_results(
 
 
 def decode_v2_enabled() -> bool:
-    """TPU_RPA_DECODE_V2=1: run the DCP CACHE_ONLY pass of decode steps with
-    `batched_rpa.decode_v2` (steps with prefill/mixed sequences keep the
-    batched RPA kernel). Not bit-identical to it: f32 softmax and f32 LSE."""
-    return os.environ.get("TPU_RPA_DECODE_V2", "0") == "1"
+    """Reports whether TPU_RPA_DECODE_V2 routes the DCP CACHE_ONLY pass of
+    decode steps to `batched_rpa.decode_v2`.
+
+    Steps with prefill or mixed sequences keep the batched RPA kernel. The two
+    are not bit-identical: decode_v2 keeps the softmax and the LSE in f32.
+    """
+    return bool(envs.TPU_RPA_DECODE_V2)
 
 
-def _decode_v2_covers(kv_cache, query, key, sliding_window, soft_cap, kv_layout) -> bool:
+def _decode_v2_covers(
+    kv_cache, query, key, sliding_window, soft_cap, kv_layout
+) -> bool:
     return _decode_v2.supported(
         kv_cache_shape=tuple(kv_cache.shape),
         kv_dtype=kv_cache.dtype,
@@ -197,7 +201,7 @@ def _pallas_rpa_kernel_dcp(
         query,
         kv_cache,
         meta,
-        sm_scale=float(sm_scale),
+        sm_scale=1.0 if sm_scale is None else float(sm_scale),
         k_scale=None if k_scale is None else float(k_scale),
         v_scale=None if v_scale is None else float(v_scale),
         decode_query_size=decode_query_size,

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Probe 2: per-block decode attention compute cost with KV resident in VMEM.
 
 One "lane block" = 64 query rows (4 tokens x 16 heads) of one sequence against
@@ -64,11 +65,24 @@ def block_math(variant, q, q2, q2t, k, v, m_prev, l_prev, acc_prev, iq):
             pv = lax.dot_general(ph, v, NT, preferred_element_type=F32) * (1.0 / PS)
         else:
             plo = ((pf - ph.astype(F32)) * SPLIT).astype(FP8)
-            pv2 = lax.dot_general(jnp.concatenate([ph, plo], axis=0), v, NT, preferred_element_type=F32)
+            pv2 = lax.dot_general(
+                jnp.concatenate([ph, plo], axis=0), v, NT, preferred_element_type=F32
+            )
             pv = (pv2[:R] + pv2[R:] * (1.0 / SPLIT)) * (1.0 / PS)
         return m_new, l_new, alpha[:, :1] * acc_prev + pv
-    if variant in ("cur", "bf16kv", "f32soft", "qkonly", "pvonly", "nat8", "nat8x2",
-                   "qk2pv1", "qk2only", "pv2only", "cur_f32p"):
+    if variant in (
+        "cur",
+        "bf16kv",
+        "f32soft",
+        "qkonly",
+        "pvonly",
+        "nat8",
+        "nat8x2",
+        "qk2pv1",
+        "qk2only",
+        "pv2only",
+        "cur_f32p",
+    ):
         if variant in ("nat8",):
             s = lax.dot(q2[:R], k, preferred_element_type=F32) * iq[:, :1]
         elif variant in ("nat8x2", "qk2pv1", "qk2only"):
@@ -82,7 +96,14 @@ def block_math(variant, q, q2, q2t, k, v, m_prev, l_prev, acc_prev, iq):
             p = jnp.full((R, k.shape[1]), 0.5, BF16 if variant == "pvonly" else F32)
             m_new, l_new, alpha = m_prev, l_prev, jnp.ones_like(m_prev)
         else:
-            if variant not in ("f32soft", "cur_f32p", "nat8x2", "qk2pv1", "qk2only", "nat8"):
+            if variant not in (
+                "f32soft",
+                "cur_f32p",
+                "nat8x2",
+                "qk2pv1",
+                "qk2only",
+                "nat8",
+            ):
                 s = s.astype(BF16)
             m_cur = jnp.max(s, axis=-1, keepdims=True).astype(F32)
             m_new = jnp.maximum(m_prev, m_cur)
@@ -108,7 +129,9 @@ def block_math(variant, q, q2, q2t, k, v, m_prev, l_prev, acc_prev, iq):
     if variant in ("T_cur", "T_nat8x2"):
         # Transposed: s^T [BKV, R] = k^T q^T, softmax along sublanes, o^T = v p^T.
         if variant == "T_cur":
-            st = lax.dot_general(k, q, (((0,), (1,)), ((), ())), preferred_element_type=F32)
+            st = lax.dot_general(
+                k, q, (((0,), (1,)), ((), ())), preferred_element_type=F32
+            )
         else:
             st2 = lax.dot_general(k, q2t, TN, preferred_element_type=F32)  # [BKV, 2R]
             st = (st2[:, :R] + st2[:, R:] * (1.0 / SPLIT)) * iq[:1]
@@ -142,7 +165,19 @@ def make_call(variant):
     else:
         ml_shape, acc_shape = (R, 128), (R, D)
 
-    def kernel(q_ref, q2_ref, q2t_ref, iq_ref, iqt_ref, kv_ref, o_ref, lse_ref, m_sc, l_sc, acc_sc):
+    def kernel(
+        q_ref,
+        q2_ref,
+        q2t_ref,
+        iq_ref,
+        iqt_ref,
+        kv_ref,
+        o_ref,
+        lse_ref,
+        m_sc,
+        l_sc,
+        acc_sc,
+    ):
         m_sc[...] = jnp.full(m_sc.shape, -jnp.inf, F32)
         l_sc[...] = jnp.zeros(l_sc.shape, F32)
         acc_sc[...] = jnp.zeros(acc_sc.shape, F32)
@@ -151,8 +186,17 @@ def make_call(variant):
         def _(s):
             for b in range(L):
                 m_new, l_new, acc_new = block_math(
-                    variant, q_ref[b], q2_ref[b], q2t_ref[b], kv_ref[b, 0], kv_ref[b, 1],
-                    m_sc[b], l_sc[b], acc_sc[b], iqt_ref[b] if transposed else iq_ref[b])
+                    variant,
+                    q_ref[b],
+                    q2_ref[b],
+                    q2t_ref[b],
+                    kv_ref[b, 0],
+                    kv_ref[b, 1],
+                    m_sc[b],
+                    l_sc[b],
+                    acc_sc[b],
+                    iqt_ref[b] if transposed else iq_ref[b],
+                )
                 m_sc[b] = m_new
                 l_sc[b] = l_new
                 acc_sc[b] = acc_new
@@ -160,7 +204,9 @@ def make_call(variant):
         for b in range(L):
             if transposed:
                 o_ref[b] = (acc_sc[b] / l_sc[b][:1]).T
-                lse_ref[b] = jnp.broadcast_to((m_sc[b][:1] + jnp.log(l_sc[b][:1])).T, (R, 128))
+                lse_ref[b] = jnp.broadcast_to(
+                    (m_sc[b][:1] + jnp.log(l_sc[b][:1])).T, (R, 128)
+                )
             else:
                 o_ref[b] = acc_sc[b] / l_sc[b][:, :1]
                 lse_ref[b] = m_sc[b] + jnp.log(l_sc[b])
@@ -170,10 +216,17 @@ def make_call(variant):
     def f(q, q2, q2t, iq, iqt, kv):
         return pl.pallas_call(
             kernel,
-            out_shape=(jax.ShapeDtypeStruct((L, R, D), F32), jax.ShapeDtypeStruct((L, R, 128), F32)),
+            out_shape=(
+                jax.ShapeDtypeStruct((L, R, D), F32),
+                jax.ShapeDtypeStruct((L, R, 128), F32),
+            ),
             in_specs=[pl.BlockSpec(memory_space=vm)] * 6,
             out_specs=(pl.BlockSpec(memory_space=vm), pl.BlockSpec(memory_space=vm)),
-            scratch_shapes=[vm((L,) + ml_shape, F32), vm((L,) + ml_shape, F32), vm((L,) + acc_shape, F32)],
+            scratch_shapes=[
+                vm((L,) + ml_shape, F32),
+                vm((L,) + ml_shape, F32),
+                vm((L,) + acc_shape, F32),
+            ],
             compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 << 20),
             name=f"p2_{variant}",
             **({"interpret": pltpu.InterpretParams()} if INTERP else {}),
@@ -226,7 +279,9 @@ for peaky in (False, True):
     q2 = jnp.asarray(np.concatenate([qh, ql], axis=1)).astype(FP8)
     q2t = jnp.swapaxes(q2, 1, 2)
     iq = jnp.asarray(np.broadcast_to(1.0 / qscale, (L, R, 128)).astype(np.float32))
-    iqt = jnp.asarray(np.broadcast_to(np.swapaxes(1.0 / qscale, 1, 2), (L, 8, R)).astype(np.float32))
+    iqt = jnp.asarray(
+        np.broadcast_to(np.swapaxes(1.0 / qscale, 1, 2), (L, 8, R)).astype(np.float32)
+    )
     for variant in VARIANTS:
         if peaky and variant in ("qkonly", "pvonly", "convonly", "qk2only", "pv2only"):
             continue
@@ -237,19 +292,37 @@ for peaky in (False, True):
                 out = jax.block_until_ready(f(q_dev, q2, q2t, iq, iqt, kv))
                 us, cnt = 1.0, 1
             else:
-                t, out, _ = devtime.device_times(f, (q_dev, q2, q2t, iq, iqt, kv), iters=5)
+                t, out, _ = devtime.device_times(
+                    f, (q_dev, q2, q2t, iq, iqt, kv), iters=5
+                )
                 us, cnt = devtime.summarize(t, r"^p2_")
             o, lse = (np.asarray(x, np.float64) for x in out)
-            rec = dict(kind="compute", variant=variant, peaky=peaky, L=L, BKV=BKV, steps=NSTEPS,
-                       us_call=round(us, 1), us_per_block=round(us / (NSTEPS * L), 3),
-                       GBps_equiv=round(L * NSTEPS * BKV * 2 * D / us / 1e3, 1))
+            rec = dict(
+                kind="compute",
+                variant=variant,
+                peaky=peaky,
+                L=L,
+                BKV=BKV,
+                steps=NSTEPS,
+                us_call=round(us, 1),
+                us_per_block=round(us / (NSTEPS * L), 3),
+                GBps_equiv=round(L * NSTEPS * BKV * 2 * D / us / 1e3, 1),
+            )
             o_r, lse_r = o_ref, lse_ref
             if variant not in ("qkonly", "pvonly", "convonly", "qk2only", "pv2only"):
                 err = np.abs(o - o_r)
-                rec.update(max_abs=float(err.max()), mean_abs=float(err.mean()),
-                           max_rel=float((err / (np.abs(o_r) + 1e-3)).max()),
-                           ref_absmean=float(np.abs(o_r).mean()))
+                rec.update(
+                    max_abs=float(err.max()),
+                    mean_abs=float(err.mean()),
+                    max_rel=float((err / (np.abs(o_r) + 1e-3)).max()),
+                    ref_absmean=float(np.abs(o_r).mean()),
+                )
             emit(**rec)
         except Exception as e:  # noqa: BLE001
-            emit(kind="compute", variant=variant, peaky=peaky, error=f"{type(e).__name__}: {str(e)[:800]}")
+            emit(
+                kind="compute",
+                variant=variant,
+                peaky=peaky,
+                error=f"{type(e).__name__}: {str(e)[:800]}",
+            )
 print("PROBE_DONE", flush=True)

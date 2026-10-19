@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Correctness (and on TPU, speed) of batched_rpa.decode_v2 against a float64
 reference and against the batched RPA DCP CACHE_ONLY kernel.
 
@@ -9,19 +22,19 @@ filled with fp8 NaN bytes, so a kernel that reads them unmasked fails.
 """
 
 import argparse
-import functools
 import json
 import os
 import sys
 import types
 
-REPO = os.environ.get("REPO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+REPO = os.environ.get(
+    "REPO", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src")
+)
 for _name, _sub in [("vllm_torchtpu", ""), ("vllm_torchtpu.kernels", "kernels")]:
     _m = types.ModuleType(_name)
     _m.__path__ = [os.path.join(REPO, "vllm_torchtpu", _sub)]
     sys.modules[_name] = _m
 
-import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -74,7 +87,9 @@ def make_case(name, seed=0):
     cu = np.zeros(N + 1, np.int64)
     cu[1:] = np.cumsum(q_lens)
     P = (N + 1) * pps + 16
-    shape = W.get_kv_cache_shape(P, PAGE, 1, D, FP8, kv_layout=C.KVLayout.SEQ_ALONG_LANE)
+    shape = W.get_kv_cache_shape(
+        P, PAGE, 1, D, FP8, kv_layout=C.KVLayout.SEQ_ALONG_LANE
+    )
     kvf = rng.standard_normal(shape).astype(np.float32) * 0.5
     kv = np.asarray(jnp.asarray(kvf).astype(FP8))
     # Fill everything with NaN bytes first; real tokens are written below.
@@ -87,7 +102,7 @@ def make_case(name, seed=0):
     perm = rng.permutation(np.arange(1, P))
     used = 0
     for s in range(N):
-        chunk = np.sort(perm[used:used + pps]) if s % 2 else perm[used:used + pps]
+        chunk = np.sort(perm[used : used + pps]) if s % 2 else perm[used : used + pps]
         if s % 2:
             nr = -(-pps // 5)
             base = 1 + s * pps
@@ -99,8 +114,21 @@ def make_case(name, seed=0):
     assert pages.max() < P
     q = (rng.standard_normal((T_pad, H, D)) * 2.0).astype(np.float32)
     q[T:] = 0
-    return dict(Tq=Tq, pps=pps, N=N, cache=cache, q_lens=q_lens, T=T, T_pad=T_pad, cu=cu,
-                kv_real=kv, kv_bytes=kv_bytes, pages=pages, q=q, bkv=bkv)
+    return dict(
+        Tq=Tq,
+        pps=pps,
+        N=N,
+        cache=cache,
+        q_lens=q_lens,
+        T=T,
+        T_pad=T_pad,
+        cu=cu,
+        kv_real=kv,
+        kv_bytes=kv_bytes,
+        pages=pages,
+        q=q,
+        bkv=bkv,
+    )
 
 
 def local_len(g, rank):
@@ -127,7 +155,9 @@ def reference(c, rank, sm_scale):
     T_pad = c["T_pad"]
     out = np.zeros((T_pad, H, D))
     lse = np.full((T_pad, H), -np.inf)
-    qb = np.asarray(jnp.asarray(c["q"]).astype(jnp.bfloat16).astype(np.float32)).astype(np.float64)
+    qb = np.asarray(jnp.asarray(c["q"]).astype(jnp.bfloat16).astype(np.float32)).astype(
+        np.float64
+    )
     for s in range(c["N"]):
         ln = int(local_len(c["cache"][s], rank))
         if ln == 0:
@@ -143,9 +173,9 @@ def reference(c, rank, sm_scale):
             sc = qb[r] @ Kt.T * sm_scale  # [H, ln]
             m = sc.max(-1, keepdims=True)
             p = np.exp(sc - m)
-            l = p.sum(-1, keepdims=True)
-            out[r] = (p @ Vt) / l
-            lse[r] = (m + np.log(l))[:, 0]
+            lv = p.sum(-1, keepdims=True)
+            out[r] = (p @ Vt) / lv
+            lse[r] = (m + np.log(lv))[:, 0]
     return out, lse
 
 
@@ -155,9 +185,24 @@ def run_v2(c, kv, rank, sm_scale, group, issue, pv):
     pidx = jnp.asarray(c["pages"].reshape(-1))
     cu = jnp.asarray(c["cu"], jnp.int32)
     out, lse = V2.decode_cache_pass(
-        q, kv, kv_lens, pidx, cu, jnp.array([rank], jnp.int32),
-        sm_scale=sm_scale, k_scale=1.0, v_scale=1.0, cp_group_size=DCP,
-        decode_query_size=c["Tq"], bkv=c["bkv"], group=group, depth=A.depth, issue_mode=issue, pv_mode=pv, chunk=A.chunk)
+        q,
+        kv,
+        kv_lens,
+        pidx,
+        cu,
+        jnp.array([rank], jnp.int32),
+        sm_scale=sm_scale,
+        k_scale=1.0,
+        v_scale=1.0,
+        cp_group_size=DCP,
+        decode_query_size=c["Tq"],
+        bkv=c["bkv"],
+        group=group,
+        depth=A.depth,
+        issue_mode=issue,
+        pv_mode=pv,
+        chunk=A.chunk,
+    )
     return np.asarray(out.astype(jnp.float32), np.float64), np.asarray(lse, np.float64)
 
 
@@ -172,25 +217,44 @@ def run_old(c, kv, rank, sm_scale):
     N = c["N"]
     dist = jnp.array([N, N, N], jnp.int32)
     out, _, lse = W.ragged_paged_attention(
-        q, knew, vnew, jnp.asarray(kv), kv_lens, pidx, cu, dist,
-        sm_scale=sm_scale, k_scale=1.0, v_scale=1.0, cp_group_size=DCP,
-        cp_rank=jnp.array([rank], jnp.int32), attention_scope=C.AttentionScope.CACHE_ONLY,
-        decode_query_size=c["Tq"], return_lse=True, kv_layout=C.KVLayout.SEQ_ALONG_LANE)
-    return np.asarray(out.astype(jnp.float32), np.float64), np.asarray(lse.astype(jnp.float32), np.float64)
+        q,
+        knew,
+        vnew,
+        jnp.asarray(kv),
+        kv_lens,
+        pidx,
+        cu,
+        dist,
+        sm_scale=sm_scale,
+        k_scale=1.0,
+        v_scale=1.0,
+        cp_group_size=DCP,
+        cp_rank=jnp.array([rank], jnp.int32),
+        attention_scope=C.AttentionScope.CACHE_ONLY,
+        decode_query_size=c["Tq"],
+        return_lse=True,
+        kv_layout=C.KVLayout.SEQ_ALONG_LANE,
+    )
+    return np.asarray(out.astype(jnp.float32), np.float64), np.asarray(
+        lse.astype(jnp.float32), np.float64
+    )
 
 
 def compare(name, out, lse, ref_out, ref_lse, rows):
     o, ro = out[rows], ref_out[rows]
-    l, rl = lse[rows], ref_lse[rows]
+    lv, rl = lse[rows], ref_lse[rows]
     fin = np.isfinite(rl)
     err_o = np.abs(o - ro)[fin]
-    err_l = np.abs(l - rl)[fin]
+    err_l = np.abs(lv - rl)[fin]
     nan_bad = bool(np.isnan(o).any())
-    inf_mismatch = bool((np.isfinite(l) != fin).any())
-    return {f"{name}_max_abs_o": float(err_o.max()) if err_o.size else 0.0,
-            f"{name}_mean_abs_o": float(err_o.mean()) if err_o.size else 0.0,
-            f"{name}_max_abs_lse": float(err_l.max()) if err_l.size else 0.0,
-            f"{name}_nan": nan_bad, f"{name}_lse_inf_mismatch": inf_mismatch}
+    inf_mismatch = bool((np.isfinite(lv) != fin).any())
+    return {
+        f"{name}_max_abs_o": float(err_o.max()) if err_o.size else 0.0,
+        f"{name}_mean_abs_o": float(err_o.mean()) if err_o.size else 0.0,
+        f"{name}_max_abs_lse": float(err_l.max()) if err_l.size else 0.0,
+        f"{name}_nan": nan_bad,
+        f"{name}_lse_inf_mismatch": inf_mismatch,
+    }
 
 
 c = make_case(A.case)
@@ -199,10 +263,19 @@ rows = np.arange(c["T"])
 for rank in [int(x) for x in A.ranks.split(",")]:
     kv = jnp.asarray(build_rank(c, rank))
     ref_out, ref_lse = reference(c, rank, sm_scale)
-    rec = dict(case=A.case, rank=rank, bkv=c["bkv"], local=[int(local_len(g, rank)) for g in c["cache"]][:8])
+    rec = dict(
+        case=A.case,
+        rank=rank,
+        bkv=c["bkv"],
+        local=[int(local_len(g, rank)) for g in c["cache"]][:8],
+    )
     o2 = None
-    for group, issue, pv in [(int(g), i, v) for g in A.groups.split(",") for i in A.issues.split(",")
-                             for v in A.pvs.split(",")]:
+    for group, issue, pv in [
+        (int(g), i, v)
+        for g in A.groups.split(",")
+        for i in A.issues.split(",")
+        for v in A.pvs.split(",")
+    ]:
         tag = f"v2g{group}{issue[0]}{pv[0]}"
         try:
             o2, l2 = run_v2(c, kv, rank, sm_scale, group, issue, pv)
@@ -216,7 +289,9 @@ for rank in [int(x) for x in A.ranks.split(",")]:
             rec.update(compare("old", o1, l1, ref_out, ref_lse, rows))
             if o2 is not None:
                 fin = np.isfinite(ref_lse[rows])
-                rec["v2_vs_old_max_abs_o"] = float(np.abs(o2[rows] - o1[rows])[fin].max())
+                rec["v2_vs_old_max_abs_o"] = float(
+                    np.abs(o2[rows] - o1[rows])[fin].max()
+                )
         except Exception as e:  # noqa: BLE001
             rec["old_error"] = f"{type(e).__name__}: {str(e)[:600]}"
     emit(**rec)

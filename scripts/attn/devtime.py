@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Device-side op durations of a JAX callable, from a jax.profiler capture.
 
 device_times(fn, args, iters) runs fn(*args) once to compile, then `iters`
