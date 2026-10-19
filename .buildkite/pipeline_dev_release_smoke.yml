@@ -72,11 +72,14 @@ steps:
             -d "{\"model\": \"$$M\", \"prompt\": \"Count from one to five:\", \"max_tokens\": 24, \"temperature\": 0, \"stream\": true}" > /tmp/stream.txt
           grep -c "^data: {" /tmp/stream.txt; grep -q "^data: \[DONE\]" /tmp/stream.txt
           echo "--- 16 concurrent completions"
+          pids=()
           for n in $$(seq 1 16); do
             curl -sf localhost:8000/v1/completions -H "Content-Type: application/json" \
               -d "{\"model\": \"$$M\", \"prompt\": \"Request $$n: write one sentence about TPUs.\", \"max_tokens\": 32}" -o /tmp/c$$n.json &
+            pids+=($$!)
           done
-          wait
+          # Only the requests: a bare wait would also wait on the server.
+          for p in "$${pids[@]}"; do wait "$$p"; done
           python3 -c "import json; r = [json.load(open(f\"/tmp/c{n}.json\"))[\"choices\"][0][\"text\"] for n in range(1, 17)]; print(len(r), \"responses, all non-empty:\", all(t.strip() for t in r)); assert all(t.strip() for t in r)"'
 
   - label: ":tpu: online: vllm serve Qwen3-8B TP=4 + requests (4 chips)"
@@ -108,9 +111,12 @@ steps:
             -d "{\"model\": \"$$M\", \"messages\": [{\"role\": \"user\", \"content\": \"Explain in two sentences what a TPU is.\"}], \"max_tokens\": 128, \"temperature\": 0}" \
             | python3 -c "import json, sys; t = json.load(sys.stdin)[\"choices\"][0][\"message\"][\"content\"]; print(repr(t)); assert t.strip()"
           echo "--- 16 concurrent completions"
+          pids=()
           for n in $$(seq 1 16); do
             curl -sf localhost:8000/v1/completions -H "Content-Type: application/json" \
               -d "{\"model\": \"$$M\", \"prompt\": \"Request $$n: write one sentence about TPUs.\", \"max_tokens\": 32}" -o /tmp/c$$n.json &
+            pids+=($$!)
           done
-          wait
+          # Only the requests: a bare wait would also wait on the server.
+          for p in "$${pids[@]}"; do wait "$$p"; done
           python3 -c "import json; r = [json.load(open(f\"/tmp/c{n}.json\"))[\"choices\"][0][\"text\"] for n in range(1, 17)]; print(len(r), \"responses, all non-empty:\", all(t.strip() for t in r)); assert all(t.strip() for t in r)"'
