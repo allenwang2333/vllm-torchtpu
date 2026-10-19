@@ -2603,18 +2603,19 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # Read by raiden's host memory allocator: prefer, rather than bind to,
         # the TPU's NUMA node when placing host pages.
         os.environ.setdefault("RAIDEN_NUMA_POLICY", "preferred")
-        if parallel.pp_size > 1:
-            pp_target_bytes = int(
-                os.environ.get("TPU_RAIDEN_PP_MAX_CPU_BYTES", "550000000000")
-            )
-            if int(cpu_bytes_to_use) != pp_target_bytes:
+        pp_cpu_bytes = envs.TPU_RAIDEN_PP_MAX_CPU_BYTES
+        if pp_cpu_bytes is not None and parallel.pp_size > 1:
+            # A pipeline-parallel engine holds one layer range per rank, so
+            # the tier is sized here rather than capped: the connector's
+            # cpu_bytes_to_use is replaced by TPU_RAIDEN_PP_MAX_CPU_BYTES.
+            if int(cpu_bytes_to_use) != pp_cpu_bytes:
                 logger.info(
                     "TPURaidenOffloadingConnector: setting PP cpu_bytes_to_use "
-                    "from %s to %d (TPU_RAIDEN_PP_MAX_CPU_BYTES) for host RAM headroom",
+                    "from %s to %d (TPU_RAIDEN_PP_MAX_CPU_BYTES)",
                     cpu_bytes_to_use,
-                    pp_target_bytes,
+                    pp_cpu_bytes,
                 )
-                cpu_bytes_to_use = pp_target_bytes
+                cpu_bytes_to_use = pp_cpu_bytes
         else:
             max_cpu_bytes = int(
                 os.environ.get("TPU_RAIDEN_MAX_CPU_BYTES", "560000000000")
