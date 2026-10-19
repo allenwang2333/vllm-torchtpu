@@ -31,6 +31,7 @@ import torch.fx as fx
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.export.weight_name_mapper import resolve_source_tensor_and_path
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -2395,17 +2396,12 @@ def maybe_export_sampling_subgraphs(runner: Any) -> None:
                     for src_entry in sources:
                         if not isinstance(src_entry, dict):
                             continue
-                        src_tensor = str(src_entry.get("source_tensor") or w_name)
-                        if (
-                            src_tensor == "lm_head.weight"
-                            and "lm_head.weight" not in tensor_to_file
-                            and "model.embed_tokens.weight" in tensor_to_file
-                        ):
-                            src_tensor = "model.embed_tokens.weight"
-                            src_entry["source_tensor"] = src_tensor
-                        src_entry["path"] = tensor_to_file.get(
-                            src_tensor, default_st_path
+                        raw_target = str(src_entry.get("source_tensor") or w_name)
+                        src_tensor, shard_path = resolve_source_tensor_and_path(
+                            raw_target, tensor_to_file, default_st_path
                         )
+                        src_entry["source_tensor"] = src_tensor
+                        src_entry["path"] = shard_path
                         if "source_shape" not in src_entry and w_shape:
                             src_entry["source_shape"] = w_shape
                     w_spec.pop("is_internal_constant", None)
