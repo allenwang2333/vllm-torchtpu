@@ -68,13 +68,13 @@ def old_fn(kv, q, kv_lens, pidx, cu):
     return new_kv, out, lse.astype(jnp.float32)
 
 
-def v2_fn(bkv, group, depth, issue, dbg, pv="bf16"):
+def v2_fn(bkv, group, depth, issue, dbg, pv="bf16", chunk=4096):
     @functools.partial(jax.jit, donate_argnums=(0,))
     def f(kv, q, kv_lens, pidx, cu):
         out, lse = V2.decode_cache_pass(
             q, kv, kv_lens, pidx, cu, jnp.array([0], jnp.int32), sm_scale=1 / 16, k_scale=1.0, v_scale=1.0,
             cp_group_size=DCP, decode_query_size=T, bkv=bkv, group=group, depth=depth, issue_mode=issue,
-            pv_mode=pv, dbg=dbg)
+            pv_mode=pv, chunk=chunk, dbg=dbg)
         return kv, out, lse
     return f
 
@@ -84,8 +84,9 @@ def parse_cfg(cfg):
     parts = cfg.split(":")
     toks = parts[5].split("+") if len(parts) > 5 else []
     pv = "fp8x2" if "pv8x2" in toks else "bf16"
-    dbg = ",".join(t for t in toks if t != "pv8x2")
-    return v2_fn(int(parts[3]), int(parts[1]), int(parts[2]), parts[4], dbg, pv)
+    chunk = int(next((t[1:] for t in toks if t.startswith("c") and t[1:].isdigit()), 4096))
+    dbg = ",".join(t for t in toks if t != "pv8x2" and not (t.startswith("c") and t[1:].isdigit()))
+    return v2_fn(int(parts[3]), int(parts[1]), int(parts[2]), parts[4], dbg, pv, chunk)
 
 
 def carry(out, args):

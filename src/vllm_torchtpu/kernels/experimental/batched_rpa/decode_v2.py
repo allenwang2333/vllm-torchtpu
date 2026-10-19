@@ -55,6 +55,7 @@ reference (scripts/attn/test_decode_v2.py).
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import math
 
@@ -171,6 +172,7 @@ def _kernel(
     depth: int,
     issue_mode: str,
     pv_mode: str,
+    chunk: int,
     v_scale: float | None,
     out_dtype,
     dbg: str,
@@ -316,6 +318,38 @@ def _kernel(
         return pltpu.bitcast(k_u32, kv_dtype), pltpu.bitcast(v_u32, kv_dtype)
 
     def partial(it, slot):
+        if chunk >= bkv:
+            return partial_block(it, slot)
+        # Online softmax over `chunk`-token pieces of the block (smaller score tiles).
+        s, _, valid, _ = geom(it)
+        q = q_ref[s]
+        m = l = acc = None
+        cp = chunk // page
+        for c in range(bkv // chunk):
+            k_u32 = jnp.concatenate([page_ref(slot, c * cp + p, 0)[...] for p in range(cp)], axis=1)
+            v_u32 = jnp.concatenate([page_ref(slot, c * cp + p, 1)[...] for p in range(cp)], axis=1)
+            k = pltpu.bitcast(k_u32, kv_dtype)
+            v = pltpu.bitcast(v_u32, kv_dtype)
+            sc = lax.dot(q, k, preferred_element_type=F32)
+            lane = lax.broadcasted_iota(jnp.int32, (1, chunk), 1) + c * chunk
+            sc = sc + jnp.where(lane < valid, 0.0, -jnp.inf).astype(F32)
+            m_c = jnp.max(sc, axis=-1, keepdims=True)
+            m_new = m_c if m is None else jnp.maximum(m, m_c)
+            m_safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+            p_ = jnp.exp(sc - m_safe)
+            l_c = jnp.sum(p_, axis=-1, keepdims=True)
+            pv = lax.dot_general(p_.astype(BF16), v, _NT, preferred_element_type=F32)
+            if m is None:
+                l, acc = l_c, pv
+            else:
+                a = jnp.exp(jnp.where(m == -jnp.inf, 0.0, m) - m_safe)
+                a = jnp.where(m == -jnp.inf, 0.0, a)
+                l = a * l + l_c
+                acc = a * acc + pv
+            m = m_new
+        return m, l, acc
+
+    def partial_block(it, slot):
         """Independent softmax partial of one item: (m [R,1], l [R,1], acc [R,D])."""
         s, _, valid, _ = geom(it)
         q = q_ref[s]
@@ -435,96 +469,125 @@ def _kernel(
                 merge(base + g, parts[g])
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class DecodeMeta:
+    """Per-step metadata of decode_cache_pass. It depends only on the step's
+    lengths and page tables, so every layer of a forward computes the same
+    one and XLA CSE keeps a single copy (build it outside any lax.cond)."""
+
+    local: jax.Array  # [N] rank-local cache tokens (0: no work)
+    page_indices: jax.Array  # [N * pps] (pps padded to whole blocks)
+    rsrc: jax.Array  # [N * nb * RUNS]
+    rdl: jax.Array  # [N * nb * RUNS]
+    rcov: jax.Array  # [N * nb]
+    q_idx: jax.Array  # [N * Tq] token row of (sequence, query row)
+    q_ok: jax.Array  # [N * Tq] that row exists (t < q_len)
+    row: jax.Array  # [T] (sequence, query row) of each token row
+    row_ok: jax.Array  # [T] token row is real and its sequence has cache
+
+
+@functools.partial(
+    jax.jit, static_argnames=("num_tokens", "cp_group_size", "decode_query_size", "page_size", "bkv")
+)
+def prepare(
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cp_rank: jax.Array,
+    num_decode_seqs: jax.Array | None = None,
+    *,
+    num_tokens: int,
+    cp_group_size: int,
+    decode_query_size: int,
+    page_size: int,
+    bkv: int = 4096,
+) -> DecodeMeta:
+    N = kv_lens.shape[0]
+    T, Tq, page = num_tokens, decode_query_size, page_size
+    ppb = bkv // page
+    page_indices = page_indices.reshape(-1)
+    pps = page_indices.shape[0] // N
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    local = _local_cache_len(kv_lens - q_lens, cp_group_size, cp_rank[0], page).astype(jnp.int32)
+    if num_decode_seqs is not None:
+        # Sequences past the decode range (padding) may carry stale lengths and
+        # page tables: give them no work.
+        local = jnp.where(jnp.arange(N) < num_decode_seqs, local, 0)
+    if pps % ppb:
+        # Whole blocks of page-table entries (the padding is never fetched).
+        pad = ppb - pps % ppb
+        page_indices = jnp.pad(page_indices.reshape(N, pps), ((0, 0), (0, pad))).reshape(-1)
+        pps += pad
+    local = jnp.minimum(local, pps * page)
+    rsrc, rdl, rcov = build_block_runs(page_indices, N, ppb)
+    t_idx = jnp.arange(Tq, dtype=jnp.int32)
+    tok = cu_q_lens[:N, None] + t_idx[None, :]
+    q_idx = jnp.clip(tok, 0, T - 1).reshape(-1).astype(jnp.int32)
+    q_ok = (t_idx[None, :] < q_lens[:, None]).reshape(-1)
+    r_idx = jnp.arange(T, dtype=jnp.int32)
+    seq_of_tok = jnp.sum((cu_q_lens[None, 1:] <= r_idx[:, None]).astype(jnp.int32), axis=1)
+    seq_of_tok = jnp.minimum(seq_of_tok, N - 1)
+    t_of_tok = jnp.clip(r_idx - cu_q_lens[seq_of_tok], 0, Tq - 1)
+    row = (seq_of_tok * Tq + t_of_tok).astype(jnp.int32)
+    row_ok = (r_idx < cu_q_lens[N]) & (local[seq_of_tok] > 0)
+    return DecodeMeta(local, page_indices, rsrc, rdl, rcov, q_idx, q_ok, row, row_ok)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
         "sm_scale",
         "k_scale",
         "v_scale",
-        "cp_group_size",
         "decode_query_size",
         "bkv",
         "group",
         "depth",
-        "issue_mode",
         "pv_mode",
+        "chunk",
         "dbg",
         "vmem_limit_bytes",
     ),
 )
-def decode_cache_pass(
+def run(
     queries: jax.Array,  # [T, H, D]
     kv_cache: jax.Array,  # [P, 2*KVH, Dp, pack, page] fp8 (SEQ_ALONG_LANE)
-    kv_lens: jax.Array,  # [N] global length incl. this step's tokens
-    page_indices: jax.Array,  # [N * pages_per_seq] rank-local pages
-    cu_q_lens: jax.Array,  # [N + 1]
-    cp_rank: jax.Array,  # [1] int32
-    num_decode_seqs: jax.Array | None = None,  # scalar: distribution[0]
+    meta: DecodeMeta,
     *,
     sm_scale: float,
     k_scale: float | None,
     v_scale: float | None,
-    cp_group_size: int,
     decode_query_size: int,
     bkv: int = 4096,
     group: int = 8,
     depth: int = 2,
-    issue_mode: str = "runs",
     pv_mode: str = "bf16",
+    chunk: int = 4096,
     dbg: str = "",
     vmem_limit_bytes: int = 60 << 20,
 ) -> tuple[jax.Array, jax.Array]:
-    """DCP CACHE_ONLY pass over this rank's KV shard.
-
-    Every sequence below `num_decode_seqs` must have q_len <= decode_query_size
-    (callers check); sequences at or past it are skipped.
-    Returns (out [T, H, D] in the query dtype, lse [T, H] f32); rows of
-    sequences with no local cache get out 0 and lse -inf.
-    """
+    """The per-layer part of decode_cache_pass (see prepare)."""
     T, H, D = queries.shape
-    N = kv_lens.shape[0]
+    N = meta.local.shape[0]
     P, kvh2, dp, pack, page = kv_cache.shape
     assert kvh2 == 2, "decode_v2 supports one KV head per device"
     assert bkv % page == 0
     ppb = bkv // page
-    page_indices = page_indices.reshape(-1)
-    pages_per_seq = page_indices.shape[0] // N
+    pages_per_seq = meta.page_indices.shape[0] // N
     Tq = decode_query_size
     R = Tq * H
-
-    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
-    cache_lens = kv_lens - q_lens
-    local = _local_cache_len(cache_lens, cp_group_size, cp_rank[0], page).astype(jnp.int32)
-    if num_decode_seqs is not None:
-        # Sequences past the decode range (padding) may carry stale lengths and
-        # page tables: give them no work.
-        local = jnp.where(jnp.arange(N) < num_decode_seqs, local, 0)
-    if pages_per_seq % ppb:
-        # Whole blocks of page-table entries (the padding is never fetched).
-        pad = ppb - pages_per_seq % ppb
-        page_indices = jnp.pad(page_indices.reshape(N, pages_per_seq), ((0, 0), (0, pad))).reshape(-1)
-        pages_per_seq += pad
-    local = jnp.minimum(local, pages_per_seq * page)
     max_items = N * (pages_per_seq // ppb)
     # VMEM: K/V slots plus the resident q / out / lse blocks; halve the group
     # until it fits (large batch buckets).
     io_bytes = N * R * D * 2 * jnp.dtype(queries.dtype).itemsize + N * R * _LANES * 4
     while group > 1 and group * depth * bkv * dp * pack * 2 + io_bytes > (vmem_limit_bytes * 3) // 4:
         group //= 2
-    one = jnp.zeros((1,), jnp.int32)
-    runlen = build_run_lengths(page_indices, N, ppb) if issue_mode == "loop" else one
-    if issue_mode == "runs":
-        rsrc, rdl, rcov = build_block_runs(page_indices, N, ppb)
-    else:
-        rsrc, rdl, rcov = one, one, one
 
     # Queries per sequence: row t * H + h of sequence s is token cu[s] + t, head h.
     scale = float(sm_scale) * (1.0 if k_scale is None else float(k_scale))
-    t_idx = jnp.arange(Tq, dtype=jnp.int32)
-    tok = cu_q_lens[:N, None] + t_idx[None, :]  # [N, Tq]
-    tok_ok = t_idx[None, :] < q_lens[:, None]
-    q_seq = jnp.take(queries, jnp.clip(tok, 0, T - 1).reshape(-1), axis=0).reshape(N, Tq, H, D)
-    q_seq = jnp.where(tok_ok[:, :, None, None], q_seq.astype(F32) * scale, 0.0)
+    q_seq = jnp.take(queries, meta.q_idx, axis=0)  # [N * Tq, H, D]
+    q_seq = jnp.where(meta.q_ok[:, None, None], q_seq.astype(F32) * scale, 0.0)
     q_seq = q_seq.astype(queries.dtype).reshape(N, R, D)
 
     kernel = functools.partial(
@@ -535,14 +598,16 @@ def decode_cache_pass(
         pages_per_seq=pages_per_seq,
         group=group,
         depth=depth,
-        issue_mode=issue_mode,
+        issue_mode="runs",
         pv_mode=pv_mode,
+        chunk=min(chunk, bkv),
         v_scale=v_scale,
         out_dtype=queries.dtype,
         dbg=dbg,
     )
     vmem = pltpu.VMEM
     num_slots = group * depth
+    one = jnp.zeros((1,), jnp.int32)
     o_seq, lse_seq = pl.pallas_call(
         kernel,
         out_shape=(
@@ -571,24 +636,54 @@ def decode_cache_pass(
             vmem_limit_bytes=vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        name=f"RPAd2-{issue_mode}-{pv_mode}-p{page}-k{bkv}-g{group}-d{depth}",
+        name=f"RPAd2-{pv_mode}-p{page}-k{bkv}-g{group}-d{depth}",
         **_interpret_kwargs(),
-    )(local, page_indices, runlen, rsrc, rdl, rcov, q_seq, kv_cache)
+    )(meta.local, meta.page_indices, one, meta.rsrc, meta.rdl, meta.rcov, q_seq, kv_cache)
 
-    has = (local > 0)[:, None]
-    lse_seq = jnp.where(has, lse_seq[:, :, 0], -jnp.inf)  # [N, R]
-    o_seq = jnp.where(has[:, :, None], o_seq, jnp.zeros_like(o_seq))
-    # Back to token rows: token r is row t of sequence s with cu[s] <= r < cu[s+1].
-    r_idx = jnp.arange(T, dtype=jnp.int32)
-    seq_of_tok = jnp.sum((cu_q_lens[None, 1:] <= r_idx[:, None]).astype(jnp.int32), axis=1)
-    seq_of_tok = jnp.minimum(seq_of_tok, N - 1)
-    t_of_tok = jnp.clip(r_idx - cu_q_lens[seq_of_tok], 0, Tq - 1)
-    row = seq_of_tok * Tq + t_of_tok
-    o = jnp.take(o_seq.reshape(N * Tq, H, D), row, axis=0)
-    lse = jnp.take(lse_seq.reshape(N * Tq, H), row, axis=0)
-    tok_valid = r_idx < cu_q_lens[N]
-    lse = jnp.where(tok_valid[:, None], lse, -jnp.inf)
+    # Back to token rows; rows of padding tokens or of sequences without cache
+    # get out 0 and lse -inf.
+    o = jnp.take(o_seq.reshape(N * Tq, H, D), meta.row, axis=0)
+    lse = jnp.take(lse_seq[:, :, 0].reshape(N * Tq, H), meta.row, axis=0)
+    o = jnp.where(meta.row_ok[:, None, None], o, jnp.zeros_like(o))
+    lse = jnp.where(meta.row_ok[:, None], lse, -jnp.inf)
     return o, lse
+
+
+def decode_cache_pass(
+    queries: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cp_rank: jax.Array,
+    num_decode_seqs: jax.Array | None = None,
+    *,
+    cp_group_size: int,
+    decode_query_size: int,
+    bkv: int = 4096,
+    **run_kwargs,
+) -> tuple[jax.Array, jax.Array]:
+    """DCP CACHE_ONLY pass over this rank's KV shard: prepare() + run().
+
+    Every sequence below `num_decode_seqs` must have q_len <= decode_query_size
+    (callers check); sequences at or past it are skipped.
+    Returns (out [T, H, D] in the query dtype, lse [T, H] f32); rows of
+    sequences with no local cache get out 0 and lse -inf.
+    """
+    meta = prepare(
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        cp_rank,
+        num_decode_seqs,
+        num_tokens=queries.shape[0],
+        cp_group_size=cp_group_size,
+        decode_query_size=decode_query_size,
+        page_size=kv_cache.shape[-1],
+        bkv=bkv,
+    )
+    run_kwargs.pop("issue_mode", None)  # always "runs" (the others were measurement variants)
+    return run(queries, kv_cache, meta, decode_query_size=decode_query_size, bkv=bkv, **run_kwargs)
 
 
 def supported(

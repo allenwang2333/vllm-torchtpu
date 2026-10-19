@@ -77,7 +77,7 @@ def carry(out, args):
 
 
 kv, q, knew, lens, pidx, cu = build(N)
-for rank in (0, 3):
+for rank in (() if os.environ.get("CP_MULTI_ONLY") == "1" else (0, 3)):
     for name, dist in (("decode", jnp.array([N, N, N], jnp.int32)),
                        ("mixed", jnp.array([N - 1, N - 1, N], jnp.int32))):
         res = {}
@@ -101,3 +101,43 @@ for rank in (0, 3):
              nan_v2=bool(np.isnan(o1[rows]).any()),
              ops_over_50us_old=big0, ops_over_50us_v2=big1)
 print("CPTEST_DONE", flush=True)
+
+
+# Four "layers" in one program (same metadata, different queries), as in the
+# engine's forward: device time per layer including all glue, old vs v2.
+def multi(use_v2, rank, layers=4):
+    one = entry(use_v2, rank).__wrapped__ if hasattr(entry(use_v2, rank), "__wrapped__") else None
+    fn = functools.partial(
+        CP._pallas_rpa_kernel_dcp,
+        q_scale=None, k_scale=1.0, v_scale=1.0,
+        sliding_window=None, sm_scale=1 / 16, soft_cap=None,
+        cp_group_size=DCP, cp_rank_val=rank,
+        attention_scope=C.AttentionScope.CACHE_ONLY,
+        kv_layout=C.KVLayout.SEQ_ALONG_LANE, decode_query_size=T,
+        use_decode_v2=use_v2)
+    del one
+
+    @functools.partial(jax.jit, donate_argnums=(0,))
+    def f(kv, q, knew, lens, pidx, cu, dist):
+        outs = []
+        for i in range(layers):
+            kv, out, lse = fn(kv, q * (1.0 + 0.01 * i), knew, knew, lens, pidx, cu, dist)
+            lf = lse.astype(jnp.float32)
+            outs.append(out.astype(jnp.float32).sum() + jnp.where(jnp.isfinite(lf), lf, 0.0).sum())
+        return kv, jnp.stack(outs)
+
+    return f
+
+
+dist = jnp.array([N, N, N], jnp.int32)
+for use_v2, sel in ((False, "1"), (True, "0"), (True, "1")):
+    os.environ["TPU_RPA_DECODE_V2_SELECT"] = sel
+    jax.clear_caches()
+    args = (jnp.copy(kv), q, knew, lens, pidx, cu, dist)
+    t, out, _ = devtime.device_times(multi(use_v2, 0), args, iters=3, carry=carry)
+    total = sum(sum(v) for v in t.values()) / 3
+    nested = sum(sum(v) for k, v in t.items() if k.startswith("cond") or k.startswith("conditional")) / 3
+    top = sorted(((k, round(sum(v) / 3, 1), len(v) // 3) for k, v in t.items()), key=lambda r: -r[1])[:12]
+    emit(mode="4layers", use_v2=use_v2, select=sel, us_per_layer_total=round(total / 4, 1),
+         us_per_layer_excl_cond_wrappers=round((total - nested) / 4, 1), top=top)
+print("CPTEST_MULTI_DONE", flush=True)

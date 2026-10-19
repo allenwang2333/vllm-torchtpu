@@ -34,8 +34,9 @@ AP.add_argument("--bkv", type=int, default=0)
 AP.add_argument("--slots", type=int, default=4)
 AP.add_argument("--groups", default="1,2")
 AP.add_argument("--depth", type=int, default=2)
-AP.add_argument("--issues", default="runs,pages,loop")
+AP.add_argument("--issues", default="runs")
 AP.add_argument("--pvs", default="bf16,fp8x2")
+AP.add_argument("--chunk", type=int, default=4096)
 A = AP.parse_args()
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as C  # noqa: E402
@@ -156,7 +157,7 @@ def run_v2(c, kv, rank, sm_scale, group, issue, pv):
     out, lse = V2.decode_cache_pass(
         q, kv, kv_lens, pidx, cu, jnp.array([rank], jnp.int32),
         sm_scale=sm_scale, k_scale=1.0, v_scale=1.0, cp_group_size=DCP,
-        decode_query_size=c["Tq"], bkv=c["bkv"], group=group, depth=A.depth, issue_mode=issue, pv_mode=pv)
+        decode_query_size=c["Tq"], bkv=c["bkv"], group=group, depth=A.depth, issue_mode=issue, pv_mode=pv, chunk=A.chunk)
     return np.asarray(out.astype(jnp.float32), np.float64), np.asarray(lse, np.float64)
 
 
