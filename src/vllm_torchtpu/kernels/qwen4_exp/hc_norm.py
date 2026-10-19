@@ -17,28 +17,24 @@ def _norm_kernel(input_ref, weight_ref, output_ref, *, hidden, branches, eps):
         start = branch * hidden
         segment = values[:, start : start + hidden]
         variance = jnp.mean(segment * segment, axis=-1, keepdims=True)
-        # The current Torch/XLA prefill HLO rounds each normalized branch to
-        # BF16, then rounds branch * weight to BF16 before adding it back.
-        # Keep both boundaries while eliminating the branch materializations.
-        normalized = (
-            (segment * jax.lax.rsqrt(variance + eps))
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
-        scaled = (
-            (normalized * weight[None, start : start + hidden])
-            .astype(jnp.bfloat16)
-            .astype(jnp.float32)
-        )
+        # Match upstream grouped Gemma RMSNorm: round only the stored output.
+        normalized = segment * jax.lax.rsqrt(variance + eps)
+        scaled = normalized * weight[None, start : start + hidden]
         pieces.append(normalized + scaled)
     output_ref[...] = jnp.concatenate(pieces, axis=-1).astype(jnp.bfloat16)
 
 
 @functools.partial(jax.jit, static_argnames=("branches", "hidden", "eps", "token_tile"))
 def _normalize(input_tensor, weight, *, branches, hidden, eps, token_tile):
+    if branches <= 0 or hidden <= 0 or hidden % 128:
+        raise ValueError("HC norm requires positive branches and 128-aligned hidden")
+    # This vector-only kernel also supports the model's 64-row norm tiles.
+    if token_tile <= 0 or token_tile % 64:
+        raise ValueError("HC norm requires positive 64-aligned token tiles")
     tokens, width = input_tensor.shape
     if (
-        tokens % token_tile
+        tokens == 0
+        or tokens % token_tile
         or width != branches * hidden
         or weight.shape != (width,)
         or input_tensor.dtype != jnp.bfloat16
