@@ -25,6 +25,10 @@ local serverImage = cdk.var('IMAGE', 'us-central1-docker.pkg.dev/cloud-ullm-infe
 // editable /workspace/vllm-torchtpu/src before the patches below. Pair it with the nightly built from
 // the same dependency pins; empty runs the image's own source.
 local vllmTorchtpuSrc = cdk.var('VLLM_TORCHTPU_SRC', '');
+// gs:// path of a vllm-rs binary (vLLM's Rust API-server frontend, as the B200 reference serves with) built for
+// the image's vLLM version. The image ships vLLM without it; this installs it where VLLM_RUST_FRONTEND_PATH=auto
+// looks. It is only used with SERVER_EXTRA_ENV=VLLM_USE_RUST_FRONTEND=1.
+local vllmRsBin = cdk.var('VLLM_RS_BIN', '');
 local clientImage = cdk.var('BENCH_IMAGE', 'us-central1-docker.pkg.dev/cloud-tpu-inference-test/inferencex/inferencex-agentx:latest');
 
 local modelPath = cdk.var('MODEL_PATH', 'deepseek-ai/DeepSeek-V4-Pro-0813');
@@ -33,6 +37,10 @@ local gcsCkptDir = cdk.var('GCS_CKPT_DIR', 'gs://cloud-devkit/ckpt/hf/deepseek-a
 local gcsModelSrc = cdk.var('GCS_MODEL_SRC', gcsCkptDir);
 local gcsDatasetCache = cdk.var('GCS_DATASET_CACHE', 'gs://cloud-devkit/datasets/hf_cache/semianalysisai/cc-traces-weka-062126');
 local sharedCachePvc = cdk.var('SHARED_CACHE_PVC', '');
+// WEIGHTS_PVC=<claim>: mount a pre-populated read-only checkpoint disk at /models (the checkpoint at
+// /models/DeepSeek-V4-Pro-0813, as in gxd-dsv4-pro-weights-rox-pvc) instead of syncing the checkpoint from GCS
+// into a fresh 1500Gi premium-rwo volume per pod, whose provisioning often times out the 15 min pending deadline.
+local weightsPvc = cdk.var('WEIGHTS_PVC', '');
 local hfStorageSize = cdk.var('HF_STORAGE_SIZE', '1500Gi');
 
 // --- Cluster shape -----------------------------------------------------------
@@ -107,6 +115,9 @@ local port = cdk.numVar('PORT', 47903);
 // still shard experts across all DP x TP = 16 ranks.
 local dataParallelSize = cdk.numVar('DATA_PARALLEL_SIZE', 16);
 local tensorParallelSize = cdk.numVar('TENSOR_PARALLEL_SIZE', 1);
+// EXPERT_PARALLEL=false shards the MoE experts tensor-parallel over the TP group instead (the B200 TP8 reference
+// passes no --enable-expert-parallel). The fused EP kernel and TPU_EXPERT_PLACEMENT need expert parallelism.
+local expertParallel = cdk.boolVar('EXPERT_PARALLEL', true);
 local maxModelLen = cdk.numVar('MAX_MODEL_LEN', 1048576);
 // Evolve defaults (forge run x2vw65z3, j-9fc3926b: 86,862 vs 69,267 total tok/s for the values in the notes
 // below, j-c7c6502d): every step carries at most a 128-token prefill chunk, so the DP-wide bucket stays
@@ -441,8 +452,9 @@ local serveArgs = [
   '--enable-prompt-tokens-details',
   '--kv-cache-dtype=%s' % kvCacheDtype,
   '--safetensors-load-strategy=prefetch',
-  '--enable-expert-parallel',
-  '--enable-ep-weight-filter',
+]
++ (if expertParallel then ['--enable-expert-parallel', '--enable-ep-weight-filter'] else [])
++ [
   '--gpu-memory-utilization=%s' % gpuMemoryUtilization,
   '"${OFFLOAD_ARGS[@]}"',
 ]
@@ -497,6 +509,11 @@ local serverScript = agentx.fill(
     HEAD_ADDR="@HEAD_ADDR@"
     echo "Resolved Ray head address (HEAD_ADDR) as: ${HEAD_ADDR}"
 
+    if [ -n "${VLLM_RS_BIN:-}" ]; then
+      VLLM_RS_DST="$(python3 -c 'import importlib.util, os; print(os.path.join(os.path.dirname(importlib.util.find_spec("vllm").origin), "vllm-rs"))')"
+      gcloud storage cp "${VLLM_RS_BIN}" "$VLLM_RS_DST" || exit 1
+      chmod +x "$VLLM_RS_DST" && echo "Installed vllm-rs from ${VLLM_RS_BIN} at $VLLM_RS_DST: $("$VLLM_RS_DST" --version 2>&1 | head -1)"
+    fi
     if [ -n "${VLLM_TORCHTPU_SRC:-}" ]; then
       echo "Replacing /workspace/vllm-torchtpu/src with ${VLLM_TORCHTPU_SRC}..."
       rm -rf /tmp/vllm-torchtpu-src && mkdir -p /tmp/vllm-torchtpu-src
@@ -525,7 +542,12 @@ local serverScript = agentx.fill(
       python3 -m py_compile "$PAW_SCHED_PATH" && echo "Patched PrefixAwareScheduler compiled successfully"
     fi
 
-    if [ -d "/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813" ]; then
+    if [ -d "/models/DeepSeek-V4-Pro-0813" ]; then
+      echo "Found DeepSeek-V4 on the read-only weights PVC at /models/DeepSeek-V4-Pro-0813"
+      export MODEL_PATH="/models/DeepSeek-V4-Pro-0813"
+      export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
+      export HF_HUB_OFFLINE=1
+    elif [ -d "/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813" ]; then
       echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export MODEL_PATH="/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
@@ -680,7 +702,9 @@ local serverVolumes = [
   hfTokenVolume,
   agentx.memoryVolume('dshm', '300Gi'),
 ] + (
-  if sharedCachePvc != '' then [
+  if weightsPvc != '' then [
+    { name: 'model-weights', persistentVolumeClaim: { claimName: weightsPvc, readOnly: true } },
+  ] else if sharedCachePvc != '' then [
     agentx.sharedCacheVolume(sharedCachePvc, name='vllm-shared-cache'),
   ] else [
     {
@@ -706,7 +730,9 @@ local serverVolumeMounts = [
   agentx.hfTokenMount(),
   agentx.mount('dshm', '/dev/shm'),
 ] + (
-  if sharedCachePvc != '' then [
+  if weightsPvc != '' then [
+    { name: 'model-weights', mountPath: '/models', readOnly: true },
+  ] else if sharedCachePvc != '' then [
     agentx.sharedCacheMount('vllm-shared-cache', '/vllm-cache'),
   ] else [
     agentx.mount('huggingface-storage', '/root/.cache/huggingface/'),
@@ -730,6 +756,7 @@ local serverJob = cdk.job(
         SERVED_MODEL_NAME: servedModelName,
         GCS_CKPT_DIR: gcsCkptDir,
         VLLM_TORCHTPU_SRC: vllmTorchtpuSrc,
+        VLLM_RS_BIN: vllmRsBin,
         HF_HUB_OFFLINE: cdk.var('HF_HUB_OFFLINE', '1'),
         JOBSET_JOB_INDEX: { valueFrom: { fieldRef: { fieldPath: "metadata.labels['jobset.sigs.k8s.io/job-index']" } } },
         POD_NAMESPACE: { valueFrom: { fieldRef: { fieldPath: 'metadata.namespace' } } },
