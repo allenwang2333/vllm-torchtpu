@@ -31,6 +31,7 @@ a multiple of 32), contiguous per-layer KV caches [NKV, S, HD] fp8, dense per-la
 """
 
 import dataclasses
+import os
 
 import jax
 import jax.numpy as jnp
@@ -208,7 +209,8 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                 P.bmatmul(W["xb"], lw["sgate_w"], W["sg"], tm=tl.tm)
             with jax.named_scope(f"L{li}_moe_route"):
                 P.moe_route(W["lg"], W["topi"], W["topw"], W["rank"], W["cnt"], e=c.E, topk=c.TOPK,
-                            tm=tl.tm_route)
+                            tm=tl.tm_route, simulate_uniform=SIM_UNIFORM,
+            salt=li)
             with jax.named_scope(f"L{li}_moe_experts"):
                 P.moe_experts(W["xf"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
                               lw["w2"], lw["w2_s"], W["ys"], W["pos"], W["cpos"], e=c.E,
@@ -276,6 +278,9 @@ class StageLayout:
     def n_regions(self):
         return max(self.layer_region) + 1
 
+
+# vLLM's routing simulation, honored so the megakernel and the stock MoE run the same load.
+SIM_UNIFORM = os.environ.get("VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "") == "uniform_random"
 
 META = ("tile_seg", "seg_start", "seg_len", "seg_ctx", "bt", "gslot0", "gslot1", "gslot2")
 
@@ -404,7 +409,8 @@ def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, p
                 P.bmatmul(W["xb"], lw["sgate_w"], W["sg"], tm=tl.tm)
             with jax.named_scope(f"L{li}_moe_route"):
                 P.moe_route(W["lg"], W["topi"], W["topw"], W["rank"], W["cnt"], e=c.E,
-                            topk=c.TOPK, tm=tl.tm_route)
+                            topk=c.TOPK, tm=tl.tm_route, simulate_uniform=SIM_UNIFORM,
+            salt=li)
             with jax.named_scope(f"L{li}_moe_experts"):
                 P.moe_experts(W["xf"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
                               lw["w2"], lw["w2_s"], W["ys"], W["pos"], W["cpos"], e=c.E,

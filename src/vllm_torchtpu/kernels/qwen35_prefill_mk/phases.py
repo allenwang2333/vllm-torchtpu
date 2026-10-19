@@ -705,14 +705,19 @@ def att_gate_quant(o_hbm, att_hbm, xq_hbm, xs_hbm, *, nh, hd, tm):
 # ------------------------------------------------------------------------------------------------
 
 
-def moe_route(logits_hbm, topi_hbm, topw_hbm, rank_hbm, counts_hbm, *, e, topk, tm):
+def moe_route(logits_hbm, topi_hbm, topw_hbm, rank_hbm, counts_hbm, *, e, topk, tm,
+              simulate_uniform=False, salt=0):
     """Softmax over the router logits, top-k renormalized, and for every (token, slot) its rank
     among the earlier tokens routed to the same expert, so that grouped rows keep token order.
 
     logits [T, E] bf16 -> topi [T, K] i32, topw [T, K] f32, rank [T, K] i32 and counts [1, E]
     i32 (tokens per expert). A token's K experts are distinct, so with H the tile's one-hot rows
     summed over slots, rank(t, k) = (strictly-lower-triangular prefix of H)[t, id] plus the
-    running counts of earlier tiles."""
+    running counts of earlier tiles.
+
+    simulate_uniform (profiling only, like vLLM's VLLM_MOE_ROUTING_SIMULATION_STRATEGY=
+    uniform_random): each token takes K distinct pseudo-random experts (a per-token hash, an odd
+    stride over the E experts) with equal weights, whatever the logits."""
     t = logits_hbm.shape[0]
 
     def run(run_ref, sem):
@@ -723,16 +728,25 @@ def moe_route(logits_hbm, topi_hbm, topw_hbm, rank_hbm, counts_hbm, *, e, topk, 
         strict_lower = (c_i < r_i).astype(BF16)
 
         def body(lg_ref, ti_ref, tw_ref, rk_ref):
-            lg = lg_ref[...].astype(F32)
-            p = jnp.exp(lg - jnp.max(lg, -1, keepdims=True))
-            p = p / jnp.sum(p, -1, keepdims=True)
             ids, wts = [], []
-            for _ in range(topk):
-                mx = jnp.max(p, -1, keepdims=True)
-                idx = jnp.min(jnp.where(p == mx, lane, e), -1, keepdims=True)  # lowest id on ties
-                ids.append(idx)
-                wts.append(mx)
-                p = jnp.where(lane == idx, -1.0, p)
+            if simulate_uniform:
+                tok = jax.lax.broadcasted_iota(jnp.int32, (tm, 1), 0) + pl.program_id(0) * tm
+                h = (tok * 1103515245 + 12345 + salt * 2654435761) & 0x7FFFFFFF
+                base = (h >> 8) % e
+                for kk in range(topk):
+                    ids.append((base + kk * 37) % e)          # 37 odd: distinct for K < E
+                    wts.append(jnp.full((tm, 1), 1.0, F32))
+            else:
+                lg = lg_ref[...].astype(F32)
+                p = jnp.exp(lg - jnp.max(lg, -1, keepdims=True))
+                p = p / jnp.sum(p, -1, keepdims=True)
+                for _ in range(topk):
+                    mx = jnp.max(p, -1, keepdims=True)
+                    # lowest id on ties
+                    idx = jnp.min(jnp.where(p == mx, lane, e), -1, keepdims=True)
+                    ids.append(idx)
+                    wts.append(mx)
+                    p = jnp.where(lane == idx, -1.0, p)
             hot = jnp.zeros((tm, e), F32)
             for idx in ids:
                 hot = hot + (lane == idx).astype(F32)
@@ -1262,7 +1276,8 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
         def wait(slot):
             for p in range(npg):
                 for dst in (kbuf, vbuf):
-                    pltpu.make_async_copy(pool_hbm.at[0, 0], dst.at[slot, :, :, pl.ds(p * PAGE, PAGE)],
+                    pltpu.make_async_copy(pool_hbm.at[0, 0],
+                                          dst.at[slot, :, :, pl.ds(p * PAGE, PAGE)],
                                           sems.at[slot]).wait()
 
         def body(q_ref, o_ref):
