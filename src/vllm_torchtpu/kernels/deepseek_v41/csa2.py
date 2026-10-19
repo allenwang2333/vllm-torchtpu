@@ -258,6 +258,7 @@ def main_kernel(
 
     def transfer_group(request_index, t0, bank, *, wait=False):
         with jax.named_scope("query_kv_dma_wait" if wait else "query_kv_dma_start"):
+
             def per_query():
                 @pl.loop(0, group_count(request_index, t0))
                 def transfer(i):
@@ -340,7 +341,9 @@ def main_kernel(
                 source_q = jnp.minimum(
                     end - 1,
                     start
-                    + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
+                    + jnp.maximum(
+                        0, anchor + wanted * 128 + 127 - first_query_position
+                    ),
                 )
                 rows = pl.ds(slot * 128, 128)
                 keep = jnp.ones((128, 1), jnp.bool_)
@@ -523,7 +526,9 @@ def main_kernel(
                         for mxu in range(2):
                             ns = pl.ds(mxu * 256, 256)
                             rhs = (
-                                main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
+                                main_bf16_ref[i, ks, ns]
+                                if pv
+                                else main_bf16_ref[i, ns, ks]
                             )
                             pltpu.matmul_push_rhs(
                                 rhs, staging_register=0, mxu_index=mxu, transpose=not pv
@@ -552,13 +557,13 @@ def main_kernel(
             if not interpret:
                 csa_launch(0, 0, pv=False)
 
-            def softmax(i, addr, *, has_next=True):
+            def prepare_logits(i, addr, *, has_next=True):
                 if has_next:
                     dequant(i + 1)
                 if not interpret and has_next:
                     csa_launch(i + 1, mrb_stride - addr, pv=False)
                 main_logits = csa_pop(i, addr, pv=False) * scale
-                with jax.named_scope("softmax"):
+                with jax.named_scope("softmax_prepare"):
                     main_count = main_lengths_ref[t0 + i]
                     main_logits = jnp.where(
                         jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
@@ -567,10 +572,12 @@ def main_kernel(
                     key_positions = jnp.concatenate(
                         (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
                     )
-                    # Concatenate integer boundaries before constructing the boolean mask.
+                    # Concatenate integer boundaries before constructing the mask.
                     unique = key_positions >= jnp.concatenate(
                         tuple(
-                            jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
+                            jnp.full(
+                                (128,), anchor + swa_cache_ids[slot] * 128, jnp.int32
+                            )
                             for slot in range(2)
                         )
                     )
@@ -578,35 +585,60 @@ def main_kernel(
                         key_positions >= jnp.maximum(0, p0 + i - window_size + 1)
                     ) & (key_positions <= p0 + i)
                     if swa_bounds_ref is not None:
-                        swa_valid = (key_positions >= swa_bounds_ref[request_index, 0]) & (
-                            key_positions < swa_bounds_ref[request_index, 1]
-                        )
+                        swa_valid = (
+                            key_positions >= swa_bounds_ref[request_index, 0]
+                        ) & (key_positions < swa_bounds_ref[request_index, 1])
                     if swa_metadata_ref is not None:
                         swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
                     swa_logits = jnp.where(
-                        (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
+                        (swa_valid & unique)[None, :],
+                        swa_score_ref[i] * scale,
+                        -jnp.inf,
                     )
-                    # Keep both branches in one FP32 softmax tile; round only P.
-                    logits = jnp.concatenate((main_logits, swa_logits), axis=1)
-                    maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+                    return jnp.concatenate((main_logits, swa_logits), axis=1)
+
+            def normalize_logits(logits):
+                with jax.named_scope("softmax"):
+                    tile_sink = jnp.concatenate(
+                        (sink,) * (logits.shape[0] // num_heads), axis=0
+                    )
+                    maximum = jnp.maximum(
+                        tile_sink, jnp.max(logits, axis=1, keepdims=True)
+                    )
                     exponentials = jnp.exp(logits - maximum)
-                    denominator = jnp.exp(sink - maximum) + jnp.sum(
+                    denominator = jnp.exp(tile_sink - maximum) + jnp.sum(
                         exponentials, axis=1, keepdims=True
                     )
-                    probabilities = (exponentials / denominator).astype(jnp.bfloat16)
-                    main_p_ref[i] = probabilities[:, :512]
-                    swa_p_ref[i] = probabilities[:, 512:]
+                    return (exponentials / denominator).astype(jnp.bfloat16)
+
+            def softmax(i, addr, *, has_next=True):
+                logits = prepare_logits(i, addr, has_next=has_next)
+                probabilities = normalize_logits(logits)
+                main_p_ref[i] = probabilities[:, :512]
+                swa_p_ref[i] = probabilities[:, 512:]
 
             # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
             if 10 * mrb_stride <= 256:
 
                 def launch_tile(first, slot, *, size=2, has_next=True):
+                    # Independent query rows share one normalization to expose
+                    # more work while cross-lane reductions are in flight.
+                    logits = jnp.concatenate(
+                        tuple(
+                            prepare_logits(
+                                first + row,
+                                row * mrb_stride,
+                                has_next=row + 1 < size or has_next,
+                            )
+                            for row in range(size)
+                        ),
+                        axis=0,
+                    )
+                    probabilities = normalize_logits(logits)
                     for row in range(size):
-                        softmax(
-                            first + row,
-                            row * mrb_stride,
-                            has_next=row + 1 < size or has_next,
-                        )
+                        query_p = probabilities[row * num_heads : (row + 1) * num_heads]
+                        main_p_ref[first + row] = query_p[:, :512]
+                        swa_p_ref[first + row] = query_p[:, 512:]
                         if not interpret:
                             csa_launch(
                                 first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
@@ -625,7 +657,9 @@ def main_kernel(
                                         ((0, mxu_heads - num_heads), (0, 0)),
                                     )
                                     pltpu.matmul_acc_lhs(
-                                        accumulator(mxu, (6 + 2 * slot + row) * mrb_stride),
+                                        accumulator(
+                                            mxu, (6 + 2 * slot + row) * mrb_stride
+                                        ),
                                         lhs,
                                         load_staged_rhs=0 if row == 0 else None,
                                     )
@@ -643,7 +677,9 @@ def main_kernel(
                             swa_output = jnp.concatenate(
                                 tuple(
                                     pltpu.matmul_pop(
-                                        accumulator(mxu, (6 + 2 * slot + row) * mrb_stride)
+                                        accumulator(
+                                            mxu, (6 + 2 * slot + row) * mrb_stride
+                                        )
                                     )[:num_heads]
                                     for mxu in range(2)
                                 ),
