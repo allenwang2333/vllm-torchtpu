@@ -93,12 +93,12 @@ def take_words(words, idx, granule0, shape, dtype):
     return words[idx, start : start + nwords].view(dtype).reshape(idx.shape[0], *shape)
 
 
-def pack_bf16_rows(ssm):
+def pack_bf16_rows(values):
     """bf16 [..., D_K, D_V] -> uint32 [..., D_K // 2, D_V], packed the way a
     ref bitcast packs it: word (r, l) holds row 2r (low half) and row 2r + 1
     (high half) of lane l."""
-    pairs = ssm.astype(jnp.bfloat16).reshape(
-        *ssm.shape[:-2], ssm.shape[-2] // 2, 2, ssm.shape[-1]
+    pairs = values.astype(jnp.bfloat16).reshape(
+        *values.shape[:-2], values.shape[-2] // 2, 2, values.shape[-1]
     )
     return jax.lax.bitcast_convert_type(jnp.moveaxis(pairs, -2, -1), jnp.uint32)
 
@@ -117,11 +117,11 @@ def recurrent_granules(recurrent_shape, recurrent_dtype=jnp.float32) -> int:
     return nbytes // GRANULE
 
 
-def _recurrent_words(ssm, recurrent_dtype):
+def _recurrent_words(recurrent, recurrent_dtype):
     if jnp.dtype(recurrent_dtype) == jnp.bfloat16:
-        return pack_bf16_rows(ssm)
+        return pack_bf16_rows(recurrent)
     assert jnp.dtype(recurrent_dtype) == jnp.float32, recurrent_dtype
-    return jnp.asarray(ssm, jnp.float32).view(jnp.uint32)
+    return jnp.asarray(recurrent, jnp.float32).view(jnp.uint32)
 
 
 def write_states(pool, ssm, conv, idx, *, split, recurrent_dtype=jnp.float32):

@@ -1031,56 +1031,6 @@
       "concise_description": "Object of class `int` has no attribute `astype`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `conv_state_in_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `recurrent_in_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_conv_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_recurrent_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.vmem_ldst.load_activation_as_large`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
@@ -1099,46 +1049,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/memory_ref.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateInBufferedRef, StateInBufferedRef, OutBufferedRef, StateOutBufferedRef, StateOutBufferedRef]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `qkv_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `b_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `a_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `conv_state_in_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `recurrent_in_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `out_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref | None` is not assignable to parameter `carry_conv_scratch_ref` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref | None` is not assignable to parameter `carry_recurrent_scratch_ref` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
@@ -1169,16 +1079,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `dict[str, float | int | str]` is not assignable to parameter `metadata` with type `dict[str, str] | None` in function `jax._src.pallas.pallas_call.pallas_call`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `conv_state_out_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Ref` is not assignable to parameter `recurrent_out_slot_ref` with type `Array` in function `vllm_torchtpu.kernels.experimental.gdn_pcp_fused.kernel.inner_kernel`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/vmem_ldst.py",

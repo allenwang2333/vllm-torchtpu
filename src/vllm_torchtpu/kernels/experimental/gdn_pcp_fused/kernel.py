@@ -36,20 +36,20 @@ from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
-    b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_in_slot_ref: jax.Array,  # [seq, 1, prev_kernel_size, 1, dim_size]
-    recurrent_in_slot_ref: jax.Array,  # [seq, 1, num_v_heads, kq_head, v_head]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    conv_state_in_slot_ref: jax.Ref,  # [seq, 1, prev_kernel_size, 1, dim_size]
+    recurrent_in_slot_ref: jax.Ref,  # [seq, 1, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq, chunk, num_v_heads, v_head]
-    conv_state_out_slot_ref: jax.Array,  # [seq, window, prev_kernel_size, 1, dim]
-    recurrent_out_slot_ref: jax.Array,  # [seq, window, num_v_heads, kq, v]
+    out_slot_ref: jax.Ref,  # [seq, chunk, num_v_heads, v_head]
+    conv_state_out_slot_ref: jax.Ref,  # [seq, window, prev_kernel_size, 1, dim]
+    recurrent_out_slot_ref: jax.Ref,  # [seq, window, num_v_heads, kq, v]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
