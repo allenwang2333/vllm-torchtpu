@@ -288,8 +288,23 @@ def main_kernel(
         request_window(first_request)
         transfer_group(first_request, first_t0, 0)
 
+    def wait_output(t0, i):
+        with jax.named_scope("output_dma_wait"):
+            pltpu.make_async_copy(
+                output_ref.at[i],
+                output_hbm_ref.at[t0 + i],
+                dma_sem.at[2 + 8 * bq + i],
+            ).wait()
+
     def process_group(state):
-        request_index, t0, bank = state
+        request_index, t0, bank, previous_t0, previous_count = state
+
+        def wait_previous_output(i):
+            # Reuse each output slot only after its previous HBM write finishes.
+            @pl.when(i < previous_count)
+            def wait():
+                wait_output(previous_t0, i)
+
         start, end, first_query_position, anchor = request_info(request_index)
 
         def start_block_dma(wanted):
@@ -634,6 +649,7 @@ def main_kernel(
                                 ),
                                 axis=1,
                             )
+                    wait_previous_output(i)
                     with jax.named_scope("merge_inverse_rope"):
                         output = main_output + swa_output
                         tail = output[:, 384:]
@@ -746,6 +762,7 @@ def main_kernel(
                                 ),
                                 axis=1,
                             )
+                    wait_previous_output(i)
                     with jax.named_scope("merge_inverse_rope"):
                         output = main_output + swa_output
                         tail = output[:, 384:]
@@ -813,25 +830,27 @@ def main_kernel(
                 ),
             )
 
-        @pl.loop(0, count)
-        def wait_output(i):
-            with jax.named_scope("output_dma_wait"):
-                pltpu.make_async_copy(
-                    output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
-                ).wait()
+        # A shorter group leaves some previous output slots unused.
+        @pl.loop(count, previous_count)
+        def drain_previous_output(i):
+            wait_output(previous_t0, i)
 
         @pl.when((next_request != request_index) & (swa_prefetched_id[0] >= 0))
         def drain_request_prefetch():
             wait_block_dma(swa_prefetched_id[0])
             swa_prefetched_id[0] = -1
 
-        return next_request, next_t0, 1 - bank
+        return next_request, next_t0, 1 - bank, t0, count
 
-    lax.while_loop(
+    _, _, _, last_t0, last_count = lax.while_loop(
         lambda state: state[0] < request_limit,
         process_group,
-        (first_request, first_t0, jnp.int32(0)),
+        (first_request, first_t0, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
     )
+
+    @pl.loop(0, last_count)
+    def drain_output(i):
+        wait_output(last_t0, i)
 
     def clear_padding():
         with jax.named_scope("clear_padding"):
