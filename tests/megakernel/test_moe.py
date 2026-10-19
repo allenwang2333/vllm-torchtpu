@@ -15,13 +15,16 @@
 
 from __future__ import annotations
 
+import ast
+import pathlib
+
 import jax
 import jax.numpy as jnp
 from conftest import FakeGeometry, FakeMixerBlock, MiniCtx
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import comm, planner, stream, vmem
+from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.spec import (
@@ -30,6 +33,52 @@ from vllm_torchtpu.megakernel.spec import (
     LayerType,
     ModelSpec,
 )
+
+BLOCKS_DIR = pathlib.Path(blocks.__file__).resolve().parent
+
+# Row-count names that must never be compared to a literal inside `blocks/`.
+_ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
+# Remaining literal row-count comparisons are hardware / layout limits, not
+# per-bucket tuning (each one with its reason).
+_ALLOWED = {
+    ("moe.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
+    ("gqa.py", "ex.NS <= 64"): "GQ packs 128 // NS lanes per sequence (m | l) field",
+}
+
+
+def _row_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name) and node.id in _ROW_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in _ROW_NAMES:
+        return node.attr
+    return None
+
+
+def _is_num(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def test_blocks_have_no_row_count_literal_comparisons():
+    """Blocks read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
+    assert (BLOCKS_DIR / "moe.py").is_file()
+    found = []
+    for path in sorted(BLOCKS_DIR.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Compare):
+                continue
+            ops = [node.left, *node.comparators]
+            for a, b in zip(ops, ops[1:]):
+                pair = (_row_name(a) and _is_num(b)) or (_row_name(b) and _is_num(a))
+                if pair:
+                    key = (path.name, ast.unparse(node))
+                    if key not in _ALLOWED:
+                        found.append(f"{path.name}:{node.lineno}: {key[1]}")
+    assert not found, "row-count literal comparisons in blocks/:\n" + "\n".join(found)
 
 
 def test_moe_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):

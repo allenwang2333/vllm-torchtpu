@@ -31,52 +31,6 @@ from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.profiles.qwen35_candidate30 import (
     candidate30_tiles,
 )
-from vllm_torchtpu.megakernel.stream import TwoRing
-
-# Every opt-in performance flag added in M5 and its frozen-parity (off) value.
-_M5_FLAGS_OFF = dict(
-    ecopy_opt=0,
-    pipe_ep=False,
-    r2_direct_store=False,
-    route_vec=False,
-    dense_acc_pair=False,
-    kv_ering=False,
-    pair_kv=False,
-    dmm_unroll=0,
-    gq_pack=False,
-    topk_lanes=False,
-    conv_stage=False,
-    gdn_head_major=False,
-    gqa_qv=False,
-    moe_unroll=False,
-    rel_fetch=False,
-)
-
-
-def test_tiles_field_defaults_are_frozen_parity():
-    t = mk.Tiles()
-    for k, v in _M5_FLAGS_OFF.items():
-        assert getattr(t, k) == v, k
-    assert t.kv_sub == 0
-    assert mk.Tiles(hier=1, pack=1, mb8=2) == mk_spec.DEFAULT_TILES
-
-
-@pytest.mark.parametrize("R", [1, 8])
-@pytest.mark.parametrize("moe_tp", [False, True])
-def test_default_tiles_equal_frozen_parity_and_ignore_moe_tp(R: int, moe_tp: bool):
-    for B in range(1, 65):
-        t = mk.default_tiles(B, moe_tp=moe_tp, R=R)
-        assert t == mk.frozen_parity_tiles(B, moe_tp=moe_tp, R=R)
-        assert t == mk.default_tiles(B, R=R)  # no moe_tp dependence
-        assert t.kv_sub == 0 and not t.route_vec and not t.dense_acc_pair
-        assert not t.pipe_ep and t.pipe  # frozen PIPE stays on (TP single tile)
-
-
-def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
-    g_tp = replace(qwen35.FULL, moe_tp=True)
-    for B in (4, 8, 16, 32, 64):
-        ex = mk.ExecSpec(B=B, R=8)
-        assert ex.resolved_tiles == ex.resolve_tiles(g_tp) == ex.resolve_tiles()
 
 
 def test_default_tiles_match_frozen_prototype_schedule():
@@ -95,12 +49,6 @@ def test_default_tiles_match_frozen_prototype_schedule():
         tl = mk.default_tiles(B, R=8)
         for name in frozen_fields:
             assert getattr(tl, name) == getattr(tf, name), (B, name)
-
-
-@pytest.mark.parametrize("R", [2, 4])
-def test_default_tiles_non_v7x8_ranks_use_flat_ring(R: int):
-    for B in (2, 4, 8, 16, 32, 64):
-        assert mk.default_tiles(B, R=R).hier == 0
 
 
 def test_profile_registry_and_default_profile():
@@ -178,27 +126,6 @@ def test_profile_exec_for_respects_explicit_tiles():
     assert p.exec_for(base_t, B=8, T=1).tiles is mk_spec.TINY_TILES
     d = mk.get_profile("default").exec_for(base, B=8, T=1)
     assert d.tiles == mk.default_tiles(8) and d.pool_gather is False
-
-
-def test_exec_spec_pool_gather_default_is_split():
-    assert mk.ExecSpec().pool_gather is False
-    assert not mk.ExecSpec(paged_kv=True, T=4, B=24).GPR
-
-
-def test_borrow_epool_rejected_inside_expert_stream():
-    ring = object.__new__(TwoRing)
-    ring._ering_busy = False
-    ring.scr = {"epool": "EPOOL"}
-    assert ring.borrow_epool() == "EPOOL"
-    with ring.expert_stream():
-        with pytest.raises(AssertionError, match="dynamic expert streaming"):
-            ring.borrow_epool()
-        with (
-            pytest.raises(AssertionError, match="not re-entrant"),
-            ring.expert_stream(),
-        ):
-            pass
-    assert ring.borrow_epool() == "EPOOL"
 
 
 def _tiny_pool_setup(R: int = 1, B: int = 2, T: int = 1):

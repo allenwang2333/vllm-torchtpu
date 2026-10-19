@@ -194,3 +194,20 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
     )
     with pytest.raises(MegakernelConfigError, match="exceeds tiles.vmem_mib budget"):
         vmem.build_scratch(ms_hybrid, tiny_budget_ex)
+
+
+def test_unsupported_stream_ring_is_config_error(
+    fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
+):
+    """Unknown `WeightDecl.stream_ring` raises `MegakernelConfigError` at plan time."""
+    orig = FakeMixerBlock.weights
+
+    def _weights(
+        self: FakeMixerBlock, g: FakeGeometry, ex: ExecSpec
+    ) -> list[WeightDecl]:
+        ws = orig(self, g, ex)
+        return [dataclasses.replace(ws[0], stream_ring="bogus"), *ws[1:]]  # type: ignore[arg-type]
+
+    monkeypatch.setattr(FakeMixerBlock, "weights", _weights)
+    with pytest.raises(MegakernelConfigError, match="Unsupported stream_ring"):
+        planner.plan(make_fake_model_spec(), fake_ex)

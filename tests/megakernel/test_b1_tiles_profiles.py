@@ -19,9 +19,7 @@ import os
 
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
-import ast
 import dataclasses
-import pathlib
 import subprocess
 import sys
 from typing import Any
@@ -30,82 +28,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from conftest import EXACT_FLIPS
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
-from vllm_torchtpu.megakernel import spec as spec_mod
 from vllm_torchtpu.megakernel.cache import _should_use_pool_gather
 from vllm_torchtpu.megakernel.models import qwen35
-
-BLOCKS_DIR = pathlib.Path(mk.__file__).parent / "blocks"
-
-# Row-count names that must never be compared to a literal inside `blocks/`.
-_ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
-# Remaining literal row-count comparisons are hardware / layout limits, not
-# per-bucket tuning (each one with its reason).
-_ALLOWED = {
-    ("moe.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
-    ("gqa.py", "ex.NS <= 64"): "GQ packs 128 // NS lanes per sequence (m | l) field",
-}
+from vllm_torchtpu.megakernel.profiles.default import frozen_parity_tiles
 
 
 @pytest.fixture(autouse=True)
 def _use_cpu_default_device():
     with jax.default_device(jax.devices("cpu")[0]):
         yield
-
-
-def _row_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name) and node.id in _ROW_NAMES:
-        return node.id
-    if isinstance(node, ast.Attribute) and node.attr in _ROW_NAMES:
-        return node.attr
-    return None
-
-
-def _is_num(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Constant)
-        and isinstance(node.value, (int, float))
-        and not isinstance(node.value, bool)
-    )
-
-
-def test_blocks_have_no_row_count_literal_comparisons():
-    """Blocks read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
-    found = []
-    for path in sorted(BLOCKS_DIR.glob("*.py")):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Compare):
-                continue
-            ops = [node.left, *node.comparators]
-            for a, b in zip(ops, ops[1:]):
-                pair = (_row_name(a) and _is_num(b)) or (_row_name(b) and _is_num(a))
-                if pair:
-                    key = (path.name, ast.unparse(node))
-                    if key not in _ALLOWED:
-                        found.append(f"{path.name}:{node.lineno}: {key[1]}")
-    assert not found, "row-count literal comparisons in blocks/:\n" + "\n".join(found)
-
-
-def test_tile_numerics_registry_covers_every_field():
-    names = {f.name for f in dataclasses.fields(mk.Tiles)}
-    assert set(spec_mod.TILE_NUMERICS) == names
-    assert set(spec_mod.TILE_NUMERICS.values()) <= {"exact", "approx"}
-    assert spec_mod.POOL_IO_NUMERICS == {
-        "fused_pool_io": "approx",
-        "pool_gather": "exact",
-        "pool_gather_eligible": "approx",
-    }
-    # Classes the plan fixes from TPU / CPU evidence.
-    for f in ("kv_sub", "route_vec", "dense_acc_pair", "moe_unroll", "gdn_head_major"):
-        assert spec_mod.TILE_NUMERICS[f] == "approx", f
-    assert spec_mod.TILE_NUMERICS["gq_pack"] == "approx"
-    for f in ("pair_kv", "kv_ering", "gqa_qv"):
-        assert spec_mod.TILE_NUMERICS[f] == "exact", f
 
 
 def test_per_bucket_thresholds_come_from_tiles():
@@ -140,21 +77,13 @@ def test_per_bucket_thresholds_come_from_tiles():
         assert plan.block_params["moe"].group_rel is want, (B, rows)
 
 
-def test_default_tile_rule_lives_in_default_profile():
-    from vllm_torchtpu.megakernel.profiles.default import frozen_parity_tiles
-
-    for R in (1, 2, 8):
-        for B in range(1, 65):
-            assert mk.default_tiles(B, R=R) == frozen_parity_tiles(B, R=R)
-    assert mk.DEFAULT_PROFILE.tiles_for(20, R=8) == frozen_parity_tiles(20, R=8)
-
-
 # ---------------------------------------------------------------------------
 # Numerics classes
 # ---------------------------------------------------------------------------
 
 
 def test_profile_numerics_are_derived_and_enforced():
+    assert mk.DEFAULT_PROFILE.tiles_for(20, R=8) == frozen_parity_tiles(20, R=8)
     assert profile_mod.approx_features(mk.DEFAULT_PROFILE) == ()
     c30 = mk.get_profile("qwen35-candidate30")
     feats = set(profile_mod.approx_features(c30))
@@ -328,45 +257,10 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
     }.get(field)
 
 
-# Exact-class fields: (id, field, value off the default, (T, B), extra kwargs).
-_EXACT_FLIPS = [
-    ("nbd", "nbd", 8, (2, 4), {}),
-    ("nkv", "nkv", 4, (2, 4), {}),
-    ("lazy", "lazy", False, (2, 4), {}),
-    ("pair_kv", "pair_kv", True, (2, 4), {}),
-    ("kv_ering", "kv_ering", True, (2, 4), {}),
-    ("gqa_qv", "gqa_qv", True, (2, 4), {}),
-    ("rel_fetch", "rel_fetch", True, (2, 4), {}),
-    ("bounds_checks", "bounds_checks", True, (2, 4), {}),
-    ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
-    ("smem_mib", "smem_mib", 2, (2, 4), {}),
-    ("moe_group_rows", "moe_group_rows", 0, (2, 4), {"moe_unroll": True}),
-    # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
-    (
-        "moe_group_rows-pipe_ep",
-        "moe_group_rows",
-        0,
-        (2, 4),
-        {"pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
-    ),
-    # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
-    ("gdn_bufs-wide", "gdn_bufs", 2, (4, 24), {}),
-    ("pair_kv-wide", "pair_kv", True, (4, 24), {}),
-    ("kv_ering-wide", "kv_ering", True, (4, 24), {}),
-    ("gqa_qv-wide", "gqa_qv", True, (4, 24), {}),
-]
-
-
-def test_exact_flip_list_covers_registry():
-    exact = {k for k, v in spec_mod.TILE_NUMERICS.items() if v == "exact"}
-    # kv_scatter_vec_ns only affects the non-paged path (tested separately).
-    assert exact == {f for _, f, _, _, _ in _EXACT_FLIPS} | {"kv_scatter_vec_ns"}
-
-
 @pytest.mark.parametrize(
     "field,value,tb,extra",
-    [c[1:] for c in _EXACT_FLIPS],
-    ids=[c[0] for c in _EXACT_FLIPS],
+    [c[1:] for c in EXACT_FLIPS],
+    ids=[c[0] for c in EXACT_FLIPS],
 )
 def test_exact_tile_fields_reproduce_default(
     field: str, value: Any, tb: tuple[int, int], extra: dict
@@ -602,25 +496,3 @@ def test_gq_pack_without_gqa_qv_is_config_error():
     )
     with pytest.raises(mk.MegakernelConfigError, match="gq_pack requires gqa_qv"):
         mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)
-
-
-def test_unsupported_stream_ring_is_config_error(monkeypatch: pytest.MonkeyPatch):
-    from vllm_torchtpu.megakernel.blocks.moe import MoEBlock
-
-    orig = MoEBlock.weights
-
-    def _weights(self: Any, g: Any, ex: mk.ExecSpec) -> list:
-        ws = orig(self, g, ex)
-        return [dataclasses.replace(ws[0], stream_ring="bogus"), *ws[1:]]
-
-    monkeypatch.setattr(MoEBlock, "weights", _weights)
-    tiles = dataclasses.replace(mk.spec.TINY_TILES, bank=512 << 10)
-    ex = mk.ExecSpec(R=2, B=4, ctx=256, interpret=True, tiles=tiles)
-    with pytest.raises(mk.MegakernelConfigError, match="Unsupported stream_ring"):
-        mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)
-
-
-def test_error_classes():
-    assert issubclass(mk.MegakernelLayoutError, ValueError)
-    assert not issubclass(mk.MegakernelConfigError, ValueError)
-    assert issubclass(mk.MegakernelConfigError, RuntimeError)

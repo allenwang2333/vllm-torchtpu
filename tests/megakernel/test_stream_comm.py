@@ -365,3 +365,20 @@ def test_allreduce_ring_modes_in_pallas(R: int, hier: int, rsag: bool):
         expected = rnd(expected + rnd(expected_one))
     for r in range(R):
         assert jnp.allclose(out_all[r, : ex.B], expected, atol=2e-1, rtol=2e-2)
+
+
+def test_borrow_epool_rejected_inside_expert_stream():
+    """Verify `TwoRing.borrow_epool` is rejected while `expert_stream` is active."""
+    ring = object.__new__(stream.TwoRing)
+    ring._ering_busy = False
+    ring.scr = {"epool": "EPOOL"}
+    assert ring.borrow_epool() == "EPOOL"
+    with ring.expert_stream():
+        with pytest.raises(AssertionError, match="dynamic expert streaming"):
+            ring.borrow_epool()
+        with (
+            pytest.raises(AssertionError, match="not re-entrant"),
+            ring.expert_stream(),
+        ):
+            pass
+    assert ring.borrow_epool() == "EPOOL"

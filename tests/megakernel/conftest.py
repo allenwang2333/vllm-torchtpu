@@ -362,3 +362,32 @@ class MiniCtx:
         )
         self.scr["xb"][...] = x.astype(BF16)
         self.norm_x = x
+
+
+# Exact-class fields: (id, field, value off the default, (T, B), extra kwargs).
+EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
+    ("nbd", "nbd", 8, (2, 4), {}),
+    ("nkv", "nkv", 4, (2, 4), {}),
+    ("lazy", "lazy", False, (2, 4), {}),
+    ("pair_kv", "pair_kv", True, (2, 4), {}),
+    ("kv_ering", "kv_ering", True, (2, 4), {}),
+    ("gqa_qv", "gqa_qv", True, (2, 4), {}),
+    ("rel_fetch", "rel_fetch", True, (2, 4), {}),
+    ("bounds_checks", "bounds_checks", True, (2, 4), {}),
+    ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
+    ("smem_mib", "smem_mib", 2, (2, 4), {}),
+    ("moe_group_rows", "moe_group_rows", 0, (2, 4), {"moe_unroll": True}),
+    # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
+    (
+        "moe_group_rows-pipe_ep",
+        "moe_group_rows",
+        0,
+        (2, 4),
+        {"pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+    ),
+    # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
+    ("gdn_bufs-wide", "gdn_bufs", 2, (4, 24), {}),
+    ("pair_kv-wide", "pair_kv", True, (4, 24), {}),
+    ("kv_ering-wide", "kv_ering", True, (4, 24), {}),
+    ("gqa_qv-wide", "gqa_qv", True, (4, 24), {}),
+]
