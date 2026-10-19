@@ -100,15 +100,87 @@ def test_in_graph_rope_matches_cached_rope(rope_parameters: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    ("rope_parameters", "head_size", "max_position", "positions"),
+    ("rope_parameters", "positions"),
     [
         pytest.param(
             {"rope_type": "default", "rope_theta": 1e6, "mrope_section": [16, 24, 24]},
-            _HEAD_SIZE,
-            4096,
-            torch.tensor([[0, 1, 2, 3], [0, 4, 4, 5], [0, 7, 8, 9]]),
-            id="mrope",
+            torch.tensor([0, 1, 5, 23, 1024, 4095]),
+            id="mrope_1d",
         ),
+        pytest.param(
+            {"rope_type": "default", "rope_theta": 1e6, "mrope_section": [16, 24, 24]},
+            torch.tensor([[0, 1, 2, 3], [0, 4, 4, 5], [0, 7, 8, 9]]),
+            id="mrope_2d_chunked",
+        ),
+        pytest.param(
+            {
+                "rope_type": "default",
+                "rope_theta": 1e6,
+                "mrope_section": [24, 20, 20],
+                "mrope_interleaved": True,
+            },
+            torch.tensor([[0, 1, 2, 3], [0, 4, 4, 5], [0, 7, 8, 9]]),
+            id="mrope_2d_interleaved",
+        ),
+    ],
+)
+def test_in_graph_mrope_matches_cached_rope(
+    rope_parameters: dict, positions: torch.Tensor
+) -> None:
+    rope = _make_rope(rope_parameters)
+    query, key = _qk(positions.shape[-1])
+    ref_q, ref_k = rope(positions, query.clone(), key.clone())
+
+    num_patched = runner_utils.patch_in_graph_rotary_embedding(
+        _Model(rope), query.dtype
+    )
+
+    out_q, out_k = rope(positions, query.clone(), key.clone())
+    _assert_bitwise_equal(out_q, ref_q)
+    _assert_bitwise_equal(out_k, ref_k)
+    assert num_patched == 1
+    assert "cos_sin_cache" not in rope._buffers
+
+
+def test_in_graph_mrope_interleaved_class_matches_cached_rope() -> None:
+    from vllm.model_executor.layers.rotary_embedding import (
+        MRotaryEmbeddingInterleaved,
+    )
+
+    vllm_config = MagicMock()
+    vllm_config.compilation_config.custom_ops = ["none"]
+    with set_current_vllm_config(vllm_config):
+        rope = MRotaryEmbeddingInterleaved(
+            head_size=_HEAD_SIZE,
+            rotary_dim=64,
+            max_position_embeddings=4096,
+            base=1e6,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+            mrope_section=[11, 11, 10],
+            mrope_interleaved=True,
+        )
+    # Also perturb a few cache rows by 1 ulp to exercise the 2-D correction path.
+    rope.cos_sin_cache.view(torch.int16)[4, 3] += 1
+    rope.cos_sin_cache.view(torch.int16)[9, 40] -= 1
+    positions = torch.tensor([[0, 1, 2, 3], [0, 4, 4, 5], [0, 7, 8, 9]])
+    query, key = _qk(positions.shape[-1], dtype=torch.bfloat16)
+    ref_q, ref_k = copy.deepcopy(rope)(positions, query.clone(), key.clone())
+
+    num_patched = runner_utils.patch_in_graph_rotary_embedding(
+        _Model(rope), query.dtype
+    )
+
+    out_q, out_k = rope(positions, query.clone(), key.clone())
+    _assert_bitwise_equal(out_q, ref_q)
+    _assert_bitwise_equal(out_k, ref_k)
+    assert num_patched == 1
+    assert "cos_sin_cache" not in rope._buffers
+
+
+@pytest.mark.parametrize(
+    ("rope_parameters", "head_size", "max_position", "positions"),
+    [
         pytest.param(
             {
                 "rope_type": "yarn",

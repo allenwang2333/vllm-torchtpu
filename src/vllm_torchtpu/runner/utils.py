@@ -11,6 +11,10 @@ from typing import Any
 import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
+from vllm.model_executor.layers.rotary_embedding import (
+    MRotaryEmbedding,
+    MRotaryEmbeddingInterleaved,
+)
 from vllm.model_executor.layers.rotary_embedding.base import (
     ApplyRotaryEmb,
     RotaryEmbedding,
@@ -464,17 +468,50 @@ def _in_graph_rope_eligible(module: torch.nn.Module) -> bool:
     """Whether `module`'s cos/sin values depend only on its `inv_freq`.
 
     Holds for `RotaryEmbedding` and subclasses that override only
-    `_compute_inv_freq` (e.g. Llama3, NTK, Gemma4). Excludes M-RoPE (2-D
-    positions), variants whose cache scales positions or values (YaRN mscale,
-    linear and dynamic-NTK scaling), and variants with their own forward
+    `_compute_inv_freq` (e.g. Llama3, NTK, Gemma4), as well as
+    `MRotaryEmbedding` and `MRotaryEmbeddingInterleaved` without YaRN scaling.
+    Excludes variants whose cache scales positions or values (YaRN mscale,
+    linear and dynamic-NTK scaling) and variants with their own forward
     (DeepSeek, Fourier). Those keep their `cos_sin_cache`.
     """
     cls = type(module)
-    return (
+    if (
         isinstance(module, RotaryEmbedding)
         and cls.forward_native is RotaryEmbedding.forward_native
         and cls._compute_cos_sin_cache is RotaryEmbeddingBase._compute_cos_sin_cache
-    )
+    ):
+        return True
+    if isinstance(module, MRotaryEmbedding) and module.scaling_factor is None:
+        return cls in (MRotaryEmbedding, MRotaryEmbeddingInterleaved)
+    return False
+
+
+def _in_graph_mrope_dim_modalities(module: MRotaryEmbedding) -> tuple[int, ...] | None:
+    """Per-frequency modality index in `{0, 1, 2}` for 2-D M-RoPE positions."""
+    if isinstance(module, MRotaryEmbeddingInterleaved):
+        half = module.rotary_dim // 2
+        return tuple(int(x) for x in module.mrope_dim[:half])
+    if not module.mrope_section:
+        return None
+    half = module.rotary_dim // 2
+    if module.mrope_interleaved:
+        out: list[int] = []
+        for ch in range(half):
+            if ch % 3 == 1 and ch < module.mrope_section[1] * 3:
+                out.append(1)
+            elif (
+                ch % 3 == 2
+                and len(module.mrope_section) > 2
+                and ch < module.mrope_section[2] * 3
+            ):
+                out.append(2)
+            else:
+                out.append(0)
+        return tuple(out)
+    out = []
+    for mod_idx, count in enumerate(module.mrope_section):
+        out.extend([mod_idx] * count)
+    return tuple(out)
 
 
 # TODO: Delete the cache comparison, the correction table, the correction limit
@@ -508,7 +545,11 @@ def _in_graph_cos_sin(
     """
     # A Python-constant table traces as a graph constant, not an input.
     inv = torch.tensor(inv_freq, dtype=torch.float32, device=positions.device)
-    freqs = torch.outer(positions.to(torch.float32), inv)
+    freqs = (
+        torch.outer(positions.to(torch.float32), inv)
+        if positions.ndim == 1
+        else positions.to(torch.float32) * inv
+    )
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(cache_dtype).to(dtype)
 
 
@@ -517,6 +558,7 @@ def _in_graph_rope_forward(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor | None = None,
+    offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """`RotaryEmbedding.forward_native` computing cos/sin from positions."""
     if query.dtype != self._in_graph_rope_dtype:
@@ -524,10 +566,20 @@ def _in_graph_rope_forward(
             f"In-graph RoPE was prepared for {self._in_graph_rope_dtype} "
             f"queries, got {query.dtype}"
         )
-    positions = positions.flatten()
-    num_tokens = positions.shape[0]
+    if offsets is not None:
+        positions = positions + offsets
+    dim_modalities = self._in_graph_rope_dim_modalities
+    if positions.ndim == 2 and dim_modalities is not None:
+        num_tokens = positions.shape[-1]
+        mod_idx = torch.tensor(
+            dim_modalities, dtype=torch.long, device=positions.device
+        )
+        pos_for_freq = positions.index_select(0, mod_idx).transpose(0, 1)
+    else:
+        pos_for_freq = positions.flatten()
+        num_tokens = pos_for_freq.shape[0]
     cos_sin = _in_graph_cos_sin(
-        positions,
+        pos_for_freq,
         self._in_graph_rope_inv_freq,
         self._in_graph_rope_cache_dtype,
         self._in_graph_rope_dtype,
@@ -544,9 +596,19 @@ def _in_graph_rope_forward(
             dtype=self._in_graph_rope_dtype,
             device=positions.device,
         )
-        match = positions[:, None] == fix_positions[None, :]
-        fixed = fix_rows[match.to(torch.int32).argmax(dim=-1)]
-        cos_sin = torch.where(match.any(dim=-1, keepdim=True), fixed, cos_sin)
+        if pos_for_freq.ndim == 1:
+            match = pos_for_freq[:, None] == fix_positions[None, :]
+            fixed = fix_rows[match.to(torch.int32).argmax(dim=-1)]
+            cos_sin = torch.where(match.any(dim=-1, keepdim=True), fixed, cos_sin)
+        else:
+            pos_rep = torch.cat((pos_for_freq, pos_for_freq), dim=-1)
+            match = pos_rep[:, :, None] == fix_positions[None, None, :]
+            row_idx = match.to(torch.int32).argmax(dim=-1)
+            col_idx = torch.arange(
+                pos_rep.shape[1], dtype=torch.long, device=positions.device
+            )[None, :]
+            fixed = fix_rows[row_idx, col_idx]
+            cos_sin = torch.where(match.any(dim=-1), fixed, cos_sin)
     cos, sin = cos_sin.chunk(2, dim=-1)
 
     query_shape = query.shape
@@ -664,6 +726,11 @@ def patch_in_graph_rotary_embedding(model: torch.nn.Module, dtype: torch.dtype) 
         module._in_graph_rope_inv_freq = inv_freq_values
         module._in_graph_rope_cache_dtype = cache.dtype
         module._in_graph_rope_dtype = dtype
+        module._in_graph_rope_dim_modalities = (
+            _in_graph_mrope_dim_modalities(module)
+            if isinstance(module, MRotaryEmbedding)
+            else None
+        )
         module._in_graph_rope_fix_positions = tuple(fix_positions)
         module._in_graph_rope_fix_rows = tuple(
             tuple(row) for row in fix_rows.to("cpu", torch.float32).tolist()
@@ -671,6 +738,8 @@ def patch_in_graph_rotary_embedding(model: torch.nn.Module, dtype: torch.dtype) 
         bound = types.MethodType(_in_graph_rope_forward, module)
         module.forward_native = bound
         module._forward_method = bound
+        if isinstance(module, MRotaryEmbeddingInterleaved):
+            module.forward = bound
         for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
             module._buffers.pop(buf_name, None)
             module.__dict__.pop(buf_name, None)
