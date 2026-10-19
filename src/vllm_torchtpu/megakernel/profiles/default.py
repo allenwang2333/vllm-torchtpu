@@ -27,12 +27,11 @@ from ..spec import DEFAULT_TILES, VERIFY_TILES, WIDE_TILES, Tiles
 
 
 def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """General, frozen-parity default tiles for batch row count `B`.
+    """General default tiles for batch row count `B`.
 
-    Matches the frozen prototype's `default_tiles` (`frozen_qwen35/megakernel.py`)
-    with one numerics-neutral deviation kept since M2: `nbe=6` for `B > 48` (the
-    frozen TPU benches apply the same override so 64-row MoE scratch fits VMEM).
-    Every opt-in performance flag stays at its `Tiles` default (off). Tuned,
+    Selects the per-bucket ring depths, all-reduce mode, and VMEM budget (using
+    `nbe=6` for `B > 48` so 64-row MoE scratch fits VMEM). Every opt-in
+    performance flag stays at its `Tiles` default (off). Tuned,
     numerics-changing schedules live in named profiles (`profile.py`).
 
     `moe_tp` is accepted for signature compatibility with profile tile rules; the

@@ -161,8 +161,7 @@ NumericsClass = Literal["exact", "approx"]
 # Numerics class of every `Tiles` field (`profile.approx_features` reads this).
 # `exact`: moving the field off the `default` profile's value keeps hidden
 # states and pools bit-identical, because it only changes DMA / ring
-# scheduling, budgets or debug checks; each such claim is checked on CPU by
-# `tests/megakernel/test_b1_tiles_profiles.py`. `approx`: changes the
+# scheduling, budgets or debug checks. `approx`: changes the
 # arithmetic (matmul K-tiling, reduction / softmax order, rounding, routing) or
 # is not proven exact; profiles that move any of these are `approx`.
 TILE_NUMERICS: dict[str, NumericsClass] = {
@@ -213,12 +212,10 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
 POOL_IO_NUMERICS: dict[str, NumericsClass] = {
     "fused_pool_io": "approx",  # always runs the head-major GDN recurrence
     # GPR, auto (`Profile.pool_gather=None`): WIDE verify buckets only, where
-    # GCH is already on. CPU bitwise vs split at T=4 B=24 with the default and
-    # qwen35-candidate30 tiles.
+    # GCH is already on (bitwise vs split at T=4 B=24).
     "pool_gather": "exact",
-    # GPR on every eligible bucket (`Profile.pool_gather=True`): CPU bitwise vs
-    # split at T=4 B=8/16 with default tiles, but NOT with qwen35-candidate30
-    # tiles (pools differ at B=8, hidden and pools at B=16).
+    # GPR on every eligible bucket (`Profile.pool_gather=True`): may reassociate
+    # non-WIDE verify buckets under tuned tile schedules.
     "pool_gather_eligible": "approx",
 }
 
@@ -243,7 +240,7 @@ def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
 
 
 def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Tiles matching the frozen prototype for bit-exact parity (`== default_tiles`)."""
+    """Default per-bucket tile schedule (`== default_tiles`)."""
     return default_tiles(B, moe_tp=moe_tp, R=R)
 
 

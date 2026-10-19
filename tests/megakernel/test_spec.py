@@ -24,8 +24,8 @@ from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import spec as spec_mod
 from vllm_torchtpu.megakernel.profiles.default import frozen_parity_tiles
 
-# Every opt-in performance flag added in M5 and its frozen-parity (off) value.
-_M5_FLAGS_OFF = dict(
+# Opt-in performance flags and their default (off) values.
+_PERF_FLAGS_OFF = dict(
     ecopy_opt=0,
     pipe_ep=False,
     r2_direct_store=False,
@@ -76,7 +76,7 @@ def test_default_tile_rule_lives_in_default_profile():
 
 def test_tiles_field_defaults_are_frozen_parity():
     t = mk.Tiles()
-    for k, v in _M5_FLAGS_OFF.items():
+    for k, v in _PERF_FLAGS_OFF.items():
         assert getattr(t, k) == v, k
     assert t.kv_sub == 0
     assert mk.Tiles(hier=1, pack=1, mb8=2) == spec_mod.DEFAULT_TILES

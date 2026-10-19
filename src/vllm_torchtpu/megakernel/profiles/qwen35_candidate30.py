@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""`qwen35-candidate30`: the M5 Qwen3.5 tuning, moved out of library defaults.
+"""`qwen35-candidate30`: tuned Qwen3.5 execution profile.
 
 Select with `VLLM_TPU_MEGAKERNEL="profile=qwen35-candidate30"` or
 `additional_config={"megakernel": {"profile": "qwen35-candidate30"}}`.
 
-This reproduces the tiles and perf flags that `spec.default_tiles` /
-`Tiles` defaults carried at M5 head `bb5316a0a` (including the code paths that
-were unconditional there and are now flags: `pipe_ep`, `gdn_head_major`,
-`gqa_qv`, `moe_unroll`, `rel_fetch`), plus `pool_gather="auto"`.
+Enables the Qwen3.5 performance flags (`pipe_ep`, `gdn_head_major`, `gqa_qv`,
+`moe_unroll`, `rel_fetch`, `kv_sub=1024`, `route_vec`, `dense_acc_pair`,
+`pair_kv`, `kv_ering`, `gq_pack`, `topk_lanes`, `dmm_unroll=8`, `ecopy_opt=1`,
+`r2_direct_store`), deeper EP expert rings, and `pool_gather="auto"`.
 Fused pool I/O stays off here (experimental); `qwen35-candidate30-fused` is
 the same tuning with `fused_pool_io="auto"`, the configuration measured
 closest to candidate30 in serving (see `CANDIDATE30_BASELINE`).
@@ -32,7 +32,7 @@ import dataclasses
 from ..profile import Baseline, Profile, register_profile
 from ..spec import Tiles
 
-# Opt-in perf flags that were default-on at M5 (`bb5316a0a`).
+# Opt-in performance flags enabled by this profile.
 _C30_FLAGS = dict(
     kv_sub=1024,
     ecopy_opt=1,
@@ -59,7 +59,7 @@ _WIDE = dataclasses.replace(_VERIFY, nbd=10, nkv=3, vmem_mib=62, hier=0)
 
 
 def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Per-bucket tiles of the M5 tuning (deeper EP expert rings, hier=2, HIER3)."""
+    """Per-bucket tiles for the tuned Qwen3.5 schedule (deeper EP rings, hier=2/3)."""
     nbe_ep = 12 if not moe_tp else 10
     nbe_small = 20 if not moe_tp else nbe_ep
     if B > 48:
@@ -106,7 +106,7 @@ CANDIDATE30_BASELINE = Baseline(
 )
 
 _DESCRIPTION = (
-    "M5 Qwen3.5 tuning (bb5316a0a defaults): kv_sub=1024, route_vec, "
+    "Tuned Qwen3.5 schedule: kv_sub=1024, route_vec, "
     "dense_acc_pair, pair_kv, KVE, QV/GQ, Batcher top-k, unrolled experts "
     "+ PIPE_EP, head-major GDN, deeper EP expert rings, hier=2 for B>16, "
     "conv staging from B>=8, GPR auto. Numerics: approx."

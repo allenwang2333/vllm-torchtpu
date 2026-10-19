@@ -17,24 +17,14 @@ from __future__ import annotations
 
 
 class MegakernelConfigError(RuntimeError):
-    """Invalid megakernel configuration (fail loudly; never a silent fallback).
-
-    Raised for requests the configuration cannot satisfy: VMEM / SMEM budget
-    overflow, `pool_gather=True` or `fused_pool_io=True` on a bucket or pool
-    backend that cannot run it, `compile_hlo=True` on a mock-device mesh.
-
-    Deliberately not a `ValueError`: framework adapters treat `ValueError` from
-    cache binding as an incompatible KV layout (and fall back to the stock
-    path); configuration mistakes must surface instead.
+    """A requested configuration cannot be satisfied (e.g. a scratch budget overflow);
+    never silently ignored.
     """
 
 
 class MegakernelLayoutError(ValueError):
-    """The runtime's KV / state cache layout is incompatible with the megakernel.
-
-    The only error a framework adapter may treat as "fall back to the stock
-    path" (e.g. compact mamba layout, a pool that does not alias, an unexpected
-    pool shape or storage offset). Everything else must surface.
+    """An externally provided cache layout is incompatible; callers may fall back to
+    a non-megakernel path.
     """
 
 

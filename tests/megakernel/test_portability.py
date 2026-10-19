@@ -33,8 +33,7 @@ def test_megakernel_portability_ast_guard():
     - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
-    - Private `jax._src.*` imports are restricted to `{"pool_alias.py"}` (plus
-      `"cache_experimental.py"` if added in M3).
+    - Private `jax._src.*` imports are restricted to `{"pool_alias.py"}`.
     - Dynamic import calls (`__import__`, `import_module`) are forbidden.
     """
     pkg_root = Path(pool_alias.__file__).resolve().parent
