@@ -652,7 +652,17 @@ def _lift_tensors(model: Any) -> list[torch.Tensor]:
     return tensors
 
 
-_LIFT_OP: Any = None
+# Lift ops by arity, and the chunk sizes the armed model's tensors split
+# into: a torch op schema takes at most 64 arguments (positions + 63), and the
+# served model lifts ~950 tensors (j-b0950221).
+LIFT_MAX_TENSORS = 63
+_LIFT_OPS: dict[int, Any] = {}
+_LIFT_CHUNKS: list[int] = []
+
+
+def lift_chunks(n: int, cap: int = LIFT_MAX_TENSORS) -> list[int]:
+    """Sizes of consecutive chunks of n tensors, each at most `cap`."""
+    return [min(cap, n - i) for i in range(0, n, cap)]
 
 
 def _build_lift_op(n: int) -> Any:
@@ -684,9 +694,14 @@ def lift_segment_buffers(model: Any, positions: torch.Tensor) -> torch.Tensor:
     both), and the backbone warmup can hand buckets between them. Reading
     them in torch instead materialized relayout copies of the fp8 weights
     every step (twin j-8f7e86c3: layer 0 +337 us)."""
-    if _LIFT_OP is None:
+    if not _LIFT_CHUNKS:
         return positions
-    return _LIFT_OP(positions, *_lift_tensors(model))
+    tensors = _lift_tensors(model)
+    start = 0
+    for k in _LIFT_CHUNKS:  # positions threads through the chain
+        positions = _LIFT_OPS[k](positions, *tensors[start : start + k])
+        start += k
+    return positions
 
 
 def _compile_sizes_reason(vllm_config: Any) -> str | None:
@@ -830,8 +845,10 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         )
         setattr(nxt, HEAD_ATTR, True)
     if plan:
-        global _LIFT_OP
-        _LIFT_OP = _build_lift_op(len(_lift_tensors(inner)))
+        _LIFT_CHUNKS[:] = lift_chunks(len(_lift_tensors(inner)))
+        for k in set(_LIFT_CHUNKS):
+            if k not in _LIFT_OPS:
+                _LIFT_OPS[k] = _build_lift_op(k)
     log = logger.info if plan else logger.warning
     log(
         "segment_megakernel: armed %d boundaries (layers N = %s, buckets %s, sig %s); "
