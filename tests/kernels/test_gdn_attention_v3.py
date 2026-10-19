@@ -20,6 +20,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from absl.testing import parameterized
+from jax._src.state import indexing
+from jax._src.state import types as state_types
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
@@ -388,17 +390,6 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
 class GDNStatePipelineRaceTest(parameterized.TestCase):
     """CPU interpret-mode checks of the state DMA pipeline."""
 
-    # Non-strict so an unrelated JAX bump that fixes this does not turn CI red;
-    # remove the mark once this test XPASSes.
-    @pytest.mark.xfail(
-        raises=jax.errors.JaxRuntimeError,
-        reason=(
-            "Pallas interpret mode cannot resolve DMAs on bitcast refs "
-            "('BitcastTransform' object has no attribute 'indices'), and every "
-            "V3 state DMA goes through granule_view (bitcast to uint32). A "
-            "detected race still fails the test with an AssertionError."
-        ),
-    )
     def test_state_pipeline_has_no_dma_race(self):
         """Pallas interpret-mode vector-clock detector finds zero DMA races."""
         n_kq, n_v, d_k, d_v, kernel_size = 1, 2, 128, 128, 4
@@ -432,16 +423,55 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
         seq_lens = jnp.full((num_seqs,), 11, dtype=jnp.int32)
 
         # OSS jax 0.11.x has no InterpretParams.on_race, so read the detector's
-        # verdict before each pallas_call clears the shared state.
+        # verdict before each pallas_call clears the shared state. Also resolve
+        # granule_view's BitcastTransform and ReshapeTransform in CPU interpret
+        # mode, which otherwise assumes NDIndexer-only DMA transforms. Delete the
+        # shim once JAX interpret mode resolves bitcast and reshape refs.
         mosaic_interpret = sys.modules[pltpu.reset_tpu_interpret_mode_state.__module__]
+        interpret_utils = mosaic_interpret.interpret_utils
+        shared_memory = sys.modules[f"{mosaic_interpret.__package__}.shared_memory"]
         races_per_call: list[bool] = []
         orig_clear = mosaic_interpret._clear_shared_memory
+        orig_store = shared_memory.SharedMemory.store_buffer_content
 
         def _record_and_clear():
             races = getattr(mosaic_interpret, "races", None)
             if races is not None:
                 races_per_call.append(bool(races.races_found))
             orig_clear()
+
+        # granule_view = ref.bitcast(uint32).reshape(*lead, -1, 1, 128) over the
+        # 3 state dims. Resolve ref ranges on the lead axes only: drop the state
+        # dims at the first view and the granule dims after it, requiring a
+        # full-state block; Buffer._normalize_range re-expands the state dims.
+        def _resolve_to_range(transforms):
+            ret, viewed = (), False
+            for t in transforms:
+                if isinstance(t, indexing.NDIndexer):
+                    idx = tuple(
+                        interpret_utils._transform_slice_or_index(i) for i in t.indices
+                    )
+                    if viewed:
+                        full = tuple(slice(0, d, 1) for d in t.shape[-3:])
+                        assert idx[-3:] == full, f"partial-state ref: {idx}"
+                        idx = idx[:-3]
+                    ret = interpret_utils._compose_slice_or_index(ret, idx)
+                elif isinstance(
+                    t, (state_types.BitcastTransform, state_types.ReshapeTransform)
+                ):
+                    if not viewed:
+                        ret, viewed = ret[:-3], True
+                else:
+                    raise NotImplementedError(f"unsupported ref transform: {t}")
+            return ret
+
+        def _store_buffer_content(buf_self, key, rnge, value, *args, **kwargs):
+            # Bitcast DMAs move raw bits between equal-width dtypes only.
+            buff_dtype = buf_self.mem[key].dtype
+            assert value.itemsize == buff_dtype.itemsize, (value.dtype, buff_dtype)
+            return orig_store(
+                buf_self, key, rnge, value.view(buff_dtype), *args, **kwargs
+            )
 
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
@@ -452,6 +482,12 @@ class GDNStatePipelineRaceTest(parameterized.TestCase):
             with (
                 use_abstract_mesh(mesh),
                 mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+                mock.patch.object(interpret_utils, "to_range", _resolve_to_range),
+                mock.patch.object(
+                    shared_memory.SharedMemory,
+                    "store_buffer_content",
+                    _store_buffer_content,
+                ),
                 pltpu.force_tpu_interpret_mode(
                     pltpu.InterpretParams(
                         detect_races=True,
