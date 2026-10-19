@@ -466,18 +466,11 @@ class DFlashProposer:
         aux_hidden = target_hidden[0]
         num_tokens = aux_hidden.shape[0]
 
+        positions = chunk.position_ids
+        if positions.dim() > 1:
+            positions = positions[0]
+        positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
-        if (
-            draft_md_tuple
-            and draft_md_tuple[0].input_positions is not None
-            and draft_md_tuple[0].input_positions.shape[0] == num_tokens
-        ):
-            positions = draft_md_tuple[0].input_positions
-        else:
-            positions = chunk.position_ids
-            if positions.dim() > 1:
-                positions = positions[0]
-            positions = positions[:num_tokens]
 
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config

@@ -854,11 +854,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         total_rows = positions.shape[0]
         if isinstance(output, (list, tuple)) and len(output) == 2:
             dec_hidden, dec_aux = output
-            if not encoder_aux and isinstance(metadata, dict) and dp_metadata is None:
-                metadata.update(decoder_metadata)
-                return _scatter_decoder_rows(dec_hidden, indices, total_rows), list(
-                    dec_aux
-                )
             return (
                 _scatter_decoder_rows(dec_hidden, indices, total_rows),
                 [
