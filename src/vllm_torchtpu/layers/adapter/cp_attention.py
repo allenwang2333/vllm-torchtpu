@@ -40,7 +40,10 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     wrapper as _batched_rpa_wrapper,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # LSE-weighted combination
@@ -175,31 +178,47 @@ def _pallas_rpa_kernel_dcp(
         return new_kv_cache, output, lse.astype(jnp.float32)
 
     # Decode steps (every sequence in the DECODE range) take decode_v2; a step
-    # with prefill/mixed sequences keeps the batched RPA kernel. The cache
-    # passes through both branches so XLA keeps it in place.
-    def v2_branch(kv):
-        output, lse = _decode_v2.decode_cache_pass(
-            query,
-            kv,
-            seq_lens,
-            block_tables.reshape(-1),
-            query_start_loc,
-            cp_rank_arr,
-            request_distribution[0],
-            sm_scale=float(sm_scale),
-            k_scale=None if k_scale is None else float(k_scale),
-            v_scale=None if v_scale is None else float(v_scale),
-            cp_group_size=cp_group_size,
-            decode_query_size=decode_query_size,
-        )
-        return kv, output, lse
+    # with prefill/mixed sequences keeps the batched RPA kernel. decode_v2 runs
+    # outside the lax.cond: its per-step metadata (prepare) is then one shared
+    # computation across layers (XLA CSE does not reach into cond branches).
+    # The cache passes through both cond branches so XLA keeps it in place.
+    meta = _decode_v2.prepare(
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        cp_rank_arr,
+        request_distribution[0],
+        num_tokens=query.shape[0],
+        cp_group_size=cp_group_size,
+        decode_query_size=decode_query_size,
+        page_size=kv_cache.shape[-1],
+    )
+    v2_output, v2_lse = _decode_v2.run(
+        query,
+        kv_cache,
+        meta,
+        sm_scale=float(sm_scale),
+        k_scale=None if k_scale is None else float(k_scale),
+        v_scale=None if v_scale is None else float(v_scale),
+        decode_query_size=decode_query_size,
+    )
+
+    def skip_branch(kv):
+        return kv, jnp.zeros_like(v2_output), jnp.zeros_like(v2_lse)
 
     def rpa_branch(kv):
         new_kv_cache, output, lse = batched_rpa(kv)
         return new_kv_cache, output, lse.astype(jnp.float32)
 
     all_decode = request_distribution[0] >= request_distribution[2]
-    return jax.lax.cond(all_decode, v2_branch, rpa_branch, kv_cache)
+    # The cond only runs the fallback; the v2 results are selected after it, so
+    # they are not copied through the cond's outputs.
+    new_kv_cache, rpa_output, rpa_lse = jax.lax.cond(
+        all_decode, skip_branch, rpa_branch, kv_cache
+    )
+    output = jnp.where(all_decode, v2_output, rpa_output)
+    lse = jnp.where(all_decode, v2_lse, rpa_lse)
+    return new_kv_cache, output, lse
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +324,14 @@ def build_dcp_kernels(
         decode_query_size,
     )
     cache_key = ("dcp_cache_v2" if use_v2 else "dcp_cache", *base_key)
+    if use_v2 and cache_key not in _DCP_KERNEL_REGISTRY:
+        logger.info(
+            "TPU_RPA_DECODE_V2: DCP CACHE_ONLY decode pass uses batched_rpa.decode_v2 "
+            "(cp_rank=%d of %d, decode_query_size=%d)",
+            cp_rank,
+            cp_group_size,
+            decode_query_size,
+        )
     new_key = ("dcp_new", *base_key)
 
     cached_cache = _DCP_KERNEL_REGISTRY.get(cache_key)
