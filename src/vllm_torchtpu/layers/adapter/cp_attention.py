@@ -355,11 +355,17 @@ def build_dcp_kernels(
             decode_query_size=decode_query_size,
             use_decode_v2=use_v2,
         )
-        cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_cache{'_v2' if use_v2 else ''}_{_alloc_instance_id()}",
-            fn,
-            fake=_fake_dcp_f32_lse if use_v2 else _fake_dcp,
-        )
+        if use_v2:
+            cached_cache = _build_dcp_kernel_op(
+                f"pallas::rpa_dcp_cache_v2_{_alloc_instance_id()}",
+                fn,
+                fake=_fake_dcp_f32_lse,
+            )
+        else:
+            cached_cache = _build_dcp_kernel_op(
+                f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
+            )
+        _DCP_KERNEL_REGISTRY[cache_key] = cached_cache
 
     if cached_new is None:
         fn = functools.partial(
