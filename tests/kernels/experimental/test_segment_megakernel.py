@@ -24,8 +24,14 @@ no row has a near-tie in its top-k and every row is compared.
     o_proj, the small all-reduce, fused_add_rmsnorm.reference, the router dot,
     moe_tp_decode, xla_quantized_matmul, the bf16 NeoX rope, quantize_kv,
     pack_write_rows) on decode buckets b1/b2/b4/b8 (T = 4/8/16/32) and a
-    padded b3, judged by the campaign's rule: tol = max(1.5 x the incumbent's
+    padded b3, compiled without excess precision as torch_tpu compiles the
+    served model, judged by the campaign's rule: tol = max(1.5 x the incumbent's
     error, floor) per metric; the kernel passes if under tol everywhere.
+  * Routing (both modes): on real-bias-like router inputs (GLM-5.2's
+    e_score_correction_bias offset and spread) the kernel's routing must pick
+    the same top-k sets, with the same weights, as production's -- GateLinear's
+    bf16 logits, XLA sigmoid, moe_tp_decode's `_route` -- while the f32-logit
+    form must not (the positive control).
 """
 
 import dataclasses
@@ -352,6 +358,14 @@ def _reference_device(d, T, n_valid, sh, pr, rank):
     return s2, q_c, kv, pe, s2 - sh["res"].astype(F32)
 
 
+def _production_scores(h, gate):
+    """GateLinear on TPU (F.linear in bf16: bf16 logits) then
+    `moe_routing._apply_scoring_fn`: .float().sigmoid()."""
+    logits = lax.dot_general(h, gate, (((1,), (1,)), ((), ())))  # bf16 out
+    assert logits.dtype == BF16
+    return jax.nn.sigmoid(logits.astype(F32))
+
+
 def _incumbent_device(d, T, n_valid, sh, pr, rank, dst_rows):
     """The production ops the kernel replaces, composed as the decoder runs
     them (instruments incumbent.block_body, skip exit)."""
@@ -413,11 +427,7 @@ def _incumbent_device(d, T, n_valid, sh, pr, rank, dst_rows):
     else:
         attn_sum = small_ar.small_all_reduce(y, num_cores=N_RANKS, axis=AXIS, rank=rank)
     h, res1 = fused_add_rmsnorm.reference(attn_sum, sh["res"], sh["g_post"], d.eps)
-    scores = jax.nn.sigmoid(
-        lax.dot_general(
-            h, sh["gate"], (((1,), (1,)), ((), ())), preferred_element_type=F32
-        )
-    )
+    scores = _production_scores(h, sh["gate"])
     m = max(moe_kernel.ROW_BUCKETS[0], T)
     moe = moe_kernel.moe_tp_decode(
         jnp.pad(h, ((0, m - T), (0, 0))),
@@ -526,6 +536,153 @@ def _metrics(d, T, n_valid, sh, out, ref, dst):
         ),
     }
     return m, flags
+
+
+# =====================================================================================
+# Routing against production's, on real-bias-like inputs
+# =====================================================================================
+# GLM-5.2-FP8 layers 10/30/60 (probes/numerics-ab/router_cpu.py on the
+# checkpoint): router rows |W| 1.8-4.5, e_score_correction_bias mean 4-10 and
+# std 0.03-0.05, post_attention_layernorm |g| 0.05-0.44. The bias offset makes
+# the f32 sum coarse and the bias spread is the size of the score gaps, so the
+# bf16 rounding of the logits decides the top-k set on 2-3% of rows.
+ROUTE_ROWS, ROUTE_CALLS = 32, 32
+ROUTE_LAYERS = (
+    (4.465, 6.986, 0.0402, 0.055),
+    (3.128, 3.984, 0.0481, 0.186),
+    (1.824, 10.447, 0.0311, 0.440),
+)  # (|W row|, bias mean, std, |g|)
+
+
+def _routing_inputs(d: Dims, layer: int, call: int):
+    w_norm, b_mean, b_std, g_abs = ROUTE_LAYERS[layer]
+    rng = np.random.default_rng(7919 * layer + call)
+    H, E, n = d.hidden, d.experts, ROUTE_ROWS
+    gate = rng.standard_normal((E, H))
+    gate *= w_norm / np.linalg.norm(gate, axis=1, keepdims=True)
+    gate = _host(gate, BF16)
+    bias = (b_mean + b_std * rng.standard_normal(E)).astype(np.float32)
+    g = g_abs * (1 + 0.3 * rng.standard_normal(H))
+    # Half the rows unaligned, half leaning on 8 router directions.
+    s = rng.standard_normal((n, H))
+    pick = np.stack([rng.choice(E, d.topk, replace=False) for _ in range(n // 2)])
+    lean = np.asarray(gate, np.float32)[pick].sum(1)
+    lean /= np.linalg.norm(lean, axis=1, keepdims=True)
+    s[n // 2 :] += lean * np.sqrt(H) * rng.uniform(0.3, 1.0, (n // 2, 1)) / g_abs
+    h = s / np.sqrt(np.mean(s * s, axis=1, keepdims=True)) * g
+    return _host(h, BF16), gate, bias[None, :]
+
+
+@functools.cache
+def _routing_fns(topk: int, n: int, E: int, interpret: bool):
+    """Jitted (kernel, production router, production `_route`, f32-logit
+    control) for [n, H] tokens and E experts."""
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as moe_kernel
+    from vllm_torchtpu.kernels.experimental.segment_megakernel import kernel as sk
+
+    nt = (((1,), (1,)), ((), ()))
+
+    def pcall(fn):
+        def body(*refs):
+            refs[-1][...] = fn(*(r[...] for r in refs[:-1]))
+
+        return jax.jit(
+            pl.pallas_call(
+                body,
+                out_shape=jax.ShapeDtypeStruct((n, E), F32),
+                compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 2**20),
+                interpret=interpret,
+            )
+        )
+
+    def prod_router(a, g):  # GateLinear (bf16 logits) + .float().sigmoid()
+        lg = lax.dot_general(a, g, nt).astype(F32)
+        return lg, jax.nn.sigmoid(lg)
+
+    def f32_logits(a, g, b):
+        lg = lax.dot_general(a, g, nt, preferred_element_type=F32)
+        return sk._route_argmax(jax.nn.sigmoid(lg), b, n, topk=topk)
+
+    return (
+        pcall(lambda a, g, b: sk.route_weights(a, g, b, n, topk=topk)),
+        jax.jit(prod_router),
+        pcall(lambda sc, b: moe_kernel._route(sc, b, jnp.int32(n), topk=topk)),
+        pcall(f32_logits),
+    )
+
+
+def _routing_tables(d: Dims, h, gate, bias, *, interpret):
+    """-> (kernel, production, kernel-with-f32-logits) routing tables [rows, E]:
+    the kernel's routing (router_scores + _route_argmax in Mosaic), production's
+    (XLA GateLinear + sigmoid, then moe_tp_decode's `_route` in Mosaic), and the
+    pre-fix f32-logit form as the positive control."""
+    kern_fn, router_fn, route_fn, old_fn = _routing_fns(
+        d.topk, h.shape[0], gate.shape[0], bool(interpret)
+    )
+    lg32, scores = router_fn(h, gate)
+    # torch_tpu compiles with allow_excess_precision off, so the served logits
+    # are bf16 values; this process must too (XLA_FLAGS), or XLA folds the
+    # rounding away and the "production" side is not production.
+    lg32 = np.asarray(lg32)
+    assert np.array_equal(
+        np.asarray(jnp.asarray(lg32).astype(BF16).astype(F32)), lg32
+    ), "logits not bf16: run with XLA_FLAGS=--xla_allow_excess_precision=false"
+    kern = kern_fn(h, gate, bias)
+    prod = route_fn(scores, bias)
+    old = old_fn(h, gate, bias)
+    return tuple(np.asarray(x) for x in (kern, prod, old))
+
+
+def routing_vs_production(d: Dims, *, interpret, calls=ROUTE_CALLS):
+    """Rows whose top-k SET differs from production's, for the kernel and the
+    f32-logit control; the max routing-weight difference where the sets agree."""
+    out = dict(rows=0, kernel_set_diff=0, f32_logit_set_diff=0, kernel_w_maxdiff=0.0)
+    for layer in range(len(ROUTE_LAYERS)):
+        for call in range(calls):
+            kern, prod, old = _routing_tables(
+                d, *_routing_inputs(d, layer, call), interpret=interpret
+            )
+            ks, ps, os_ = kern != 0, prod != 0, old != 0
+            assert (ps.sum(1) == d.topk).all()
+            out["rows"] += ks.shape[0]
+            out["kernel_set_diff"] += int(np.any(ks != ps, axis=1).sum())
+            out["f32_logit_set_diff"] += int(np.any(os_ != ps, axis=1).sum())
+            same = np.all(ks == ps, axis=1)
+            if same.any():
+                out["kernel_w_maxdiff"] = max(
+                    out["kernel_w_maxdiff"],
+                    float(np.abs(kern[same] - prod[same]).max()),
+                )
+    return out
+
+
+def test_routing_matches_production_gate_linear():
+    """Identical top-k sets to production's bf16-logit router on real-bias-like
+    inputs; the f32-logit form must differ somewhere (the check can fail).
+    Interpret mode on CPU in a subprocess without excess precision: XLA:CPU
+    otherwise drops the bf16 rounding of the logits that XLA:TPU keeps."""
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS="--xla_allow_excess_precision=false",
+    )
+    proc = subprocess.run(
+        [sys.executable, __file__, "--routing-worker"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("ROUTING ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-4000:] + proc.stderr[-4000:]
+    r = json.loads(lines[-1][len("ROUTING ") :])
+    assert r["f32_logit_set_diff"] > 0, r
+    assert r["kernel_set_diff"] == 0, r
+    # XLA:CPU's logistic is not 1 / (1 + exp(-x)) (on TPU they agree bit for
+    # bit and --tpu asserts equal weights): at most one bf16 ulp of a weight.
+    assert r["kernel_w_maxdiff"] <= 2**-8, r
 
 
 # =====================================================================================
@@ -756,6 +913,18 @@ def _tpu_main():
                 flush=True,
             )
     if jax.process_index() == 0:
+        t0 = time.time()
+        route = routing_vs_production(GLM52, interpret=False)
+        route_ok = (
+            route["kernel_set_diff"] == 0
+            and route["kernel_w_maxdiff"] == 0.0
+            and route["f32_logit_set_diff"] > 0
+        )
+        ok = ok and route_ok
+        summary["routing"] = dict(
+            route, pass_=route_ok, seconds=round(time.time() - t0, 1)
+        )
+        print(f"[segmk] routing vs production pass={route_ok} {route}", flush=True)
         print(
             "SEGMK_TPU_RESULT " + json.dumps({"pass": ok, "cases": summary}), flush=True
         )
@@ -763,11 +932,23 @@ def _tpu_main():
 
 
 if __name__ == "__main__":
-    if "--cpu-worker" in sys.argv:
+    if "--routing-worker" in sys.argv:
+        print(
+            "ROUTING "
+            + json.dumps(routing_vs_production(GLM52, interpret=True, calls=8)),
+            flush=True,
+        )
+    elif "--cpu-worker" in sys.argv:
         # Around everything: pallas_call reads the mode when it is built.
         with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
             _cpu_worker()
     elif "--tpu" in sys.argv:
+        # The served model's numerics: torch_tpu compiles every program with
+        # allow_excess_precision off (bf16 casts are kept), so the incumbent
+        # composition here must be compiled the same way.
+        os.environ["XLA_FLAGS"] = (
+            os.environ.get("XLA_FLAGS", "") + " --xla_allow_excess_precision=false"
+        )
         sys.exit(_tpu_main())
     else:
         sys.exit(pytest.main([__file__, "-v"]))
