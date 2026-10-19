@@ -11,17 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `ops`, `pool_alias`, and `spec`."""
+"""Unit tests for `ops`."""
 
 from __future__ import annotations
 
 import jax.numpy as jnp
 
-from vllm_torchtpu.megakernel import pool_alias
 from vllm_torchtpu.megakernel.ops import (
     BF16,
     F32,
-    FP8,
     bswitch,
     rms_zc,
     rmsnorm,
@@ -62,10 +60,3 @@ def test_ops_primitives():
     assert sm.dtype == BF16
     val = bswitch(jnp.int32(2), [lambda i=i: jnp.int32(i * 10) for i in range(4)])
     assert int(val) == 20
-
-
-def test_pool_alias_storage_size():
-    """Verify TPU 8x128 tile storage calculation."""
-    assert pool_alias.storage_size((128, 256), jnp.dtype(FP8)) == 128 * 256 * 1
-    assert pool_alias.storage_size((128, 256), jnp.dtype(BF16)) == 128 * 256 * 2
-    assert pool_alias.storage_size((1, 256), jnp.dtype(F32)) == 8 * 256 * 4

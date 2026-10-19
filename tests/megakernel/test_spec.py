@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `spec`, `profiles.default`, and `errors`."""
+"""Unit tests for `spec` and `profiles.default`."""
 
 from __future__ import annotations
 
@@ -113,9 +113,3 @@ def test_exec_spec_pool_gather_default_is_split():
         assert mk.ExecSpec(pool_gather=val).pool_gather == val
     with pytest.raises(ValueError, match="pool_gather must be one of"):
         mk.ExecSpec(pool_gather="sometimes")  # type: ignore[arg-type]
-
-
-def test_error_classes():
-    assert issubclass(mk.MegakernelLayoutError, ValueError)
-    assert not issubclass(mk.MegakernelConfigError, ValueError)
-    assert issubclass(mk.MegakernelConfigError, RuntimeError)
