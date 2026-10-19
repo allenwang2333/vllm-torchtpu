@@ -7458,7 +7458,8 @@ class TPUModelRunner(GPUModelRunner):
         # value. It is unset until the platform finalizes it.
         cache_config = getattr(self, "cache_config", None)
         block_size = getattr(cache_config, "block_size", None)
-        if block_size is not None:
+        block_size_changed = block_size is not None and block_size != self.block_size
+        if block_size_changed:
             self.block_size = block_size
         groups = (
             kv_cache_config
@@ -7479,7 +7480,11 @@ class TPUModelRunner(GPUModelRunner):
             if groups is not None
             else []
         )
-        if not attention_groups and block_size is not None:
+        # Before the final cache groups exist, `max_num_blocks_per_req` is the
+        # placeholder block table's width (synced in `__init__`). Re-derive it
+        # only when the block size moved, so an unchanged size keeps the width
+        # the table and `block_table_cpu` were actually allocated with.
+        if not attention_groups and block_size_changed:
             self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
 
         def widest_table(model_len: int | None) -> int:
