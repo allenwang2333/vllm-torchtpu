@@ -26,6 +26,7 @@ import pytest
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.model_loader_patches import (
+    SupportsCheckpointTensorFilter,
     _compute_local_expert_ids,
     _sharded_runai_weights_iterator,
     _should_skip,
@@ -228,10 +229,21 @@ def test_unused_tensors_follow_pipeline_stage_and_mapper():
 
 
 def test_unused_tensor_predicate_defers_to_the_model():
-    model = SimpleNamespace(is_checkpoint_tensor_used=lambda n: n.startswith("mtp."))
+    import torch
+
+    class Draft(torch.nn.Module):
+        shared_checkpoint_keys = ("embed_tokens",)
+
+        def is_checkpoint_tensor_used(self, name: str) -> bool:
+            return name.startswith("mtp.") or "embed_tokens" in name
+
+    model = Draft()
+    assert isinstance(model, SupportsCheckpointTensorFilter)
     is_unused = _unused_checkpoint_tensor_predicate(model)
     assert is_unused is not None
     assert is_unused("model.layers.0.self_attn.q_proj.weight")
+    # Shared with the target, so not fetched although load_weights reads it.
+    assert is_unused("model.embed_tokens.weight")
     assert not is_unused("mtp.fc.weight")
 
 
@@ -326,8 +338,9 @@ def test_request_plan_groups_contiguous_kept_runs():
 
 
 def test_request_plan_drops_tensors_the_model_does_not_load():
-    """Tensors the model discards split runs like skipped experts, and the
-    layer finisher only waits on the tensors that are fetched."""
+    """Tensors the pipeline stage discards (another stage's layer, a name its
+    mapper drops) split runs like skipped experts, and the layer finisher
+    only waits on the tensors that are fetched."""
     pytest.importorskip("runai_model_streamer")
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.safetensors_streamer import safetensors_streamer
@@ -337,10 +350,10 @@ def test_request_plan_drops_tensors_the_model_does_not_load():
     file_meta = _fake_file_meta(
         offset=0,
         names_and_sizes=[
-            ("model.layers.0.dense.weight", 4),  # kept   @0
-            ("model.layers.1.dense.weight", 8),  # unused @4
-            ("model.layers.2.dense.weight", 2),  # kept   @12
-            ("mtp.fc.weight", 6),  # unused @14
+            ("model.language_model.layers.0.dense.weight", 4),  # kept   @0
+            ("model.language_model.layers.1.dense.weight", 8),  # other stage @4
+            ("model.language_model.layers.11.dense.weight", 2),  # kept   @12
+            ("mtp.fc.weight", 6),  # mapper drops it @14
         ],
     )
     captured = {}
@@ -370,11 +383,6 @@ def test_request_plan_drops_tensors_the_model_does_not_load():
     with (
         patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
         patch.object(sp, "SafetensorsMetadata", fake_metadata),
-        patch.object(
-            mlp,
-            "_unused_checkpoint_tensor_predicate",
-            return_value=lambda n: ".1." in n or n.startswith("mtp."),
-        ),
         patch.object(mlp, "_OnlineFp8LayerFinisher", FakeFinisher),
     ):
         list(
@@ -382,7 +390,7 @@ def test_request_plan_drops_tensors_the_model_does_not_load():
                 ["gs://bucket/file0.safetensors"],
                 local_expert_ids=set(),
                 use_tqdm_on_load=False,
-                model=object(),
+                model=_pipeline_stage_model(),
             )
         )
 
@@ -391,8 +399,8 @@ def test_request_plan_drops_tensors_the_model_does_not_load():
         ([12], [2]),
     ]
     assert captured["finisher_names"] == [
-        "model.layers.0.dense.weight",
-        "model.layers.2.dense.weight",
+        "model.language_model.layers.0.dense.weight",
+        "model.language_model.layers.11.dense.weight",
     ]
 
 

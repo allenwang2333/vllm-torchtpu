@@ -59,6 +59,7 @@ import threading
 import time
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Protocol, runtime_checkable
 
 import torch
 
@@ -194,22 +195,45 @@ def _compute_local_expert_ids() -> set[int] | None:
     return local_ids
 
 
+@runtime_checkable
+class SupportsCheckpointTensorFilter(Protocol):
+    """A model that names the checkpoint tensors its ``load_weights`` reads."""
+
+    # Checkpoint-name fragments of modules borrowed from another model (a
+    # draft sharing the target's embedding or head); their tensors are not
+    # fetched even when ``is_checkpoint_tensor_used`` accepts them.
+    shared_checkpoint_keys: tuple[str, ...]
+
+    def is_checkpoint_tensor_used(self, name: str) -> bool: ...
+
+
+def checkpoint_tensor_filter(model: object) -> SupportsCheckpointTensorFilter | None:
+    """Returns ``model`` when it implements ``SupportsCheckpointTensorFilter``.
+
+    Takes ``object`` rather than ``nn.Module``: against a module type the
+    protocol's members overlap ``Module.__getattr__``'s ``Module | Tensor``.
+    """
+    return model if isinstance(model, SupportsCheckpointTensorFilter) else None
+
+
 def _unused_checkpoint_tensor_predicate(
     model: torch.nn.Module | None,
 ) -> Callable[[str], bool] | None:
     """Builds a predicate for checkpoint tensors ``model.load_weights`` discards.
 
-    A model that defines ``is_checkpoint_tensor_used`` answers for itself (an
-    MTP draft reads only its ``mtp.`` tensors). Otherwise a tensor is unused
-    when ``hf_to_vllm_mapper`` drops its name or the mapped name falls under a
+    A ``SupportsCheckpointTensorFilter`` model answers for itself (an MTP
+    draft reads only its ``mtp.`` tensors). Otherwise a tensor is unused when
+    ``hf_to_vllm_mapper`` drops its name or the mapped name falls under a
     pipeline-missing layer, the two cases ``AutoWeightsLoader`` discards.
     Returns None when nothing can be dropped.
     """
     if model is None:
         return None
-    is_used = getattr(model, "is_checkpoint_tensor_used", None)
-    if callable(is_used):
-        return lambda name: not is_used(name)
+    filtered = checkpoint_tensor_filter(model)
+    if filtered is not None:
+        is_used = filtered.is_checkpoint_tensor_used
+        shared = filtered.shared_checkpoint_keys
+        return lambda name: not is_used(name) or any(key in name for key in shared)
 
     from vllm.model_executor.models.utils import PPMissingLayer, StageMissingLayer
 
