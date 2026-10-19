@@ -40,6 +40,10 @@ from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.utils import get_mesh_shape_product
 
+# Dtype the pooled kernel stores each slot's SSM state in, inside the slot the
+# declared (allocation) dtype sizes; the kernel widens it to f32 in VMEM.
+POOLED_SSM_STORAGE_DTYPE = jnp.bfloat16
+
 
 def run_jax_gdn_attention(
     j_mixed_qkv: jnp.ndarray,
@@ -812,10 +816,18 @@ def _build_v3_pool_state_plan(
             f"block: {state_layout.required_tokens} > "
             f"{pool_block_tokens}."
         )
+    # The conv region stays where the allocation layout puts it; only the
+    # SSM region's leading tokens carry the narrower state.
+    storage_dtype = jnp.dtype(POOLED_SSM_STORAGE_DTYPE)
+    if storage_dtype.itemsize > jnp.dtype(recurrent_state_dtype).itemsize:
+        storage_dtype = jnp.dtype(recurrent_state_dtype)
+    ssm_storage_bytes = pooled_gdn_ssm_state_bytes(
+        num_v_heads=n_v, head_k_dim=d_k, head_v_dim=d_v, dtype=storage_dtype
+    )
     return pool_adapters.v3_state_source(
         pool,
         split=split,
-        ssm_ntok=state_layout.ssm_tokens,
+        ssm_ntok=-(-ssm_storage_bytes // tok_bytes),
         conv_tok0=state_layout.ssm_tokens,
         conv_ntok=state_layout.conv_tokens,
         conv_dim=conv_dim,
@@ -824,7 +836,7 @@ def _build_v3_pool_state_plan(
         d_v=d_v,
         kernel_size=kernel_size,
         qk_pair_layout=qk_pair_layout,
-        recurrent_state_dtype=recurrent_state_dtype,
+        recurrent_state_dtype=storage_dtype,
     )
 
 
