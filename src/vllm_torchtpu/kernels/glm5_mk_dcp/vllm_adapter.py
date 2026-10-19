@@ -37,6 +37,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
+from vllm_torchtpu.kernels.glm5_mk_dcp import debug as D
 from vllm_torchtpu.kernels.glm5_mk_dcp import kernel as K
 from vllm_torchtpu.kernels.glm5_mk_dcp.config import FULL
 from vllm_torchtpu.kernels.glm5_mk_dcp.layout import rup, smalls_layout
@@ -230,7 +231,28 @@ class Glm5MKD:
                     len(self.weights), copied / 2 ** 30, self.rank, R)
         self.caches = None
         self._step = None
+        self._probe = None
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
+        # ---- G0 debug instruments (debug.py); all off unless their env is set
+        self.sched = D.schedule_from_env()
+        self.kvdiff = D._env_on("GLM5_MKD_KVDIFF")
+        self.idcheck = (D._env_on("GLM5_MKD_IDCHECK") or self.kvdiff
+                        or os.environ.get("GLM5_MKD_SPECDBG") == "1"
+                        or bool(os.environ.get("GLM5_MKD_MODE")))
+        self.dbg_every = int(os.environ.get("GLM5_MKD_DBG_EVERY", "50"))
+        self.id_tot = [0, 0]                         # requests checked, requests violating
+        self.kv_tot: dict[str, dict] = {}
+        self.sh_tot: dict[str, list] = {}
+        self.n_dbg = 0
+        self.idx_layers = [l for l in range(cfg.L) if cfg.full_indexer(l)]
+        self.k_scales = self._kv_scales(bb)
+        if self.rank == 0:
+            logger.info("GLM-5.2 TPxDCP megakernel debug: mode %s (probe %s) kvdiff %s idcheck %s; "
+                        "MLA k_scale values %s (the kernel assumes 1.0: K:1660 decodes fp8 raw)",
+                        self.sched.spec, self.sched.needs_probe, self.kvdiff, self.idcheck,
+                        sorted(set(self.k_scales)))
+        _need(all(v == 1.0 for v in self.k_scales),
+              f"MLA k_scale {sorted(set(self.k_scales))} != 1.0 (the megakernel ignores k_scale)")
 
     # ---------------------------------------------------------------- weights
 
@@ -360,6 +382,7 @@ class Glm5MKD:
             stk = getattr(runner, "glm5_kv_stack", None) or {}
             grp = {k: [v] for k, v in stk.items()}
         caches = []
+        cmap = {}
         if set(grp) == {"nope", "rope", "idx"}:
             nb = int(grp["nope"][0][0].shape[1])
             ck = K.cache_kinds(cfg, nb)
@@ -372,6 +395,8 @@ class Glm5MKD:
                     _need(tuple(t.shape) == (gs,) + tuple(shape),
                           f"stacked cache {kind}[{gi}]: {tuple(t.shape)} != {(gs,) + tuple(shape)}")
                     caches.append(t)
+                for i, l in enumerate(layers):           # KVDIFF view: layer -> (group tensor, row)
+                    cmap[(kind, l)] = (groups[i // gs][0], i % gs)
                 G[kind] = len(groups)
             _need(G["nope"] == G["rope"], "nope / rope grouped differently")
             self.stack_c = G
@@ -395,15 +420,47 @@ class Glm5MKD:
                     t = per[(kind, l)]
                     _need(tuple(t.shape) == tuple(shape), f"cache {kind}[{l}]: {tuple(t.shape)} != {shape}")
                     caches.append(t)
+                    cmap[(kind, l)] = (t, None)
             self.stack_c = frozenset()
             self.c_specs = [P(AXIS)] * len(caches)
         logger.info("GLM-5.2 TPxDCP megakernel: %s caches, %d operands, %d blocks",
                     f"stacked {self.stack_c}" if self.stack_c else "per-layer", len(caches), nb)
         self.caches = caches
         self.nb = nb
-        self._step = self._build_op()
+        self._cmap = cmap
+        self._step = self._build_op(writer=True, staging=self.kvdiff)
+        if self.sched.needs_probe or self.kvdiff:
+            # read-only megakernel (no writer, caches not donated) returning its staged rows
+            self._probe = self._build_op(writer=False, staging=True)
 
-    def _build_op(self):
+    def _cache_of(self, kind: str, l: int):
+        e = self._cmap.get((kind, l))
+        if e is None:
+            return None
+        t, row = e
+        return t if row is None else t[row]
+
+    def _kv_scales(self, bb) -> list[float]:
+        """Every backbone MLA layer's k_scale as the stock sparse-MLA op reads it
+        (`_get_kv_scales`: `_k_scale_float`, else a 0-d `_k_scale`). The megakernel ignores it."""
+        out = []
+        for l in range(self.cfg.L):
+            at = _attn_module(bb.layers[l].self_attn)
+            v = getattr(at, "_k_scale_float", None)
+            if v is None:
+                t = getattr(at, "_k_scale", None)
+                if isinstance(t, torch.Tensor) and t.numel() == 1:
+                    v = float(t.detach().float().cpu())
+                elif t is not None:
+                    v = float(t)
+            out.append(1.0 if v is None else float(v))
+        return out
+
+    def _build_op(self, writer: bool = True, staging: bool = False):
+        """The compiled step. writer=True: megakernel + barrier-free writer (caches donated, updated
+        in place: the served path). writer=False: the megakernel alone, caches read-only (a probe
+        for the G0 modes). staging=True: also return the staged rows nrow / rrow / irec
+        ([L, TMAX, 128] u32, [L, TMAX, 128] u32, [L, TMAX, 256] i32, identical on every rank)."""
         cfg = self.cfg
         build_kw = dict(nb=self.nb, max_pages=self.max_pages, bmax=cfg.TMAX,
                         stack_w=self.stack_w, stack_c=self.stack_c)
@@ -412,8 +469,8 @@ class Glm5MKD:
         self.debug = os.environ.get("GLM5_MKD_DEBUG", "0") == "1"
         call, info = K.build(cfg, axis_name=AXIS, debug=self.debug, dbg_part=False, tiles=self.tiles,
                              **build_kw)
-        writer, winfo = K.build_writer(cfg, axis_name=AXIS, nb=self.nb, max_pages=self.max_pages,
-                                       bmax=cfg.TMAX, stack_c=build_kw["stack_c"])
+        wfn, winfo = K.build_writer(cfg, axis_name=AXIS, nb=self.nb, max_pages=self.max_pages,
+                                    bmax=cfg.TMAX, stack_c=build_kw["stack_c"])
         assert list(info["w_names"]) == self.w_names, "weight operand order"
         assert len(info["c_names"]) == len(self.caches) == len(winfo["c_names"])
         self.info = info
@@ -421,15 +478,21 @@ class Glm5MKD:
         rep = P()
         in_specs = (rep,) * 7 + (P(AXIS),) + tuple(self.w_specs) + tuple(self.c_specs)
         n_dbg = 2 if self.debug else 0
-        out_specs = (P(AXIS),) + tuple(self.c_specs) + (P(AXIS),) * n_dbg
+        n_stg = 3 if staging else 0
+        out_specs = ((P(AXIS),) + (tuple(self.c_specs) if writer else ()) + (P(AXIS),) * n_stg
+                     + (P(AXIS),) * n_dbg)
 
         def body(*a):
             scal, rmeta, qmeta, bt, rvec, h0, tab, smalls = a[:8]
             caches = a[8 + n_w:]
             outs = call(*a)
             out, nrow, rrow, irec = outs[:4]
-            new = writer(scal, rmeta, bt, nrow, rrow, irec, *caches)
-            return (out, *new, *outs[4:4 + n_dbg])
+            res = [out]
+            if writer:
+                res += list(wfn(scal, rmeta, bt, nrow, rrow, irec, *caches))
+            if staging:
+                res += [nrow, rrow, irec]
+            return tuple(res + list(outs[4:4 + n_dbg]))
 
         smap = jax.shard_map(body, mesh=self.mesh, in_specs=in_specs, out_specs=out_specs,
                              check_vma=False)
@@ -440,12 +503,13 @@ class Glm5MKD:
                f"    return _smap({', '.join(args)})\n")
         ns: dict[str, Any] = {"jax": jax, "_smap": smap}
         exec(compile(src, "<glm5_mkd>", "exec"), ns)  # noqa: S102 - arity is data
-        name = "glm5_mkd::step"
+        name = "glm5_mkd::" + ("step" if writer else "probe") + ("_stg" if staging else "")
         # unregistered callable: ~175 operands exceed a torch op schema's 64 (j-a67fe755); the op
         # below takes the weights and caches as two Tensor[] arguments
         flat = sharded_jax_op(name + "_flat", ns["glm5_mkd"], mesh=self.mesh,
                               input_partition_specs=in_specs, output_partition_specs=out_specs,
-                              donate_argnums=tuple(range(n_in - n_c, n_in)), register=False)
+                              donate_argnums=tuple(range(n_in - n_c, n_in)) if writer else (),
+                              register=False)
 
         @torch.library.custom_op(name, mutates_args=())
         def op(scal: torch.Tensor, rmeta: torch.Tensor, qmeta: torch.Tensor, bt: torch.Tensor,
@@ -456,11 +520,16 @@ class Glm5MKD:
         @op.register_fake
         def _(scal, rmeta, qmeta, bt, rvec, h0, tab, smalls, weights, caches):
             M = info["M"]
-            dbg = ([torch.empty((cfg.L, 2, cfg.RPR, cfg.H), dtype=torch.float32, device=h0.device),
-                    torch.empty((cfg.L, cfg.TMAX, cfg.KT // 128, 128), dtype=torch.int32, device=h0.device)]
+            dev = h0.device
+            stg = ([torch.empty((cfg.L, cfg.TMAX, 128), dtype=torch.uint32, device=dev),
+                    torch.empty((cfg.L, cfg.TMAX, 128), dtype=torch.uint32, device=dev),
+                    torch.empty((cfg.L, cfg.TMAX, 256), dtype=torch.int32, device=dev)]
+                   if staging else [])
+            dbg = ([torch.empty((cfg.L, 2, cfg.RPR, cfg.H), dtype=torch.float32, device=dev),
+                    torch.empty((cfg.L, cfg.TMAX, cfg.KT // 128, 128), dtype=torch.int32, device=dev)]
                    if n_dbg else [])
-            return ([torch.empty((M, cfg.H), dtype=torch.bfloat16, device=h0.device)]
-                    + [torch.empty_like(c) for c in caches] + dbg)
+            return ([torch.empty((M, cfg.H), dtype=torch.bfloat16, device=dev)]
+                    + ([torch.empty_like(c) for c in caches] if writer else []) + stg + dbg)
 
         TMAX, M, DR = cfg.TMAX, info["M"], cfg.DR
         nb = int(self.nb)
@@ -519,27 +588,38 @@ class Glm5MKD:
             tab[:, TMAX:, :] = torch.tensor([1.0, 0.0, 1.0, 0.0], device=dev)[:, None, None]
             h0 = self.backbone.embed_tokens(fit(ids, TMAX)).float()
             outs = op(scal, rmeta, qmeta, bt_b, rvec, h0, tab, smalls, list(weights), list(caches))
-            n_c_ = len(caches)
-            for dst, src in zip(caches, outs[1:1 + n_c_]):
-                dst.copy_(src)
-            return (outs[0][:TMAX], *outs[1 + n_c_:])
+            k = 1
+            if writer:
+                for dst, src in zip(caches, outs[1:1 + len(caches)]):
+                    dst.copy_(src)
+                k += len(caches)
+            return (outs[0][:TMAX], *outs[k:])
 
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
     # ------------------------------------------------------------------- run
 
-    def step_ok(self, runner, scheduler_output, num_chunks: int) -> bool:
-        """Rank-uniform host predicate: every request in decode / verify, <= QMAX tokens each,
-        <= TMAX total, one chunk, no encoder inputs."""
+    def step_plan(self, runner, scheduler_output, num_chunks: int) -> "D.Plan | None":
+        """Rank-uniform host decision for this step: None (not eligible) or the `debug.Plan` the
+        runner's forward_model executes (GLM5_MKD_MODE; default `mk`). A `pure_stock` plan runs the
+        stock forward alone; it is kept (not None) so SPECDBG can label it (alt:k/stock, cycle arms)."""
+        self.sched.observe_requests(scheduler_output.num_scheduled_tokens.keys())
         ok, why = self._step_ok(runner, scheduler_output, num_chunks)
-        # engagement counters (rank 0 logs every 500 steps): decode-only steps the megakernel took vs
-        # decode-only steps it declined (too many tokens), and steps with a prefill (never taken)
+        plan = self.sched.plan() if ok else None
+        if plan is not None:
+            why = plan.label
+        # engagement counters (rank 0 logs every 500 steps): steps per plan label, decode-only steps
+        # the megakernel declined (too many tokens), and steps with a prefill (never taken)
         c = self.counts
         c[why] = c.get(why, 0) + 1
         c["n"] = c.get("n", 0) + 1
         if c["n"] % 500 == 0 and self.rank == 0:
             logger.info("GLM-5.2 TPxDCP megakernel engagement: %s", {k: v for k, v in c.items() if k != "n"})
-        return ok
+        return plan
+
+    def step_ok(self, runner, scheduler_output, num_chunks: int) -> bool:
+        plan = self.step_plan(runner, scheduler_output, num_chunks)
+        return plan is not None and not plan.pure_stock
 
     def _step_ok(self, runner, scheduler_output, num_chunks: int):
         cfg = self.cfg
@@ -553,10 +633,6 @@ class Glm5MKD:
                 return False, "prefill"
         if scheduler_output.total_num_scheduled_tokens > cfg.TMAX or len(ns) > cfg.TMAX:
             return False, "decode_over_tmax"
-        if os.environ.get("GLM5_MKD_ALT") == "1":    # debug A/B: every other eligible step on the stock path
-            self._alt = not getattr(self, "_alt", False)
-            if not self._alt:
-                return False, "alt_stock"
         return True, "mk"
 
     def _metadata(self) -> AttentionMetadata:
@@ -568,20 +644,145 @@ class Glm5MKD:
         assert isinstance(md, AttentionMetadata), type(md)
         return md
 
+    def _run(self, fn, md, input_ids, positions):
+        """One compiled call -> (out [n, H] padded like the runner's bucket, staging or None)."""
+        res = fn(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
+                 self.cos_sin, self.smalls, self.weights, self.caches)
+        out = res[0]
+        stg = tuple(res[1:4]) if (fn is self._probe or self.kvdiff) and len(res) >= 4 else None
+        rest = res[4:] if stg is not None else res[1:]
+        if len(rest) > 0:
+            self.last_dbg = tuple(rest)
+        n = input_ids.shape[0]
+        out = out[:n] if n <= out.shape[0] else torch.nn.functional.pad(out, (0, 0, 0, n - out.shape[0]))
+        return out, stg
+
     @torch.no_grad()
     def __call__(self, runner, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """The served path (plan `mk`): megakernel + writer."""
         if self._step is None:               # capture_model was skipped (e.g. a microbenchmark)
             self.bind_caches(runner)
         md = self._metadata()
-        res = self._step(input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables,
-                         self.cos_sin, self.smalls, self.weights, self.caches)
-        out = res[0]
-        if len(res) > 1:
-            self.last_dbg = tuple(res[1:])
-        n = input_ids.shape[0]
-        if n <= out.shape[0]:
-            return out[:n]
-        return torch.nn.functional.pad(out, (0, 0, 0, n - out.shape[0]))
+        coords = snap = None
+        if self.kvdiff:
+            coords, snap = self._dbg_safe(lambda: self._coords_snapshot(md, positions), (None, None))
+        out, stg = self._run(self._step, md, input_ids, positions)
+        if self.kvdiff and stg is not None and coords is not None:
+            # after the megakernel's own writer: placement must be byte-exact, neighbours untouched
+            self._dbg_safe(lambda: self._kv_report("writer", coords, stg, snap))
+        self._after_step(md, positions)
+        return out
+
+    @torch.no_grad()
+    def aux(self, runner, plan, input_ids: torch.Tensor, positions: torch.Tensor,
+            stock_out: torch.Tensor) -> torch.Tensor:
+        """A mixed plan, after the stock forward ran (it wrote its KV for this step's rows): run the
+        megakernel with its writer (plan.kv == 'M': overwrites the owned rows with its own bytes) or
+        read-only (plan.kv == 'S'), then hand back the hidden the plan selects; the drafter's hidden
+        goes through runner._mkd_draft_hidden."""
+        md = self._metadata()
+        if plan.mk_writer:
+            coords = snap = None
+            if self.kvdiff:
+                coords, snap = self._dbg_safe(lambda: self._coords_snapshot(md, positions), (None, None))
+            out, stg = self._run(self._step, md, input_ids, positions)
+            if self.kvdiff and stg is not None and coords is not None:
+                self._dbg_safe(lambda: self._kv_report("writer", coords, stg, snap))
+        else:
+            out, stg = self._run(self._probe, md, input_ids, positions)
+            if self.kvdiff and stg is not None:
+                # the caches hold what the STOCK forward just wrote for these rows: numerics/format
+                self._dbg_safe(lambda: self._kv_report(
+                    "numerics", self._coords_snapshot(md, positions, snap=False)[0], stg, None))
+        if plan.stats:
+            self._dbg_safe(lambda: self._shadow(runner, plan, md, out, stock_out))
+        self._after_step(md, positions)
+        ret = out if plan.ret == "M" else stock_out
+        drafted = out if plan.draft == "M" else stock_out
+        runner._mkd_draft_hidden = None if plan.draft == plan.ret else drafted
+        return ret
+
+    # ------------------------------------------------------------- debug helpers
+
+    def _dbg_safe(self, fn, default=None):
+        try:
+            return fn()
+        except Exception as e:                   # noqa: BLE001 - debug must never take serving down
+            logger.warning("GLM-5.2 TPxDCP megakernel debug failed: %r", e)
+            return default
+
+    def _coords_snapshot(self, md, positions, snap: bool = True):
+        cfg = self.cfg
+        TMAX = cfg.TMAX
+        qsl = md.query_start_loc.to(torch.int64)
+        T = qsl[-1]
+        npos = min(TMAX, positions.shape[0])
+        pos = torch.zeros(TMAX, dtype=torch.int64, device=positions.device)
+        pos[:npos] = positions[:npos].to(torch.int64)
+        t = torch.arange(TMAX, device=positions.device)
+        valid = t < T
+        req = (qsl[1:][None, :] <= t[:, None]).sum(1)
+        nq_tab = md.query_start_loc.shape[0] - 1
+        bt2 = md.block_tables.reshape(nq_tab, -1)
+        req = req.clamp(max=nq_tab - 1)
+        c = D.owned_row_coords(pos, req, valid, bt2, self.nb, cfg.R, cfg.ILV, cfg.page, self.rank)
+        s = D.snapshot(self._cache_of, cfg.L, self.idx_layers, c) if snap else None
+        return c, s
+
+    def _kv_report(self, kind: str, coords, stg, snap) -> None:
+        nrow, rrow, irec = stg
+        res = D.compare_staging(self._cache_of, self.cfg.L, self.idx_layers, coords, nrow, rrow,
+                                irec, self.cfg.IDIM, self.cfg.IDIM + 1, neighbors=snap)
+        tot = self.kv_tot.setdefault(kind, {})
+        for k, r in res.items():
+            a = tot.setdefault(k, {})
+            for f, v in r.items():
+                a[f] = max(a.get(f, 0), v) if f == "max_abs" else a.get(f, 0) + v
+        bad = any(r.get("bad_rows", 0) for k, r in res.items() if k != "clobber") or any(
+            res.get("clobber", {}).values())
+        if bad and kind == "writer":
+            logger.warning("KVDIFF %s rank %d step mismatch: %s", kind, self.rank, D.fmt_kvdiff(res))
+
+    def _shadow(self, runner, plan, md, out_mk, out_stock) -> None:
+        T = int(md.query_start_loc[-1].cpu())
+        if T <= 0:
+            return
+        lm = runner.model.compute_logits(out_mk[:T])
+        ls = runner.model.compute_logits(out_stock[:T])
+        st = D.shadow_stats(lm, ls, out_mk[:T], out_stock[:T])
+        a = self.sh_tot.setdefault(plan.label, [0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        a[0] += 1
+        a[1] += st["kl_mean"]
+        a[2] = max(a[2], st["kl_max"])
+        a[3] += st["argmax_agree"]
+        a[4] = max(a[4], st["dh_max"])
+        a[5] = max(a[5], st["dh_rel_max"])
+
+    def _after_step(self, md, positions) -> None:
+        self.n_dbg += 1
+        if self.idcheck:
+            def chk():
+                qsl = md.query_start_loc.cpu().numpy()
+                seq = md.seq_lens.cpu().numpy()
+                pos = positions[: int(qsl[-1])].cpu().numpy()
+                n, bad, ex = D.metadata_identity(qsl, seq, pos)
+                self.id_tot[0] += n
+                self.id_tot[1] += bad
+                if bad:
+                    logger.warning("IDCHECK rank %d: p0 = seq_len - nq != position_ids[t0] on %d of %d "
+                                   "requests: %s", self.rank, bad, n, ex)
+            self._dbg_safe(chk)
+        if self.n_dbg % self.dbg_every == 0:
+            if self.idcheck and self.rank == 0:
+                logger.info("IDCHECK steps %d requests %d violations %d", self.n_dbg, *self.id_tot)
+            for kind, tot in self.kv_tot.items():
+                logger.info("KVDIFF %s rank %d steps %d: %s", kind, self.rank, self.n_dbg,
+                            D.fmt_kvdiff(tot))
+            if self.rank == 0:
+                for lab, a in self.sh_tot.items():
+                    logger.info("SHADOW %s steps %d mean KL(p_mk||p_stock) %.4g max %.4g argmax "
+                                "agree %.4f max|dh| %.4g max rel|dh| %.4g", lab, a[0], a[1] / a[0],
+                                a[2], a[3] / a[0], a[4], a[5])
 
     def warmup(self, runner) -> None:
         """Compile and run once: one request of QMAX rows at positions 0..QMAX-1 on block 0 (the
@@ -596,8 +797,11 @@ class Glm5MKD:
         qsl = torch.tensor([0] + [T] * cfg.TMAX, dtype=torch.int32, device=dev)
         seq = torch.tensor([T] + [0] * (cfg.TMAX - 1), dtype=torch.int32, device=dev)
         bt = torch.zeros(cfg.TMAX * self.max_pages, dtype=torch.int32, device=dev)
-        t0 = time.monotonic()
-        out = self._step(ids, pos, qsl, seq, bt, self.cos_sin, self.smalls, self.weights, self.caches)[0]
-        synchronize_tensors([out])
-        logger.info("GLM-5.2 TPxDCP megakernel compiled and warmed in %.1f s (%d weight operands)",
-                    time.monotonic() - t0, len(self.weights))
+        for fn, what in ((self._step, "step"), (self._probe, "probe")):
+            if fn is None:
+                continue
+            t0 = time.monotonic()
+            out = fn(ids, pos, qsl, seq, bt, self.cos_sin, self.smalls, self.weights, self.caches)[0]
+            synchronize_tensors([out])
+            logger.info("GLM-5.2 TPxDCP megakernel %s compiled and warmed in %.1f s (%d weight operands)",
+                        what, time.monotonic() - t0, len(self.weights))

@@ -3757,10 +3757,14 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._dp_step_num_chunks = target_num_chunks
         # GLM5_MKD: the whole decode / verify forward as one megakernel on eligible steps
+        # (GLM5_MKD_MODE: a debug Plan may also run the stock forward; see kernels/glm5_mk_dcp/debug.py)
         mkd = getattr(self, "glm5_mkd", None)
-        self._mkd_step = bool(
-            mkd is not None and mkd.step_ok(self, scheduler_output, target_num_chunks)
+        self._mkd_plan = (
+            mkd.step_plan(self, scheduler_output, target_num_chunks)
+            if mkd is not None
+            else None
         )
+        self._mkd_step = self._mkd_plan is not None and not self._mkd_plan.pure_stock
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -4114,7 +4118,12 @@ class TPUModelRunner(GPUModelRunner):
                     aux_hidden_states=(
                         aux_hidden_states if aux_hidden_states is not None else []
                     ),
-                    hidden_states=hidden_states,
+                    # GLM5_MKD_MODE mix:..M / ..S: the drafter's hidden from the other forward
+                    hidden_states=(
+                        self._mkd_draft_hidden
+                        if getattr(self, "_mkd_draft_hidden", None) is not None
+                        else hidden_states
+                    ),
                     draft_lengths=(
                         spec_decode_metadata.draft_lengths
                         if spec_decode_metadata is not None
@@ -4524,7 +4533,15 @@ class TPUModelRunner(GPUModelRunner):
                     topk_candidates=topk_candidates,
                 ).view(-1)
         if os.environ.get("GLM5_MKD_SPECDBG") == "1":
-            self._specdbg(md, target_logits, all_greedy, req_temperatures)
+            self._specdbg_logits(
+                md,
+                target_logits,
+                all_greedy,
+                req_temperatures,
+                req_top_k,
+                req_top_p,
+                topk_candidates,
+            )
         accept_u = None
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
@@ -4536,7 +4553,7 @@ class TPUModelRunner(GPUModelRunner):
                 generator=sampling_generator,
             )
         if all_greedy:
-            return self.rejection_sampler(
+            sel = self.rejection_sampler(
                 draft_token_ids=md.draft_token_ids,
                 num_draft_tokens=md.draft_lengths,
                 target_logits=target_logits,
@@ -4546,6 +4563,9 @@ class TPUModelRunner(GPUModelRunner):
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=accept_u,
             )
+            if os.environ.get("GLM5_MKD_SPECDBG") == "1":
+                self._specdbg_output(md, sel)
+            return sel
         assert accept_u is not None
         assert req_temperatures is not None
         assert req_top_k is not None
@@ -4570,7 +4590,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
         )
         if os.environ.get("GLM5_MKD_SPECDBG") == "1":
-            self._specdbg(md, None, all_greedy, None, out=sel)
+            self._specdbg_output(md, sel)
         return sel
 
     @_pp_step
@@ -5267,6 +5287,8 @@ class TPUModelRunner(GPUModelRunner):
 
         self.glm5_mkd = Glm5MKD.maybe_create(self)
         self._mkd_step = False
+        self._mkd_plan = None
+        self._mkd_draft_hidden = None
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5472,6 +5494,7 @@ class TPUModelRunner(GPUModelRunner):
         settles the hand-off afterwards.
         """
         self._mkd_step = False
+        self._mkd_plan = None
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -7577,51 +7600,56 @@ class TPUModelRunner(GPUModelRunner):
             num_valid_tokens = num_tokens_padded
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
-    def _specdbg(self, md, target_logits, all_greedy, req_temperatures, out=None) -> None:
-        """GLM5_MKD_SPECDBG=1 (debug, host sync): per verify step, by the forward path that produced
-        it (megakernel / stock): the drafts' target probability (temperature-scaled softmax, no
-        top-p), argmax agreement, and the rejection sampler's accepted length (valid tokens per
-        request); rank 0 logs every 50 steps per path."""
+    def _specdbg_obj(self):
+        st = self.__dict__.get("_specdbg_st")
+        if st is None:
+            from vllm_torchtpu.kernels.glm5_mk_dcp.debug import SpecDbg
+
+            st = self.__dict__["_specdbg_st"] = SpecDbg(
+                int(os.environ.get("GLM5_MKD_DBG_EVERY", "50"))
+            )
+        return st
+
+    def _specdbg_logits(
+        self, md, target_logits, all_greedy, temps, top_k, top_p, topk_candidates
+    ) -> None:
+        """GLM5_MKD_SPECDBG=1 (debug, host sync): the drafts' acceptance probability under the
+        rejection sampler's own transform, on real draft slots only; see debug.SpecDbg."""
+        try:
+            self._specdbg_obj().on_logits(
+                str(getattr(self, "_fwd_was_mkd", "stock")),
+                md,
+                target_logits,
+                temps,
+                top_k,
+                top_p,
+                topk_candidates,
+                all_greedy,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("SPECDBG failed: %r", e)
+
+    def _specdbg_output(self, md, sel) -> None:
         try:
             import torch.distributed as _dist
-            path = "mk" if getattr(self, "_fwd_was_mkd", False) else "stock"
-            st = self.__dict__.setdefault("_specdbg_st", {})
-            a = st.setdefault(path, [0, 0.0, 0, 0, 0, 0])
-            if out is not None:                  # selected tokens [reqs, 1 + K], invalid < 0
-                v = (out >= 0).sum(-1)
-                a[4] += int(v.sum())
-                a[5] += int(v.numel())
-                return
-            d = md.draft_token_ids.reshape(-1).to(torch.int64)
-            tl = target_logits.reshape(-1, target_logits.shape[-1]).float()
-            n = min(d.shape[0], tl.shape[0])
-            d, tl = d[:n], tl[:n]
-            ok = d >= 0
-            if not bool(ok.any()):
-                return
-            if req_temperatures is not None:
-                t = req_temperatures[md.segment_ids].reshape(-1)[:n].float().unsqueeze(-1)
-            else:
-                t = torch.ones_like(tl[:, :1])
-            p = torch.softmax(tl / (t + 1e-9), -1).gather(-1, d.clamp(min=0).unsqueeze(-1)).squeeze(-1)
-            am = tl.argmax(-1) == d
-            a[0] += 1
-            a[1] += float(p[ok].mean())
-            a[2] += int((am & ok).sum())
-            a[3] += int(ok.sum())
-            r0 = (not _dist.is_initialized()) or _dist.get_rank() == 0
-            if a[0] % 50 == 0 and r0:
-                logger.info("SPECDBG %s steps %d mean p(draft) %.3f argmax==draft %.3f accepted_len %.3f "
-                            "(n=%d, greedy=%s)", path, a[0], a[1] / a[0], a[2] / max(a[3], 1),
-                            a[4] / max(a[5], 1), a[3], all_greedy)
-        except Exception as e:                   # noqa: BLE001
+
+            rank = _dist.get_rank() if _dist.is_initialized() else 0
+            self._specdbg_obj().on_output(
+                str(getattr(self, "_fwd_was_mkd", "stock")), md, sel, rank
+            )
+        except Exception as e:  # noqa: BLE001
             logger.warning("SPECDBG failed: %r", e)
 
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
-        self._fwd_was_mkd = bool(getattr(self, "_mkd_step", False))
-        if getattr(self, "_mkd_step", False):
+        plan = getattr(self, "_mkd_plan", None)
+        # SPECDBG labels the verify step by the plan that produced its logits
+        self._fwd_was_mkd = plan.label if plan is not None else "stock"
+        if not getattr(self, "_mkd_step", False):
+            plan = None
+        self._mkd_draft_hidden = None
+        if plan is not None and plan.pure_mk:
             return self.glm5_mkd(self, input_ids, positions), None
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
@@ -7647,6 +7675,9 @@ class TPUModelRunner(GPUModelRunner):
         aux_hidden_states = None
         if isinstance(out, (list, tuple)) and len(out) == 2:
             out, aux_hidden_states = out
+        if plan is not None:
+            # a mixed debug plan: the stock forward ran (and wrote its KV) first
+            out = self.glm5_mkd.aux(self, plan, input_ids, positions, out)
         return out, aux_hidden_states
 
     def _pp_intermediate_tensors(
