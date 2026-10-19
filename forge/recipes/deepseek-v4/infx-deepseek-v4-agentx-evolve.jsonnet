@@ -33,6 +33,10 @@ local gcsCkptDir = cdk.var('GCS_CKPT_DIR', 'gs://cloud-devkit/ckpt/hf/deepseek-a
 local gcsModelSrc = cdk.var('GCS_MODEL_SRC', gcsCkptDir);
 local gcsDatasetCache = cdk.var('GCS_DATASET_CACHE', 'gs://cloud-devkit/datasets/hf_cache/semianalysisai/cc-traces-weka-062126');
 local sharedCachePvc = cdk.var('SHARED_CACHE_PVC', '');
+// WEIGHTS_PVC=<claim>: mount a pre-populated read-only checkpoint disk at /models (the checkpoint at
+// /models/DeepSeek-V4-Pro-0813, as in gxd-dsv4-pro-weights-rox-pvc) instead of syncing the checkpoint from GCS
+// into a fresh 1500Gi premium-rwo volume per pod, whose provisioning often times out the 15 min pending deadline.
+local weightsPvc = cdk.var('WEIGHTS_PVC', '');
 local hfStorageSize = cdk.var('HF_STORAGE_SIZE', '1500Gi');
 
 // --- Cluster shape -----------------------------------------------------------
@@ -525,7 +529,12 @@ local serverScript = agentx.fill(
       python3 -m py_compile "$PAW_SCHED_PATH" && echo "Patched PrefixAwareScheduler compiled successfully"
     fi
 
-    if [ -d "/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813" ]; then
+    if [ -d "/models/DeepSeek-V4-Pro-0813" ]; then
+      echo "Found DeepSeek-V4 on the read-only weights PVC at /models/DeepSeek-V4-Pro-0813"
+      export MODEL_PATH="/models/DeepSeek-V4-Pro-0813"
+      export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
+      export HF_HUB_OFFLINE=1
+    elif [ -d "/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813" ]; then
       echo "Found DeepSeek-V4 on shared PVC at /vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export MODEL_PATH="/vllm-cache/deepseek-ai/DeepSeek-V4-Pro-0813"
       export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek-ai/DeepSeek-V4-Pro-0813}"
@@ -680,7 +689,9 @@ local serverVolumes = [
   hfTokenVolume,
   agentx.memoryVolume('dshm', '300Gi'),
 ] + (
-  if sharedCachePvc != '' then [
+  if weightsPvc != '' then [
+    { name: 'model-weights', persistentVolumeClaim: { claimName: weightsPvc, readOnly: true } },
+  ] else if sharedCachePvc != '' then [
     agentx.sharedCacheVolume(sharedCachePvc, name='vllm-shared-cache'),
   ] else [
     {
@@ -706,7 +717,9 @@ local serverVolumeMounts = [
   agentx.hfTokenMount(),
   agentx.mount('dshm', '/dev/shm'),
 ] + (
-  if sharedCachePvc != '' then [
+  if weightsPvc != '' then [
+    { name: 'model-weights', mountPath: '/models', readOnly: true },
+  ] else if sharedCachePvc != '' then [
     agentx.sharedCacheMount('vllm-shared-cache', '/vllm-cache'),
   ] else [
     agentx.mount('huggingface-storage', '/root/.cache/huggingface/'),
