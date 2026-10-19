@@ -20,6 +20,14 @@ import torch
 from vllm_torchtpu.spec_decode import utils
 
 
+@pytest.fixture(autouse=True)
+def _gather_exchange(monkeypatch):
+    """These tests cover the all-gather exchange; TPU_MTP_ONEHOT_AR (on by
+    default) needs an initialized TP group and per-rank slots, and its tests
+    below build their slots explicitly."""
+    monkeypatch.setenv("TPU_MTP_ONEHOT_AR", "0")
+
+
 def test_own_vocab_weights_are_kept_when_tp_layout_matches():
     target_embed = object()
     target_head = object()

@@ -818,8 +818,11 @@ def _build_streamidx_ops(monkeypatch, configs, kernels=None):
                 monkeypatch.delenv(var, raising=False)
             else:
                 monkeypatch.setenv(var, str(value))
+        # __init__ resolves TPU_STREAMIDX_SHARED_META per layer before the build.
         indexer = SimpleNamespace(
-            topk_tokens=topk, k_cache=SimpleNamespace(prefix=prefix)
+            topk_tokens=topk,
+            k_cache=SimpleNamespace(prefix=prefix),
+            _shared_meta=mla_attention_op._streamidx_shared_meta_for(prefix),
         )
         VllmTPUSparseAttnIndexer._build_streamidx_op(indexer)
     return names
@@ -851,6 +854,7 @@ def test_streamidx_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
         "skip_empty_decode_chunked",
         "mixed_bkvp",
         "decode_pack",
+        "shared_meta",
         "topk",
     }
 
@@ -1721,6 +1725,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
         )
         indexer.topk_tokens = topk
         indexer.k_cache = SimpleNamespace(prefix="model.layers.0.indexer")
+        indexer._shared_meta = False
         indexer._build_streamidx_op()
         assert captured["donate_argnums"] == (2,)
         new_cache, topk_out = captured["fn"](

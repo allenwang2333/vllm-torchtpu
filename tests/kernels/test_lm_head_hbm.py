@@ -26,6 +26,9 @@ import pytest
 
 from vllm_torchtpu.kernels import lm_head_hbm as lh
 
+# Pallas TPU kernel (no CPU interpret mode): off the CPU unit-test lane.
+pytestmark = pytest.mark.tpu_test
+
 K = 6144
 N = 9680  # GLM-5.2 vocab shard at TP16
 
