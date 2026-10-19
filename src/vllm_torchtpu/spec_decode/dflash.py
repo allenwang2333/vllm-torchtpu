@@ -463,11 +463,7 @@ class DFlashProposer:
             return
 
         target_hidden = chunk.aux_hidden_states
-        aux_hidden = (
-            target_hidden[0]
-            if isinstance(target_hidden, (list, tuple))
-            else target_hidden
-        )
+        aux_hidden = target_hidden[0]
         num_tokens = aux_hidden.shape[0]
 
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
