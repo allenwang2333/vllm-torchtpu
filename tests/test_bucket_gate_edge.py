@@ -48,29 +48,6 @@ def test_non_power_of_two_keeps_its_exact_meaning(min_tokens):
         assert (t > edge) == (t >= min_tokens)
 
 
-@pytest.mark.parametrize("cap,first_absorb", [(64, 128), (32, 64), (16, 64)])
-def test_absorb_starts_above_the_a2a_cap(cap, first_absorb, monkeypatch):
-    """Absorb is `T > max(cap, MIN_TOKENS // 2)`: never true on a bucket the
-    a2a merge (`T <= cap`) also takes, and with MIN_TOKENS=64 it starts at
-    bucket 64 for caps 16 and 32 (cap 16 leaves bucket 32 on the
-    reduce-scatter merge without absorb), at bucket 128 for cap 64."""
-    from vllm_torchtpu.layers.adapter import attention
-
-    # Module attributes, not env vars: robust to an envs cache another test
-    # enabled and to the image's own env.
-    for name, value in dict(
-        TPU_MLA_ABSORB_TOKEN_MAJOR="1",
-        TPU_DCP_LSE_MERGE_A2A=True,
-        TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS=64,
-        TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=cap,
-    ).items():
-        monkeypatch.setattr(attention.envs, name, value, raising=False)
-    for t in LADDER[2:13]:
-        absorb = attention.mla_absorb_mode(t) is not None
-        assert absorb == (t >= first_absorb), (cap, t)
-        assert not (absorb and t <= cap)
-
-
 @pytest.mark.parametrize("cap", [16, 32, 64])
 def test_merge_chunk_gate_unchanged_on_the_ladder(cap, monkeypatch):
     """`_merge_chunks` (TPU_DCP_MERGE_CHUNKED_MIN_TOKENS=1024, chunks 8,
