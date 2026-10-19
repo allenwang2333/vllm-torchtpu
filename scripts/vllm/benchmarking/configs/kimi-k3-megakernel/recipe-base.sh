@@ -39,6 +39,7 @@
 #   RECIPE_STORE_SERVERS          1: the decode-host store servers (oct13, oct16)
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
 #   RECIPE_PREFILL_MAX_NUM_SEQS   the prefill's --max-num-seqs; optional, 4
+#   RECIPE_PREFILL_LONG_THRESHOLD the long prefill's --long-prefill-token-threshold; optional, 4096
 #
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
@@ -431,7 +432,7 @@ if [ "$_role" = prefill ]; then
   # rank's host store lands on its own node; vLLM launches the workers under
   # numactl, which k3_1p1d.sh checks the engine image for.
   if [ -n "${RECIPE_SET:-}" ] && [ "$_long" = 1 ]; then
-    ROLE_ARGS+=(--long-prefill-token-threshold 4096)
+    ROLE_ARGS+=(--long-prefill-token-threshold "${RECIPE_PREFILL_LONG_THRESHOLD:-4096}")
     ROLE_ARGS+=(--numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1)
   fi
 elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
