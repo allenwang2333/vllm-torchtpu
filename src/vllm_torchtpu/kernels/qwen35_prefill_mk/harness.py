@@ -90,6 +90,29 @@ def make_case(c, layout, lens, ctxs, *, max_seqs, pps, block_tokens, t=None, see
                 attn_blocks, gdn_slots)
 
 
+def runner_meta(case, max_seqs):
+    """The runner's step metadata for a case, as the stage megakernel takes it (META): packed
+    query_start_loc, seq_lens, request_distribution, block tables and GDN state indices."""
+    n = len(case.lens)
+    qsl = np.zeros((max_seqs + 1,), np.int32)
+    qsl[1:n + 1] = np.cumsum(case.lens)
+    qsl[n + 1:] = qsl[n]
+    seq_lens = np.zeros((max_seqs,), np.int32)
+    seq_lens[:n] = np.asarray(case.lens) + np.asarray(case.ctxs)
+    meta = {"qsl": qsl, "seq_lens": seq_lens, "dist": np.asarray([0, 0, n], np.int32),
+            "bt": np.asarray(case.meta["bt"])}
+    for g in range(3):
+        meta[f"gslot{g}"] = np.asarray(case.meta[f"gslot{g}"])
+    return {k: jnp.asarray(v) for k, v in meta.items()}
+
+
+def to_runner(x_pad, case, n_buf):
+    """Padded-layout rows -> the runner's packed layout [n_buf, ...] (zeros past the tokens)."""
+    rows = np.concatenate([np.arange(st, st + n) for st, n in zip(case.starts, case.lens)])
+    out = jnp.zeros((n_buf,) + x_pad.shape[1:], x_pad.dtype)
+    return out.at[:len(rows)].set(x_pad[rows])
+
+
 def write_kv(pool, blocks, k, v, p0, split, block_tokens):
     """pool[page, 2h | 2h+1, d // 4, d % 4, lane] = k | v[p - p0, h, d] for the given positions."""
     n, nkv, hd = k.shape

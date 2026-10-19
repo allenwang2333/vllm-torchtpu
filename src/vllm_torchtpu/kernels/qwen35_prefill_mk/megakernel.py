@@ -31,6 +31,7 @@ a multiple of 32), contiguous per-layer KV caches [NKV, S, HD] fp8, dense per-la
 """
 
 import dataclasses
+import functools
 import os
 
 import jax
@@ -282,23 +283,28 @@ class StageLayout:
 # vLLM's routing simulation, honored so the megakernel and the stock MoE run the same load.
 SIM_UNIFORM = os.environ.get("VLLM_MOE_ROUTING_SIMULATION_STRATEGY", "") == "uniform_random"
 
-META = ("tile_seg", "seg_start", "seg_len", "seg_ctx", "bt", "gslot0", "gslot1", "gslot2")
+# The runner's step metadata, passed to the kernel as they are (SMEM): query_start_loc,
+# seq_lens, request_distribution, the attention group's block_tables (kernel pages), and each
+# GDN group's state indices; the first stage also takes the token ids.
+META = ("qsl", "seq_lens", "dist", "bt", "gslot0", "gslot1", "gslot2")
 
 
 def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, pps: int,
-                pool_shape, plan, stride, tiles: MKTiles = MKTiles(), interpret=False,
-                debug=False):
-    """Returns step(meta, hidden, residual, weights, pools, rope) -> (hidden, residual, pools):
-    the stage's whole prefill step in one pallas_call over a multi-sequence step.
+                pool_shape, plan, stride, n_buf: int, first: bool = False, last: bool = False,
+                tiles: MKTiles = MKTiles(), interpret=False, debug=False):
+    """Returns step(meta, x, r, norm, rope, weights, pools) -> (h, r, pools): a pipeline
+    stage's whole prefill step function as ONE pallas_call, from the runner's tensors to the
+    runner's tensors.
 
-    meta (int32, SMEM): tile_seg [t / 64] (sequence of each 64-row block, -1 = padding),
-    seg_start / seg_len / seg_ctx [max_seqs] (padded-layout start, new tokens, cached tokens;
-    starts are multiples of 256, ctx multiples of 128), bt [max_seqs * pps] (the attention
-    group's page table: kernel page of position p of sequence s at bt[s * pps + p // 128]),
-    gslot0..2 [max_seqs] (each GDN group's state block per sequence). hidden / residual
-    [t, H] bf16 in the padded layout; weights per layer in kernel_weight_layout; pools: the
-    region tensors (pages, 2 kvh, 64, 4, 128) fp8, updated in place (KV of the new tokens, GDN
-    states); plan / stride from pool_plan.build_gdn_plan."""
+    meta: the runner's step metadata as is (int32, SMEM, see META; "ids" too on the first
+    stage). x / r: the runner's hidden / residual buffers [n_buf, H] bf16 (packed by
+    query_start_loc); on the first stage x is the bf16 embedding table viewed as int32
+    [V, H / 2] (no copy) and r is unused. norm: the final norm weight [1, H] (used on
+    the last stage). Returns hidden / residual in the runner's layout [n_buf, H] (the last
+    stage's hidden is final-normed) and the region pools, updated in place. Inside: the
+    metadata becomes the padded segment layout (each sequence at a multiple of 256 rows, at most
+    t rows), the tokens move into it, every layer runs, and the results move back.
+    plan / stride: pool_plan.build_gdn_plan."""
     tl = tiles
     types = layout.layer_types
     assert c.layer_types == types
@@ -313,7 +319,8 @@ def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, p
           "hs": ((t, 1), F32), "sd": ((t, c.H), BF16), "sg": ((t, 1), F32),
           "topi": ((t, c.TOPK), I32), "topw": ((t, c.TOPK), F32), "rank": ((t, c.TOPK), I32),
           "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), F32), "xf": ((t, c.H), F32),
-          "pos": ((t, c.TOPK), I32), "cpos": ((t, c.TOPK), I32)}
+          "pos": ((t, c.TOPK), I32), "cpos": ((t, c.TOPK), I32),
+          "hrun": ((t, c.H), BF16), "rrun": ((t, c.H), BF16)}
     if has_gdn:
         kdim = c.KH * c.KD
         ws.update({"qkvz": ((t, c.QKV + c.Z), BF16), "ba": ((t, 2 * c.VH), BF16),
@@ -331,22 +338,46 @@ def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, p
     k_scales = layout.k_scales or (1.0,) * len(att_idx)
     v_scales = layout.v_scales or (1.0,) * len(att_idx)
 
-    def kernel(tile_seg, seg_start, seg_len, seg_ctx, bt, gs0, gs1, gs2, h_in, r_in, rope,
-               *refs):
+    n_meta = len(META) + (1 if first else 0)
+
+    def kernel(*refs):
+        m = dict(zip(META + (("ids",) if first else ()), refs[:n_meta]))
+        refs = refs[n_meta:]
+        x_in, r_in, norm_w, rope = refs[:4]
+        refs = refs[4:]
         w_refs, refs = refs[:n_w], refs[n_w:]
         pools_in, refs = refs[:n_reg], refs[n_reg:]
-        h_out, r_out = refs[0], refs[1]
+        h_dst, r_dst = refs[0], refs[1]
         pools, refs = refs[2:2 + n_reg], refs[2 + n_reg:]
         W = dict(zip(ws_names, refs))
         del pools_in                            # aliased by `pools`
-        gslots = (gs0, gs1, gs2)
+        pl.run_scoped(functools.partial(layers, m, x_in, r_in, norm_w, rope, w_refs, h_dst,
+                                        r_dst, pools, W),
+                      pltpu.SMEM((t // P.BLK,), I32), pltpu.SMEM((max_seqs,), I32),
+                      pltpu.SMEM((max_seqs,), I32), pltpu.SMEM((max_seqs,), I32))
+
+    def layers(m, x_in, r_in, norm_w, rope, w_refs, h_dst, r_dst, pools, W,
+               tile_seg, seg_start, seg_len, seg_ctx):
+        bt = m["bt"]
+        gslots = (m["gslot0"], m["gslot1"], m["gslot2"])
+        with jax.named_scope("prep_segments"):
+            P.prep_segments(m["qsl"], m["seq_lens"], m["dist"], tile_seg, seg_start, seg_len,
+                            seg_ctx, max_seqs=max_seqs, t=t)
+        segs0 = P.Segments(tile_seg, seg_start, seg_len, seg_ctx, gslots[0])
+        h_out, r_out = W["hrun"], W["rrun"]
+        with jax.named_scope("tokens_in"):
+            if first:
+                P.embed_in(m["ids"], x_in, m["qsl"], h_out, r_out, segs0)
+            else:
+                P.gather_in(x_in, r_in, m["qsl"], h_out, r_out, segs0)
+        h_in, r_in = h_out, r_out
         wi = 0
         for li, lt in enumerate(types):
             lw = dict(zip(w_names[li], w_refs[wi:wi + len(w_names[li])]))
             wi += len(w_names[li])
             pool = pools[layout.layer_region[li]]
             segs = P.Segments(tile_seg, seg_start, seg_len, seg_ctx,
-                              gslots[layout.layer_group[li]] if lt == "gdn" else gs0)
+                              gslots[layout.layer_group[li]] if lt == "gdn" else gslots[0])
             hsrc, rsrc = (h_in, r_in) if li == 0 else (h_out, r_out)
             with jax.named_scope(f"L{li}_in_norm"):
                 P.norm_add_quant(hsrc, rsrc, lw["in_norm"], r_out, W["xb"], W["xq"], W["xs"],
@@ -419,28 +450,32 @@ def build_stage(c: StageConfig, layout: StageLayout, t: int, *, max_seqs: int, p
             with jax.named_scope(f"L{li}_moe_combine"):
                 P.moe_combine(W["ys"], W["pos"], W["topw"], W["sd"], W["sg"], h_out, topk=c.TOPK,
                               tm=tl.tm_combine, inflight=tl.inflight)
+        with jax.named_scope("tokens_out"):
+            P.scatter_out(h_out, r_out, m["qsl"], m["dist"], h_dst, r_dst, segs0,
+                          norm_hbm=norm_w if last else None, eps=c.eps)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    n_in = 3 + n_w + n_reg                       # h, r, rope, weights, pools (after the meta)
+    n_in = 4 + n_w + n_reg                       # x, r, norm, rope, weights, pools (after meta)
 
-    def step(meta, hidden, residual, weights, pools, rope):
+    def step(meta, x, r, norm, rope, weights, pools):
         flat_w = [weights[li][n] for li in range(len(types)) for n in w_names[li]]
-        out_shape = ([jax.ShapeDtypeStruct((t, c.H), BF16)] * 2
+        out_shape = ([jax.ShapeDtypeStruct((n_buf, c.H), BF16)] * 2
                      + [jax.ShapeDtypeStruct(p.shape, p.dtype) for p in pools]
                      + [jax.ShapeDtypeStruct(*ws[n]) for n in ws_names])
-        aliases = {len(META) + 3 + n_w + i: 2 + i for i in range(n_reg)}
+        aliases = {n_meta + 4 + n_w + i: 2 + i for i in range(n_reg)}
         call = pl.pallas_call(
             kernel,
             out_shape=out_shape,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(META), grid=(), in_specs=[hbm] * n_in,
+                num_scalar_prefetch=n_meta, grid=(), in_specs=[hbm] * n_in,
                 out_specs=[hbm] * len(out_shape)),
             input_output_aliases=aliases,
             compiler_params=pltpu.CompilerParams(vmem_limit_bytes=tl.vmem_mib << 20),
             interpret=pltpu.InterpretParams() if interpret else False,
             name="qwen3_5_prefill_stage_megakernel",
         )
-        outs = call(*[meta[k] for k in META], hidden, residual, rope, *flat_w, *pools)
+        names = META + (("ids",) if first else ())
+        outs = call(*[meta[k] for k in names], x, r, norm, rope, *flat_w, *pools)
         h, r = outs[0], outs[1]
         new_pools = list(outs[2:2 + n_reg])
         if debug:

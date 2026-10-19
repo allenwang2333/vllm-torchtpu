@@ -144,10 +144,12 @@ class Qwen35PrefillMegakernel:
         self.pps = int(runner.model_config.max_model_len + PAGE - 1) // PAGE
         rope = MK.rope_table(c, self.pps * PAGE)
         self.rope = _t(torch.from_numpy(np.asarray(rope)).to(pool0.device))
-        if self.first:
-            self.embed = self.backbone.embed_tokens.weight
-        if self.last:
-            self.final_norm = self.backbone.norm.weight
+        # Per-stage operands in the kernel's forms, all views (no copies): the first stage
+        # reads the embedding table as int32 words, the last the final norm as one row; an
+        # operand a stage does not use is any small array.
+        self.x_first = (self.backbone.embed_tokens.weight.view(torch.int32) if self.first
+                        else None)
+        self.norm = (self.backbone.norm.weight.reshape(1, c.H) if self.last else self.rope)
         self.w_flat = [w[n] for li, w in enumerate(self.weights)
                        for n in ((MK.GDN_W if self.types[li] == "gdn" else MK.ATT_W) + MK.MOE_W)]
         self.max_tok = int(runner.max_num_tokens)
@@ -206,62 +208,32 @@ class Qwen35PrefillMegakernel:
                 return b
         return None
 
-    def _build_step(self, bucket: int):
-        c, S, pps = self.c, self.max_seqs, self.pps
-        step = MK.build_stage(c, self.layout, bucket, max_seqs=S, pps=pps,
-                              pool_shape=self.pool_shape, plan=self.plan, stride=self.stride)
+    def _build_step(self, bucket: int, n_buf: int, max_seqs: int, pps: int):
+        """The stage's step function: the megakernel's one pallas_call and nothing else. Every
+        operand is a runner tensor as the runner holds it."""
+        step = MK.build_stage(self.c, self.layout, bucket, max_seqs=max_seqs, pps=pps,
+                              pool_shape=self.pool_shape, plan=self.plan, stride=self.stride,
+                              n_buf=n_buf, first=self.first, last=self.last)
         n_w, n_p = len(self.w_flat), len(self.pools)
         w_names = [(MK.GDN_W if lt == "gdn" else MK.ATT_W) + MK.MOE_W for lt in self.types]
-        first, last, eps = self.first, self.last, c.eps
+        names = MK.META + (("ids",) if self.first else ())
+        n_m = len(names)
 
-        def fn(qsl, seq_lens, n_seq, bt, s0, s1, s2, hidden, residual, aux, norm, rope, *rest):
-            """Runner layout -> padded segment layout -> megakernel -> runner layout."""
-            ws_flat, pools = rest[:n_w], rest[n_w:]
-            n_tok = hidden.shape[0] if not first else aux.shape[0]
-            sidx = jnp.arange(S)
-            live = sidx < n_seq[0]
-            q_len = jnp.where(live, qsl[1:S + 1] - qsl[:S], 0)
-            ctx = jnp.where(live, seq_lens[:S] - q_len, 0)
-            padded = (q_len + P.SEG_ALIGN - 1) // P.SEG_ALIGN * P.SEG_ALIGN
-            start = jnp.cumsum(padded) - padded
-            row = jnp.arange(bucket)
-            inside = ((row[:, None] >= start[None, :]) & (row[:, None] < (start + padded)[None, :])
-                      & live[None, :])
-            seg = jnp.any(inside, 1)
-            sid = jnp.argmax(inside, 1)
-            local = row - start[sid]
-            valid = seg & (local < q_len[sid])
-            src = jnp.where(valid, qsl[sid] + local, 0)
-            tile_seg = jnp.where(seg, sid, -1).astype(jnp.int32)[::P.BLK]
-            meta = {"tile_seg": tile_seg, "seg_start": start.astype(jnp.int32),
-                    "seg_len": q_len.astype(jnp.int32), "seg_ctx": ctx.astype(jnp.int32),
-                    "bt": bt.reshape(-1)[:S * pps].astype(jnp.int32),
-                    "gslot0": s0[:S].astype(jnp.int32), "gslot1": s1[:S].astype(jnp.int32),
-                    "gslot2": s2[:S].astype(jnp.int32)}
-            if first:                              # aux = input ids, hidden = embedding table
-                h_in = jnp.take(hidden, jnp.take(aux, src), axis=0).astype(jnp.bfloat16)
-                r_in = jnp.zeros_like(h_in)
-            else:
-                h_in, r_in = jnp.take(hidden, src, axis=0), jnp.take(residual, src, axis=0)
+        def fn(*a):
+            meta = dict(zip(names, a[:n_m]))
+            x, r, norm, rope = a[n_m:n_m + 4]
+            ws_flat, pools = a[n_m + 4:n_m + 4 + n_w], a[n_m + 4 + n_w:]
             wl, k = [], 0
-            for names in w_names:
-                wl.append(dict(zip(names, ws_flat[k:k + len(names)])))
-                k += len(names)
-            h, r, new_pools = step(meta, h_in, r_in, wl, list(pools), rope)
-            # padded -> runner rows: token j of sequence s sits at start[s] + j - qsl[s].
-            tok = jnp.arange(n_tok)
-            ts = jnp.clip(jnp.searchsorted(qsl[1:S + 1], tok, side="right"), 0, S - 1)
-            back = jnp.clip(start[ts] + tok - qsl[ts], 0, bucket - 1)
-            h_out, r_out = jnp.take(h, back, axis=0), jnp.take(r, back, axis=0)
-            if last:                               # model.norm(hidden, residual)
-                x = h_out.astype(jnp.float32) + r_out.astype(jnp.float32)
-                x = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
-                h_out = (x * (1.0 + norm.reshape(1, -1).astype(jnp.float32))).astype(jnp.bfloat16)
-            return (h_out, r_out, *new_pools)
+            for nm in w_names:
+                wl.append(dict(zip(nm, ws_flat[k:k + len(nm)])))
+                k += len(nm)
+            h, r, new_pools = step(meta, x, r, norm, rope, wl, list(pools))
+            return (h, r, *new_pools)
 
-        n_fixed = 12
+        n_fixed = n_m + 4
         n_in = n_fixed + n_w + n_p
-        name = f"qwen35_prefill_mk_stage{self.local[0]}_{self.local[-1]}_t{bucket}"
+        name = (f"qwen35_prefill_mk_stage{self.local[0]}_{self.local[-1]}_t{bucket}_n{n_buf}"
+                f"_s{max_seqs}_p{pps}")
         # sharded_jax_callable reads the signature: every argument a jax.Array, positional.
         args = [f"x{i}" for i in range(n_in)]
         src = (f"def {name}({', '.join(a + ': jax.Array' for a in args)}) -> "
@@ -271,10 +243,34 @@ class Qwen35PrefillMegakernel:
         exec(compile(src, f"<{name}>", "exec"), ns)  # noqa: S102
         spec = jax.sharding.PartitionSpec()
         return sharded_jax_callable(
-            f"qwen35_prefill_mk::stage{self.local[0]}_{self.local[-1]}_t{bucket}", ns[name],
+            f"qwen35_prefill_mk::{name}", ns[name],
             mesh=self.mesh, input_partition_specs=(spec,) * n_in,
             output_partition_specs=(spec,) * (2 + n_p),
             donate_argnums=tuple(range(n_fixed + n_w, n_in)))
+
+    def _get_step(self, bucket, n_buf, max_seqs, pps):
+        key = (bucket, n_buf, max_seqs, pps)
+        step = self._steps.get(key)
+        if step is None:
+            import time
+            t0 = time.perf_counter()
+            step = self._steps[key] = self._build_step(*key)
+            logger.info("Qwen3.5 prefill megakernel: step t=%d n_buf=%d seqs=%d pps=%d built "
+                        "in %.1f s", *key, time.perf_counter() - t0)
+        return step
+
+    def _operands(self, md, input_ids, intermediate_tensors):
+        """The runner's tensors, in the kernel's operand order, untouched."""
+        attn_md = md[self.attn_name]
+        meta = [attn_md.query_start_loc, attn_md.seq_lens, attn_md.request_distribution,
+                attn_md.block_tables]
+        meta += [md[name].mamba_state_indices for name in self.mamba_names]
+        if self.first:
+            meta.append(input_ids)
+            x, r = self.x_first, self.rope
+        else:
+            x, r = intermediate_tensors["hidden_states"], intermediate_tensors["residual"]
+        return meta, x, r
 
     def can_run(self, input_ids, positions, intermediate_tensors=None, runner=None, **_) -> bool:
         if not self.bound:
@@ -296,6 +292,16 @@ class Qwen35PrefillMegakernel:
         padded = int(((q_len + P.SEG_ALIGN - 1) // P.SEG_ALIGN * P.SEG_ALIGN).sum())
         if self._bucket(padded) is None:
             return self._fallback("tokens")
+        n_buf = int(input_ids.shape[0]) if self.first else int(
+            intermediate_tensors["hidden_states"].shape[0])
+        if n_buf % P.BLK or n_buf < P.WIN or n_buf < int(qsl[-1]):
+            return self._fallback("runner-padding")
+        am = md[self.attn_name]
+        S = int(am.seq_lens.shape[0])
+        if (n > S or int(am.query_start_loc.shape[0]) < S + 1 or am.block_tables.numel() % S
+                or am.block_tables.numel() // S * PAGE > self.pps * PAGE
+                or any(md[nm].mamba_state_indices is None for nm in self.mamba_names)):
+            return self._fallback("metadata")
         return True
 
     def _fallback(self, why: str) -> bool:
@@ -306,73 +312,42 @@ class Qwen35PrefillMegakernel:
         return False
 
     def warmup(self, runner: Any) -> None:
-        """Compile every bucket before serving, on all-padding metadata (no sequence: nothing is
-        read from or written to the pools)."""
-        import time
-
+        """Compile every bucket before serving, at the runner's largest padded token count and
+        metadata shapes, on all-padding metadata (request_distribution all zeros: no sequence,
+        nothing read from or written to the pools)."""
         dev = self.rope.device
-        S = self.max_seqs
+        S = int(runner.max_num_reqs)
+        pps = self.pps
+        n_buf = self.max_tok
+        z = lambda *sh: torch.zeros(sh, dtype=torch.int32, device=dev)
+        meta = [z(S + 1), z(S), z(3), z(S * pps), z(S), z(S), z(S)]
+        if self.first:
+            meta.append(z(n_buf))
+            x, r = self.x_first, self.rope
+        else:
+            x = torch.zeros(n_buf, self.c.H, dtype=torch.bfloat16, device=dev)
+            r = x
         for bucket in self.buckets:
-            t0 = time.perf_counter()
-            self._steps[bucket] = step = self._build_step(bucket)
-            z = lambda n: torch.zeros(n, dtype=torch.int32, device=dev)
-            if self.first:
-                hidden, residual, aux = self.embed, self.embed[:1], z(self.max_tok)
-            else:
-                hidden = torch.zeros(self.max_tok, self.c.H, dtype=torch.bfloat16, device=dev)
-                residual, aux = hidden, z(1)
-            norm = self.final_norm if self.last else self.rope[:1, :1]
-            outs = step(z(S + 1), z(S), z(1), z(S * self.pps), z(S), z(S), z(S), hidden, residual,
-                        aux, norm, self.rope, *self.w_flat, *self.pools)
+            step = self._get_step(bucket, n_buf, S, pps)
+            outs = step(*meta, x, r, self.norm, self.rope, *self.w_flat, *self.pools)
             for dst, src in zip(self.pools, outs[2:]):
                 dst.set_(src)
-            logger.info("Qwen3.5 prefill megakernel: bucket %d compiled in %.1f s", bucket,
-                        time.perf_counter() - t0)
 
     def __call__(self, input_ids, positions, intermediate_tensors=None, runner=None):
         md = get_forward_context().attn_metadata
-        attn_md = md[self.attn_name]
         n = int(runner.input_batch.num_reqs)
-        qsl_np = np.asarray(runner.query_start_loc_np[:n + 1])
-        q_len = np.diff(qsl_np)
+        q_len = np.diff(np.asarray(runner.query_start_loc_np[:n + 1]))
         padded = int(((q_len + P.SEG_ALIGN - 1) // P.SEG_ALIGN * P.SEG_ALIGN).sum())
         bucket = self._bucket(padded)
-        step = self._steps.get(bucket)
-        if step is None:
-            step = self._steps[bucket] = self._build_step(bucket)
-        dev = self.rope.device
-        S = self.max_seqs
-        qsl = torch.zeros(S + 1, dtype=torch.int32, device=dev)
-        qsl[:n + 1] = attn_md.query_start_loc[:n + 1].to(torch.int32)
-        qsl[n + 1:] = qsl[n]
-        seq_lens = torch.zeros(S, dtype=torch.int32, device=dev)
-        seq_lens[:n] = attn_md.seq_lens[:n].to(torch.int32)
-        n_seq = torch.tensor([n], dtype=torch.int32, device=dev)
-        bt = attn_md.block_tables.reshape(-1).to(torch.int32)
-        if bt.numel() < S * self.pps:
-            bt = torch.nn.functional.pad(bt, (0, S * self.pps - bt.numel()))
-        slots = []
-        for name in self.mamba_names:
-            si = md[name].mamba_state_indices.to(torch.int32).reshape(-1)
-            slots.append(torch.nn.functional.pad(si, (0, max(0, S - si.numel())))[:S])
-        # Fixed op shapes (max_num_tokens rows) whatever the runner's padding for the step, so
-        # each bucket compiles once.
-        n_tok = int(positions.shape[-1])
-        fit = lambda x: torch.nn.functional.pad(x, (0, 0, 0, self.max_tok - x.shape[0])) \
-            if x.shape[0] < self.max_tok else x[:self.max_tok]
-        if self.first:
-            ids = input_ids.to(torch.int32).reshape(-1)
-            ids = torch.nn.functional.pad(ids, (0, self.max_tok - ids.shape[0])) \
-                if ids.shape[0] < self.max_tok else ids[:self.max_tok]
-            hidden, residual, aux = self.embed, self.embed[:1], ids
-        else:
-            hidden = fit(intermediate_tensors["hidden_states"])
-            residual = fit(intermediate_tensors["residual"])
-            aux = n_seq
-        norm = self.final_norm if self.last else self.rope[:1, :1]
-        outs = step(qsl, seq_lens, n_seq, bt, *slots, hidden, residual, aux, norm, self.rope,
-                    *self.w_flat, *self.pools)
-        h, r = outs[0][:n_tok], outs[1][:n_tok]
+        meta, x, r = self._operands(md, input_ids, intermediate_tensors)
+        if self.n_run == 0:
+            logger.info("Qwen3.5 prefill megakernel operands: %s",
+                        [(tuple(t.shape), str(t.dtype)) for t in meta + [x, r]])
+        S = int(meta[1].shape[0])
+        pps = int(meta[3].numel()) // S
+        n_buf = int(x.shape[0]) if not self.first else int(input_ids.shape[0])
+        step = self._get_step(bucket, n_buf, S, pps)
+        outs = step(*meta, x, r, self.norm, self.rope, *self.w_flat, *self.pools)
         for dst, src in zip(self.pools, outs[2:]):
             dst.set_(src)
         self.n_run += 1
@@ -380,6 +355,5 @@ class Qwen35PrefillMegakernel:
             logger.info("Qwen3.5 prefill megakernel: runs %d, fallbacks %d (last bucket %d)",
                         self.n_run, self.n_fallback, bucket)
         if self.last:
-            return h
-        return IntermediateTensors({"hidden_states": h, "residual": r})
-
+            return outs[0]
+        return IntermediateTensors({"hidden_states": outs[0], "residual": outs[1]})

@@ -22,6 +22,9 @@ def main():
     ap.add_argument("--tiles", default="")
     ap.add_argument("--pooled", action="store_true", help="the serving form (build_stage)")
     ap.add_argument("--max-seqs", type=int, default=16)
+    ap.add_argument("--n-buf", type=int, default=8192, help="the runner's padded token count")
+    ap.add_argument("--first", action="store_true")
+    ap.add_argument("--last", action="store_true")
     args = ap.parse_args()
     os.environ.pop("LIBTPU_INIT_ARGS", None)
     os.environ.setdefault("TPU_ACCELERATOR_TYPE", "tpu7x-8")
@@ -83,16 +86,22 @@ def main():
                                                     d_k=c.KD, d_v=c.VD, kernel_size=c.CONV,
                                                     pool_block_tokens=2176)
             step = MK.build_stage(c, layout, args.t, max_seqs=args.max_seqs, pps=pps,
-                                  pool_shape=pool_shape, plan=plan, stride=stride, tiles=tiles)
-            S = args.max_seqs
-            meta = {"tile_seg": sd((args.t // 64,), jnp.int32), "seg_start": sd((S,), jnp.int32),
-                    "seg_len": sd((S,), jnp.int32), "seg_ctx": sd((S,), jnp.int32),
-                    "bt": sd((S * pps,), jnp.int32), "gslot0": sd((S,), jnp.int32),
-                    "gslot1": sd((S,), jnp.int32), "gslot2": sd((S,), jnp.int32)}
+                                  pool_shape=pool_shape, plan=plan, stride=stride,
+                                  n_buf=args.n_buf, first=args.first, last=args.last,
+                                  tiles=tiles)
+            S, nb = args.max_seqs, args.n_buf
+            i32 = lambda *sh: sd(sh, jnp.int32)
+            meta = {"qsl": i32(S + 1), "seq_lens": i32(S), "dist": i32(3), "bt": i32(S * pps),
+                    "gslot0": i32(S), "gslot1": i32(S), "gslot2": i32(S)}
+            if args.first:
+                meta["ids"] = i32(nb)
+                x, rr = i32(248320, c.H // 2), sd((1, c.H), R.BF16)
+            else:
+                x, rr = sd((nb, c.H), R.BF16), sd((nb, c.H), R.BF16)
             pools = [sd(pool_shape, R.FP8) for _ in range(layout.n_regions)]
-            lowered = jax.jit(lambda m, h, r, kw_, p_, rope_: step(m, h, r, kw_, p_, rope_),
-                              in_shardings=shard, out_shardings=shard).trace(
-                meta, h, r, kws, pools, rope).lower(lowering_platforms=("tpu",))
+            lowered = jax.jit(step, in_shardings=shard, out_shardings=shard).trace(
+                meta, x, rr, sd((1, c.H), R.BF16), sd((pps * 128, c.ROT), jnp.float32), kws,
+                pools).lower(lowering_platforms=("tpu",))
         else:
             step = MK.build(c, args.t, s_max, tiles)
             lowered = jax.jit(lambda ctx, h, r, kw_, ks_, rope_: step(ctx, h, r, kw_, ks_, rope_),

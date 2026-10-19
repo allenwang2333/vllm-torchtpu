@@ -60,17 +60,43 @@ if HAS_GDN:
     print("state pack/unpack round trip: conv", rel(cv[0], gstates[0]["conv"]), "rec", rel(rc[0], gstates[0]["rec"]))
 
 states = [gstates if lt == "gdn" else astates for lt in TYPES]
+FIRST, LAST = "--first" in sys.argv, "--last" in sys.argv
+N_BUF = -(-max(sum(lens), 80) // 64) * 64 + 64          # the runner's padded token count
+meta = Hn.runner_meta(case, MAXS)
+pad_mask = np.zeros((T, 1), bool)
+for st, n in zip(case.starts, lens):
+    pad_mask[st:st + n] = True
+if FIRST:                                               # token ids -> embedding rows
+    V = 1000
+    emb = (jax.random.normal(jax.random.PRNGKey(7), (V, c.H), R.F32) * 0.5).astype(R.BF16)
+    ids_pad = jnp.asarray(rng.integers(0, V, (T,)), jnp.int32)
+    h = jnp.where(pad_mask, emb[ids_pad], 0).astype(R.BF16)
+    r = jnp.zeros_like(h)
+    meta["ids"] = Hn.to_runner(ids_pad, case, N_BUF)
+    x_in, r_in = jax.lax.bitcast_convert_type(emb.reshape(V, c.H // 2, 2), jnp.int32), emb[:1]
+else:
+    h = jnp.where(pad_mask, h, 0).astype(R.BF16)
+    r = jnp.where(pad_mask, r, 0).astype(R.BF16)
+    x_in, r_in = Hn.to_runner(h, case, N_BUF), Hn.to_runner(r, case, N_BUF)
 hr, rr, sr = Hn.reference_step(c, layout, ws, h, r, case, states, flash_bkv=tiles.bkv,
                                moe_fn=R.moe_ragged if REAL else None)
+norm_w = (jax.random.normal(jax.random.PRNGKey(8), (1, c.H), R.F32) * 0.1).astype(R.BF16)
+if LAST:
+    hr = R.rmsnorm_zc(hr.astype(R.F32) + rr.astype(R.F32), norm_w, c.eps).astype(R.BF16)
 ai = TYPES.index("attn") if "attn" in TYPES else None
 gi = TYPES.index("gdn") if HAS_GDN else None
 kw = [MK.kernel_weight_layout(c, w, lt) for w, lt in zip(ws, c.layer_types)]
 step = MK.build_stage(c, layout, T, max_seqs=MAXS, pps=PPS, pool_shape=pool.shape, plan=plan,
-                      stride=stride, tiles=tiles, interpret=INTERP)
-h2, r2, pools2 = jax.jit(step)(case.meta, h, r, kw, [pool], MK.rope_table(c, PPS * Hn.PAGE))
+                      stride=stride, n_buf=N_BUF, first=FIRST, last=LAST, tiles=tiles,
+                      interpret=INTERP)
+h2, r2, pools2 = jax.jit(step)(meta, x_in, r_in, norm_w, MK.rope_table(c, PPS * Hn.PAGE), kw,
+                               [pool])
 pool2 = np.asarray(pools2[0])
+q0 = np.concatenate([[0], np.cumsum(lens)])
+print("rows past the tokens zero:", bool(jnp.all(h2[q0[-1]:] == 0)))
 for s, (st, n, cx) in enumerate(zip(case.starts, lens, ctxs)):
-    print(f"seq {s} (len {n}, ctx {cx}): hidden rel {rel(h2[st:st + n], hr[st:st + n]):.2e} residual rel {rel(r2[st:st + n], rr[st:st + n]):.2e}")
+    a0 = q0[s]
+    print(f"seq {s} (len {n}, ctx {cx}): hidden rel {rel(h2[a0:a0 + n], hr[st:st + n]):.2e}" + ("" if LAST else f" residual rel {rel(r2[a0:a0 + n], rr[st:st + n]):.2e}"))
     if ai is not None:
         kk, vv = Hn.read_kv(pool2, case.attn_blocks[s], cx, n, split, BT_TOK, c.NKV, c.HD)
         print(f"   new K rel {rel(jnp.asarray(kk), sr[ai][s]['k'][cx:cx + n]):.2e} V rel {rel(jnp.asarray(vv), sr[ai][s]['v'][cx:cx + n]):.2e}")

@@ -129,6 +129,70 @@ def time_step(args):
         print("XPROF " + d, flush=True)
 
 
+def stage(args):
+    """The serving form end to end: build_stage on runner-layout operands (packed hidden /
+    residual, the runner's metadata, region pools), --lens sequences with --ctxs cached tokens
+    each, timed as one call; --xprof captures one more."""
+    serving_env(trace_regions=args.xprof)
+    os.environ.setdefault("VLLM_KV_CACHE_LAYOUT", "HND")
+    os.environ.setdefault("TPU_GDN_CONV_QK_PAIR_LAYOUT", "1")
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import harness as Hn
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import megakernel as MK
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import pool_plan
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import reference as R
+
+    types = tuple(args.layers.split(","))
+    c = R.StageConfig(layer_types=types)
+    layout = MK.StageLayout(types, tuple(i // 4 for i in range(len(types))),
+                            tuple(i % 4 for i in range(len(types))))
+    lens = [int(x) for x in args.lens.split(",")]
+    ctxs = [int(x) for x in args.ctxs.split(",")]
+    bt_tok, S = 2176, 16
+    pps = -(-(max(ctxs) + max(lens)) // Hn.PAGE)
+    case = Hn.make_case(c, layout, lens, ctxs, max_seqs=S, pps=pps, block_tokens=bt_tok,
+                        t=args.t)
+    pools = [jnp.asarray(p) for p in case.pools]
+    plan, stride = pool_plan.build_gdn_plan(pools[0].shape, pools[0].dtype, conv_dim=c.QKV,
+                                            n_v=c.VH, d_k=c.KD, d_v=c.VD, kernel_size=c.CONV,
+                                            pool_block_tokens=bt_tok)
+    ws, _, h, r = jax.jit(lambda k: R.random_stage_device(c, args.t, 0, k))(
+        jax.random.PRNGKey(args.seed))
+    kw = [MK.kernel_weight_layout(c, w, lt) for w, lt in zip(ws, types)]
+    del ws
+    n_buf = args.n_buf or -(-sum(lens) // 64) * 64
+    meta = Hn.runner_meta(case, S)
+    x, rr = Hn.to_runner(h, case, n_buf), Hn.to_runner(r, case, n_buf)
+    tiles = tiles_from(args, MK)
+    step = jax.jit(MK.build_stage(c, layout, args.t, max_seqs=S, pps=pps,
+                                  pool_shape=pools[0].shape, plan=plan, stride=stride,
+                                  n_buf=n_buf, tiles=tiles), donate_argnums=(6,))
+    rope = MK.rope_table(c, pps * Hn.PAGE)
+    norm = jnp.zeros((1, c.H), jnp.bfloat16)
+    t0 = time.time()
+    out = jax.block_until_ready(step(meta, x, rr, norm, rope, kw, pools))
+    first = time.time() - t0
+    best, pools = 1e9, out[2]
+    for _ in range(args.reps):
+        t1 = time.perf_counter()
+        out = jax.block_until_ready(step(meta, x, rr, norm, rope, kw, pools))
+        best = min(best, time.perf_counter() - t1)
+        pools = out[2]
+    res = {"mode": "stage", "layers": args.layers, "t": args.t, "lens": lens, "ctxs": ctxs,
+           "n_buf": n_buf, "tiles": dataclasses.asdict(tiles), "first_call_s": round(first, 1),
+           "step_ms": round(best * 1e3, 2),
+           "finite": bool(jnp.isfinite(out[0][:sum(lens)].astype(jnp.float32)).all())}
+    print("MK_RESULT " + json.dumps(res), flush=True)
+    if args.xprof:
+        d = os.path.join(args.xprof_dir, "stage")
+        os.makedirs(d, exist_ok=True)
+        with jax.profiler.trace(d):
+            jax.block_until_ready(step(meta, x, rr, norm, rope, kw, pools))
+        print("XPROF " + d, flush=True)
+
+
 def attn_acc(args):
     """Flash-phase accuracy: the kernel's attention output (workspace "ao") against exact f32
     attention computed from the kernel's own normalized q ("qn") and K/V caches."""
@@ -179,7 +243,8 @@ def sweep(args):
     rows = []
     for tiles in args.sweep_tiles:
         cmd = [sys.executable, os.path.abspath(__file__), args.sweep_mode, "--layers", args.layers, "--t",
-               str(args.t), "--ctx", str(args.ctx), "--reps", str(args.reps), "--tiles", tiles]
+               str(args.t), "--ctx", str(args.ctx), "--reps", str(args.reps), "--tiles", tiles,
+               "--lens", args.lens, "--ctxs", args.ctxs, "--n-buf", str(args.n_buf)]
         print(f"[mk_sweep] {tiles}", flush=True)
         p = subprocess.run(cmd, capture_output=True, text=True)
         line = [l for l in p.stdout.splitlines() if l.startswith("MK_RESULT ")]
@@ -193,8 +258,11 @@ def sweep(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["check", "time", "profile", "sweep", "attn_acc"])
-    ap.add_argument("--sweep-mode", default="time", choices=["time", "attn_acc"])
+    ap.add_argument("mode", choices=["check", "time", "profile", "sweep", "attn_acc", "stage"])
+    ap.add_argument("--sweep-mode", default="time", choices=["time", "attn_acc", "stage"])
+    ap.add_argument("--lens", default="8192", help="stage: new tokens per sequence")
+    ap.add_argument("--ctxs", default="87040", help="stage: cached tokens per sequence")
+    ap.add_argument("--n-buf", type=int, default=0, help="stage: runner rows (0: tokens)")
     ap.add_argument("--layers", default="gdn,attn")
     ap.add_argument("--t", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=4096)
@@ -206,7 +274,7 @@ def main():
     ap.add_argument("--xprof-dir", default=os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof"))
     args = ap.parse_args()
     {"check": check, "time": time_step, "profile": time_step, "sweep": sweep,
-     "attn_acc": attn_acc}[args.mode](args)
+     "attn_acc": attn_acc, "stage": stage}[args.mode](args)
 
 
 if __name__ == "__main__":

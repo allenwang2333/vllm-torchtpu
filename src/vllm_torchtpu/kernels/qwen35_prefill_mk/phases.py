@@ -1357,3 +1357,197 @@ def att_flash_paged(qn_hbm, pool_hbm, bt, pps, o_hbm, segs, *, nh, nkv, hd, bq, 
     pl.run_scoped(run, pltpu.VMEM((rows, 128), F32), pltpu.VMEM((rows, 128), F32),
                   pltpu.VMEM((rows, hd), F32), pltpu.VMEM((2, hd // 4, 4, bkv), FP8),
                   pltpu.VMEM((2, hd // 4, 4, bkv), FP8), pltpu.SemaphoreType.DMA((2,)))
+
+
+# ------------------------------------------------------------------------------------------------
+# Step prep and finish inside the kernel: the runner's metadata and packed token layout in, the
+# runner's layout out, so the stage's whole step function is this one kernel.
+# ------------------------------------------------------------------------------------------------
+
+WIN = 80                  # rows of an aligned window that covers 64 rows at any offset
+
+
+def prep_segments(qsl, seq_lens, dist, tile_seg, seg_start, seg_len, seg_ctx, *, max_seqs, t):
+    """Scalar pass over the runner's metadata (query_start_loc [>= S+1], seq_lens [>= S],
+    request_distribution [3], all SMEM) into the Segments tables (SMEM scratch): sequence s's
+    new tokens start at a multiple of SEG_ALIGN rows of the padded layout."""
+    n = dist[2]
+
+    def clear(b, c):
+        tile_seg[b] = jnp.int32(-1)
+        return c
+    jax.lax.fori_loop(0, t // BLK, clear, 0)
+
+    def seq(s, acc):
+        live = s < n
+        q = jnp.where(live, qsl[s + 1] - qsl[s], 0)
+        seg_start[s] = acc
+        seg_len[s] = q
+        seg_ctx[s] = jnp.where(live, seq_lens[s] - q, 0)
+        padded = (q + SEG_ALIGN - 1) // SEG_ALIGN * SEG_ALIGN
+
+        def mark(b, c):
+            tile_seg[b] = s
+            return c
+        jax.lax.fori_loop(acc // BLK, jnp.minimum(acc + padded, t) // BLK, mark, 0)
+        return acc + padded
+    jax.lax.fori_loop(0, max_seqs, seq, jnp.int32(0))
+
+
+def _rows_window(src_hbm, row0, n_src, win, sem):
+    """DMA the aligned WIN-row window holding rows row0 .. row0+63 of src (bf16 [n_src, H],
+    16-row tiles) into win; returns the dynamic offset of row0 inside the window."""
+    base = jnp.clip((row0 // 16) * 16, 0, n_src - WIN)
+    base = pl.multiple_of(base, 16)
+    cp = pltpu.make_async_copy(src_hbm.at[pl.ds(base, WIN)], win, sem)
+    cp.start()
+    cp.wait()
+    return row0 - base
+
+
+def gather_in(h_src, r_src, qsl, h_pad, r_pad, segs):
+    """Runner layout -> padded layout: padded block b of sequence s takes runner rows
+    qsl[s] + (b * 64 - start[s]) .. +63 (aligned window, sublane roll by the offset); rows past
+    the sequence are zeros. h_src / r_src [n_buf, H] bf16, h_pad / r_pad [t, H] bf16."""
+    n_buf, h = h_src.shape
+    t = h_pad.shape[0]
+
+    def run(win, sem):
+        def body(ho_ref, ro_ref):
+            b = pl.program_id(0)
+            seg = segs.tile_seg[b]
+            sg = jnp.maximum(seg, 0)
+            local = b * BLK - segs.start[sg]
+            valid = jnp.where(seg >= 0, jnp.clip(segs.length[sg] - local, 0, BLK), 0)
+            row = jax.lax.broadcasted_iota(jnp.int32, (BLK, 1), 0)
+            for src, dst in ((h_src, ho_ref), (r_src, ro_ref)):
+                @pl.when(valid > 0)
+                def _():
+                    off = _rows_window(src, qsl[sg] + local, n_buf, win, sem.at[0])
+                    x = pltpu.roll(win[...].astype(F32), (WIN - off) % WIN, 0)[:BLK]
+                    dst[...] = jnp.where(row < valid, x, 0.0).astype(dst.dtype)
+
+                @pl.when(valid == 0)
+                def _():
+                    dst[...] = jnp.zeros(dst.shape, dst.dtype)
+
+        pltpu.emit_pipeline(
+            body, grid=(t // BLK,),
+            out_specs=[pl.BlockSpec((BLK, h), lambda b: (b, 0))] * 2,
+        )(h_pad, r_pad)
+
+    pl.run_scoped(run, pltpu.VMEM((WIN, h), BF16), pltpu.SemaphoreType.DMA((1,)))
+
+
+def embed_in(ids, emb_i32, qsl, h_pad, r_pad, segs, *, inflight=64):
+    """First stage: h_pad rows = embedding rows of the step's token ids (runner layout ids in
+    SMEM), residual zeros. emb_i32 is the bf16 embedding table [V, H] viewed as int32
+    [V, H / 2] (no copy): word k of a row holds columns 2k (low half) and 2k + 1 (high half).
+    One DMA per row; the halves are put back in column order by two exact 0/1 matmuls per
+    256 columns."""
+    t, h = h_pad.shape
+    hh = h // 2
+    lw = 128                                    # words per de-interleave tile (256 columns)
+
+    def run(rows, sem_r):
+        k = jax.lax.broadcasted_iota(jnp.int32, (lw, 2 * lw), 0)
+        col = jax.lax.broadcasted_iota(jnp.int32, (lw, 2 * lw), 1)
+        even = (col == 2 * k).astype(BF16)
+        odd = (col == 2 * k + 1).astype(BF16)
+
+        def body(ho_ref, ro_ref):
+            b = pl.program_id(0)
+            seg = segs.tile_seg[b]
+            sg = jnp.maximum(seg, 0)
+            local = b * BLK - segs.start[sg]
+            valid = jnp.where(seg >= 0, jnp.clip(segs.length[sg] - local, 0, BLK), 0)
+            src0 = qsl[sg] + local
+
+            def tok(r):
+                return ids[src0 + jnp.minimum(r, jnp.maximum(valid - 1, 0))]
+            nrows = jnp.where(valid > 0, BLK, 0)
+            _gather_issue(emb_i32, tok, rows, nrows, sem_r, inflight)
+            _gather_drain(emb_i32, rows, nrows, sem_r, inflight)
+            row = jax.lax.broadcasted_iota(jnp.int32, (BLK, 1), 0)
+            keep = row < valid
+            for j in range(hh // lw):
+                u = rows[:, j * lw:(j + 1) * lw]
+                lo = jax.lax.bitcast_convert_type(u << 16, F32).astype(BF16)
+                hi = jax.lax.bitcast_convert_type(u & jnp.int32(-65536), F32).astype(BF16)
+                x = (jnp.dot(lo, even, preferred_element_type=F32)
+                     + jnp.dot(hi, odd, preferred_element_type=F32))
+                ho_ref[:, j * 2 * lw:(j + 1) * 2 * lw] = jnp.where(keep, x, 0.0).astype(
+                    ho_ref.dtype)
+            ro_ref[...] = jnp.zeros(ro_ref.shape, ro_ref.dtype)
+
+        pltpu.emit_pipeline(
+            body, grid=(t // BLK,),
+            out_specs=[pl.BlockSpec((BLK, h), lambda b: (b, 0))] * 2,
+        )(h_pad, r_pad)
+
+    pl.run_scoped(run, pltpu.VMEM((BLK, hh), jnp.int32), pltpu.SemaphoreType.DMA((inflight,)))
+
+
+def scatter_out(h_pad, r_pad, qsl, dist, h_dst, r_dst, segs, *, norm_hbm=None, eps=1e-6):
+    """Padded layout -> runner layout: runner block j takes, for every sequence overlapping it,
+    the padded rows start[s] + (r - qsl[s]) (aligned window + roll), rows past the step's tokens
+    are zeros. With norm_hbm (last stage) h_dst is rmsnorm(h + r) * (1 + w) and r_dst unused."""
+    t, h = h_pad.shape
+    n_buf = h_dst.shape[0]
+    n = dist[2]
+
+    def run(win_h, win_r, nw, sem):
+        if norm_hbm is not None:
+            cp = pltpu.make_async_copy(norm_hbm, nw, sem.at[0])
+            cp.start()
+            cp.wait()
+
+        def body(ho_ref, ro_ref):
+            j = pl.program_id(0)
+            r0 = j * BLK
+            row = jax.lax.broadcasted_iota(jnp.int32, (BLK, 1), 0) + r0
+            total = qsl[n]
+
+            # sequences overlapping rows r0 .. r0+63: first s with qsl[s+1] > r0
+            def first_seq(s, acc):
+                return jnp.where((acc < 0) & (qsl[s + 1] > r0), s, acc)
+            s0 = jnp.maximum(jax.lax.fori_loop(0, segs.start.shape[0], first_seq,
+                                               jnp.int32(-1)), 0)
+
+            def one(s, accs):
+                acc_h, acc_r = accs
+                mine = (row >= qsl[s]) & (row < qsl[s + 1]) & (row < total)
+                prow = segs.start[s] + r0 - qsl[s]
+                outs = []
+                for src, win, acc in ((h_pad, win_h, acc_h), (r_pad, win_r, acc_r)):
+                    off = _rows_window(src, jnp.maximum(prow, 0), t, win, sem.at[0])
+                    shift = off + jnp.minimum(prow, 0)        # prow < 0: rows before the window
+                    x = pltpu.roll(win[...].astype(F32), (WIN - shift) % WIN, 0)[:BLK]
+                    outs.append(jnp.where(mine, x, acc))
+                return tuple(outs)
+
+            def cond_loop(carry):
+                s, _ = carry
+                return (s < n) & (qsl[s] < r0 + BLK)
+
+            def step_loop(carry):
+                s, accs = carry
+                return s + 1, one(s, accs)
+
+            z = jnp.zeros((BLK, h), F32)
+            _, (hx, rx) = jax.lax.while_loop(cond_loop, step_loop, (s0, (z, z)))
+            if norm_hbm is not None:
+                x = hx + rx
+                x = x * jax.lax.rsqrt(jnp.mean(x * x, -1, keepdims=True) + eps)
+                ho_ref[...] = (x * (1.0 + nw[...].astype(F32))).astype(ho_ref.dtype)
+            else:
+                ho_ref[...] = hx.astype(ho_ref.dtype)
+            ro_ref[...] = rx.astype(ro_ref.dtype)
+
+        pltpu.emit_pipeline(
+            body, grid=(n_buf // BLK,),
+            out_specs=[pl.BlockSpec((BLK, h), lambda j: (j, 0))] * 2,
+        )(h_dst, r_dst)
+
+    pl.run_scoped(run, pltpu.VMEM((WIN, h), BF16), pltpu.VMEM((WIN, h), BF16),
+                  pltpu.VMEM((1, h), BF16), pltpu.SemaphoreType.DMA((1,)))

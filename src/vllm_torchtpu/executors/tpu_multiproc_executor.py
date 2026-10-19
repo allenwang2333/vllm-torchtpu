@@ -10,6 +10,9 @@ from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -20,8 +23,15 @@ class TpuMultiprocExecutor(MultiprocExecutor):
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
 
+    def determine_available_memory(self) -> list[int]:
+        mem = super().determine_available_memory()
+        logger.info("[kv-sizing] per-worker available KV memory: %s", mem)
+        return mem
+
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
+        logger.info("[kv-sizing] per-worker KV spec page bytes: %s", [
+            sorted({(type(v).__name__, v.page_size_bytes) for v in w.values()}) for w in specs])
 
         if self.vllm_config.cache_config.num_gpu_blocks_override is None:
             # Compact-mamba sizing sets `num_gpu_blocks_override` on the worker's
@@ -34,6 +44,7 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             )
             if agreed is not None:
                 self.vllm_config.cache_config.num_gpu_blocks_override = agreed
+            logger.info("[kv-sizing] num_gpu_blocks_override agreed: %s", agreed)
 
         return specs
 
