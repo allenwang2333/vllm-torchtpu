@@ -118,7 +118,7 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
           "hs": ((t, 1), F32), "sd": ((t, c.H), BF16), "sg": ((t, 1), F32),
           "topi": ((t, c.TOPK), I32), "topw": ((t, c.TOPK), F32), "rank": ((t, c.TOPK), I32),
           "cnt": ((1, c.E), I32), "ys": ((n_pad, c.H), F32), "xf": ((t, c.H), F32),
-          "pos": ((t, c.TOPK), I32)}
+          "pos": ((t, c.TOPK), I32), "cpos": ((t, c.TOPK), I32)}
     if has_gdn:
         kdim = c.KH * c.KD
         ws.update({"qkvz": ((t, c.QKV + c.Z), BF16), "ba": ((t, 2 * c.VH), BF16),
@@ -211,9 +211,9 @@ def build(c: StageConfig, t: int, s_max: int, tiles: MKTiles = MKTiles(), *, int
                             tm=tl.tm_route)
             with jax.named_scope(f"L{li}_moe_experts"):
                 P.moe_experts(W["xf"], W["topi"], W["rank"], W["cnt"], lw["w13"], lw["w13_s"],
-                              lw["w2"], lw["w2_s"], W["ys"], W["pos"], e=c.E, topk=c.TOPK,
-                              inter=c.I, rt=tl.rt, inflight=tl.inflight, tm=tl.tm_route,
-                                  interleave=tl.moe_interleave, wslots=tl.moe_wslots)
+                              lw["w2"], lw["w2_s"], W["ys"], W["pos"], W["cpos"], e=c.E,
+                              topk=c.TOPK, inter=c.I, rt=tl.rt, inflight=tl.inflight,
+                              tm=tl.tm_route, interleave=tl.moe_interleave, wslots=tl.moe_wslots)
             with jax.named_scope(f"L{li}_moe_combine"):
                 P.moe_combine(W["ys"], W["pos"], W["topw"], W["sd"], W["sg"], h_out, topk=c.TOPK,
                               tm=tl.tm_combine, inflight=tl.inflight)

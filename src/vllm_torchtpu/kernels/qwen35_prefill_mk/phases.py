@@ -718,13 +718,15 @@ def _expert_tile_interleaved(x, w13, w13s, w2, w2s, inter, issue_chunks):
 
 
 def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hbm, w2s_hbm,
-                y_sorted_hbm, pos_hbm, *, e, topk, inter, rt, inflight=64, tm=256,
+                y_sorted_hbm, pos_hbm, cpos_hbm, *, e, topk, inter, rt, inflight=64, tm=256,
                 interleave=0, wslots=2):
     """Routed experts. Rows are grouped by expert (expert e's segment starts at off[e], padded to
     a multiple of `rt`), gathered by DMA from the normed activations, quantized per row, run
     through w13 -> SwiGLU -> w2 (w8a8), and written to y_sorted [n_pad, H] f32 (bf16 values) in
     grouped order. Also writes pos [T, K] = off[topi] + rank, the grouped row of every (token,
-    slot). Rows are 32-bit: a single-row DMA cannot address one row of a packed bf16 tile.
+    slot), and cpos [T, K], the same without the per-expert padding (it indexes the token map
+    kept in SMEM, which the padding would overflow at T = 16384). Rows are 32-bit: a single-row
+    DMA cannot address one row of a packed bf16 tile.
 
     The grouped tiles of all experts form one list, software-pipelined: tile g+1's rows are
     gathered while tile g computes, outputs are written asynchronously, and each expert's
@@ -740,8 +742,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
     n_slots = t * topk
     max_tiles = n_slots // rt + e
 
-    def run(cnt_s, off_s, tok_s, stage_s, t_e, t_r0, t_n, t_first, t_next, t_next2, sems,
-            sem1):
+    def run(cnt_s, off_s, coff_s, tok_s, stage_s, t_e, t_r0, t_cr0, t_n, t_first, t_next,
+            t_next2, sems, sem1):
         cp = pltpu.make_async_copy(counts_hbm, cnt_s, sem1.at[0])
         cp.start()
         cp.wait()
@@ -750,9 +752,10 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
         # expert, first grouped row, live rows, whether it starts its expert, and the next
         # expert with rows (to prefetch, -1 if none).
         def off_body(ei, carry):
-            acc, ntile, prev_first, prev2_first = carry
+            acc, cacc, ntile, prev_first, prev2_first = carry
             n = cnt_s[0, ei]
             off_s[0, ei] = acc
+            coff_s[0, ei] = cacc
             nt = (n + rt - 1) // rt
 
             @pl.when(nt > 0)
@@ -769,46 +772,50 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                 g = ntile + ti
                 t_e[g] = ei
                 t_r0[g] = acc + ti * rt
+                t_cr0[g] = cacc + ti * rt
                 t_n[g] = jnp.minimum(rt, n - ti * rt)
                 t_first[g] = (ti == 0).astype(jnp.int32)
                 t_next[g] = -1
                 t_next2[g] = -1
                 return c
             jax.lax.fori_loop(0, nt, tile_body, 0)
-            return (acc + nt * rt, ntile + nt, jnp.where(nt > 0, ntile, prev_first),
+            return (acc + nt * rt, cacc + n, ntile + nt, jnp.where(nt > 0, ntile, prev_first),
                     jnp.where(nt > 0, prev_first, prev2_first))
 
         with jax.named_scope("moe_offsets"):
-            _, n_tiles, _, _ = jax.lax.fori_loop(
-                0, e, off_body, (jnp.int32(0), jnp.int32(0), jnp.int32(-1), jnp.int32(-1)))
+            _, _, n_tiles, _, _ = jax.lax.fori_loop(
+                0, e, off_body,
+                (jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.int32(-1), jnp.int32(-1)))
 
         # pos = off[topi] + rank (vector pass), and the inverse map tok_s[pos] = t (scalar).
-        def pos_pass(off_v):
-            cpo = pltpu.make_async_copy(off_s, off_v, sem1.at[0])  # SMEM -> VMEM
-            cpo.start()
-            cpo.wait()
+        def pos_pass(off_v, coff_v):
+            for src, dst in ((off_s, off_v), (coff_s, coff_v)):   # SMEM -> VMEM
+                cpo = pltpu.make_async_copy(src, dst, sem1.at[0])
+                cpo.start()
+                cpo.wait()
             lane = jax.lax.broadcasted_iota(jnp.int32, (tm, e), 1)
 
-            def body(ti_ref, rk_ref, pos_ref):
-                ids = ti_ref[...]
-                off = off_v[...]
-                cols = [jnp.sum(jnp.where(lane == ids[:, kk:kk + 1], off, 0), -1, keepdims=True)
-                        for kk in range(topk)]
-                pos_ref[...] = jnp.concatenate(cols, -1) + rk_ref[...]
+            def body(ti_ref, rk_ref, pos_ref, cpos_ref):
+                ids, rk = ti_ref[...], rk_ref[...]
+                for ref, offv in ((pos_ref, off_v), (cpos_ref, coff_v)):
+                    off = offv[...]
+                    cols = [jnp.sum(jnp.where(lane == ids[:, kk:kk + 1], off, 0), -1,
+                                    keepdims=True) for kk in range(topk)]
+                    ref[...] = jnp.concatenate(cols, -1) + rk
 
             pltpu.emit_pipeline(
                 body, grid=(t // tm,),
                 in_specs=[pl.BlockSpec((tm, topk), lambda i: (i, 0))] * 2,
-                out_specs=[pl.BlockSpec((tm, topk), lambda i: (i, 0))],
-            )(topi_hbm, rank_hbm, pos_hbm)
+                out_specs=[pl.BlockSpec((tm, topk), lambda i: (i, 0))] * 2,
+            )(topi_hbm, rank_hbm, pos_hbm, cpos_hbm)
 
         with jax.named_scope("moe_pos"):
-            pl.run_scoped(pos_pass, pltpu.VMEM((1, e), jnp.int32))
+            pl.run_scoped(pos_pass, pltpu.VMEM((1, e), jnp.int32), pltpu.VMEM((1, e), jnp.int32))
 
         rows_per_stage = stage_s.shape[0]
 
         def scatter_stage(si, c):
-            cps = pltpu.make_async_copy(pos_hbm.at[pl.ds(si * rows_per_stage, rows_per_stage)],
+            cps = pltpu.make_async_copy(cpos_hbm.at[pl.ds(si * rows_per_stage, rows_per_stage)],
                                         stage_s, sem1.at[0])
             cps.start()
             cps.wait()
@@ -835,8 +842,8 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                     pltpu.make_async_copy(src.at[0], dst.at[slot], wsem.at[slot, k]).wait()
 
             def gather(g, b):
-                r0 = t_r0[g]
-                _gather_issue(xb_hbm, lambda r: tok_s[r0 + r], xin.at[b], t_n[g], sems.at[b],
+                c0 = t_cr0[g]
+                _gather_issue(xb_hbm, lambda r: tok_s[c0 + r], xin.at[b], t_n[g], sems.at[b],
                               inflight)
 
             def ywrite(g, b):
@@ -846,7 +853,7 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
 
             def row_copy(g, b, r):
                 # Rows past the tile's live count re-read its first token (never used).
-                src = tok_s[t_r0[g] + jnp.where(r < t_n[g], r, 0)]
+                src = tok_s[t_cr0[g] + jnp.where(r < t_n[g], r, 0)]
                 return pltpu.make_async_copy(xb_hbm.at[pl.ds(src, 1)], xin.at[b, pl.ds(r, 1)],
                                              isems.at[b, r])
 
@@ -943,11 +950,12 @@ def moe_experts(xb_hbm, topi_hbm, rank_hbm, counts_hbm, w13_hbm, w13s_hbm, w2_hb
                       pltpu.SemaphoreType.DMA((wslots, 4)), pltpu.SemaphoreType.DMA((2,)),
                       pltpu.SemaphoreType.DMA((2, rt)))
 
-    n_pad = n_slots + e * (rt - 1)
     stage_rows = 64
     pl.run_scoped(run, pltpu.SMEM((1, e), jnp.int32), pltpu.SMEM((1, e), jnp.int32),
-                  pltpu.SMEM((n_pad,), jnp.int32), pltpu.SMEM((stage_rows, topk), jnp.int32),
+                  pltpu.SMEM((1, e), jnp.int32),
+                  pltpu.SMEM((n_slots,), jnp.int32), pltpu.SMEM((stage_rows, topk), jnp.int32),
                   pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
+                  pltpu.SMEM((max_tiles,), jnp.int32),
                   pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
                   pltpu.SMEM((max_tiles,), jnp.int32), pltpu.SMEM((max_tiles,), jnp.int32),
                   pltpu.SemaphoreType.DMA((2, inflight)), pltpu.SemaphoreType.DMA((1,)))
