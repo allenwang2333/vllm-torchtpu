@@ -51,6 +51,7 @@ steps:
         bash .buildkite/scripts/run_in_docker.sh
         python -m pytest
         tests/models/vllm/test_dsv41_config.py
+        tests/models/vllm/test_csa2_chunk_cache.py
         tests/models/vllm/test_dsv41_v2_model_full.py
         tests/models/vllm/test_dsv41_v2_model_sp.py
         tests/models/vllm/test_dsv41_v2_local_q.py

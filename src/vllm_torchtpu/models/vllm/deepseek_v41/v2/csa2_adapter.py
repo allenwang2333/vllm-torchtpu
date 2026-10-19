@@ -218,11 +218,11 @@ def _manual_bridge(function, mesh, tensor_args, out_specs):
     from jax.sharding import PartitionSpec as P
 
     @functools.wraps(function)
-    def call(*args):
+    def call(*args, **kwargs):
         # Scalars are static trailing arguments. Optional banks remain part of
         # the array pytree, matching the native attention bridge contract.
         return jax.shard_map(
-            lambda *arrays: function(*arrays, *args[tensor_args:]),
+            lambda *arrays: function(*arrays, *args[tensor_args:], **kwargs),
             mesh=mesh,
             in_specs=(P(),) * tensor_args,
             out_specs=out_specs,
