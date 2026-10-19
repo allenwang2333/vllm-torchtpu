@@ -129,11 +129,56 @@ def time_step(args):
         print("XPROF " + d, flush=True)
 
 
+def attn_acc(args):
+    """Flash-phase accuracy: the kernel's attention output (workspace "ao") against exact f32
+    attention computed from the kernel's own normalized q ("qn") and K/V caches."""
+    serving_env()
+    import jax
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import megakernel as MK
+    from vllm_torchtpu.kernels.qwen35_prefill_mk import reference as R
+
+    c = R.StageConfig(layer_types=("attn",))
+    s_max = args.ctx + args.t
+    weights, states, h, r = jax.jit(lambda k: R.random_stage_device(c, args.t, args.ctx, k))(
+        jax.random.PRNGKey(args.seed))
+    kw = [MK.kernel_weight_layout(c, weights[0], "attn")]
+    ks = [{"k": jnp.swapaxes(states[0]["k"], 0, 1), "v": jnp.swapaxes(states[0]["v"], 0, 1)}]
+    tiles = tiles_from(args, MK)
+    step = jax.jit(MK.build(c, args.t, s_max, tiles, debug=True))
+    _, _, s2, W = jax.block_until_ready(step(args.ctx, h, r, kw, ks, MK.rope_table(c, s_max)))
+    q = W["qn"].astype(jnp.float32)                                  # [NH, T, HD]
+    kc, vc = s2[0]["k"].astype(jnp.float32), s2[0]["v"].astype(jnp.float32)   # [NKV, S, HD]
+    grp = c.NH // c.NKV
+    pos = args.ctx + jnp.arange(args.t)
+
+    @jax.jit
+    def ref_head(qh, kh, vh):                                         # one q head, f32 exact
+        sc = (qh @ kh.T) * (c.HD ** -0.5)
+        sc = jnp.where(jnp.arange(kh.shape[0])[None, :] <= pos[:, None], sc, -jnp.inf)
+        return jax.nn.softmax(sc, -1) @ vh
+
+    errs, num, den = [], 0.0, 0.0
+    for hh in range(c.NH):
+        o_ref = ref_head(q[hh], kc[hh // grp], vc[hh // grp])
+        d = W["ao"][hh] - o_ref
+        num += float(jnp.sum(d * d))
+        den += float(jnp.sum(o_ref * o_ref))
+        errs.append(jnp.max(jnp.linalg.norm(d, axis=-1) / jnp.linalg.norm(o_ref, axis=-1)))
+    t0 = time.perf_counter()
+    jax.block_until_ready(step(args.ctx, h, r, kw, s2, MK.rope_table(c, s_max)))
+    res = {"mode": "attn_acc", "tiles_arg": args.tiles, "t": args.t, "ctx": args.ctx,
+           "rel_l2": (num / den) ** 0.5, "worst_row_rel": float(jnp.max(jnp.stack(errs))),
+           "step_ms_one": round((time.perf_counter() - t0) * 1e3, 2)}
+    print("MK_RESULT " + json.dumps(res), flush=True)
+
+
 def sweep(args):
     """One `time` run per --sweep-tiles entry, each in its own process (one TPU holder at a time)."""
     rows = []
     for tiles in args.sweep_tiles:
-        cmd = [sys.executable, os.path.abspath(__file__), "time", "--layers", args.layers, "--t",
+        cmd = [sys.executable, os.path.abspath(__file__), args.sweep_mode, "--layers", args.layers, "--t",
                str(args.t), "--ctx", str(args.ctx), "--reps", str(args.reps), "--tiles", tiles]
         print(f"[mk_sweep] {tiles}", flush=True)
         p = subprocess.run(cmd, capture_output=True, text=True)
@@ -148,7 +193,8 @@ def sweep(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["check", "time", "profile", "sweep"])
+    ap.add_argument("mode", choices=["check", "time", "profile", "sweep", "attn_acc"])
+    ap.add_argument("--sweep-mode", default="time", choices=["time", "attn_acc"])
     ap.add_argument("--layers", default="gdn,attn")
     ap.add_argument("--t", type=int, default=1024)
     ap.add_argument("--ctx", type=int, default=4096)
@@ -159,7 +205,8 @@ def main():
     ap.add_argument("--sweep-tiles", nargs="*", default=[""])
     ap.add_argument("--xprof-dir", default=os.path.join(os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof"))
     args = ap.parse_args()
-    {"check": check, "time": time_step, "profile": time_step, "sweep": sweep}[args.mode](args)
+    {"check": check, "time": time_step, "profile": time_step, "sweep": sweep,
+     "attn_acc": attn_acc}[args.mode](args)
 
 
 if __name__ == "__main__":

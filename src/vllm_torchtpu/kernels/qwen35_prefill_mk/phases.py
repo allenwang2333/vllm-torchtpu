@@ -30,6 +30,7 @@ from jax.experimental.pallas import tpu as pltpu
 F32, BF16 = jnp.float32, jnp.bfloat16
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
+P_FP8_SCALE = 448.0       # fp8 attention: probabilities in [0, 1] scaled to the e4m3 range
 
 
 @dataclasses.dataclass(frozen=True)
@@ -430,7 +431,8 @@ def att_qk_norm_rope_kv(att_hbm, qn_w_hbm, kn_w_hbm, rope_hbm, ctx, qn_hbm, kc_h
                   pltpu.VMEM((nkv, tm, hd), FP8), pltpu.SemaphoreType.DMA((3,)))
 
 
-def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max, sub=4):
+def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max, sub=4,
+              fp8=False):
     """Causal GQA attention of the T new tokens (positions ctx + t) over the cache rows
     0 .. ctx + T - 1, per kv head with its nh / nkv q heads folded into the rows.
 
@@ -439,6 +441,9 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
     go to bf16 for the max / exp (sum, running max and accumulator in f32), and only KV tiles
     that cross the causal diagonal are masked. The rows are split into `sub` chunks, unrolled, so
     one chunk's QK matmul can overlap another's softmax.
+    fp8: QK and PV as native fp8 matmuls (opt-in; changes numerics): q quantized per row with a
+    dynamic scale against the fp8 K cache, probabilities (in [0, 1]) scaled by 448 into fp8
+    against the fp8 V; the softmax sum is taken over the same quantized probabilities.
     qn [nh, T, hd] bf16, kc / vc [nkv, S, hd] fp8, o [nh, T, hd] f32."""
     t = qn_hbm.shape[1]
     grp = nh // nkv
@@ -453,13 +458,19 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
 
     def run(m_ref, l_ref, acc_ref):
         def step(q_ref, k_ref, v_ref, i, j, masked):
-            kk = k_ref[0].astype(BF16)
-            vv = v_ref[0].astype(BF16)
+            if fp8:
+                kk, vv = k_ref[0], v_ref[0]
+            else:
+                kk = k_ref[0].astype(BF16)
+                vv = v_ref[0].astype(BF16)
 
             def pv(c, p, alpha):                 # chunk c's PV and accumulator update
                 r = slice(c * rc, (c + 1) * rc)
-                acc_ref[r, :] = alpha * acc_ref[r, :] + jax.lax.dot_general(
-                    p, vv, (((1,), (0,)), ((), ())), preferred_element_type=F32)
+                y = jax.lax.dot_general(p, vv, (((1,), (0,)), ((), ())),
+                                        preferred_element_type=F32)
+                if fp8:
+                    y = y * (1.0 / P_FP8_SCALE)
+                acc_ref[r, :] = alpha * acc_ref[r, :] + y
 
             # Software pipelined like the serving RPA: chunk c's QK + softmax, then chunk c-1's
             # PV, so the MXU has independent work while the VPU runs the softmax.
@@ -467,11 +478,17 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
             for c in range(sub):
                 r = slice(c * rc, (c + 1) * rc)
                 q = q_ref[...].reshape(rows, hd)[r]
-                if fold:
-                    q = q * jnp.asarray(scale, BF16)
-                s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
-                                        preferred_element_type=F32)
-                s = (s if fold else s * scale).astype(BF16)
+                if fp8:
+                    q8, qs = quantize_rows(q)
+                    s = jax.lax.dot_general(q8, kk, (((1,), (1,)), ((), ())),
+                                            preferred_element_type=F32)
+                    s = (s * (qs * scale)).astype(BF16)
+                else:
+                    if fold:
+                        q = q * jnp.asarray(scale, BF16)
+                    s = jax.lax.dot_general(q, kk, (((1,), (1,)), ((), ())),
+                                            preferred_element_type=F32)
+                    s = (s if fold else s * scale).astype(BF16)
                 if masked:
                     row = jax.lax.broadcasted_iota(jnp.int32, (rc, 1), 0) + c * rc
                     col = jax.lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
@@ -481,8 +498,12 @@ def att_flash(qn_hbm, kc_hbm, vc_hbm, ctx, o_hbm, *, nh, nkv, hd, bq, bkv, s_max
                 m_new = jnp.maximum(m_prev, jnp.max(s, -1, keepdims=True).astype(F32))
                 alpha = jnp.exp(m_prev - m_new)
                 p = jnp.exp(s - m_new.astype(BF16))
-                l_ref[r, :] = jnp.broadcast_to(
-                    alpha * l_ref[r, :1] + jnp.sum(p, -1, keepdims=True, dtype=F32), (rc, 128))
+                if fp8:
+                    p = (p * jnp.asarray(P_FP8_SCALE, BF16)).astype(FP8)
+                    psum = jnp.sum(p.astype(F32), -1, keepdims=True) * (1.0 / P_FP8_SCALE)
+                else:
+                    psum = jnp.sum(p, -1, keepdims=True, dtype=F32)
+                l_ref[r, :] = jnp.broadcast_to(alpha * l_ref[r, :1] + psum, (rc, 128))
                 m_ref[r, :] = jnp.broadcast_to(m_new, (rc, 128))
                 if prev is not None:
                     pv(*prev)
