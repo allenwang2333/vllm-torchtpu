@@ -1193,14 +1193,14 @@ def test_unstacked_expert_weights_equivalence(T: int, B: int):
             )
 
         # Verify unpack_local_weight rejects transposed non-expert and expert tensors
-        with pytest.raises(ValueError, match="local shard has shape"):
+        with pytest.raises(mk.MegakernelConfigError, match="local shard has shape"):
             mk.kernel.unpack_local_weight(
                 jnp.zeros((1, 4, 32, 16, 128), dtype=jnp.bfloat16),
                 (4, 16, 128, 32),
                 name="router",
                 allow_expert_reshape=False,
             )
-        with pytest.raises(ValueError, match="local shard has shape"):
+        with pytest.raises(mk.MegakernelConfigError, match="local shard has shape"):
             mk.kernel.unpack_local_weight(
                 jnp.zeros((8, 64, 256), dtype=jnp.float8_e4m3fn),
                 (8, 2, 128, 64),
@@ -1969,6 +1969,40 @@ def _rec_pool_max_ulp(r_a: Any, r_b: Any, num_pages: int, kinds: dict[int, str])
     return worst
 
 
+def _pool_diff_summary(
+    raw_a: Any, raw_b: Any, num_pages: int, kinds: dict[int, str]
+) -> dict[str, Any]:
+    """Per page kind: number of differing pages (+ max bf16 ULP for rec pages)."""
+    out: dict[str, Any] = {}
+    for r_a, r_b in zip(raw_a, raw_b):
+        a = np.asarray(r_a).view(np.uint8)
+        b = np.asarray(r_b).view(np.uint8)
+        for gp_ in np.unique(np.argwhere(a != b)[:, 0]):
+            kind = kinds.get(int(gp_) % num_pages, "unreferenced")
+            n, ulp = out.get(kind, (0, 0))
+            if kind == "rec":
+                ba = _rec_page_bf16_bits(a[gp_]).astype(np.int32)
+                bb = _rec_page_bf16_bits(b[gp_]).astype(np.int32)
+                ulp = max(ulp, int(np.max(np.abs(ba - bb))))
+            out[kind] = (n + 1, ulp)
+    return out
+
+
+def _assert_hidden_equal_per_row(
+    out_a: Any, out_b: Any, R: int, pools: tuple | None = None
+) -> None:
+    """Hidden outputs bitwise equal; on mismatch report per-row max bf16 ULP.
+
+    `pools=(raw_a, raw_b, num_pages, kinds)` adds a `_pool_diff_summary`.
+    """
+    a = np.asarray(mk.unfold(out_a, R)).view(np.uint16).astype(np.int32)
+    b = np.asarray(mk.unfold(out_b, R)).view(np.uint16).astype(np.int32)
+    d = np.abs(a - b).max(axis=tuple(i for i in range(a.ndim) if i != 1))
+    if d.any():
+        extra = f"; pools: {_pool_diff_summary(*pools)}" if pools else ""
+        raise AssertionError(f"hidden per-row max bf16 ULP: {d.tolist()}{extra}")
+
+
 def _assert_pools_equal_up_to_rec_ulp(
     r_a: Any, r_b: Any, num_pages: int, kinds: dict[int, str], *, max_ulp: int
 ) -> None:
@@ -2007,17 +2041,25 @@ WIDE_FUSED_REC_ULP_BOUND = 12
         (2, 4, 1),
         (2, 4, 2),
         (4, 8, 1),
-        # Open (fused is experimental, numerics class approx): with this seed
-        # fused vs split differs beyond rec-state rounding at T=4 (hidden rows
-        # 2-3 by up to 6 bf16 ULP, plus the KV bytes of those tokens). Seed 4
-        # (not run here) differs on rows 3-7 by up to 177 ULP, including t=0 of
-        # the second sequence, so it is not only intermediate-checkpoint
-        # rounding; root cause under investigation. Strict, so it fails loudly
-        # once fixed.
+        # Open (fused is experimental, numerics class approx; Track F): with
+        # seeds 2 and 4 fused vs split differs beyond rec-state rounding at T=4.
+        # Seed 2: hidden rows 2-3 by up to 6 bf16 ULP, plus the KV bytes of
+        # those tokens. Seed 4: rows 3-7 by up to 177 ULP, including t=0 of the
+        # second sequence. The failure message records per-row hidden ULP and
+        # the per-kind pool diff. Strict, so they fail loudly once fixed.
         pytest.param(
             4,
             8,
             2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="fused T=4 deviation beyond rec-state ULP for this seed (open)",
+            ),
+        ),
+        pytest.param(
+            4,
+            8,
+            4,
             marks=pytest.mark.xfail(
                 strict=True,
                 reason="fused T=4 deviation beyond rec-state ULP for this seed (open)",
@@ -2124,11 +2166,10 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     out_s, raw_s = step_split(pos, hid_mk, w_mk, pools_s, pt, ckpt, roff)
     out_f, raw_f = step_fused(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff)
 
-    np.testing.assert_array_equal(
-        np.asarray(out_f).view(np.uint8),
-        np.asarray(out_s).view(np.uint8),
-    )
     kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    _assert_hidden_equal_per_row(
+        out_f, out_s, ex.R, pools=(raw_f, raw_s, ex.num_pages, kinds)
+    )
     rec_ulp = max(1, T - 1)
     if ex.WIDE:
         # Known open deviation (root cause under investigation): on WIDE buckets
@@ -2225,6 +2266,119 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
         assert "decode_megakernel" in jaxpr_str
         assert "gather_gdn_states" not in jaxpr_str
         assert "scatter_pool_states" not in jaxpr_str
+
+
+@pytest.mark.parametrize(
+    "B,seed",
+    [
+        # Measured at the B1 head (CPU interpret): hidden bitwise, rec-state
+        # pages within T - 1 ULP.
+        (8, 1),
+        # Open (Track F): beyond the bound. B=8 seed 0: hidden row 7 differs
+        # by 11 bf16 ULP plus the KV bytes of that token; B=24 seed 0: rows
+        # 6-7 by 36 ULP. Strict, so these fail loudly once fixed.
+        pytest.param(
+            8,
+            0,
+            marks=pytest.mark.xfail(
+                strict=True, reason="fused T=4 deviation beyond bound (Track F, open)"
+            ),
+        ),
+        pytest.param(
+            24,
+            0,
+            marks=[
+                pytest.mark.slow,
+                pytest.mark.xfail(
+                    strict=True,
+                    reason="fused T=4 deviation beyond bound (Track F, open)",
+                ),
+            ],
+        ),
+    ],
+)
+def test_candidate30_fused_profile_vs_split(B: int, seed: int):
+    """Fused vs split for the real `qwen35-candidate30-fused` exec config (T=4).
+
+    The ExecSpec comes from `get_profile(...).exec_for(...)` (only ring / bank
+    sizes shrunk to the CPU geometry), so it exercises the profile's own tile
+    flags (`conv_stage`, `gdn_head_major`, `kv_sub`, ...). Same policy as
+    `test_fused_pool_io_bit_exact_and_hlo`: hidden bitwise, pools bytewise
+    except GDN rec-state pages within `T - 1` bf16 ULP (WIDE: the measured
+    WIDE bound, reported as XFAIL).
+    """
+    T = 4
+    mesh = _cpu_mesh(2)
+    tp = NamedSharding(mesh, P("tp"))
+    g = _tiny_geom(L=4, att_every=4)
+    spec = qwen35.qwen35_spec(g)
+    prof = mk.get_profile("qwen35-candidate30-fused")
+    base = mk.ExecSpec(
+        R=2,
+        B=B,
+        T=T,
+        ctx=256,
+        paged_kv=True,
+        num_pages=512 if B <= 8 else 2048,
+        interpret=True,
+    )
+    ex = prof.exec_for(base, B=B, T=T, g=g)
+    t = ex.resolved_tiles
+    t = replace(
+        t,
+        bank=512 << 10,
+        nbd=10,
+        nbe=max(6, min(t.nbe, 12)),
+        ebank=256 << 10,
+        kv_blk=256,
+        vmem_mib=32,
+        kv_sub=128 if t.kv_sub else 0,
+    )
+    ex = replace(ex, tiles=t, pool_gather=False)
+    assert mk.should_fuse_pool_io(spec, ex, fused_pool_io=prof.fused_pool_io)
+    assert t.conv_stage and t.gdn_head_major
+
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.key(810 + B + 1000 * seed), g, ex
+    )
+    pos_list = []
+    for s_i in range(ex.NS):
+        base_p = 126 if s_i == 0 else (20 + 10 * s_i)
+        pos_list.extend(base_p + t_i for t_i in range(T))
+    pos = jnp.asarray(pos_list, dtype=jnp.int32)
+    st_l = dict(st_l, conv=st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32))
+    _, hid_mk, w_mk, _ = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
+    )
+    pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
+
+    def _fresh_pools():
+        return tuple(
+            jax.device_put(np.asarray(r).copy(), tp)
+            for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
+        )
+
+    step_s, _ = mk.PallasWriter(fused_pool_io=False).make_step(
+        mesh, spec, ex, donate=False
+    )
+    step_f, _ = mk.PallasWriter(fused_pool_io=True).make_step(
+        mesh, spec, ex, donate=True
+    )
+    out_s, raw_s = step_s(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    out_f, raw_f = step_f(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
+    kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
+    _assert_hidden_equal_per_row(
+        out_f, out_s, ex.R, pools=(raw_f, raw_s, ex.num_pages, kinds)
+    )
+    worst = max(
+        _rec_pool_max_ulp(r_f, r_s, ex.num_pages, kinds)
+        for r_f, r_s in zip(raw_f, raw_s)
+    )
+    if ex.WIDE:
+        assert worst <= WIDE_FUSED_REC_ULP_BOUND, (worst, WIDE_FUSED_REC_ULP_BOUND)
+        if worst:
+            pytest.xfail(f"fused WIDE rec-state deviation vs split: {worst} bf16 ULP")
+    assert worst <= T - 1, (worst, T - 1)
 
 
 def test_pool_gather_verify_wide_cpu_interpret():

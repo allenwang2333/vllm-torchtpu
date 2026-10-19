@@ -19,6 +19,7 @@ import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .errors import MegakernelConfigError
 from .ops import BF16, F32, rup
 from .spec import (
     Block,
@@ -219,7 +220,7 @@ def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
             elif w.stream_ring == "hbm":
                 hbm_weights[w.name] = w
             else:
-                raise ValueError(
+                raise MegakernelConfigError(
                     f"Unsupported stream_ring {w.stream_ring!r} on {w.name}"
                 )
 

@@ -60,4 +60,3 @@ def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
 
 
 __all__ = ["frozen_parity_tiles"]
-

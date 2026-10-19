@@ -27,6 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .comm import AllReduceRing
+from .errors import MegakernelConfigError
 from .ops import BF16, F32, I32, rmsnorm
 from .planner import (
     kernel_out_shapes,
@@ -461,7 +462,7 @@ def unpack_local_weight(
             return x[0].reshape(target_sh)
         if x.shape == unpacked_sh:
             return x.reshape(target_sh)
-    raise ValueError(
+    raise MegakernelConfigError(
         f"Weight {name!r} local shard has shape {x.shape}, expected "
         f"{(1, *target_sh)} or {target_sh}"
     )

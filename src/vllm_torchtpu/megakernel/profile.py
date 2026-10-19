@@ -74,7 +74,8 @@ class Profile:
     fused_pool_io_max_b: int = 24
     fused_pool_io_min_b_hi: int = 56
     # In-kernel GDN gather (GPR): False (split) | None (auto: WIDE verify buckets
-    # where eligible) | True (every bucket where eligible, never a T=1 bucket).
+    # where eligible; exact) | True (every bucket where eligible, never a T=1
+    # bucket; approx, see `spec.POOL_IO_NUMERICS`).
     pool_gather: bool | None = False
     baseline: Baseline | None = None
     description: str = ""
@@ -133,10 +134,11 @@ class Profile:
         Explicit settings on `base` win (expert / test overrides), the profile
         fills the rest:
         - `tiles`: `base.tiles` if set, else the profile's tile rule;
-        - `pool_gather`: `base.pool_gather` if it is not the library default
-          (`False`, which cannot be told apart from "unset"), else the
-          profile's: `None` -> auto, `True` -> `"eligible"` (gather wherever
-          the pool backend can, e.g. never on a `T=1` bucket).
+        - `pool_gather`: `base.pool_gather` unless it is the library default
+          `False` ("no explicit choice"), else the profile's: `None` -> auto,
+          `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
+          never on a `T=1` bucket). Pass `pool_gather="split"` to force split
+          under a GPR profile.
         Fused pool I/O is resolved by the caller through `should_fuse_pool_io`
         because it also depends on the pool backend.
         """
@@ -182,8 +184,10 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
     ):
         feats.add("fused_pool_io")
-    if profile.pool_gather is not False and POOL_IO_NUMERICS["pool_gather"] == "approx":
-        feats.add("pool_gather")
+    if profile.pool_gather is not False:
+        mode = "pool_gather_eligible" if profile.pool_gather is True else "pool_gather"
+        if POOL_IO_NUMERICS[mode] == "approx":
+            feats.add(mode)
     return tuple(sorted(feats))
 
 
@@ -203,8 +207,8 @@ _BUILTINS_LOADED = False
 def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
     """Register `profile` by name (`replace=True` to overwrite an existing one)."""
     if profile.name in _REGISTRY and not replace:
-        if _REGISTRY[profile.name] is profile:
-            return profile
+        if _REGISTRY[profile.name] == profile:
+            return _REGISTRY[profile.name]  # idempotent (e.g. re-import)
         raise ValueError(f"profile {profile.name!r} is already registered")
     _REGISTRY[profile.name] = profile
     return profile

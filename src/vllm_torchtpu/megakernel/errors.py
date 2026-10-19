@@ -29,5 +29,13 @@ class MegakernelConfigError(RuntimeError):
     """
 
 
-__all__ = ["MegakernelConfigError"]
+class MegakernelLayoutError(ValueError):
+    """The runtime's KV / state cache layout is incompatible with the megakernel.
 
+    The only error a framework adapter may treat as "fall back to the stock
+    path" (e.g. compact mamba layout, a pool that does not alias, an unexpected
+    pool shape or storage offset). Everything else must surface.
+    """
+
+
+__all__ = ["MegakernelConfigError", "MegakernelLayoutError"]

@@ -22,6 +22,8 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 import ast
 import dataclasses
 import pathlib
+import subprocess
+import sys
 from typing import Any
 
 import jax
@@ -96,6 +98,7 @@ def test_tile_numerics_registry_covers_every_field():
     assert spec_mod.POOL_IO_NUMERICS == {
         "fused_pool_io": "approx",
         "pool_gather": "exact",
+        "pool_gather_eligible": "approx",
     }
     # Classes the plan fixes from TPU / CPU evidence.
     for f in ("kv_sub", "route_vec", "dense_acc_pair", "moe_unroll", "gdn_head_major"):
@@ -187,8 +190,11 @@ def test_overrides_relabel_and_never_silently_stay_exact():
         "approx",
         "auto",
     )
-    g = d.with_overrides(pool_gather=True)  # GPR is exact-class
+    g = d.with_overrides(pool_gather=None)  # auto GPR (WIDE only) is exact-class
     assert (g.name, g.numerics) == ("default+overrides", "exact")
+    e = d.with_overrides(pool_gather=True)  # GPR on every eligible bucket: approx
+    assert (e.name, e.numerics) == ("default+overrides", "approx")
+    assert profile_mod.approx_features(e) == ("pool_gather_eligible",)
     c = mk.get_profile("qwen35-candidate30").with_overrides(fused_pool_io="auto")
     assert (c.name, c.numerics) == ("qwen35-candidate30+overrides", "approx")
     assert c.with_overrides(fused_pool_io=True).name == "qwen35-candidate30+overrides"
@@ -220,24 +226,12 @@ def _cpu_mesh(R: int) -> Mesh:
     return Mesh(np.array(devs[:R]), ("tp",))
 
 
-def _geom() -> qwen35.Qwen35Geometry:
-    return qwen35.Qwen35Geometry(
-        L=4,
-        H=256,
-        I=256,
-        IS=256,
-        E=128,
-        TOPK=2,
-        NH=4,
-        NKV=2,
-        HD=256,
-        ROT=64,
-        KH=2,
-        VH=4,
-        KD=128,
-        VD=128,
-        att_every=4,
-    )
+def _geom(**kw: Any) -> qwen35.Qwen35Geometry:
+    base = dict(
+        L=4, H=256, I=256, IS=256, E=128, TOPK=2, NH=4, NKV=2, HD=256, ROT=64,
+        KH=2, VH=4, KD=128, VD=128, att_every=4,
+    )  # fmt: skip
+    return qwen35.Qwen35Geometry(**{**base, **kw})
 
 
 def _tiny(t: mk.Tiles) -> mk.Tiles:
@@ -256,39 +250,40 @@ def _tiny(t: mk.Tiles) -> mk.Tiles:
 _OUT_CACHE: dict[tuple, list] = {}
 
 
-def _pooled_outputs(prof: mk.Profile | str, *, T: int, B: int, **tile_kw: Any) -> list:
+def _flip_exec(
+    prof: mk.Profile | str, *, T: int, B: int, geom_kw: dict | None = None, **tile_kw
+) -> tuple[Any, mk.ExecSpec]:
+    """Geometry + ExecSpec of one tiny paged bucket under `prof` (+ tile overrides)."""
+    g = _geom(**(geom_kw or {}))
+    base = mk.ExecSpec(
+        R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=512 if B <= 8 else 2048,
+        stack_e=False, interpret=True,
+    )  # fmt: skip
+    ex = mk.get_profile(prof).exec_for(base, B=B, T=T, g=g)
+    ex = dataclasses.replace(
+        ex, tiles=dataclasses.replace(_tiny(ex.resolved_tiles), **tile_kw)
+    )
+    return g, ex
+
+
+def _pooled_outputs(prof: mk.Profile | str, *, T: int, B: int, **kw: Any) -> list:
     """Bytes of hidden + pools of one tiny paged pooled step under `prof` (cached)."""
     key = (
         prof if isinstance(prof, str) else id(prof),
         T,
         B,
-        tuple(sorted(tile_kw.items())),
+        repr(sorted(kw.items())),
     )
     if key not in _OUT_CACHE:
-        _OUT_CACHE[key] = _pooled_outputs_uncached(prof, T=T, B=B, **tile_kw)
+        _OUT_CACHE[key] = _pooled_outputs_uncached(prof, T=T, B=B, **kw)
     return _OUT_CACHE[key]
 
 
 def _pooled_outputs_uncached(
-    prof: mk.Profile | str, *, T: int, B: int, **tile_kw: Any
+    prof: mk.Profile | str, *, T: int, B: int, **kw: Any
 ) -> list:
-    R = 2
-    mesh = _cpu_mesh(R)
-    g = _geom()
-    base = mk.ExecSpec(
-        R=R,
-        B=B,
-        T=T,
-        ctx=256,
-        paged_kv=True,
-        num_pages=512,
-        stack_e=False,
-        interpret=True,
-    )
-    ex = mk.get_profile(prof).exec_for(base, B=B, T=T, g=g)
-    ex = dataclasses.replace(
-        ex, tiles=dataclasses.replace(_tiny(ex.resolved_tiles), **tile_kw)
-    )
+    mesh = _cpu_mesh(2)
+    g, ex = _flip_exec(prof, T=T, B=B, **kw)
     spec = qwen35.qwen35_spec(g)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.key(31 + T + B), g, ex
@@ -316,36 +311,83 @@ def _assert_same(a: list, b: list) -> None:
         np.testing.assert_array_equal(x, y)
 
 
-# Exact-class fields: (field, value off the default, extra tiles the field needs).
+def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
+    """The plan / scratch parameter an exact tile field controls (None: budget only)."""
+    _, info = qwen35.build(g, ex)
+    bp, sp = info["plan"].block_params, info["core_plan"].stream
+    return {
+        "nbd": sp.NBD,
+        "nkv": bp["gqa"].NKV,
+        "gdn_bufs": bp["gdn"].NRB,
+        "lazy": (bp["gqa"].LAZY_ATT, bp["moe"].LAZY_MOE),
+        "pair_kv": bp["gqa"].PAIR_KV,
+        "kv_ering": bp["gqa"].KVE,
+        "gqa_qv": bp["gqa"].QV,
+        "rel_fetch": sp.rel_fetch,
+        "moe_group_rows": bp["moe"].group_rel,
+    }.get(field)
+
+
+# Exact-class fields: (id, field, value off the default, (T, B), extra kwargs).
 _EXACT_FLIPS = [
-    ("nbd", 8, {}),
-    ("nkv", 4, {}),
-    ("gdn_bufs", 2, {}),
-    ("lazy", False, {}),
-    ("pair_kv", True, {}),
-    ("kv_ering", True, {}),
-    ("gqa_qv", True, {}),
-    ("rel_fetch", True, {}),
-    ("bounds_checks", True, {}),
-    ("vmem_mib", 48, {}),
-    ("smem_mib", 2, {}),
-    ("moe_group_rows", 0, {"moe_unroll": True}),
+    ("nbd", "nbd", 8, (2, 4), {}),
+    ("nkv", "nkv", 4, (2, 4), {}),
+    ("lazy", "lazy", False, (2, 4), {}),
+    ("pair_kv", "pair_kv", True, (2, 4), {}),
+    ("kv_ering", "kv_ering", True, (2, 4), {}),
+    ("gqa_qv", "gqa_qv", True, (2, 4), {}),
+    ("rel_fetch", "rel_fetch", True, (2, 4), {}),
+    ("bounds_checks", "bounds_checks", True, (2, 4), {}),
+    ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
+    ("smem_mib", "smem_mib", 2, (2, 4), {}),
+    ("moe_group_rows", "moe_group_rows", 0, (2, 4), {"moe_unroll": True}),
+    # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
+    (
+        "moe_group_rows-pipe_ep",
+        "moe_group_rows",
+        0,
+        (2, 4),
+        {"pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+    ),
+    # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
+    ("gdn_bufs-wide", "gdn_bufs", 2, (4, 24), {}),
+    ("pair_kv-wide", "pair_kv", True, (4, 24), {}),
+    ("kv_ering-wide", "kv_ering", True, (4, 24), {}),
+    ("gqa_qv-wide", "gqa_qv", True, (4, 24), {}),
 ]
 
 
 def test_exact_flip_list_covers_registry():
     exact = {k for k, v in spec_mod.TILE_NUMERICS.items() if v == "exact"}
     # kv_scatter_vec_ns only affects the non-paged path (tested separately).
-    assert exact == {f for f, _, _ in _EXACT_FLIPS} | {"kv_scatter_vec_ns"}
+    assert exact == {f for _, f, _, _, _ in _EXACT_FLIPS} | {"kv_scatter_vec_ns"}
 
 
 @pytest.mark.parametrize(
-    "field,value,extra", _EXACT_FLIPS, ids=[f for f, _, _ in _EXACT_FLIPS]
+    "field,value,tb,extra",
+    [c[1:] for c in _EXACT_FLIPS],
+    ids=[c[0] for c in _EXACT_FLIPS],
 )
-def test_exact_tile_fields_reproduce_default(field: str, value: Any, extra: dict):
-    """Each `exact` tile field, moved alone, keeps hidden + pools bit-identical."""
-    ref = _pooled_outputs("default", T=2, B=4, **extra)
-    _assert_same(_pooled_outputs("default", T=2, B=4, **extra, **{field: value}), ref)
+def test_exact_tile_fields_reproduce_default(
+    field: str, value: Any, tb: tuple[int, int], extra: dict
+):
+    """Each `exact` tile field, moved alone, keeps hidden + pools bit-identical.
+
+    The flip must also reach the plan (asserted below), so a field that is
+    silently gated off cannot pass vacuously.
+    """
+    T, B = tb
+    g0, ex0 = _flip_exec("default", T=T, B=B, **extra)
+    g1, ex1 = _flip_exec("default", T=T, B=B, **extra, **{field: value})
+    assert getattr(ex1.resolved_tiles, field) != getattr(ex0.resolved_tiles, field)
+    before, after = _plan_effect(field, g0, ex0), _plan_effect(field, g1, ex1)
+    if before is not None:
+        assert before != after, (field, before, after)
+    if "pipe_ep" in extra:
+        _, info = qwen35.build(g1, ex1)
+        assert info["plan"].block_params["moe"].PIPE_EP
+    ref = _pooled_outputs("default", T=T, B=B, **extra)
+    _assert_same(_pooled_outputs("default", T=T, B=B, **extra, **{field: value}), ref)
 
 
 def test_exact_kv_scatter_vec_ns_non_paged():
@@ -374,19 +416,73 @@ def test_exact_kv_scatter_vec_ns_non_paged():
     _assert_same(outs[1], outs[0])
 
 
-def test_every_exact_profile_reproduces_default():
-    """Every registered `exact` profile matches `default` bit-exactly (CPU)."""
+def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
+    """Test-only tile rule: the default rule plus exact-class schedule changes."""
+    return dataclasses.replace(
+        mk.default_tiles(B, moe_tp=moe_tp, R=R),
+        pair_kv=True,
+        kv_ering=True,
+        gqa_qv=True,
+        rel_fetch=True,
+        moe_group_rows=0,
+        nkv=4,
+    )
+
+
+_EXACT_SCHED_PROFILE = mk.Profile(
+    name="test-exact-sched",
+    numerics="exact",
+    tiles=_exact_sched_rule,
+    description="Test-only: default numerics, exact-class schedule flags on.",
+)
+
+
+def test_every_exact_profile_reproduces_default(monkeypatch: pytest.MonkeyPatch):
+    """Every registered `exact` profile matches `default` bit-exactly (CPU).
+
+    A test-only exact profile that turns on exact-class schedule flags is
+    registered so the check is not vacuous.
+    """
+    monkeypatch.setitem(
+        profile_mod._REGISTRY, _EXACT_SCHED_PROFILE.name, _EXACT_SCHED_PROFILE
+    )
     exact = [n for n in mk.list_profiles() if mk.get_profile(n).numerics == "exact"]
-    assert "default" in exact
+    assert {"default", _EXACT_SCHED_PROFILE.name} <= set(exact)
     for T, B in ((1, 8), (2, 4)):
         ref = _pooled_outputs("default", T=T, B=B)
         for name in exact:
+            if name != "default":
+                g0, ex0 = _flip_exec("default", T=T, B=B)
+                g1, ex1 = _flip_exec(name, T=T, B=B)
+                assert ex0.resolved_tiles != ex1.resolved_tiles, name
             _assert_same(_pooled_outputs(name, T=T, B=B), ref)
 
 
 # ---------------------------------------------------------------------------
 # pool_gather semantics and config errors
 # ---------------------------------------------------------------------------
+
+
+_GPR_ELIGIBLE = mk.DEFAULT_PROFILE.with_overrides(pool_gather=True)
+_GPR_AUTO = mk.DEFAULT_PROFILE.with_overrides(pool_gather=None)
+
+
+@pytest.mark.parametrize(
+    "prof,B", [(_GPR_ELIGIBLE, 8), (_GPR_ELIGIBLE, 16), (_GPR_AUTO, 24)]
+)
+def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
+    """In-kernel GDN gather (GPR) vs split gather at T=4, default tiles (CPU).
+
+    Bitwise with default tiles on non-WIDE (B=8, 16) and WIDE (B=24) buckets.
+    With qwen35-candidate30 tiles GPR is bitwise only on WIDE buckets (pools
+    differ at B=8, hidden and pools at B=16), which is why
+    `pool_gather=True` ("every eligible bucket") is classed approx and auto
+    GPR (WIDE only) exact in `spec.POOL_IO_NUMERICS`.
+    """
+    g, ex = _flip_exec(prof, T=4, B=B)
+    spec = qwen35.qwen35_spec(g)
+    assert _should_use_pool_gather(spec, spec.pool_backend, ex, use_fused=False)
+    _assert_same(_pooled_outputs(prof, T=4, B=B), _pooled_outputs("default", T=4, B=B))
 
 
 def test_profile_pool_gather_true_means_where_eligible():
@@ -454,3 +550,77 @@ def test_load_builtins_sets_flag_only_after_success(monkeypatch: pytest.MonkeyPa
     assert profile_mod._BUILTINS_LOADED is False
     monkeypatch.undo()
     assert "qwen35-candidate30-fused" in profile_mod.list_profiles()
+
+
+def test_builtin_profiles_resolve_in_a_fresh_interpreter():
+    """`get_profile` works before any profile module was imported directly."""
+    code = (
+        "from vllm_torchtpu import megakernel as mk; "
+        "print(mk.get_profile('qwen35-candidate30-fused').name); "
+        "from vllm_torchtpu.megakernel import profiles; "
+        "print(profiles.qwen35_candidate30.PROFILE.name)"
+    )
+    env = dict(os.environ, JAX_PLATFORMS="cpu")
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split() == ["qwen35-candidate30-fused", "qwen35-candidate30"]
+
+
+def test_builtin_profile_registration_is_idempotent():
+    c30 = mk.get_profile("qwen35-candidate30")
+    assert mk.register_profile(c30) is c30
+    assert mk.register_profile(dataclasses.replace(c30)) is c30  # equal: no-op
+    with pytest.raises(ValueError, match="already registered"):
+        mk.register_profile(dataclasses.replace(c30, description="different"))
+
+
+def test_exec_spec_pool_gather_values_and_explicit_split():
+    with pytest.raises(ValueError, match="pool_gather must be one of"):
+        mk.ExecSpec(pool_gather="sometimes")  # type: ignore[arg-type]
+    g = _geom()
+    spec = qwen35.qwen35_spec(g)
+    gpr = mk.DEFAULT_PROFILE.with_overrides(pool_gather=None)
+    base = mk.ExecSpec(R=2, ctx=256, paged_kv=True, num_pages=2048, interpret=True)
+    ex_auto = gpr.exec_for(base, B=24, T=4, g=g)
+    assert _should_use_pool_gather(spec, spec.pool_backend, ex_auto, use_fused=False)
+    # An explicit "split" wins over a GPR profile; the default False does not.
+    ex_split = gpr.exec_for(
+        dataclasses.replace(base, pool_gather="split"), B=24, T=4, g=g
+    )
+    assert ex_split.pool_gather == "split" and ex_split.GPR is False
+    assert not _should_use_pool_gather(
+        spec, spec.pool_backend, ex_split, use_fused=False
+    )
+
+
+def test_gq_pack_without_gqa_qv_is_config_error():
+    t = dataclasses.replace(_tiny(mk.default_tiles(8, R=2)), gq_pack=True)
+    ex = mk.ExecSpec(
+        R=2, B=8, T=4, ctx=256, paged_kv=True, num_pages=512, interpret=True, tiles=t
+    )
+    with pytest.raises(mk.MegakernelConfigError, match="gq_pack requires gqa_qv"):
+        mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)
+
+
+def test_unsupported_stream_ring_is_config_error(monkeypatch: pytest.MonkeyPatch):
+    from vllm_torchtpu.megakernel.blocks.moe import MoEBlock
+
+    orig = MoEBlock.weights
+
+    def _weights(self: Any, g: Any, ex: mk.ExecSpec) -> list:
+        ws = orig(self, g, ex)
+        return [dataclasses.replace(ws[0], stream_ring="bogus"), *ws[1:]]
+
+    monkeypatch.setattr(MoEBlock, "weights", _weights)
+    tiles = dataclasses.replace(mk.spec.TINY_TILES, bank=512 << 10)
+    ex = mk.ExecSpec(R=2, B=4, ctx=256, interpret=True, tiles=tiles)
+    with pytest.raises(mk.MegakernelConfigError, match="Unsupported stream_ring"):
+        mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)
+
+
+def test_error_classes():
+    assert issubclass(mk.MegakernelLayoutError, ValueError)
+    assert not issubclass(mk.MegakernelConfigError, ValueError)
+    assert issubclass(mk.MegakernelConfigError, RuntimeError)

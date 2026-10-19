@@ -25,6 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .. import pool_alias
+from ..errors import MegakernelConfigError
 from ..ops import (
     BF16,
     F32,
@@ -249,7 +250,8 @@ class GQABlock(Block):
             and nh <= 8
             and (not PACK or PB * nh == 8)
         )
-        assert not tiles.gq_pack or tiles.gqa_qv, "Tiles.gq_pack requires gqa_qv"
+        if tiles.gq_pack and not tiles.gqa_qv:
+            raise MegakernelConfigError("Tiles.gq_pack requires gqa_qv")
         QG = ex.T * nh
         GQ = bool(
             tiles.gq_pack

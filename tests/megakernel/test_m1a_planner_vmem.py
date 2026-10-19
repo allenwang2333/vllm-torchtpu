@@ -233,7 +233,9 @@ def test_vmem_phase_overlay_and_conflict(fake_ex: ExecSpec):
         config=FakeGeometry(L=2, H=256),
         layer_type=LayerType("bad_layer", slots=(FakeMixerBlock(), CollidingBlock())),
     )
-    with pytest.raises(ValueError, match="Conflicting scratch buffer 'kbuf'"):
+    with pytest.raises(
+        MegakernelConfigError, match="Conflicting scratch buffer 'kbuf'"
+    ):
         vmem.build_scratch(bad_ms, fake_ex)
 
     # Exceeding tiles.vmem_mib raises MegakernelConfigError with per-buffer breakdown

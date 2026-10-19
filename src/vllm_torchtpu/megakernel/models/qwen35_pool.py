@@ -1834,7 +1834,7 @@ def qwen35_pool_backend(g: Any) -> PoolBackend:
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:
         if not has_gdn or ex_paged.page_size != 128 or ex_paged.T <= 1:
             return False
-        if ex_paged.pool_gather is False:
+        if ex_paged.pool_gather in (False, "split"):
             return False
         if ex_paged.pool_gather is None and not ex_paged.WIDE:
             return False

@@ -287,7 +287,7 @@ def _should_use_pool_gather(
     use_fused: bool,
 ) -> bool:
     """Return True when non-fused verify should gather GDN states in-kernel (`GPR`)."""
-    if use_fused or ex.pool_gather is False:
+    if use_fused or ex.pool_gather in (False, "split"):
         return False
     if not pb.supports_pool_gather or not pb.has_recurrent_pool:
         if ex.pool_gather is True:
@@ -314,7 +314,7 @@ def _require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) 
     `donate_pools=True` XLA may hand the kernel a copy, silently dropping writes.
     """
     if use_fused and not donate_pools:
-        raise ValueError(
+        raise MegakernelConfigError(
             f"fused_pool_io for ModelSpec {ms.name!r} requires donate_pools=True "
             "(the fused kernel relies on outer buffer donation for its pool writes)"
         )

@@ -201,7 +201,7 @@ def _merge_scratch(
         elif r.spec == cur_spec and r.phase == cur_phase:
             continue
         else:
-            raise ValueError(
+            raise MegakernelConfigError(
                 f"Conflicting scratch buffer {r.name!r}: "
                 f"phase {r.phase!r} vs {cur_phase!r}"
             )

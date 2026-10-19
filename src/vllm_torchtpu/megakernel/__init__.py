@@ -53,7 +53,7 @@ from .cache_experimental import (
     make_fused_pooled_step,
 )
 from .comm import AllReduceRing
-from .errors import MegakernelConfigError
+from .errors import MegakernelConfigError, MegakernelLayoutError
 from .kernel import (
     KernelContext,
     build,
@@ -121,6 +121,7 @@ __all__ = [
     "KernelContext",
     "LayerType",
     "MegakernelConfigError",
+    "MegakernelLayoutError",
     "MoEBlock",
     "MoEParams",
     "ModelSpec",

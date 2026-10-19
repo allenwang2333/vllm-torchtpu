@@ -814,7 +814,15 @@ def test_compile_hlo_check_config_errors_are_not_layout_errors() -> None:
     with pytest.raises(MegakernelConfigError, match="bad config"):
         drv_cfg.bind_and_warmup(runner)
     assert runner._megakernel == "mk"
-    drv_layout = _driver_raising(ValueError("incompatible KV layout"))
+    # A plain ValueError (e.g. an internal bug) is not a layout error either.
+    drv_val = _driver_raising(ValueError("some internal error"))
+    with pytest.raises(ValueError, match="some internal error"):
+        drv_val.bind_and_warmup(runner)
+    assert runner._megakernel == "mk"
+    # Only MegakernelLayoutError disables the megakernel (stock fallback).
+    from vllm_torchtpu.megakernel import MegakernelLayoutError
+
+    drv_layout = _driver_raising(MegakernelLayoutError("incompatible KV layout"))
     drv_layout.bind_and_warmup(runner)
     assert drv_layout._bound is False and runner._megakernel is None
 

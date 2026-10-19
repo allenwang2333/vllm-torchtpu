@@ -239,14 +239,14 @@ def _tiny_pool_setup(R: int = 1, B: int = 2, T: int = 1):
 def test_fused_pool_io_requires_pool_donation():
     g, ex, mesh = _tiny_pool_setup()
     spec = qwen35.qwen35_spec(g)
-    with pytest.raises(ValueError, match="requires donate_pools=True"):
+    with pytest.raises(mk.MegakernelConfigError, match="requires donate_pools=True"):
         mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=True)
-    with pytest.raises(ValueError, match="requires donate_pools=True"):
+    with pytest.raises(mk.MegakernelConfigError, match="requires donate_pools=True"):
         mk.make_flat_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=True)
-    with pytest.raises(ValueError, match="requires donate_pools=True"):
+    with pytest.raises(mk.MegakernelConfigError, match="requires donate_pools=True"):
         mk.PallasWriter(fused_pool_io=True).make_step(mesh, spec, ex, donate=False)
     # "auto" selecting fused at this B is held to the same rule
-    with pytest.raises(ValueError, match="requires donate_pools=True"):
+    with pytest.raises(mk.MegakernelConfigError, match="requires donate_pools=True"):
         mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io="auto")
     # Split pool I/O does not need donation
     mk.make_pooled_step(mesh, spec, ex, donate_pools=False, fused_pool_io=False)

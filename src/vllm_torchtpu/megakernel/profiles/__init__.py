@@ -15,30 +15,22 @@
 
 `default` holds the `default` profile's tile rule (imported eagerly; it depends
 only on `spec`). Named profiles register themselves when their module is
-imported; `profile.get_profile` / `list_profiles` import every module in
-`BUILTIN_PROFILE_MODULES` first, and attribute access imports one lazily.
+imported; `profile.get_profile` / `list_profiles` call `load_builtin_profiles()`
+first.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 from . import default
-
-BUILTIN_PROFILE_MODULES = ("qwen35_candidate30",)
 
 
 def load_builtin_profiles() -> None:
-    """Import (and thereby register) every checked-in named profile."""
-    from . import qwen35_candidate30  # noqa: F401
+    """Import (and thereby register) every checked-in named profile.
+
+    Uses `from .<module> import ...` rather than `from . import <module>`: the
+    latter would consult this package's attributes first.
+    """
+    from .qwen35_candidate30 import PROFILE  # noqa: F401
 
 
-def __getattr__(name: str) -> Any:
-    if name == "qwen35_candidate30":
-        from . import qwen35_candidate30
-
-        return qwen35_candidate30
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = ["BUILTIN_PROFILE_MODULES", "default", "load_builtin_profiles"]
+__all__ = ["default", "load_builtin_profiles"]

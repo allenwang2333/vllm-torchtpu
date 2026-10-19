@@ -29,6 +29,7 @@ Integrates the modular `megakernel` library with `TPUModelRunner`:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import time
@@ -55,6 +56,7 @@ from vllm_torchtpu.megakernel.cache import (
     _should_use_pool_gather,
     should_fuse_pool_io,
 )
+from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.profile import (
@@ -91,6 +93,12 @@ _MTP_VERIFY_TOKENS = 4
 _MTP_SPECULATIVE_TOKENS = _MTP_VERIFY_TOKENS - 1
 _DEFAULT_FUSED_POOL_IO_MAX_B = 24
 _DEFAULT_FUSED_POOL_IO_MIN_B_HI = 56
+
+
+def _need_layout(cond: bool, msg: str) -> None:
+    """Fail with `MegakernelLayoutError`: incompatible runtime cache layout."""
+    if not cond:
+        raise MegakernelLayoutError(f"MegakernelDriver: {msg}")
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -1201,7 +1209,7 @@ class MegakernelDriver:
 
     def bind_caches(self, runner: Any) -> None:
         """Bind the `NATT` shared `float8_e4m3fn` raw pools from `backbone.layers`."""
-        _need(
+        _need_layout(
             bool(getattr(runner, "_unified_kv_layout", True)),
             "runner._unified_kv_layout must be True "
             "(unified KV+GDN cache layout required)",
@@ -1222,28 +1230,28 @@ class MegakernelDriver:
                 raw = raw[0]
             pools.append(raw)
 
-        _need(len(pools) == natt, f"expected {natt} pools, got {len(pools)}")
+        _need_layout(len(pools) == natt, f"expected {natt} pools, got {len(pools)}")
         num_pages = int(pools[0].shape[0])
         kvh_expected = max(1, self.geom.NKV // self.base_exec.R)
         hd4_expected = self.geom.HD // 4
         expected_shape = (num_pages, 2 * kvh_expected, hd4_expected, 4, 128)
         for r, pool in enumerate(pools):
-            _need(
+            _need_layout(
                 isinstance(pool, torch.Tensor) and pool.dtype == torch.float8_e4m3fn,
                 f"pool[{r}] must be float8_e4m3fn tensor, got {type(pool)}",
             )
-            _need(
+            _need_layout(
                 pool.storage_offset() == 0,
                 f"pool[{r}] has non-zero storage_offset={pool.storage_offset()}",
             )
-            _need(
+            _need_layout(
                 tuple(pool.shape) == expected_shape,
                 f"pool[{r}] shape {tuple(pool.shape)} != {expected_shape}",
             )
             for g_idx in range(g_per_att):
                 la_layer = self.backbone.layers[att_every * r + g_idx]
                 la_cache = _unwrap(la_layer.linear_attn.kv_cache)
-                _need(
+                _need_layout(
                     isinstance(la_cache, torch.Tensor)
                     and la_cache.numel() > 0
                     and la_cache.data_ptr() == pool.data_ptr(),
@@ -1852,28 +1860,23 @@ class MegakernelDriver:
                     p[:n_save].copy_(saved)
 
     def bind_and_warmup(self, runner: Any) -> None:
-        """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets."""
+        """Bind runner KV+GDN cache pools and warm up compiled megakernel buckets.
+
+        Only `MegakernelLayoutError` (an incompatible runtime cache layout)
+        disables the megakernel and falls back to the stock path. Configuration
+        errors (`MegakernelConfigError`) and any other exception propagate.
+        """
         precompile_timed = getattr(runner, "_precompile_timed", None)
         eager_only = bool(getattr(runner, "enforce_eager", False))
-        if callable(precompile_timed):
-            with precompile_timed("megakernel"):
-                try:
-                    self.bind_caches(runner)
-                except ValueError as exc:
-                    logger.warning(
-                        "Disabling Qwen3.5 megakernel due to incompatible KV cache "
-                        "layout: %s",
-                        exc,
-                    )
-                    self._bound = False
-                    if runner is not None and hasattr(runner, "_megakernel"):
-                        runner._megakernel = None
-                    return
-                self.warmup(runner, eager_only=eager_only)
-        else:
+        ctx = (
+            precompile_timed("megakernel")
+            if callable(precompile_timed)
+            else contextlib.nullcontext()
+        )
+        with ctx:
             try:
                 self.bind_caches(runner)
-            except ValueError as exc:
+            except MegakernelLayoutError as exc:
                 logger.warning(
                     "Disabling Qwen3.5 megakernel due to incompatible KV cache "
                     "layout: %s",

@@ -212,7 +212,14 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
 # Numerics class of the pool-I/O modes selected by profiles.
 POOL_IO_NUMERICS: dict[str, NumericsClass] = {
     "fused_pool_io": "approx",  # always runs the head-major GDN recurrence
-    "pool_gather": "exact",  # gather-only DMA path (CPU bit-exact vs split)
+    # GPR, auto (`Profile.pool_gather=None`): WIDE verify buckets only, where
+    # GCH is already on. CPU bitwise vs split at T=4 B=24 with the default and
+    # qwen35-candidate30 tiles.
+    "pool_gather": "exact",
+    # GPR on every eligible bucket (`Profile.pool_gather=True`): CPU bitwise vs
+    # split at T=4 B=8/16 with default tiles, but NOT with qwen35-candidate30
+    # tiles (pools differ at B=8, hidden and pools at B=16).
+    "pool_gather_eligible": "approx",
 }
 
 DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
@@ -238,6 +245,10 @@ def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
 def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     """Tiles matching the frozen prototype for bit-exact parity (`== default_tiles`)."""
     return default_tiles(B, moe_tp=moe_tp, R=R)
+
+
+# Valid `ExecSpec.pool_gather` values (see the field comment).
+POOL_GATHER_VALUES: tuple[Any, ...] = (False, "split", None, "eligible", True)
 
 
 @dataclass(frozen=True)
@@ -269,11 +280,12 @@ class ExecSpec:
     num_pages: int = 4096  # Total pages per attention pool per rank
     max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
     fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
-    # In-kernel GDN gather (GPR): False (default) = split gather kernel;
+    # In-kernel GDN gather (GPR): False (default) = split gather kernel, which
+    # a profile may override; "split" = split, explicitly (wins over a profile);
     # None = auto (WIDE verify buckets where eligible); "eligible" = every bucket
     # the pool backend can gather on; True = required (`MegakernelConfigError`
     # if the bucket cannot).
-    pool_gather: bool | None | Literal["eligible"] = False
+    pool_gather: bool | None | Literal["eligible", "split"] = False
     act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
     ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
@@ -281,6 +293,13 @@ class ExecSpec:
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     tiles: Tiles | None = None  # None -> default_tiles(B, R=R)
     debug: DebugOptions = DebugOptions()
+
+    def __post_init__(self) -> None:
+        if self.pool_gather not in POOL_GATHER_VALUES:
+            raise ValueError(
+                f"ExecSpec.pool_gather must be one of {POOL_GATHER_VALUES}, "
+                f"got {self.pool_gather!r}"
+            )
 
     @property
     def FUSED(self) -> bool:
