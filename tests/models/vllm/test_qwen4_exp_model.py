@@ -125,3 +125,48 @@ def test_qwen_decoder_opts_into_compact_gdn_inputs(monkeypatch):
     assert layer.linear_attn is attention.return_value
     assert "use_compact_qkv" not in attention.call_args.kwargs
     assert attention.call_args.kwargs["pooled_conv_state_dtype"] == torch.float32
+
+
+@pytest.mark.usefixtures("model_cpu_config_context")
+@pytest.mark.parametrize("full_tile", [0, 128])
+def test_model_constructs_real_hc_with_only_full_mix_option(monkeypatch, full_tile):
+    from vllm_torchtpu.models.vllm.qwen4_exp import model
+    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
+
+    text = q4exp_text_config(
+        hidden_size=128,
+        hc_lowrank=32,
+        vocab_size=32,
+        num_hidden_layers=1,
+        ple_layer_ids=[],
+        layer_types=["linear_attention"],
+    )
+    cfg = NS(
+        model_config=NS(hf_text_config=text),
+        additional_config={"qwen4_exp": {"hc_prefill_full_tile": full_tile}},
+    )
+    # Construct the actual decoder and final mixer. Only unrelated distributed
+    # attention/MoE and vocabulary embedding are replaced with CPU fixtures.
+    monkeypatch.setattr(
+        model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(
+        model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
+    )
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity())
+    monkeypatch.setattr(model, "VocabParallelEmbedding", nn.Embedding)
+    with torch.device("cpu"):
+        backbone = model.Qwen4ExpBackbone(cfg)
+    decoder = backbone.layers[0]
+    connections = [
+        decoder.attn_hyper_connection,
+        decoder.mlp_hyper_connection,
+        backbone.hyper_connection_mixer,
+    ]
+    for connection in connections:
+        assert isinstance(connection, GatedResidual)
+        assert connection.prefill_full_tile == full_tile
+        assert (connection._prefill_full_op is not None) == bool(full_tile)
+    for connection in connections[:2]:
+        assert (connection._prefill_combine_op is not None) == bool(full_tile)
+    assert backbone.hyper_connection_mixer._prefill_combine_op is None

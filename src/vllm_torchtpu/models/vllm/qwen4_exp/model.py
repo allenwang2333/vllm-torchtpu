@@ -137,25 +137,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.self_attn
             )
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config=cfg, prefix=prefix + ".mlp")
-        hc_up_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
-        )
-        hc_norm_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_norm_tile", 0)
-        )
         hc_full_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_full_tile", 0)
         )
         self.attn_hyper_connection = GatedResidual(
             hc_config(t),
-            prefill_up_tile=hc_up_tile,
-            prefill_norm_tile=hc_norm_tile,
             prefill_full_tile=hc_full_tile,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config(t),
-            prefill_up_tile=hc_up_tile,
-            prefill_norm_tile=hc_norm_tile,
             prefill_full_tile=hc_full_tile,
         )
 
@@ -252,20 +242,12 @@ class Qwen4ExpBackbone(nn.Module):
         ]
         for attention in attentions[1:]:
             attention.rope_cache = attentions[0].rope_cache
-        hc_up_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_up_tile", 0)
-        )
-        hc_norm_tile = int(
-            cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_norm_tile", 0)
-        )
         hc_full_tile = int(
             cfg.additional_config.get("qwen4_exp", {}).get("hc_prefill_full_tile", 0)
         )
         self.hyper_connection_mixer = GatedResidual(
             hc_config(t),
             use_combine=False,
-            prefill_up_tile=hc_up_tile,
-            prefill_norm_tile=hc_norm_tile,
             prefill_full_tile=hc_full_tile,
         )
 
