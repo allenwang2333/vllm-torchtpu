@@ -1096,8 +1096,9 @@ def test_positive_control_reshaped_heads_major_operand_is_caught(monkeypatch):
     """The check above must fail when the heads-major operand is a reshape of
     the tokens-major one instead of a transpose."""
 
-    def _reshaped(o, w, g):
+    def _reshaped(o, lse_f32, merged_lse, g, rs_dtype=None):
         t, h, d = o.shape
+        w = torch.exp(lse_f32 - merged_lse)
         w_hm = w.reshape(h, t).unsqueeze(-1)
         x = o.reshape(h, t, d).to(torch.float32) * w_hm
         x = torch.where(w_hm > 0, x, torch.zeros_like(x))

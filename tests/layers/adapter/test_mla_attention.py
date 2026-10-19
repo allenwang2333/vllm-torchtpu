@@ -847,9 +847,7 @@ def test_streamidx_op_is_shared_by_layers_with_one_kernel_config(monkeypatch):
     assert set(kernels[0].__code__.co_freevars) == {
         "chunk_tokens",
         "kv_cache_mode",
-        "small_bucket_bq",
-        "small_bucket_bkvp",
-        "small_bucket_tokens",
+        "small_bucket",
         "skip_empty_decode",
         "skip_empty_decode_chunked",
         "mixed_bkvp",
