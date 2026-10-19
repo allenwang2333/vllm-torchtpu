@@ -127,7 +127,7 @@ def test_gdn_linear_attention_composite_expansion() -> None:
 
 def test_moe_routed_experts_composite_expansion() -> None:
     # 480B / MoE: routed_experts.w13_weight [2, 6144, 5120] expands per-expert
-    # into gate_proj and up_proj
+    # into gate_proj and up_proj with rank-3 source_shape and transpose [0, 2, 1]
     valid_keys = {
         "model.layers.0.mlp.experts.0.gate_proj.weight": "/path/e0.st",
         "model.layers.0.mlp.experts.0.up_proj.weight": "/path/e0.st",
@@ -145,23 +145,89 @@ def test_moe_routed_experts_composite_expansion() -> None:
         sources[0]["source_tensor"] == "model.layers.0.mlp.experts.0.gate_proj.weight"
     )
     assert sources[0]["path"] == "/path/e0.st"
+    assert sources[0]["source_shape"] == [1, 2560, 6144]
+    assert sources[0]["transpose"] == [0, 2, 1]
     assert sources[0]["dst_slices"] == [
         {"dim": 0, "start": 0, "length": 1},
         {"dim": 2, "start": 0, "length": 2560},
     ]
-    assert sources[0]["transpose"] == [1, 0]
     # expert 0 up
     assert sources[1]["source_tensor"] == "model.layers.0.mlp.experts.0.up_proj.weight"
+    assert sources[1]["source_shape"] == [1, 2560, 6144]
+    assert sources[1]["transpose"] == [0, 2, 1]
     assert sources[1]["dst_slices"] == [
         {"dim": 0, "start": 0, "length": 1},
         {"dim": 2, "start": 2560, "length": 2560},
     ]
-    assert sources[1]["transpose"] == [1, 0]
     # expert 1 gate
     assert (
         sources[2]["source_tensor"] == "model.layers.0.mlp.experts.1.gate_proj.weight"
     )
+    assert sources[2]["source_shape"] == [1, 2560, 6144]
+    assert sources[2]["transpose"] == [0, 2, 1]
     assert sources[2]["dst_slices"] == [
         {"dim": 0, "start": 1, "length": 1},
         {"dim": 2, "start": 0, "length": 2560},
     ]
+
+
+def test_gdn_in_proj_ba_expansion() -> None:
+    # 397B GDN in_proj_ba: target [4096, 128], sources in_proj_b and in_proj_a
+    valid_keys = {
+        "model.language_model.layers.0.linear_attn.in_proj_b.weight": "/path/b.st",
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight": "/path/a.st",
+    }
+    w_name = "model.layers.0.linear_attn.in_proj_ba.weight"
+    w_spec = {"shape": [4096, 128]}
+    from vllm_torchtpu.export.weight_name_mapper import expand_or_resolve_weight_sources
+
+    sources = expand_or_resolve_weight_sources(w_name, w_spec, valid_keys, "")
+    assert len(sources) == 2
+    assert (
+        sources[0]["source_tensor"]
+        == "model.language_model.layers.0.linear_attn.in_proj_b.weight"
+    )
+    assert sources[0]["source_shape"] == [64, 4096]
+    assert sources[0]["transpose"] == [1, 0]
+    assert sources[0]["dst_slices"] == [{"dim": 1, "start": 0, "length": 64}]
+
+    assert (
+        sources[1]["source_tensor"]
+        == "model.language_model.layers.0.linear_attn.in_proj_a.weight"
+    )
+    assert sources[1]["source_shape"] == [64, 4096]
+    assert sources[1]["transpose"] == [1, 0]
+    assert sources[1]["dst_slices"] == [{"dim": 1, "start": 64, "length": 64}]
+
+
+def test_shared_experts_gate_up_expansion() -> None:
+    # 397B shared experts: target [4096, 2048], sources gate_proj and up_proj
+    valid_keys = {
+        (
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+        ): "/path/gate.st",
+        (
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight"
+        ): "/path/up.st",
+    }
+    w_name = "model.layers.0.mlp.experts.shared_experts.layer.gate_up_proj.weight"
+    w_spec = {"shape": [4096, 2048]}
+    from vllm_torchtpu.export.weight_name_mapper import expand_or_resolve_weight_sources
+
+    sources = expand_or_resolve_weight_sources(w_name, w_spec, valid_keys, "")
+    assert len(sources) == 2
+    assert (
+        sources[0]["source_tensor"]
+        == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"
+    )
+    assert sources[0]["source_shape"] == [1024, 4096]
+    assert sources[0]["transpose"] == [1, 0]
+    assert sources[0]["dst_slices"] == [{"dim": 1, "start": 0, "length": 1024}]
+
+    assert (
+        sources[1]["source_tensor"]
+        == "model.language_model.layers.0.mlp.shared_expert.up_proj.weight"
+    )
+    assert sources[1]["source_shape"] == [1024, 4096]
+    assert sources[1]["transpose"] == [1, 0]
+    assert sources[1]["dst_slices"] == [{"dim": 1, "start": 1024, "length": 1024}]

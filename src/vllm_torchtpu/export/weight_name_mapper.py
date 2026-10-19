@@ -147,62 +147,111 @@ def expand_or_resolve_weight_sources(
                 },
             ]
 
-    # 2. GDN Attention: in_proj_ba.weight [4096, hidden_dim]
-    # Split into in_proj_b (2048) and in_proj_a (2048)
+    # 2. GDN Attention: in_proj_ba.weight
+    # Split into in_proj_b and in_proj_a
     if ".linear_attn.in_proj_ba.weight" in w_name and len(shape) == 2:
-        in_dim = shape[1]
         b_cand_name = w_name.replace(".in_proj_ba.weight", ".in_proj_b.weight")
         a_cand_name = w_name.replace(".in_proj_ba.weight", ".in_proj_a.weight")
         b_resolved = resolve_safetensor_name(b_cand_name, tensor_to_file)
         a_resolved = resolve_safetensor_name(a_cand_name, tensor_to_file)
         if b_resolved is not None and a_resolved is not None:
-            return [
-                {
-                    "path": tensor_to_file.get(b_resolved, default_path),
-                    "source_tensor": b_resolved,
-                    "source_shape": [2048, in_dim],
-                    "dst_slices": [{"dim": 0, "start": 0, "length": 2048}],
-                },
-                {
-                    "path": tensor_to_file.get(a_resolved, default_path),
-                    "source_tensor": a_resolved,
-                    "source_shape": [2048, in_dim],
-                    "dst_slices": [{"dim": 0, "start": 2048, "length": 2048}],
-                },
-            ]
+            if shape[0] >= shape[1]:  # [in_dim, total_out] e.g. [4096, 128]
+                in_dim = shape[0]
+                total_out = shape[1]
+                half_out = total_out // 2
+                return [
+                    {
+                        "path": tensor_to_file.get(b_resolved, default_path),
+                        "source_tensor": b_resolved,
+                        "source_shape": [half_out, in_dim],
+                        "transpose": [1, 0],
+                        "dst_slices": [{"dim": 1, "start": 0, "length": half_out}],
+                    },
+                    {
+                        "path": tensor_to_file.get(a_resolved, default_path),
+                        "source_tensor": a_resolved,
+                        "source_shape": [half_out, in_dim],
+                        "transpose": [1, 0],
+                        "dst_slices": [
+                            {"dim": 1, "start": half_out, "length": half_out}
+                        ],
+                    },
+                ]
+            else:  # [total_out, in_dim]
+                total_out = shape[0]
+                in_dim = shape[1]
+                half_out = total_out // 2
+                return [
+                    {
+                        "path": tensor_to_file.get(b_resolved, default_path),
+                        "source_tensor": b_resolved,
+                        "source_shape": [half_out, in_dim],
+                        "dst_slices": [{"dim": 0, "start": 0, "length": half_out}],
+                    },
+                    {
+                        "path": tensor_to_file.get(a_resolved, default_path),
+                        "source_tensor": a_resolved,
+                        "source_shape": [half_out, in_dim],
+                        "dst_slices": [
+                            {"dim": 0, "start": half_out, "length": half_out}
+                        ],
+                    },
+                ]
 
-    # 3. Shared Experts: gate_up_proj.weight [2 * intermediate, in_dim]
+    # 3. Shared Experts: gate_up_proj.weight
     # Split into gate_proj and up_proj
     if (
         ".mlp.experts.shared_experts.layer.gate_up_proj.weight" in w_name
         and len(shape) == 2
     ):
-        intermediate = shape[0] // 2
-        in_dim = shape[1]
         gate_cand = w_name.replace("gate_up_proj.weight", "gate_proj.weight")
         up_cand = w_name.replace("gate_up_proj.weight", "up_proj.weight")
         gate_resolved = resolve_safetensor_name(gate_cand, tensor_to_file)
         up_resolved = resolve_safetensor_name(up_cand, tensor_to_file)
         if gate_resolved is not None and up_resolved is not None:
-            return [
-                {
-                    "path": tensor_to_file.get(gate_resolved, default_path),
-                    "source_tensor": gate_resolved,
-                    "source_shape": [intermediate, in_dim],
-                    "dst_slices": [{"dim": 0, "start": 0, "length": intermediate}],
-                },
-                {
-                    "path": tensor_to_file.get(up_resolved, default_path),
-                    "source_tensor": up_resolved,
-                    "source_shape": [intermediate, in_dim],
-                    "dst_slices": [
-                        {"dim": 0, "start": intermediate, "length": intermediate}
-                    ],
-                },
-            ]
+            if shape[0] >= shape[1]:  # [in_dim, 2 * intermediate] e.g. [4096, 2048]
+                in_dim = shape[0]
+                intermediate = shape[1] // 2
+                return [
+                    {
+                        "path": tensor_to_file.get(gate_resolved, default_path),
+                        "source_tensor": gate_resolved,
+                        "source_shape": [intermediate, in_dim],
+                        "transpose": [1, 0],
+                        "dst_slices": [{"dim": 1, "start": 0, "length": intermediate}],
+                    },
+                    {
+                        "path": tensor_to_file.get(up_resolved, default_path),
+                        "source_tensor": up_resolved,
+                        "source_shape": [intermediate, in_dim],
+                        "transpose": [1, 0],
+                        "dst_slices": [
+                            {"dim": 1, "start": intermediate, "length": intermediate}
+                        ],
+                    },
+                ]
+            else:  # [2 * intermediate, in_dim]
+                intermediate = shape[0] // 2
+                in_dim = shape[1]
+                return [
+                    {
+                        "path": tensor_to_file.get(gate_resolved, default_path),
+                        "source_tensor": gate_resolved,
+                        "source_shape": [intermediate, in_dim],
+                        "dst_slices": [{"dim": 0, "start": 0, "length": intermediate}],
+                    },
+                    {
+                        "path": tensor_to_file.get(up_resolved, default_path),
+                        "source_tensor": up_resolved,
+                        "source_shape": [intermediate, in_dim],
+                        "dst_slices": [
+                            {"dim": 0, "start": intermediate, "length": intermediate}
+                        ],
+                    },
+                ]
 
     # 4. MoE Routed Experts: routed_experts.w13_weight
-    # [num_experts, hidden_dim, 2 * intermediate]
+    # Target shape: [num_experts, hidden_dim, 2 * intermediate]
     if ".mlp.experts.routed_experts.w13_weight" in w_name and len(shape) == 3:
         num_local_experts, hidden_dim, total_inter = shape
         intermediate_dim = total_inter // 2
@@ -225,8 +274,8 @@ def expand_or_resolve_weight_sources(
                     {
                         "path": tensor_to_file.get(gate_res, default_path),
                         "source_tensor": gate_res,
-                        "source_shape": [intermediate_dim, hidden_dim],
-                        "transpose": [1, 0],
+                        "source_shape": [1, intermediate_dim, hidden_dim],
+                        "transpose": [0, 2, 1],
                         "dst_slices": [
                             {"dim": 0, "start": e, "length": 1},
                             {"dim": 2, "start": 0, "length": intermediate_dim},
@@ -237,8 +286,8 @@ def expand_or_resolve_weight_sources(
                     {
                         "path": tensor_to_file.get(up_res, default_path),
                         "source_tensor": up_res,
-                        "source_shape": [intermediate_dim, hidden_dim],
-                        "transpose": [1, 0],
+                        "source_shape": [1, intermediate_dim, hidden_dim],
+                        "transpose": [0, 2, 1],
                         "dst_slices": [
                             {"dim": 0, "start": e, "length": 1},
                             {
@@ -253,7 +302,7 @@ def expand_or_resolve_weight_sources(
                 return sources
 
     # 5. MoE Routed Experts: routed_experts.w2_weight
-    # [num_experts, intermediate, hidden_dim]
+    # Target shape: [num_experts, intermediate, hidden_dim]
     if ".mlp.experts.routed_experts.w2_weight" in w_name and len(shape) == 3:
         num_local_experts, intermediate_dim, hidden_dim = shape
         layer_match = re.search(r"layers\.(\d+)\.", w_name)
@@ -273,8 +322,8 @@ def expand_or_resolve_weight_sources(
                     {
                         "path": tensor_to_file.get(down_res, default_path),
                         "source_tensor": down_res,
-                        "source_shape": [hidden_dim, intermediate_dim],
-                        "transpose": [1, 0],
+                        "source_shape": [1, hidden_dim, intermediate_dim],
+                        "transpose": [0, 2, 1],
                         "dst_slices": [{"dim": 0, "start": e, "length": 1}],
                     }
                 )
