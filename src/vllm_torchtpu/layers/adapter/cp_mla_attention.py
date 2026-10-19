@@ -110,6 +110,7 @@ def merge_lse_partials_scatter_heads(
     is_backbone: bool = True,
     wire_dtype: torch.dtype | None = None,
     query_start_loc: torch.Tensor | None = None,
+    return_recv: bool = False,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -148,6 +149,9 @@ def merge_lse_partials_scatter_heads(
         the real token count (so its last entry is that count). With
         TPU_DCP_LSE_MERGE_A2A_REAL_ROWS the packed all-to-all sends only the
         real tokens' rows; None keeps every padded row.
+      return_recv: TPU_SEGMENT_MEGAKERNEL. Return the packed real-rows
+        all-to-all's receive buffer unmerged (`all_to_all_packed_recv`); the
+        step must take that exchange, else this raises.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -177,6 +181,12 @@ def merge_lse_partials_scatter_heads(
             group,
             send_dtype=wire_dtype if narrow else None,
             query_start_loc=query_start_loc,
+            return_recv=return_recv,
+        )
+    if return_recv:
+        raise RuntimeError(
+            "return_recv needs the backbone's packed all-to-all merge "
+            "(TPU_DCP_LSE_MERGE_A2A, at most TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens)"
         )
 
     # The drafter cannot compare the token count in torch, but JAX exports
@@ -372,12 +382,16 @@ def merge_lse_partials_all_to_all(
     group: Any,
     send_dtype: torch.dtype | None = None,
     query_start_loc: torch.Tensor | None = None,
+    return_recv: bool = False,
 ) -> torch.Tensor:
     """Same result as the reduce-scatter merge, via all-to-all.
 
     Each rank sends head block `d` of its partial and lse to rank `d`, then
     merges its own heads locally in f32. Faster for small token counts.
     `send_dtype` is the dtype the partial crosses in; None keeps its own.
+    `return_recv`: return the packed real-rows exchange's int16 receive
+    buffer `[world, extra + T * local, V]` instead (lse words first; see
+    `_all_to_all_packed`), for a consumer that merges it itself.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
@@ -387,6 +401,21 @@ def merge_lse_partials_all_to_all(
     if send_dtype is not None:
         o_send = o_send.to(send_dtype)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
+    if return_recv:
+        if not (
+            envs.TPU_DCP_LSE_MERGE_A2A_PACK
+            and envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS
+            and o_send.element_size() == 2
+            and query_start_loc is not None
+        ):
+            raise RuntimeError(
+                "return_recv needs TPU_DCP_LSE_MERGE_A2A_PACK, "
+                "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS, a 2-byte wire partial and "
+                "query_start_loc"
+            )
+        return _all_to_all_packed(
+            o_send, l_send, group, query_start_loc[-1:].to(torch.int32), raw=True
+        )
     if envs.TPU_DCP_LSE_MERGE_A2A_PACK and output.element_size() == 2:
         real_tokens = None
         if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS and query_start_loc is not None:
@@ -404,7 +433,8 @@ def _all_to_all_packed(
     l_send: torch.Tensor,
     group: Any,
     real_tokens: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    raw: bool = False,
+) -> Any:
     """`(_all_to_all(o_send), _all_to_all(l_send))` in ONE all-to-all
     (`TPU_DCP_LSE_MERGE_A2A_PACK`).
 
@@ -428,6 +458,9 @@ def _all_to_all_packed(
     rows past that are zero. Real rows come back bit for bit; a padding row's
     partial is zero instead of whatever the kernel left there (its lse still
     arrives whole).
+
+    `raw` (with `real_tokens`): return that exchange's int16 receive buffer
+    `[world, extra + T * local, V]` as is.
     """
     world, tokens, local, vdim = o_send.shape
     rows = tokens * local
@@ -444,10 +477,13 @@ def _all_to_all_packed(
     if real_tokens is not None:
         send = torch.cat([l_words.reshape(world, extra, vdim), o_words], dim=1)
         recv = _ragged_all_to_all(send, extra + real_tokens * local, group)
+        if raw:
+            return recv
         o_recv = recv[:, extra:].reshape(world, tokens, local, vdim)
         o_recv = o_recv.view(o_send.dtype)
         l_recv_words = recv[:, :extra].reshape(world, extra * vdim)
     else:
+        assert not raw, "raw needs the real-rows exchange"
         send = torch.cat([o_words, l_words.reshape(world, extra, vdim)], dim=1)
         recv = _all_to_all(send, group)
         o_recv = recv[:, :rows].reshape(world, tokens, local, vdim).view(o_send.dtype)

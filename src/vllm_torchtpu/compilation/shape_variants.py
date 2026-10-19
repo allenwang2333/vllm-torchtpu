@@ -266,7 +266,13 @@ class BucketExecutables:
             signature = _signature(graph)
             if signature == stored_signature:
                 return runnable
-            raise _handover_error(key, _signature_delta(stored_signature, signature))
+            names = _signature_delta(
+                [name for name, _ in stored], [name for name, _ in current]
+            )
+            raise _handover_error(
+                key,
+                _signature_delta(stored_signature, signature) + f". By name: {names}",
+            )
         perm = _input_permutation(stored, current)
         if perm is None:
             raise _handover_error(key, _signature_delta(stored, current))

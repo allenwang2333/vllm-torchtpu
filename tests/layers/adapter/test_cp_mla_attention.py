@@ -679,6 +679,107 @@ def test_real_rows_merge_is_bitwise_the_packed_merge_on_real_rows(
     assert (got[real:] == 0).all() and torch.isfinite(got.float()).all()
 
 
+def _recv_real_rows(outputs, lses, monkeypatch, real):
+    """Every rank's raw packed real-rows receive buffer (`return_recv`)."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", True, raising=False
+    )
+    world = outputs.shape[0]
+    hub = _ExchangeHub(world)
+    monkeypatch.setattr(cp_mla, "_ragged_all_to_all", _ragged_stand_in(hub))
+    qsl = torch.tensor([0, real], dtype=torch.int32)
+
+    def run(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank],
+            lses[rank],
+            _A2AGroup(hub, rank),
+            query_start_loc=qsl,
+            return_recv=True,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(world) as pool:
+        return list(pool.map(run, range(world)))
+
+
+def segment_entry_layout(o_send_bf16, l_send_f32, real):
+    """The segment megakernel's entry layout, written from its own spec
+    (kernels/experimental/segment_megakernel `_entry_merge`): per source,
+    row 0.. the lse words -- the f32 bits' high halves for rows [0, R), then
+    the low halves, zero padded -- then the R = T * local partial rows; rows
+    past the real tokens' are zero. `o_send` [T, local, V], `l_send` [T, local]."""
+    tokens, local, vdim = o_send_bf16.shape
+    rows = tokens * local
+    extra = -(-2 * rows // vdim)
+    bits = l_send_f32.contiguous().view(torch.int32).reshape(rows)
+    words = torch.zeros(extra * vdim, dtype=torch.int32)
+    words[:rows] = bits >> 16
+    words[rows : 2 * rows] = ((bits & 0xFFFF) ^ 0x8000) - 0x8000
+    out = torch.zeros((extra + rows, vdim), dtype=torch.int16)
+    out[:extra] = words.to(torch.int16).reshape(extra, vdim)
+    live = real * local
+    out[extra : extra + live] = o_send_bf16.reshape(rows, vdim).view(torch.int16)[:live]
+    return out
+
+
+@pytest.mark.parametrize("dcp_size,tokens,real", [(8, 16, 4), (8, 16, 12), (8, 32, 32)])
+def test_return_recv_is_the_segment_megakernel_entry_layout(
+    dcp_size, tokens, real, monkeypatch
+):
+    """TPU_SEGMENT_MEGAKERNEL takes the real-rows exchange's receive buffer
+    unmerged: rank d's buffer holds, from every source s, the lse words and
+    partial rows of s's head block d, in the layout the megakernel unpacks;
+    and unpacking it as `_all_to_all_packed` does gives the merge bit for bit."""
+    local, vdim = 4, 256
+    outputs, lses = _hard_partials(
+        np.random.default_rng(53), dcp_size, tokens, local, vdim
+    )
+    outputs = _nan_where_unowned(outputs, lses)
+    recv = _recv_real_rows(outputs, lses, monkeypatch, real)
+    merged = _merge_real_rows(outputs, lses, monkeypatch, real)
+    extra = -(-2 * tokens * local // vdim)
+    for d in range(dcp_size):
+        assert recv[d].dtype == torch.int16
+        assert recv[d].shape == (dcp_size, extra + tokens * local, vdim)
+        for src in range(dcp_size):
+            blk = slice(d * local, (d + 1) * local)
+            want = segment_entry_layout(
+                outputs[src][:, blk], lses[src][:, blk].float(), real
+            )
+            assert torch.equal(recv[d][src], want), (d, src)
+        # The receive side of _all_to_all_packed, then _merge_received.
+        o_recv = recv[d][:, extra:].reshape(dcp_size, tokens, local, vdim)
+        words = recv[d][:, :extra].reshape(dcp_size, extra * vdim)
+        rows = tokens * local
+        hi = words[:, :rows].to(torch.int32)
+        lo = words[:, rows : 2 * rows].to(torch.int32)
+        l_recv = ((hi << 16) | (lo & 0xFFFF)).view(torch.float32)
+        got = cp_mla._merge_received(
+            o_recv.view(torch.bfloat16), l_recv.reshape(dcp_size, tokens, local)
+        ).to(torch.bfloat16)
+        assert torch.equal(
+            got[:real].view(torch.int16),
+            merged[:real, d * local : (d + 1) * local].view(torch.int16),
+        )
+
+
+def test_return_recv_refuses_without_the_real_rows_exchange(monkeypatch):
+    outputs, lses = _hard_partials(np.random.default_rng(59), 4, 16, 4, 256)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_PACK", True, raising=False)
+    monkeypatch.setattr(
+        cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS", False, raising=False
+    )
+    with pytest.raises(RuntimeError, match="return_recv"):
+        cp_mla.merge_lse_partials_all_to_all(
+            outputs[0],
+            lses[0],
+            _A2AGroup(_ExchangeHub(4), 0),
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+            return_recv=True,
+        )
+
+
 def test_real_rows_merge_without_query_start_loc_keeps_every_row(monkeypatch):
     """No query_start_loc (the drafter, eager callers): the full packed exchange."""
     outputs, lses = _hard_partials(np.random.default_rng(41), 4, 16, 4, 512)

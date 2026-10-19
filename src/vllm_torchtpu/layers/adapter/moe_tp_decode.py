@@ -70,6 +70,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OP_ATTR = "_moe_tp_decode_op"
+# On an armed layer: the op's statics (routing, scale) and experts_start, read
+# by the segment megakernel's arming (TPU_SEGMENT_MEGAKERNEL).
+STATICS_ATTR = "_moe_tp_decode_statics"
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -714,6 +717,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         for name, tensor in zip(_BUFFERS, (*adm.shared, bias, rank, e0)):
             layer.register_buffer(name, tensor, persistent=False)
         setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, adm.statics))
+        setattr(layer, STATICS_ATTR, (adm.statics, adm.experts_start))
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
