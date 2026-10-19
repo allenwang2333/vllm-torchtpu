@@ -731,7 +731,9 @@ def moe_route(logits_hbm, topi_hbm, topw_hbm, rank_hbm, counts_hbm, *, e, topk, 
             ids, wts = [], []
             if simulate_uniform:
                 tok = jax.lax.broadcasted_iota(jnp.int32, (tm, 1), 0) + pl.program_id(0) * tm
-                h = (tok * 1103515245 + 12345 + salt * 2654435761) & 0x7FFFFFFF
+                off = (12345 + salt * 2654435761) % (1 << 32)      # folded to an int32 literal
+                off = off - (1 << 32) if off >= 1 << 31 else off
+                h = (tok * 1103515245 + off) & 0x7FFFFFFF
                 base = (h >> 8) % e
                 for kk in range(topk):
                     ids.append((base + kk * 37) % e)          # 37 odd: distinct for K < E
