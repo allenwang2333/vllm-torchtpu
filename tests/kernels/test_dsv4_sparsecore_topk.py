@@ -507,6 +507,27 @@ def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b, one_lau
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("return_scores", [False, True])
+@pytest.mark.parametrize("kind", ["random", "heavy_ties"])
+@pytest.mark.parametrize("b", [8, 16])
+def test_coop_max_rows_selects_the_same_rows(kind, b, return_scores):
+    """Routing every row to the cooperative path changes nothing in the output,
+    padding rows included, for a decode-sized batch of a few long rows."""
+    n, k = N_1M // 4, 1024
+    rng = np.random.default_rng(SEED + 7 * b)
+    scores = jnp.asarray(_scores(kind, b, n, rng))
+    lengths = np.zeros(b, np.int32)
+    lengths[:7] = [0, k - 3, 50_000, 121_750, 121_751, 200_000, n]
+    lengths = jnp.asarray(lengths)
+    want = sparsecore_topk(scores, k, lengths, return_scores=return_scores)
+    got = sparsecore_topk(
+        scores, k, lengths, return_scores=return_scores, coop_max_rows=b
+    )
+    for a, b_ in zip(jax.tree.leaves(got), jax.tree.leaves(want)):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b_))
+
+
+@pytest.mark.tpu_test
 def test_scheduling_group_ids_reach_the_lowered_hlo():
     """The stub test above proves the plumbing; this proves the plumbing does
     something. The id has to survive as a frontend attribute, or the call is

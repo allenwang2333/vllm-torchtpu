@@ -1242,6 +1242,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "scheduling_group_id",
         "return_scores",
         "one_launch",
+        "coop_max_rows",
     ),
 )
 def sparsecore_topk(
@@ -1253,6 +1254,7 @@ def sparsecore_topk(
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
     one_launch: bool = False,
+    coop_max_rows: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -1267,6 +1269,11 @@ def sparsecore_topk(
     ``one_launch``: when rows can be too long for one subcore, run the
     by-length and cooperative passes as one SparseCore program
     (`_sc_topk_one_launch`) instead of two.
+
+    ``coop_max_rows``: when ``b`` is at most this, every row takes the
+    cooperative path, split over ``p`` subcores by its own length, instead of
+    one subcore per row. A decode batch has only a handful of long rows, which
+    otherwise leave most subcores idle.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -1304,6 +1311,16 @@ def sparsecore_topk(
         else lax.bitcast_convert_type(scores, jnp.int32)
     )
     lengths = jnp.minimum(row_lengths, n)
+    if b <= coop_max_rows:
+        return _sc_topk_direct(
+            words,
+            k,
+            lengths,
+            p=p,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+        )
     if one_launch and n > ONE_LAUNCH_SLOT_WORDS[return_scores] and n % (p * LANES) == 0:
         return _sc_topk_one_launch(
             words,
