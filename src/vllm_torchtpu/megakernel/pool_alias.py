@@ -80,8 +80,12 @@ def _lower(ref, transform, aval, block_shape):
 
 
 def _install() -> None:
-    global _installed
+    global _installed, _original
     if not _installed:
+        # Chain the hook that is current at install time, not at import time:
+        # another module (e.g. a reference kernel with its own pool_alias) may
+        # have installed its `_reshape_memref` hook after this module loaded.
+        _original = lowering._reshape_memref
         lowering._reshape_memref = _lower
         _installed = True
 

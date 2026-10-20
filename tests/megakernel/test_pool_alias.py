@@ -103,3 +103,67 @@ def test_pool_alias_reinterpret_mosaic_lowering():
                 assert "tpu.reinterpret_cast" in asm
                 assert "tpu.erase_memref_layout" in asm
                 assert expected_layout in asm
+
+
+def test_pool_alias_hook_chains_to_hook_installed_after_import(monkeypatch):
+    """`_install()` chains the `_reshape_memref` hook current at install time.
+
+    Another hook installed after `pool_alias` is imported but before the first
+    `view()` (e.g. a reference kernel's own pool_alias copy) must keep handling
+    non-`Reinterpret` transforms; `Reinterpret` transforms reach `_lower`.
+    """
+    from jax._src.lib import tpu
+    from jax._src.lib.mlir import ir
+    from jax._src.pallas.mosaic import lowering
+
+    calls = []
+
+    def stand_in(ref, transform, aval, block_shape):
+        calls.append(transform)
+        return "stand-in", block_shape
+
+    # monkeypatch restores the hook and pool_alias's install state afterwards.
+    monkeypatch.setattr(pool_alias, "_installed", False)
+    monkeypatch.setattr(pool_alias, "_original", pool_alias._original)
+    monkeypatch.setattr(lowering, "_reshape_memref", stand_in)
+    pool_alias._install()
+    assert lowering._reshape_memref is pool_alias._lower
+    assert pool_alias._original is stand_in
+
+    other = object()
+    assert lowering._reshape_memref("ref", other, None, (8, 128)) == (
+        "stand-in",
+        (8, 128),
+    )
+    assert calls == [other]
+
+    target_shape, flat_shape = (16, 256), (1, 8, 512)
+    with ir.Context() as ctx, ir.Location.unknown():
+        tpu.register_dialect(ctx)
+        module = ir.Module.create()
+        vmem_attr = ir.Attribute.parse("#tpu.memory_space<vmem>")
+        src_memref = ir.MemRefType.get(
+            flat_shape, ir.F32Type.get(), memory_space=vmem_attr
+        )
+        with ir.InsertionPoint(module.body):
+            func_op = ir.Operation.create(
+                "func.func",
+                attributes={
+                    "sym_name": ir.StringAttr.get("test_chain"),
+                    "function_type": ir.TypeAttr.get(
+                        ir.FunctionType.get([src_memref], [])
+                    ),
+                },
+                regions=1,
+            )
+            block = func_op.regions[0].blocks.append(src_memref)
+            with ir.InsertionPoint(block):
+                _, out_shape = lowering._reshape_memref(
+                    block.arguments[0],
+                    pool_alias.Reinterpret(target_shape),
+                    jax.ShapeDtypeStruct(flat_shape, F32),
+                    flat_shape,
+                )
+            assert out_shape == target_shape
+            assert "tpu.reinterpret_cast" in str(func_op)
+    assert calls == [other]
