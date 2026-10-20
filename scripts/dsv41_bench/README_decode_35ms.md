@@ -5,8 +5,7 @@
 The 35 ms main-model forward and 14000 output tokens/chip/s targets remain
 unmet. The serving measurements below cover an FP4 MoE height ladder for the
 observed EP8 geometry and a joint request/scorer configuration for the
-48-request full-context indexer. A subsequent router tile change has separate
-kernel evidence below; these serving results do not include it.
+48-request full-context indexer, followed by whole-batch router selection.
 
 ## Configuration and provenance
 
@@ -29,6 +28,7 @@ JAX/JAXLIB 0.11.2 and libtpu 0.0.50, with vLLM revision
 | Base | `bdb38700` | `exp-qcbagjr3z8` / `results/baseline` |
 | FP4 ladder | `c6ffd0fa` | `exp-qcbagjr3z8` / `results/rungs2-tuned` |
 | FP4 ladder + indexer | `cd47b6c9` | `exp-1mv4ll6amh` / `results/indexer-tuned` |
+| FP4 ladder + indexer + router | `7b971e97` | `exp-qg29pd6unq` / `results/router-tuned` |
 
 The FP4 run's top-level runtime source and actual checkout are `c6ffd0fa`;
 its copied nested source metadata still names the base. The first combined
@@ -42,30 +42,36 @@ throughput uses `384 * 3.47 / step_seconds / 4`, matching the reference
 harness. Observed throughput uses accepted output tokens including bonus
 tokens divided by the measured steady window; it has a different numerator.
 
-| Metric | Base | FP4 ladder | FP4 ladder + indexer |
-| --- | ---: | ---: | ---: |
-| Host step median, ms | 55.011 / 55.019 / 54.959 | 54.090 / 54.278 / 54.170 | 53.086 / 52.586 / 52.530 |
-| Fixed-acceptance output tokens/chip/s | 6056 / 6055 / 6061 | 6159 / 6137 / 6149 | 6275 / 6335 / 6341 |
-| Observed accepted+bonus tokens/chip/s | 6773 / 6840 / 6944 | 6945 / 6752 / 6891 | 7120 / 7048 / 7207 |
-| Main-model device forward, ms | 47.038 | 45.184 | 42.918 |
-| Forward minus identified entry barriers, ms | 42.722 | 42.438 | 42.264 |
-| Main-model FP4 MoE event time/step, ms | 15.442 | 15.163 | 15.119 |
-| Full-context index score event time/step, ms | 2.836 | 2.835 | 2.670 |
-| Startup HBM used per logical device, GiB range | 48.98–49.04 | 48.99–49.04 | 48.99–49.05 |
-| Server launch to health ready, seconds | 1049.86 | 1059.46 | 1006.77 |
+| Metric | Base | FP4 ladder | FP4 ladder + indexer | FP4 ladder + indexer + router |
+| --- | ---: | ---: | ---: | ---: |
+| Host step median, ms | 55.011 / 55.019 / 54.959 | 54.090 / 54.278 / 54.170 | 53.086 / 52.586 / 52.530 | 53.495 / 53.188 / 53.376 |
+| Fixed-acceptance output tokens/chip/s | 6056 / 6055 / 6061 | 6159 / 6137 / 6149 | 6275 / 6335 / 6341 | 6227 / 6263 / 6241 |
+| Observed accepted+bonus tokens/chip/s | 6773 / 6840 / 6944 | 6945 / 6752 / 6891 | 7120 / 7048 / 7207 | 7021 / 7032 / 6819 |
+| Main-model device forward, ms | 47.038 | 45.184 | 42.918 | 42.599 |
+| Forward minus identified entry barriers, ms | 42.722 | 42.438 | 42.264 | 41.847 |
+| Main-model FP4 MoE event time/step, ms | 15.442 | 15.163 | 15.119 | 15.127 |
+| Full-context index score event time/step, ms | 2.836 | 2.835 | 2.670 | 2.669 |
+| Startup HBM used per logical device, GiB range | 48.98–49.04 | 48.99–49.04 | 48.99–49.05 | 49.00–49.06 |
+| Server launch to health ready, seconds | 1049.86 | 1059.46 | 1006.77 | 1015.20 |
 
-Forward is the median of six per-step sums of the five sequential rank-0
+Forward is the median of six per-step sums of the four sequential rank-0
 main-model device modules, with 40 MoE layers verified in each step.
 It excludes draft, logits/sampling and host gaps. It is not a sum of module
 medians. Subtracting the identified `barrier-cores` intervals gives a separate
 diagnostic metric, not a replacement for the actual forward measurement.
-Most of the 47.04-to-42.92 ms change is entry-barrier variation; only about
-0.46 ms remains after this subtraction. Operator durations are inclusive and
+Most of the 47.04-to-42.60 ms change is entry-barrier variation; about
+0.88 ms remains after this subtraction. Router selection's 43 inclusive events
+(40 main and three draft) fall from 0.483 to 0.096 ms per step. The router
+run's host step medians and throughput are worse than the preceding run,
+despite the device gain; these runs do not establish a serving-throughput
+improvement from the router change. One of its six profile steps contains
+13.71 ms of entry barriers, retained in the reported samples and medians.
+Operator durations are inclusive and
 may overlap other work, so they must not be summed as a critical-path estimate.
 
 HBM values are rounded startup server-log statistics, not sampled runtime
 peaks. The joint indexer increases its isolated executable's temporary HBM by
-12 MiB (42390016 to 54658304 bytes). Neither change repacks model weights.
+12 MiB (42390016 to 54658304 bytes). These changes do not repack model weights.
 Startup includes loading, compilation and warmup; it is not a weight-load
 benchmark. Prefill, mixed batches and model-quality benchmarks were not run
 for these changes.
