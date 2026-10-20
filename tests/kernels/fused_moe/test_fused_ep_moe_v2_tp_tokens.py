@@ -36,7 +36,7 @@ def single_host_mesh():
     return Mesh(np.asarray([devices[i] for i in order]), (AXIS,))
 
 
-def _make_inputs(mesh, groups, rows, weight_format):
+def _make_inputs(mesh, groups, rows, weight_format, g_local=2):
     ep = mesh.shape[AXIS]
     owner = [0] * ep
     for i, group in enumerate(groups):
@@ -52,10 +52,10 @@ def _make_inputs(mesh, groups, rows, weight_format):
         tk = jax.random.split(jax.random.fold_in(jax.random.key(123), group_id), 2)
         wk = jax.random.split(jax.random.fold_in(jax.random.key(456), me), 2)
         x = (jax.random.normal(tk[0], (rows, 512)) * 0.2).astype(jnp.bfloat16)
-        gate = jax.random.normal(tk[1], (rows, 2 * ep))
+        gate = jax.random.normal(tk[1], (rows, g_local * ep))
 
         def weights(key, width):
-            raw = jax.random.normal(key, (2, 512, width)) / jnp.sqrt(512.0)
+            raw = jax.random.normal(key, (g_local, 512, width)) / jnp.sqrt(512.0)
             fp4 = weight_format == WeightFormat.FP4
             dtype = jnp.float4_e2m1fn if fp4 else jnp.float8_e4m3fn
             maximum = 6.0 if fp4 else float(jnp.finfo(dtype).max)
@@ -90,6 +90,7 @@ def _run_layer(
     score_bias=None,
     routed_scaling_factor=1.0,
     renormalize=True,
+    **glue,
 ):
     input_rows = inputs[0].shape[0] // mesh.shape[AXIS]
     # The original router accepts aligned blocks or a whole power-of-two
@@ -132,6 +133,7 @@ def _run_layer(
             scoring_fn=scoring_fn,
             score_bias=bias_arg,
             routed_scaling_factor=routed_scaling_factor,
+            **glue,
         )
 
     result = jax.jit(run)(rank, score_bias, *inputs)
@@ -296,6 +298,56 @@ def test_single_host_replica_routing_options(
         assert not np.allclose(
             np.asarray(actual), np.asarray(softmax), rtol=0.01, atol=1e-6
         )
+
+
+_DECODE_GLUE = {
+    "merged": dict(merge_exchange=True),
+    "onehot": dict(onehot_scatter=True),
+    "plan": dict(pallas_plan=True),
+    "all": dict(merge_exchange=True, onehot_scatter=True, pallas_plan=True),
+}
+
+
+@pytest.mark.parametrize(
+    "weight_format", [WeightFormat.FP8, WeightFormat.FP4], ids=["fp8", "fp4"]
+)
+@pytest.mark.parametrize("glue", list(_DECODE_GLUE))
+@pytest.mark.parametrize(
+    "groups,rows",
+    [
+        pytest.param(tuple((i,) for i in range(8)), 2, id="tp1"),
+        pytest.param((tuple(range(8)),), 16, id="tp8"),
+        pytest.param((tuple(range(8)),), 8, id="tp8-one-row"),
+        pytest.param(_TP4_PERMUTED, 7, id="tp4-permuted-tail"),
+        pytest.param(_TP2_PERMUTED, 24, id="tp2-permuted-padding"),
+    ],
+)
+def test_single_host_decode_glue_is_bitexact(
+    single_host_mesh, weight_format, glue, groups, rows
+):
+    """The decode-bucket glue variants change no output bit."""
+    mesh = single_host_mesh
+    # Eight experts per shard: the Pallas plan needs a sublane-tile multiple.
+    rank, inputs = _make_inputs(mesh, groups, rows, weight_format, g_local=8)
+    bias = jax.device_put(
+        np.linspace(-1, 1, 8 * mesh.shape[AXIS], dtype=np.float32),
+        NamedSharding(mesh, P()),
+    )
+    options = dict(scoring_fn="sqrtsoftplus", score_bias=bias)
+    reference = _run_layer(mesh, rank, inputs, groups, weight_format, True, **options)
+    actual = _run_layer(
+        mesh,
+        rank,
+        inputs,
+        groups,
+        weight_format,
+        True,
+        **options,
+        **_DECODE_GLUE[glue],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(reference).view(np.uint16)
+    )
 
 
 @pytest.mark.parametrize(
