@@ -191,6 +191,20 @@ def test_target_bucket_override_reaches_the_server(
     assert manifest["compile_sizes"] == expected
 
 
+def test_decode_concurrency_override_defaults_to_ci(monkeypatch):
+    import server_step_worker as worker
+
+    monkeypatch.delenv(worker.DECODE_CONCURRENCY_ENV, raising=False)
+    assert worker.decode_concurrency() == worker.CI_DECODE_CONCURRENCY == 384
+    assert worker.DECODE_SCENARIO.concurrency == 384
+    monkeypatch.setenv(worker.DECODE_CONCURRENCY_ENV, "568")
+    assert worker.decode_concurrency() == 568
+    for bad in ("0", "570"):
+        monkeypatch.setenv(worker.DECODE_CONCURRENCY_ENV, bad)
+        with pytest.raises(ValueError):
+            worker.decode_concurrency()
+
+
 @pytest.mark.parametrize("profile_only,waves", [(False, 6), (True, 1)])
 def test_prefill_keeps_formal_warmup_but_skips_duplicate_profile_warmup(
     tmp_path, monkeypatch, profile_only, waves

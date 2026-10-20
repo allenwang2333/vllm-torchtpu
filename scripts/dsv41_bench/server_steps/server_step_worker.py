@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -37,8 +38,25 @@ class Scenario:
 
 
 SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+CI_DECODE_CONCURRENCY = 384
+# Non-CI decode workloads (another request count) set this in the environment
+# of every process (prepare, launcher, server and client); CI leaves it unset.
+DECODE_CONCURRENCY_ENV = "DSV41_BENCH_DECODE_CONCURRENCY"
+
+
+def decode_concurrency() -> int:
+    value = int(os.environ.get(DECODE_CONCURRENCY_ENV, CI_DECODE_CONCURRENCY))
+    if value < 8 or value % 8:
+        raise ValueError(f"{DECODE_CONCURRENCY_ENV} must be a positive multiple of 8")
+    return value
+
+
 DECODE_SCENARIO = Scenario(
-    "decode", 384, prefix_tokens=98304, output_tokens=512, chunk_tokens=2048
+    "decode",
+    decode_concurrency(),
+    prefix_tokens=98304,
+    output_tokens=512,
+    chunk_tokens=2048,
 )
 SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
 

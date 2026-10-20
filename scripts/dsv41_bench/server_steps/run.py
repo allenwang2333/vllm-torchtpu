@@ -23,7 +23,7 @@ from bench_cached_extend import (
     load_frozen_input,
     summarize_startup,
 )
-from server_step_worker import DECODE_SCENARIO
+from server_step_worker import CI_DECODE_CONCURRENCY, DECODE_SCENARIO
 
 
 def source_identity(
@@ -233,6 +233,9 @@ def main() -> None:
         ]
     manifest = {
         "scenario": args.scenario,
+        "ci_workload": not decode
+        or DECODE_SCENARIO.concurrency == CI_DECODE_CONCURRENCY,
+        "decode_concurrency": DECODE_SCENARIO.concurrency if decode else None,
         "compile_sizes": buckets,
         "cache_mode": "disabled",
         "serialization": "enabled",
