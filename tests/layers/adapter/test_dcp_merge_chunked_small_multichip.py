@@ -14,10 +14,13 @@ Arms: off (8 chunks everywhere); s4 / s2 (SMALL=4 / 2: T <= 2048 splits into
 the gather: must differ). T=1024 and 2048 take SMALL; T=4096 and 16 must be
 bit for bit off (untouched). Splitting the token axis changes no per-row
 arithmetic; the reduce-scatter only sees larger operands. Pass: 0 diffs
-eager; the compiled merge held to 1e-4 of the elements
-(the bf16 reduce-scatter's summation order follows the compiled schedule,
-test_dcp_merge_rs_pipeline_multichip). The drafter (is_backbone False) at
-2048 never chunks: bit for bit.
+eager; compiled, each arm's max error against the f64 merge at most
+ERR_SLACK x off's. Compiled bits are not compared: the bf16 reduce-scatter's
+summation order follows the compiled schedule
+(test_dcp_merge_rs_pipeline_multichip), and at T=1024 off's 128-row chunks
+and s4 / s2's 256 / 512-row ones round about 16 % of the elements
+differently, all within the same error of the f64 merge. The drafter
+(is_backbone False) at 2048 never chunks: bit for bit.
 """
 
 import argparse
@@ -39,10 +42,34 @@ WORLD_SIZE = 8
 TOKENS = (1024, 2048, 4096, 16)
 ARMS = {"s4": 4, "s2": 2}
 LAUNCH_TIMEOUT = 3000
+# Compiled: an arm's max abs error vs the f64 merge, over off's (measured
+# 1.03 at most on TPU).
+ERR_SLACK = 1.5
 
 
 def _set(cp_mla, small=0):
     vm._set(cp_mla, TPU_DCP_MERGE_CHUNKED_SMALL=small)
+
+
+def _reference(rank, world, tokens, lses):
+    """This rank's heads of the merge in f64: sum_r w_r o_r, zero-weight
+    (possibly NaN) partials dropped."""
+    import torch
+
+    local = vm.HEADS // world
+    heads = slice(rank * local, (rank + 1) * local)
+    merged = torch.logsumexp(lses.double(), dim=0)
+    acc = None
+    for r in range(world):
+        o = vm._partial(r, tokens, lses, world)[:, heads].double()
+        w = torch.exp(lses[r].double() - merged)[:, heads].unsqueeze(-1)
+        x = torch.where(w > 0, o * w, torch.zeros_like(o))
+        acc = x if acc is None else acc + x
+    return acc
+
+
+def _max_err(got, ref):
+    return float((got.double() - ref).abs().nan_to_num(float("inf")).max())
 
 
 def _check(rank, world, cp_mla):
@@ -58,6 +85,7 @@ def _check(rank, world, cp_mla):
         lses = vm._lses(tokens, world)
         o = vm._partial(rank, tokens, lses, world).to("tpu")
         lse = lses[rank].contiguous().to("tpu")
+        ref = _reference(rank, world, tokens, lses)
         qsl = torch.tensor([0, tokens], dtype=torch.int32).to("tpu")
 
         def fn(o, lse, qsl=qsl, backbone=True):
@@ -76,6 +104,7 @@ def _check(rank, world, cp_mla):
                 _set(cp_mla)
                 off = run(fn)(o, lse).cpu()
                 c = {"tokens": tokens, "elements": int(off.numel())}
+                c["off_err"] = _max_err(off, ref)
                 for arm, small in ARMS.items():
                     _set(cp_mla, small)
                     c[f"{arm}_chunks"] = cp_mla._merge_chunks(tokens)
@@ -83,6 +112,7 @@ def _check(rank, world, cp_mla):
                     u = vm._ulp(got, off)
                     c[f"{arm}_ndiff"] = int((u > 0).sum())
                     c[f"{arm}_maxulp"] = int(u.max())
+                    c[f"{arm}_err"] = _max_err(got, ref)
                 if 16 < tokens <= 2048:
                     _set(cp_mla, 4)
                     cp_mla._gather_lse = rolled
@@ -194,7 +224,7 @@ def test_dcp_merge_chunked_small_on_real_collectives(tmp_path):
             for k, v in c.items():
                 if k.endswith("ndiff") or k == "elements":
                     t[k] = t.get(k, 0) + v
-                elif k.endswith("maxulp"):
+                elif k.endswith(("maxulp", "_err")):
                     t[k] = max(t.get(k, 0), v)
                 else:
                     t[k] = v
@@ -203,8 +233,9 @@ def test_dcp_merge_chunked_small_on_real_collectives(tmp_path):
         print(f"CHUNKSMALL {key}: {json.dumps(t)}")
         if key.endswith("/compiled"):
             # The bf16 reduce-scatter's summation order follows the compiled
-            # schedule (test_dcp_merge_rs_pipeline_multichip).
-            ok = all(t[f"{a}_ndiff"] <= 1e-4 * t["elements"] for a in ARMS)
+            # schedule (test_dcp_merge_rs_pipeline_multichip): held to the f64
+            # merge, not to off's bits.
+            ok = all(t[f"{a}_err"] <= ERR_SLACK * t["off_err"] for a in ARMS)
         else:
             ok = all(t[f"{a}_ndiff"] == 0 for a in ARMS)
         if 16 < t["tokens"] <= 2048:
