@@ -226,7 +226,6 @@ def epool_layout(cfg, tiles, max_pages):
     Returns (pool rows of 128 B, {name: (row offset, shape, dtype)}, slot rows, DSA bytes)."""
     w13 = ((cfg.H, 2 * cfg.IR), FP8)
     w2 = ((cfg.IR, cfg.H), FP8)
-    slot_b = sum(pool_alias.storage_size(s, jnp.dtype(d)) for s, d in (w13, w2))
     views = {}
     off = 0
     for i in range(tiles.nbe):
@@ -252,7 +251,10 @@ def epool_layout(cfg, tiles, max_pages):
     return total // 128, views, ring_b, dsa_b
 
 
-def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
+DEFAULT_TILES = Tiles()
+
+
+def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debug=False, skip=frozenset(),
           stack_e=True, groups=None):
     """Returns (call, info). call(*fixed, *dense weights, *expert weights, *caches) -> (out [M, H] bf16,
     nrow [L, T, 128] u32, rrow [L, T, 128] u32, irec [L, T, 256] i32[, debug outputs]) for ONE rank (wrap in
@@ -273,12 +275,9 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
     assert set(skip) <= set(ABLATIONS), skip
     fault = tiles.fault
     R, L, H, M, TMAX, BMAX = cfg.R, cfg.L, cfg.H, cfg.M, cfg.TMAX, cfg.BMAX
-    HR, NH, KL, DQ, DN, DV, QL = cfg.HR, cfg.NH, cfg.KL, cfg.DQ, cfg.DN, cfg.DV, cfg.QL
+    HR, KL, DQ, DN, DV, QL = cfg.HR, cfg.KL, cfg.DQ, cfg.DN, cfg.DV, cfg.QL
     IH, IDIM, E, EPAD, TOPK = cfg.IH, cfg.IDIM, cfg.E, cfg.EPAD, cfg.TOPK
     IR, ISR, IDR, KR, QB = cfg.IR, cfg.ISR, cfg.IDR, cfg.KR, cfg.QB
-    pg = cfg.page
-    lg_pg = int(math.log2(pg))
-    ILV, G_ = cfg.ILV, cfg.ILV * R
     QA = KL + 128
     QH = HR * QA // 2
     OH = HR * KL // 2
@@ -286,7 +285,6 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
     NQB = HR * DQ
     NBLK = H // QB
     QB8 = 8
-    IR4 = cfg.IREC // 4
     NBD, NBE = tiles.nbd, tiles.nbe
     typed = bool(interpret) or not tiles.alias
     assert typed or (H // R) % 128 == 0, "all-reduce column chunks must be lane aligned on the Mosaic path"
@@ -556,7 +554,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
             buf = scr["arbuf"]
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
             if "coll" not in skip:
-                with sc("X_ar%d" % which):
+                with sc(f"X_ar{which}"):
                     CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last)
             return buf[...].astype(F32)
 
@@ -566,11 +564,20 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
             return CO.exchange(R, me, src_fn, dst_fn, scr[ss], scr[rs], wait=wait,
                                scope=sc if tiles.trace else None)
 
-        def delay_here(l):
-            """F-DELAY: rank scal[3] spins scal[4] iterations at layer scal[5] (runtime; clean = no-op)."""
-            @pl.when(jnp.logical_and(me == scal[3], jnp.logical_or(scal[5] < 0, scal[5] == l)))
+        cur_layer = [None]
+
+        def delay_here(l, extra=True):
+            """F-DELAY: rank scal[3] spins scal[4] iterations at layer scal[5] (< 0: every layer); runtime operands,
+            so the clean program is the timed program (scal[3] = -1: never)."""
+            @pl.when(jnp.logical_and(jnp.logical_and(me == scal[3], extra),
+                                     jnp.logical_or(scal[5] < 0, scal[5] == l)))
             def _():
                 CO.spin(scal[4], scr["spin"])
+
+        def delay_count(gi, r):
+            """F-DELAY hook of the DSA count exchange: the delayed rank stalls before its round-1 send of group 0,
+            so its peers run ahead into the next parity (the `sharedsem` hazard)."""
+            delay_here(cur_layer[0], extra=jnp.logical_and(gi == 0, r == 1))
 
         # ---------------- expert ring (csq / moe_tp_decode) ----------------
         def esel(mpos, fn):
@@ -748,7 +755,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
             unpack_hi=unpack_hi, bf=bf, misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M,
             debug=False, nb=nb, ks=lambda: sm(cur_slot[0], "k_scale")[:, 0:1],
             dbg_uv=scr["dbg_uv"] if debug else None,
-            delay=None)
+            delay=delay_count)
         core.update(DSA.make(Ens))
 
         def save_table():
@@ -797,6 +804,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
             mpos = ltab[l, 3]
             slot = l % 2
             cur_slot[0] = slot
+            cur_layer[0] = l
             pltpu.make_async_copy(smalls.at[0], scr["sm"].at[slot], scr["sm_sem"].at[slot]).wait()
 
             @pl.when(l + 1 < L)
@@ -918,6 +926,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=Fals
                 scr["xq"][:, :KR] = xq3
                 a = matmul("wo", g_uv + 1, scr["xq"])
                 part1 = bf(a * sx3 * sm(slot, "o_proj_s"))
+            delay_here(l)                                    # F-DELAY: skew into the layer's AR#1
             attn = all_reduce(part1, 1, drop_last=(fault == "missing_rank_partial"))
             scr["attn"][...] = attn
             if debug:

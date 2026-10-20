@@ -18,7 +18,6 @@ wrapper.rope_table (the instruments-tested path); the torch operand collection i
 import dataclasses
 import os
 
-import numpy as np
 import torch
 
 from vllm_torchtpu.logger import init_logger

@@ -17,7 +17,6 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
 
 from . import kernel as K
@@ -231,11 +230,12 @@ def router_ids(cfg, wtab):
     return jnp.sort(key, axis=1)[:, :cfg.TOPK].astype(I32)
 
 
-def candidate_factory(tiles=K.Tiles(dot="mixed"), interpret=True, stack_e=True, groups=None, delay=(-1, 0, -1),
+def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, delay=(-1, 0, -1),
                       debug=True, embed_from_ref=True):
     """A per-rank step with glm_ref.step's signature for the instruments (check.check_candidate /
     test_accuracy.run_candidate_suite). `force` / `fault` are ignored; the kernel-side fault is tiles.fault."""
     gi = tuple(sorted(groups.items())) if groups else None
+    tiles = K.Tiles(dot="mixed", recip="exact") if tiles is None else tiles
 
     def step_fn(params, caches, batch, force, fault, *, meta, mode="native", axis="tp"):
         del force, fault, mode
