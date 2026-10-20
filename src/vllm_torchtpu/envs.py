@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
     TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
+    TPU_DSV4_SC_TOPK_ONE_LAUNCH: bool = False
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -868,6 +869,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": env_int(
         "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS", 0
     ),
+    # Run the indexer's SparseCore top-k as one program: its by-length pass
+    # and the cooperative pass for rows too long for one subcore, which is
+    # otherwise a second launch even when no row needs it.
+    "TPU_DSV4_SC_TOPK_ONE_LAUNCH": env_bool("TPU_DSV4_SC_TOPK_ONE_LAUNCH"),
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
     "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),

@@ -1217,6 +1217,7 @@ def _effective_row_lengths(
         "return_scores",
         "uniform_q_len",
         "split_mixed_blocks",
+        "sc_topk_one_launch",
     ),
 )
 def streamindex_topk(
@@ -1247,6 +1248,7 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     split_mixed_blocks: bool = False,
+    sc_topk_one_launch: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1317,6 +1319,7 @@ def streamindex_topk(
         but no q block is cut, so scoring does the same blocks as one pass.
         Each piece scores into a full-height buffer. Ignored when
         `chunk_tokens` chunks the call.
+      sc_topk_one_launch: `sparsecore_topk`'s `one_launch`.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1821,6 +1824,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
+                    one_launch=sc_topk_one_launch,
                 )
                 topk_scores_list.append(chunk_topk_scores)
             else:
@@ -1831,6 +1835,7 @@ def streamindex_topk(
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
+                    one_launch=sc_topk_one_launch,
                 )
             topk_idxs.append(chunk_topk_idxs)
 

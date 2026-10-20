@@ -463,9 +463,10 @@ def test_each_stage_gets_the_group_id_it_was_given(
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("one_launch", [False, True])
 @pytest.mark.parametrize("kind", ["random", "heavy_ties"])
-@pytest.mark.parametrize("b", [16, 128, 200])
-def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b):
+@pytest.mark.parametrize("b", [8, 16, 128, 200])
+def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b, one_launch):
     """The by-length path and the cooperative one return the same index rows,
     order included, whichever path a row takes: callers may depend on the
     order (an attention over the selected rows sums in that order)."""
@@ -480,6 +481,7 @@ def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b):
         k - 3,
         sc_module.BY_LENGTH_SLOT_WORDS,
         sc_module.BY_LENGTH_SLOT_WORDS + 1,
+        sc_module.ONE_LAUNCH_SLOT_WORDS[False] + 1,
         n,
     ]
     lengths[: len(edges)] = edges
@@ -488,8 +490,20 @@ def test_rows_by_length_select_the_cooperative_columns_in_order(kind, b):
     want = sc_module._sc_topk_direct(
         scores, k, lengths, p=p, write_empty=True, return_scores=False
     )
-    got = sparsecore_topk(scores, k, lengths)
+    got = sparsecore_topk(scores, k, lengths, one_launch=one_launch)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    if one_launch:
+        # And with no row long enough for the cooperative phase.
+        short = jnp.minimum(lengths, sc_module.ONE_LAUNCH_SLOT_WORDS[False])
+        np.testing.assert_array_equal(
+            np.asarray(sparsecore_topk(scores, k, short, one_launch=True)),
+            np.asarray(sparsecore_topk(scores, k, short)),
+        )
+        for a, b_ in zip(
+            sparsecore_topk(scores, k, lengths, return_scores=True, one_launch=True),
+            sparsecore_topk(scores, k, lengths, return_scores=True),
+        ):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b_))
 
 
 @pytest.mark.tpu_test
