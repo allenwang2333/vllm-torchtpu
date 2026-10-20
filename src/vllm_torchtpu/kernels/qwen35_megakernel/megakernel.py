@@ -382,6 +382,7 @@ def kernel_wide(ctx: MKBuildContext, refs):
     t_block, t_gdn, lay = ctx.t_block, ctx.t_gdn, ctx.lay
     me, rb_hbm = ctx.me, ctx.rb_hbm
     N_MB, BW, BWP, MB_GDN, MB_ATT = ctx.N_MB, ctx.BW, ctx.BWP, ctx.MB_GDN, ctx.MB_ATT
+    AR_DEFER = ctx.AR_DEFER
     M_OUT = ctx.c_wide.M
     res_all, xb_all, part_all = scr["res_all"], scr["xb_all"], scr["part_all"]
     assert FUSED and MB == B and B % 16 == 0, (FUSED, MB, B)
@@ -449,7 +450,7 @@ def kernel_wide(ctx: MKBuildContext, refs):
                 att_blk.init_rope()
                 if ctx.AR0S and ctx.comm:
                     att_blk.attention(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first, ars))
-                    allreduce_blk.ar0_finish(ars, first)
+                    ar0_close(ars, first)
                     return
                 allreduce_blk.add_residual(
                     allreduce_blk.allreduce(ars, att_blk.attention(l, slot, g0), first)
@@ -458,7 +459,7 @@ def kernel_wide(ctx: MKBuildContext, refs):
             def gdn_branch():
                 if ctx.AR0S and ctx.comm:
                     gdn_blk.gdn(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first, ars))
-                    allreduce_blk.ar0_finish(ars, first)
+                    ar0_close(ars, first)
                     return
                 allreduce_blk.add_residual(
                     allreduce_blk.allreduce(ars, gdn_blk.gdn(l, slot, g0), first)
@@ -468,12 +469,35 @@ def kernel_wide(ctx: MKBuildContext, refs):
                 att_branch()
             else:
                 lax.cond(is_att, att_branch, gdn_branch)
-            with sc("moe_router"):
-                xb_all[rows(m)] = rms_zc(scr["res"][...], sm(slot, "post_norm")).astype(BF16)
-                res_all[rows(m)] = scr["res"][...].astype(BF16)
+            if AR_DEFER:  # the previous microbatch's all-reduce, behind this one's mixer
+                pl.when(m > 0)(lambda: mixer_ar_end(m - 1))
+            else:
+                with sc("moe_router"):
+                    xb_all[rows(m)] = rms_zc(scr["res"][...], sm(slot, "post_norm")).astype(BF16)
+                    res_all[rows(m)] = scr["res"][...].astype(BF16)
             return carry_m
 
+        def ar0_close(ars, first):
+            if AR_DEFER:
+                allreduce_blk.ar0_mid(ars, first)
+            else:
+                allreduce_blk.ar0_finish(ars, first)
+
+        def mixer_ar_end(m):
+            """Rounds 1 and 2 of microbatch m's mixer all-reduce, its residual add and post-norm
+            (res_all holds m's residual bf16-exact, so this matches add_residual on res)."""
+            ars, _ = ar_slot(l * (2 * N_MB) + m)
+            with sc("mixer_ar_end", 3):
+                tot = allreduce_blk.ar0_end(ars)
+                with sc("ar_res"):
+                    res_m = rnd(res_all[rows(m)].astype(F32) + tot[0:B])
+                with sc("moe_router"):
+                    xb_all[rows(m)] = rms_zc(res_m, sm(slot, "post_norm")).astype(BF16)
+                    res_all[rows(m)] = res_m.astype(BF16)
+
         lax.fori_loop(0, N_MB, mixer, 0)
+        if AR_DEFER:
+            mixer_ar_end(N_MB - 1)
         with sc("moe", 3):
             moe_blk.moe_wide(l, slot, base_l + N_MB * per_mb)
 
@@ -553,6 +577,7 @@ def kernel_wide(ctx: MKBuildContext, refs):
         zero_seen.wait()
     lax.fori_loop(0, L, layer_scoped, 0)
     with sc("step_tail"):
+        allreduce_blk.ag_credit_drain()
         allreduce_blk.wait_sends()
         if c.NGDN > 0:
             for slot_o in range(NGO):

@@ -89,6 +89,12 @@ WIDE_SCATTER_TN = True
 # all-reduce n + 1 lands, so that payload must go to the other slot. One slot is only safe when
 # compute separates consecutive all-reduces, which the MoE all-reduces of the microbatches lack.
 WIDE_AR_SLOTS = 2
+# Defer the end of each microbatch's mixer all-reduce (rounds 1 and 2, residual add, post-norm)
+# past the next microbatch's mixer, so its cross-chip latency hides behind that compute. Round 1
+# of all-reduce n + 2 then can land in a slot a slower chip is still reading, so round-1 payload
+# slots are credit-protected: a chip signals its three cross-chip peers once it has read a slot's
+# round-1 payload, and a sender waits for those three credits before refilling the slot.
+WIDE_AR_DEFER = True
 # GatedDeltaNet input-state prefetch slots of a wide step's microbatch, and whether the routed
 # expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
 WIDE_NGI = 1
@@ -350,6 +356,8 @@ class MKBuildContext:
         ARP = bool(ARPIPE and R > 1 and "ar" not in skip and "dense" not in skip
                    and not WIDE_MB)
         NSL = WIDE_AR_SLOTS if WIDE_MB else 2  # all-reduce payload buffer slots
+        AR_DEFER = bool(WIDE_MB and WIDE_AR_DEFER and HIER == 2 and AR0S and NSL == 2
+                        and R == 8 and "ar" not in skip)
         assert NSL in (1, 2) and (NSL == 2 or not ARP)
         LCV_NH = 3 * qkv_128
         LCV_NH16 = -(-LCV_NH // 16) * 16
@@ -409,6 +417,7 @@ class MKBuildContext:
                                (NSL, R, AR_R, CW) if RSAG else (NSL, R, AR_R, AR_C), BF16),
             "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), NSL, AR_PEERS)),
             "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), NSL, AR_PEERS)),
+            **({"ag_credit": pltpu.SemaphoreType.REGULAR((NSL,))} if AR_DEFER else {}),
             # GatedDeltaNet
             "recb": pltpu.VMEM((B * vh, KD, VD), BF16),  # key-major states
             "sbuf": pltpu.VMEM((vh, KD, VD), F32),
@@ -686,6 +695,7 @@ class MKBuildContext:
         self.WIDE_DYN_ROW = WIDE_DYN_ROW
         self.WIDE_SCATTER_TN = WIDE_SCATTER_TN
         self.N_AR_SLOTS = NSL
+        self.AR_DEFER = AR_DEFER
         self.WIDE_TILE_REUSE = WIDE_TILE_REUSE
         self.WIDE_SCATTER = WIDE_SCATTER
         self.BLIVE = c_wide.B  # live rows of the wide step (the rest of the tail is padding)

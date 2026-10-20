@@ -242,6 +242,8 @@ class PallasAllReduce:
                         jnp.sum(ag_recv[slot, :, :, 0:HC2].astype(F32), axis=0), 0
                     )
                 return None
+            if HIER == 2:
+                self.ag_credit_wait(slot, first)
             with sc("ar_comm"):
                 self.ar_round(slot, 1, fill=fill)
             if HIER == 1:
@@ -252,6 +254,7 @@ class PallasAllReduce:
                 s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(BF16)
                 if not defer:
                     s2_recv[slot, c_idx] = s2_send[slot]
+            self.ag_credit_signal(slot)
             if defer:
                 assert HIER == 2 and ctx.ARP
                 with sc("ar_comm"):
@@ -476,6 +479,71 @@ class PallasAllReduce:
                 ),
                 h,
             )
+
+    def ag_credit_wait(self, slot, first):
+        """AR_DEFER: before round 1 refills `slot` on the three cross-chip peers, wait until each
+        has read the slot's previous round-1 payload (no previous payload on first use)."""
+        ctx = self.ctx
+        if not ctx.AR_DEFER:
+            return
+
+        @pl.when(jnp.logical_not(first))
+        def _():
+            pl.semaphore_wait(ctx.scr["ag_credit"].at[slot], 3)
+
+    def ag_credit_signal(self, slot):
+        """AR_DEFER: this chip has read `slot`'s round-1 payload; credit the three senders."""
+        ctx = self.ctx
+        if not ctx.AR_DEFER:
+            return
+        for off in (2, 4, 6):
+            pl.semaphore_signal(
+                ctx.scr["ag_credit"].at[slot],
+                1,
+                device_id=(ctx.me ^ off,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+    def ag_credit_drain(self):
+        """AR_DEFER, kernel exit: consume the credits of each slot's last round 1."""
+        ctx = self.ctx
+        if ctx.AR_DEFER:
+            for s in range(ctx.N_AR_SLOTS):
+                pl.semaphore_wait(ctx.scr["ag_credit"].at[s], 3)
+
+    def ar0_mid(self, slot, first):
+        """AR0S hier=2, deferred (wide step): wait and sum round 0, start round 1."""
+        ctx = self.ctx
+        scr, me, sc = ctx.scr, ctx.me, ctx.sc
+        recv, ag_send, ag_recv = scr["recv"], scr["ag_send"], scr["ag_recv"]
+        with sc("ar_comm"):
+            for d in self.ar_copies(slot, 0):
+                d.wait_recv()
+        with sc("ar_sum"):
+            ag_send[slot] = (recv[slot, 0].astype(F32) + recv[slot, 1].astype(F32)).astype(BF16)
+            ag_recv[slot, me // 2] = ag_send[slot]
+        self.ag_credit_wait(slot, first)
+        with sc("ar_comm"):
+            for d in self.ar_copies(slot, 1):
+                d.start()
+
+    def ar0_end(self, slot):
+        """AR0S hier=2, deferred (wide step): rounds 1 and 2 after ar0_mid -> the f32 sum."""
+        ctx = self.ctx
+        scr, me, sc = ctx.scr, ctx.me, ctx.sc
+        ag_recv, s2_send, s2_recv = scr["ag_recv"], scr["s2_send"], scr["s2_recv"]
+        c_idx = lax.rem(me, 2)
+        with sc("ar_comm"):
+            for d in self.ar_copies(slot, 1):
+                d.wait_recv()
+        with sc("ar_sum"):
+            s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(BF16)
+            s2_recv[slot, c_idx] = s2_send[slot]
+        self.ag_credit_signal(slot)
+        with sc("ar_comm"):
+            self.ar_round(slot, 2)
+        with sc("ar_sum"):
+            return jnp.concatenate([s2_recv[slot, 0], s2_recv[slot, 1]], axis=-1).astype(F32)
 
     def wait_sends(self):
         """Wait for all in-flight all-reduce sends at kernel exit."""
