@@ -116,11 +116,14 @@ def _on_run(dcp, sparse_kernel, seen):
         return t4._attention_run(dcp, on=True)
 
 
+@pytest.mark.multichip
 def test_t4_stack2_attention_all_flags_on_vs_off():
     prologue._require_tpu()
     dcp = t4._dcp_size()
-    if dcp < 2:
-        pytest.skip("DCP needs at least 2 devices")
+    if dcp < 8:
+        # The on arm forces the send layout, whose 16- and 32-token decode
+        # buckets of 32 heads fit only from DCP8 (V/2 partial rows per rank).
+        pytest.skip(f"the send-layout on arm needs DCP8 (8 devices), have {dcp}")
     import torch
 
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
@@ -204,13 +207,16 @@ def test_t4_stack2_attention_all_flags_on_vs_off():
         print("saved", prefix)
 
 
+@pytest.mark.multichip
 def test_t4_stack2_merge_pieces_swap_fault_is_caught():
     """Positive control: with the pieces exchanged (out_pieces_fault="swap")
     the 2048 step's partials must differ from the all-off run."""
     prologue._require_tpu()
     dcp = t4._dcp_size()
-    if dcp < 2:
-        pytest.skip("DCP needs at least 2 devices")
+    if dcp < 8:
+        # The on arm forces the send layout, whose 16- and 32-token decode
+        # buckets of 32 heads fit only from DCP8 (V/2 partial rows per rank).
+        pytest.skip(f"the send-layout on arm needs DCP8 (8 devices), have {dcp}")
     from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
 
     for k in T4S2_FLAGS_ON:

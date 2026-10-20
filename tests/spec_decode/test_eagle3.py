@@ -663,7 +663,11 @@ def test_prepare_draft_inputs_async_device(device):
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
 @pytest.mark.parametrize("return_device", [False, True])
-def test_propose(num_speculative_tokens, chunk_sizes, return_device, device):
+def test_propose(
+    num_speculative_tokens, chunk_sizes, return_device, device, monkeypatch
+):
+    # The stub runner has no upload cache (TPU_H2D_REUSE_STEADY, on by default).
+    monkeypatch.setenv("TPU_H2D_REUSE_STEADY", "0")
     # Each variant exercises the @torch.compile draft wrappers at distinct
     # shapes; across the full parametrize sweep they otherwise accumulate past
     # dynamo's recompile_limit (8) in one process (FailOnRecompileLimitHit).
