@@ -3,9 +3,10 @@
 # DSv4.1 decode measurements, 2026-10-20 UTC
 
 The 35 ms main-model forward and 14000 output tokens/chip/s targets remain
-unmet. This branch contains two measured changes: an FP4 MoE height ladder
-for the observed EP8 geometry and a joint request/scorer configuration for
-the 48-request full-context indexer.
+unmet. The serving measurements below cover an FP4 MoE height ladder for the
+observed EP8 geometry and a joint request/scorer configuration for the
+48-request full-context indexer. A subsequent router tile change has separate
+kernel evidence below; these serving results do not include it.
 
 ## Configuration and provenance
 
@@ -130,3 +131,35 @@ benchmark does not establish whole-model throughput. Relevant CPU and TPU
 regressions and pre-commit checks passed. Full-environment type checking
 reported the same 57 pre-existing errors as the base, with no new errors;
 it was not a clean full-environment pass.
+
+## Whole-batch expert selection
+
+At 288 local rows, the previous power-of-two divisor selected 32-row blocks,
+executing nine grid iterations. The measured TPU7x entry processes 288 rows
+in one block for 384 experts and top-k six. Other shapes and devices retain
+the previous divisor. Both the one-table and separate-weight-table paths have
+entries; hash-based routing still bypasses selection.
+
+In Falcon `exp-83rwu9buu9`, EP8 whole-layer paired runs were bit-exact.
+With softmax gating, selector time fell from 11.095 to 1.329 microseconds.
+With `sqrtsoftplus`, correction bias, routed scale 1.5 and biased expert
+logits, it fell from 11.696 to 1.743 microseconds. The latter whole-layer
+device time excluding entry barriers fell from 0.52108 to 0.51082 ms.
+These are synthetic whole-layer measurements, not an additional serving gain.
+The regression test checks the whole-batch tile against the previous tile and
+NumPy, including ties, non-finite rows and independent output weights.
+The final automatic-dispatch run at seed 1022 was bit-exact and used the same
+profiled executable as the explicit 288-row variant. Eight selector regression
+cases passed on TPU; seven layer integration cases passed on CPU. The full
+type-check error set remained identical to the base.
+
+```bash
+python scripts/dsv41_bench/bench_fp4_moe_heights.py \
+  --out /tmp/router-tiles --seed 1022 --tune-router \
+  --scoring-fn sqrtsoftplus --score-bias --gate-bias 0.9 \
+  --routed-scaling-factor 1.5 --profile
+```
+
+This mode compares 32, 96, 144 and 288 rows with automatic table dispatch,
+retaining compiled HLO and checking complete EP8 outputs against the 32-row
+reference. Height tuning remains automatic throughout the router sweep.

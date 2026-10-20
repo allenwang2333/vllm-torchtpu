@@ -65,6 +65,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.tuned_block_sizes import (
+    RouterTuningKey,
+    get_router_block_rows,
+)
 
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
@@ -585,9 +589,6 @@ def fused_ep_moe_v2(
         histogram the routing plan reads alongside the gathered payload.
         """
         scores = _apply_scoring_fn(gate_l, scoring_fn)
-        select_rows = MAX_ROUTING_BLOCK
-        while t_local % select_rows:
-            select_rows //= 2
         if hash_l is not None:
             # The selection was made by the caller's table, so the selector
             # does not run at all; the weights are still the scores at the
@@ -595,18 +596,24 @@ def fused_ep_moe_v2(
             # contributed here.
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
-        elif score_bias_l is None:
-            topk_weights, topk_idx = pallas_select(
-                scores, topk=topk, block_rows=select_rows
-            )
         else:
-            # Selection is based on (scores + score_bias_l); the weights come
-            # from the scores.
+            select_rows = get_router_block_rows(
+                RouterTuningKey(
+                    device_kind=mesh.devices.flat[0].device_kind,
+                    rows=t_local,
+                    experts=e_total,
+                    topk=topk,
+                    separate_weights=score_bias_l is not None,
+                ),
+                MAX_ROUTING_BLOCK,
+            )
             topk_weights, topk_idx = pallas_select(
-                scores + score_bias_l.astype(jnp.float32)[None, :],
+                scores
+                if score_bias_l is None
+                else scores + score_bias_l.astype(jnp.float32)[None, :],
                 topk=topk,
                 block_rows=select_rows,
-                weight_scores=scores,
+                weight_scores=None if score_bias_l is None else scores,
             )
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks

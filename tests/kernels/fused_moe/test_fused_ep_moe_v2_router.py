@@ -31,8 +31,9 @@ changed nothing would pass against a kernel that ignored the bias entirely.
 `interpret=True` runs the kernel body on the host, which is what lets the
 selection rule be gated without a chip, the same way `tests/kernels/
 test_router_topk.py` gates the sibling selector. It does not gate Mosaic
-lowering: `tests/kernels/fused_moe/test_fused_ep_moe_v2.py` is what runs this
-code on a TPU, and it needs eight of them.
+lowering: `tests/kernels/fused_moe/test_fused_ep_moe_v2.py` runs the full layer
+on eight TPUs. The decode tile regression below also checks Mosaic lowering
+when a TPU is available.
 """
 
 import numpy as np
@@ -49,15 +50,15 @@ EXPERTS = 256
 TOPK = 8
 
 
-def _select(scores, weight_scores=None, topk=TOPK, block_rows=None):
-    """The kernel on the host, as numpy."""
+def _select(scores, weight_scores=None, topk=TOPK, block_rows=None, interpret=True):
+    """Run selection and return host arrays."""
     rows = scores.shape[0]
     w, i = router_ops.pallas_select(
         jnp.asarray(scores),
         topk=topk,
         block_rows=rows if block_rows is None else block_rows,
         weight_scores=None if weight_scores is None else jnp.asarray(weight_scores),
-        interpret=True,
+        interpret=interpret,
     )
     return np.asarray(w), np.asarray(i)
 
@@ -107,6 +108,33 @@ def test_weights_come_from_the_second_table(rows, block_rows):
     ref_w, ref_i = _reference(scores, weights)
     np.testing.assert_array_equal(i, ref_i)
     np.testing.assert_array_equal(w, ref_w)
+
+
+@pytest.mark.parametrize("separate_weights", [False, True])
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("interpret", [True, False])
+def test_decode_selector_whole_batch_matches_tiled(separate_weights, ties, interpret):
+    """The non-power-of-two tile preserves routing and noaux weights."""
+    if not interpret and jax.default_backend() != "tpu":
+        pytest.skip("Compiled selector validation requires TPU")
+    rng = np.random.default_rng(1024)
+    scores = rng.random((288, 384), dtype=np.float32)
+    if ties:
+        scores = np.floor(scores * 4)
+    scores[0] = np.nan
+    scores[1] = -np.inf
+    weights = rng.random(scores.shape, dtype=np.float32) if separate_weights else None
+    actual_w, actual_i = _select(
+        scores, weights, topk=6, block_rows=288, interpret=interpret
+    )
+    old_w, old_i = _select(scores, weights, topk=6, block_rows=32, interpret=interpret)
+    ref_w, ref_i = _reference(
+        scores[2:], scores[2:] if weights is None else weights[2:], topk=6
+    )
+    np.testing.assert_array_equal(actual_i, old_i)
+    np.testing.assert_array_equal(actual_i[2:], ref_i)
+    np.testing.assert_array_equal(actual_w, old_w)
+    np.testing.assert_array_equal(actual_w[2:], ref_w)
 
 
 def test_the_bias_moves_the_selection_and_not_the_weights():

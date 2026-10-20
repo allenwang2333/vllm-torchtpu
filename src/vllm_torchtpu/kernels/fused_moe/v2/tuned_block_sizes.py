@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Measured static tile-height policies for block-scaled FP4 experts."""
+"""Measured static tiles for expert-parallel routing and FP4 experts."""
 
 from dataclasses import dataclass
 
@@ -8,6 +8,37 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 DEFAULT_HEIGHT_RUNGS = 4
+
+
+@dataclass(frozen=True)
+class RouterTuningKey:
+    device_kind: str
+    rows: int
+    experts: int
+    topk: int
+    separate_weights: bool
+
+
+# TPU7x, JAX 0.11.2 / libtpu 0.0.50: one block removes eight grid iterations.
+# Both one-table and noaux two-table selection were bit-exact in EP8 runs.
+ROUTER_BLOCK_ROWS: dict[RouterTuningKey, int] = {
+    RouterTuningKey("TPU7x", 288, 384, 6, False): 288,
+    RouterTuningKey("TPU7x", 288, 384, 6, True): 288,
+}
+
+
+def get_router_block_rows(key: RouterTuningKey, max_default_rows: int) -> int:
+    """Use a measured selector tile or the existing power-of-two divisor."""
+    tile = ROUTER_BLOCK_ROWS.get(key)
+    if tile is not None:
+        return tile
+    tile = max_default_rows
+    while key.rows % tile:
+        tile //= 2
+    logger.warning_once(
+        "[fused_ep_moe_v2] No tuned router tile for %s; using %d rows", key, tile
+    )
+    return tile
 
 
 @dataclass(frozen=True)

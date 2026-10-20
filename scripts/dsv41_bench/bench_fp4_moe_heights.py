@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compare FP4 MoE height ladders on the served EP8 decode geometry.
+"""Compare FP4 MoE height ladders or router tiles on the EP8 decode geometry.
 
 Each configuration compiles independently, verifies every output against the
-four-rung reference, and runs in rotating order. Host timings include dispatch;
-the optional XProf capture measures device execution.
+reference, and runs in rotating order. Host timings include dispatch; the
+optional XProf capture measures device execution.
 """
 
 import argparse
@@ -27,6 +27,10 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel, layer
 
 
+def _router_rows(_key, _max_default_rows, *, rows: int) -> int:
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -35,12 +39,19 @@ def main() -> None:
     parser.add_argument("--local-tokens", type=int, default=288)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=6)
+    parser.add_argument("--tune-router", action="store_true")
+    parser.add_argument("--scoring-fn", choices=layer.SCORING_FNS, default="softmax")
+    parser.add_argument("--score-bias", action="store_true")
+    parser.add_argument("--gate-bias", type=float, default=0)
+    parser.add_argument("--routed-scaling-factor", type=float, default=1)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     if args.repeats < 1 or args.local_tokens < 1:
         parser.error("repeats and local-tokens must be positive")
     if args.experts < 8 or args.experts % 8 or not 1 <= args.topk <= args.experts:
         parser.error("experts must divide over EP8 and topk must be in [1, experts]")
+    if args.tune_router and args.local_tokens != 288:
+        parser.error("router tile sweep requires 288 local tokens")
     if len(jax.devices()) < 8:
         parser.error("this benchmark requires eight TPU devices")
 
@@ -86,20 +97,41 @@ def main() -> None:
     x = jax.device_put(
         (rng.normal(size=(tokens, hidden)) * 0.1).astype(jnp.bfloat16), sharding
     )
-    gating = jax.device_put(
-        rng.normal(size=(tokens, args.experts)).astype(np.float32), sharding
+    logits = rng.normal(size=(tokens, args.experts))
+    if args.gate_bias:
+        logits += args.gate_bias * rng.normal(size=(1, args.experts))
+    gating = jax.device_put(logits.astype(np.float32), sharding)
+    score_bias = (
+        jax.device_put(
+            (rng.normal(size=args.experts) * 0.05).astype(np.float32),
+            NamedSharding(mesh, P()),
+        )
+        if args.score_bias
+        else None
     )
     inputs = (x, *weights, gating)
     compiled, checks = {}, {}
     reference = None
     override = "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE"
     saved_override = os.environ.get(override)
+    original_router_rows = layer.get_router_block_rows
+    configurations = (
+        [(f"router{rows}", None, rows) for rows in (32, 96, 144, 288)]
+        + [("automatic", None, None)]
+        if args.tune_router
+        else [("reference4", 4, None), ("automatic", None, None), ("rungs2", 2, None)]
+    )
     try:
-        for name, rungs in (("reference4", 4), ("automatic", None), ("rungs2", 2)):
+        for name, rungs, router_rows in configurations:
             if rungs is None:
                 os.environ.pop(override, None)
             else:
                 os.environ[override] = str(rungs)
+            layer.get_router_block_rows = (
+                original_router_rows
+                if router_rows is None
+                else functools.partial(_router_rows, rows=router_rows)
+            )
             kernel._BUILD_CACHE.clear()
             layer._LAYER_SM_CACHE.clear()
 
@@ -115,6 +147,9 @@ def main() -> None:
                     act_fn="silu_and_mul_with_clamp",
                     sharded_plan=True,
                     logical_intermediate_size=active,
+                    scoring_fn=args.scoring_fn,
+                    score_bias=score_bias,
+                    routed_scaling_factor=args.routed_scaling_factor,
                 )
 
             started = time.monotonic()
@@ -132,6 +167,7 @@ def main() -> None:
             for _ in range(5):
                 jax.block_until_ready(executable(*inputs))
     finally:
+        layer.get_router_block_rows = original_router_rows
         if saved_override is None:
             os.environ.pop(override, None)
         else:
@@ -153,6 +189,11 @@ def main() -> None:
         "local_tokens": args.local_tokens,
         "experts": args.experts,
         "topk": args.topk,
+        "tune_router": args.tune_router,
+        "scoring_fn": args.scoring_fn,
+        "score_bias": args.score_bias,
+        "gate_bias": args.gate_bias,
+        "routed_scaling_factor": args.routed_scaling_factor,
         "packages": {
             name: importlib.metadata.version(name)
             for name in ("jax", "jaxlib", "libtpu")
