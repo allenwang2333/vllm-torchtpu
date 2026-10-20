@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QSA with native HEAD_ALONG_SUBLANE storage and existing batched RPA decode.
+"""QSA with native HEAD_ALONG_SUBLANE storage and fused sparse decode.
 
 Scheduler pages remain intact. Selected compression groups become virtual RPA
 pages by a view; the returned cache is threaded through donation, never dropped.
-Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA.
+Prefill reuses KV tiles through block-sparse attention; decode reuses the
+batched RPA compute body.
 """
 
 import functools
@@ -30,6 +31,15 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     bf16,
     produce,
     quantize_kv,
+)
+from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
+    attend_in_chunks,
+)
+from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
+    rpa_query_batch_size as rpa_query_batch_size,
+)
+from vllm_torchtpu.kernels.sparse_gqa_decode.metadata import (
+    virtual_page_metadata as sparse_page_metadata,
 )
 
 
@@ -46,35 +56,14 @@ def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
 
 
 def virtual_page_metadata(blocks, lengths, table, *, ratio=4, page_size=128):
-    """Map selected logical groups to physical micro-pages; no KV gathering."""
-    batch, budget = blocks.shape
-    complete = lengths // ratio
-    count = jnp.minimum(complete, budget)
-    columns = jnp.arange(budget + 1)[None, :]
-    groups = jnp.concatenate((blocks, jnp.zeros((batch, 1), jnp.int32)), axis=1)
-    groups = jnp.where(columns == count[:, None], complete[:, None], groups)
-    valid = (columns < count[:, None]) | (
-        (columns == count[:, None]) & ((lengths % ratio)[:, None] > 0)
+    """Map sparse pages and pack the legacy RPA request metadata."""
+    pages, kv_lens = sparse_page_metadata(
+        blocks, lengths, table, ratio=ratio, page_size=page_size
     )
-    safe = jnp.where(valid, groups, 0)
-    # Reuse sparse MLA's vector lookup for small page tables; the generic
-    # gather lowers to a slower indirect lookup on this path.
-    from vllm_torchtpu.kernels.mla.sparse.kernel import gather_page_ids
-
-    physical = gather_page_ids(
-        table.reshape(-1),
-        safe // (page_size // ratio),
-        jnp.arange(batch, dtype=jnp.int32),
-        batch,
-    )
-    pages = jnp.where(
-        valid, physical * (page_size // ratio) + safe % (page_size // ratio), 0
-    )
-    kv_lens = count * ratio + lengths % ratio
     cu_q_lens = jnp.concatenate(
         (jnp.zeros((1,), jnp.int32), jnp.cumsum((lengths > 0).astype(jnp.int32)))
     )
-    return pages, kv_lens, cu_q_lens, jnp.full((3,), batch, jnp.int32)
+    return pages, kv_lens, cu_q_lens, jnp.full((3,), len(blocks), jnp.int32)
 
 
 def _rpa_attention_batch(
@@ -134,18 +123,9 @@ def _rpa_attention_batch(
     return out, next_cache.reshape(cache.shape)
 
 
-def rpa_query_batch_size(page_columns):
-    # RPA's minimum 128-step, batch8 schedule occupies about 815 KiB
-    # of v7's 1 MiB SMEM. A 64-query, 513-column page table fits alongside
-    # that schedule; keep larger tables within a 160 KiB scalar-data budget.
-    max_queries = min(64, (160 * 1024) // (4 * page_columns))
-    return 1 << (max_queries.bit_length() - 1)
-
-
 def rpa_attention(
     q, gate, blocks, lengths, table, cache, *, kv_heads, ratio, k_scale=1.0, v_scale=1.0
 ):
-    batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     attend = functools.partial(
         _rpa_attention_batch,
         kv_heads=kv_heads,
@@ -153,30 +133,7 @@ def rpa_attention(
         k_scale=k_scale,
         v_scale=v_scale,
     )
-    if len(q) <= batch_size:
-        return attend(q, gate, blocks, lengths, table, cache)
-    padding = (-len(q)) % batch_size
-
-    def split(x):
-        x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
-        return x.reshape(-1, batch_size, *x.shape[1:])
-
-    def step(cache, inputs):
-        query, gate, blocks, lengths, table = inputs
-        output, cache = attend(query, gate, blocks, lengths, table, cache)
-        return cache, output
-
-    # Keep the small-step path fully unrolled, but bound the unroll for large
-    # prefill steps. Fully expanding a 4K step repeats the RPA body 128 times
-    # in each QSA layer and makes whole-model compilation impractical.
-    num_chunks = (len(q) + batch_size - 1) // batch_size
-    cache, output = jax.lax.scan(
-        step,
-        cache,
-        tuple(map(split, (q, gate, blocks, lengths, table))),
-        unroll=min(num_chunks, 4),
-    )
-    return output.reshape(-1, *q.shape[1:])[: len(q)], cache
+    return attend_in_chunks(attend, q, gate, blocks, lengths, table, cache)
 
 
 def qsa_attention(
@@ -193,7 +150,7 @@ def qsa_attention(
     k_scale=1.0,
     v_scale=1.0,
 ):
-    """Use query-block reuse for prefill and the existing small-step RPA path."""
+    """Use block reuse for prefill and fused decode within its supported envelope."""
     if len(query) > len(starts) - 1:
         from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
             block_sparse_gqa_attention,
@@ -236,6 +193,35 @@ def qsa_attention(
             ratio=ratio,
             query_block=query_block,
             kv_tile=kv_tile,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    from vllm_torchtpu.kernels.sparse_gqa_decode import (
+        is_supported_by_fused_decode,
+        qsa_decode_attention,
+    )
+
+    if is_supported_by_fused_decode(
+        query,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        kv_heads=kv_heads,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    ):
+        return qsa_decode_attention(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            kv_heads=kv_heads,
+            ratio=ratio,
             k_scale=k_scale,
             v_scale=v_scale,
         )
