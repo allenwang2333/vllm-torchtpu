@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -407,6 +408,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_SPARSE_MLA_ROPE_LAYOUT", "sparsecore", ["sparsecore", "tensorcore"]
     ),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
+    # Existing libtpu flags, including collective offload eligibility.
+    "LIBTPU_INIT_ARGS": lambda: os.getenv("LIBTPU_INIT_ARGS", ""),
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")
     "TPU_ACCELERATOR_TYPE": lambda: os.getenv("TPU_ACCELERATOR_TYPE", None),

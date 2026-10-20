@@ -17,6 +17,7 @@ fused_ep_moe_v2 wraps the kernel builder in a shard_map over the
 expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
+import shlex
 import threading
 from typing import cast
 
@@ -25,6 +26,7 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental.compute_on import compute_on
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -62,7 +64,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
-from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
+from vllm_torchtpu.kernels.fused_moe.v2.scatter import (
+    can_scatter_pair,
+    scatter_pair,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -71,6 +76,24 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 # The scoring functions the router can apply to the gate logits. These
 # mirror `layers/adapter/moe_routing._apply_scoring_fn` exactly.
 SCORING_FNS = ("softmax", "sigmoid", "sqrtsoftplus")
+
+
+def _activation_sc_affinity_allowed(local_bytes: int) -> bool:
+    """Honor the process offload threshold before requiring SC placement.
+
+    libtpu aborts if sparseoffload is required but its collective eligibility
+    check rejects the operation. Use local input bytes conservatively, so
+    either input- or output-based thresholds are satisfied.
+    """
+    flag = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+    threshold = 0
+    args = shlex.split(envs.LIBTPU_INIT_ARGS)
+    for i, arg in enumerate(args):
+        if arg.startswith(flag + "="):
+            threshold = int(arg.split("=", 1)[1])
+        elif arg == flag and i + 1 < len(args):
+            threshold = int(args[i + 1])
+    return local_bytes >= threshold
 
 
 def _apply_scoring_fn(logits, scoring_fn):
@@ -720,13 +743,16 @@ def fused_ep_moe_v2(
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        # Restrict the new scratch allocation and scheduling to the measured
-        # DSV4.1 shape until other token counts have TPU coverage.
+        # Size scratch from the actual pair count and slab partition. Keep
+        # the original scatter when the subcore VMEM budget would be exceeded.
         merged_scatter = (
             jax.devices()[0].device_kind.startswith("TPU7")
             and form.quantized_activations
-            and (T, topk, e_total, ep, capacity, ragged_stride)
-            == (2304, 6, 384, 8, 128, 14336)
+            and can_scatter_pair(
+                slab_row.size,
+                ragged_stride,
+                act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+            )
         )
         scattered_scale_bits = None
         if merged_scatter:
@@ -862,7 +888,9 @@ def fused_ep_moe_v2(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        if jax.devices()[0].device_kind.startswith("TPU7"):
+        if jax.devices()[0].device_kind.startswith("TPU7") and (
+            _activation_sc_affinity_allowed(q_l.size * q_l.dtype.itemsize)
+        ):
             # Keep activation traffic off the SC0 metadata/scatter queue.
             # compute_on makes core_ids immutable across queue assignment.
             gather_activations = compute_on(
