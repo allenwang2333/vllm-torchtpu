@@ -94,6 +94,8 @@ class DeepseekV41MoE(DeepseekV4MoE):
         hidden_states_q=None,
         hidden_states_scale=None,
     ):
+        if (hidden_states_q is None) != (hidden_states_scale is None):
+            raise ValueError("routed prequantized inputs must be paired")
         if (
             self.use_sequence_parallel
             and input_ids is not None
@@ -106,9 +108,20 @@ class DeepseekV41MoE(DeepseekV4MoE):
             # but passes input_ids through as this rank's shard.
             input_ids = get_ep_group().all_gather(input_ids, dim=0)
         if hidden_states_q is not None:
+            # This bypasses upstream forward, including its hash/vision guards.
+            if self.gate.tid2eid is not None and input_ids is None:
+                raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+            if getattr(self.gate, "bias_vl", None) is not None and input_ids is None:
+                raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
+            # Upstream passes hidden_states as a placeholder only because its
+            # factory gives the runner the gate. An external gate must instead
+            # produce real logits from BF16, never from the FP8 side operands.
+            router_logits = None
+            if self.experts.gate is None:
+                router_logits, _ = self.gate(hidden_states)
             output = self.experts.forward_prequantized(
                 hidden_states,
-                hidden_states,
+                router_logits,
                 input_ids=input_ids,
                 hidden_states_q=hidden_states_q,
                 hidden_states_scale=hidden_states_scale,

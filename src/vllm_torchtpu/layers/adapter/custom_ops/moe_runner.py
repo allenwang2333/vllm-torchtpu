@@ -167,14 +167,23 @@ class VllmMoERunner(MoERunner):
     def forward_prequantized(
         self,
         hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
+        router_logits: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_input: torch.Tensor | None = None,
         *,
         hidden_states_q: torch.Tensor | None = None,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run explicit FP8 inputs through the usual TPU runner reductions."""
+        """Run explicit FP8 routed inputs, retaining BF16 gate/shared inputs.
+
+        Adapted from vLLM v0.31.1rc0 ``forward`` / ``_forward_impl``: their
+        custom-op and quant-method seams cannot carry q/scale side operands.
+        Keep those operands explicit and reuse upstream padding, dispatch,
+        combine and output-reduction helpers in the same order. Shared experts
+        run synchronously on TPU; CUDA overlap and fused shared gates are not
+        supported here. A runner without a gate requires actual router logits;
+        a runner-owned gate computes them from BF16 hidden states.
+        """
         from vllm_torchtpu.layers.adapter.quantization.fp8 import (
             VllmFp8MoEMethodTPU,
         )
@@ -185,6 +194,8 @@ class VllmMoERunner(MoERunner):
         method = self._quant_method
         if (hidden_states_q is None) != (hidden_states_scale is None):
             raise ValueError("routed prequantized inputs must be paired")
+        if self.gate is None and router_logits is None:
+            raise ValueError("prequantized inputs require router logits or a gate")
         if hidden_states_q is not None:
             if not isinstance(
                 method, (VllmFp8MoEMethodTPU, VllmDeepseekV4Mxfp4MoEMethod)
@@ -209,6 +220,7 @@ class VllmMoERunner(MoERunner):
                 hidden_states_q, (0, hidden_states.shape[-1] - original_width)
             )
         self.routed_experts._ensure_moe_quant_config_init()
+        # Preserve the upstream custom entry's forward-context layer accounting.
         _moe_runner.get_layer_from_name(
             _moe_runner._resolve_layer_name(self._encode_layer_name())
         )
@@ -218,6 +230,7 @@ class VllmMoERunner(MoERunner):
                     "prequantized inputs do not support fused shared gates"
                 )
             router_logits, _ = self.gate(hidden_states)
+        assert router_logits is not None
         with self._sequence_parallel_context():
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states, router_logits

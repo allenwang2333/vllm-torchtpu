@@ -43,6 +43,7 @@ usual story for anything that scales with hidden size.
 """
 
 from enum import StrEnum
+from functools import partial
 from typing import Any, cast
 
 import jax
@@ -595,11 +596,13 @@ def prebuild_fused_moe_ep(
     logical_intermediate_size: int | None = None,
     policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
 ) -> Any | None:
-    """Resolve the mesh and build the fused-EP op for one layer.
+    """Resolve the mesh and prebuild both activation variants for one layer.
 
     Called once per layer from `process_weights_after_loading`. Everything here
     is forbidden inside a compiled forward: mapping EP ranks to TPU device ids
     is an `all_gather_object`, and a `Mesh` cannot survive Dynamo's tracing.
+    The ops are registered once per distinct closure configuration, not per
+    layer, and forward only selects between these cached variants.
 
     Returns the op to serve this layer with, or None on any refusal. The caller
     records it, which is what makes arming per layer rather than per process --
@@ -759,7 +762,8 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    op = _build_op(
+    build_op = partial(
+        _build_op,
         mesh,
         topk,
         renormalize,
@@ -775,22 +779,8 @@ def prebuild_fused_moe_ep(
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
     )
-    _PREQUANTIZED_OPS[op] = _build_op(
-        mesh,
-        topk,
-        renormalize,
-        activation,
-        mesh_expert_order,
-        sharded_plan,
-        weight_format,
-        rhs_qb,
-        scoring_fn,
-        has_score_bias,
-        routed_scale,
-        has_hash_ids,
-        token_replica_groups=token_replica_groups,
-        prequantized=True,
-    )
+    op = build_op()
+    _PREQUANTIZED_OPS[op] = build_op(prequantized=True)
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "

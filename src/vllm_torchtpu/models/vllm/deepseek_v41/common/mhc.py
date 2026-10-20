@@ -675,19 +675,17 @@ def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
 
 
 def _quantized_value(value, moe_fp8):
-    outputs = ()
-    if moe_fp8:
-        amax = value.float().abs().amax(dim=-1, keepdim=True)
-        if moe_fp8:
-            scale = amax / 448.0
-            usable = torch.isfinite(scale) & (scale > 0)
-            scale = torch.where(usable, scale, 0.0)
-            reciprocal = torch.where(
-                usable, 1.0 / torch.where(usable, scale, 1.0), 0.0
-            ).to(value.dtype)
-            quantized = torch.where(usable, value * reciprocal, 0.0)
-            outputs += (quantized.to(torch.float8_e4m3fn), scale)
-    return outputs
+    if not moe_fp8:
+        return ()
+    amax = value.float().abs().amax(dim=-1, keepdim=True)
+    scale = amax / 448.0
+    usable = torch.isfinite(scale) & (scale > 0)
+    scale = torch.where(usable, scale, 0.0)
+    reciprocal = torch.where(usable, 1.0 / torch.where(usable, scale, 1.0), 0.0).to(
+        value.dtype
+    )
+    quantized = torch.where(usable, value * reciprocal, 0.0)
+    return quantized.to(torch.float8_e4m3fn), scale
 
 
 def pre(

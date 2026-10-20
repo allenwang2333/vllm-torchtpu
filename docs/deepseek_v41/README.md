@@ -45,11 +45,23 @@ The V2 adapter can pass prequantized FP8 activations and FP32 row scales explici
 to the routed MoE kernel, skipping local `rowquant_fp8` inside `quantize_local`.
 
 Shifted mHC produces normalized BF16 values together with the routed-MoE FP8
-representation (`moe_q`, `moe_scale`) in its epilogue. Router gates retain BF16.
+representation (`moe_q`, `moe_scale`) in its epilogue. Router gates and shared
+experts retain BF16; an external gate supplies actual router logits, while a
+runner-owned gate computes them once inside the runner.
 Routed MoE preserves its original quantization arithmetic: FP32 scale (`amax / 448`),
 BF16 reciprocal multiplication, and zero/nonfinite handling. Dispatch accepts the
 routed representation directly, preserving token layout, routing exchange, expert
 calculation, and output combine.
+
+Both activation variants are built at weight-loading time and cached per distinct
+closure configuration, not registered anew for every layer. They share routing,
+replica groups and `logical_intermediate_size`, so FP8 input does not discard the
+MXFP4 trailing-padding contract.
+
+The Pallas epilogue writes distinct residual, BF16 value, FP8 value and row-scale
+outputs from VMEM to HBM. Buffer-reuse and final-drain waits complete those DMAs;
+they do not issue additional copies. Prequantization retains the BF16 output and
+adds FP8/scale intermediates rather than eliminating all activation traffic.
 
 Preserving the quantization formula does not establish bitwise equivalence of the
 surrounding program. Small FP32 mHC gate differences (≤4 ULP) at T288 remain an

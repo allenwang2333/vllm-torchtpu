@@ -114,8 +114,11 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
                 getattr(self, "use_sequence_parallel", False)
             )
 
-    # Adapted from pinned vLLM DeepseekV4DecoderLayer.forward for explicit FP8
-    # side operands; TPU has no CUDA mHC overlap stream.
+    # Adapted from vLLM v0.31.1rc0 DeepseekV4DecoderLayer.forward: upstream's
+    # six-result mHC / BF16-only FFN seam cannot carry explicit FP8 operands.
+    # Keep delayed pre-mix, Engram and aux ordering; TPU attention owns its SP
+    # gather and TPU has no CUDA mHC overlap stream. The FFN boundary adds
+    # exactly q/scale to the six-result contract only when moe_fp8 is enabled.
     def forward(
         self,
         x,
@@ -230,9 +233,12 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
             fuse_rms=True,
             moe_fp8=moe_fp8,
         )
-        residual, post_mix, res_mix, x, ffn_pre, _, *quantized = outputs
+        if moe_fp8:
+            residual, post_mix, res_mix, x, ffn_pre, _, moe_q, moe_scale = outputs
+        else:
+            residual, post_mix, res_mix, x, ffn_pre, _ = outputs
+            moe_q, moe_scale = None, None
         assert x is not None
-        moe_q, moe_scale = quantized[-2:] if moe_fp8 else (None, None)
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             x = self.ffn.forward_unfinalized(x, input_ids)
         else:
