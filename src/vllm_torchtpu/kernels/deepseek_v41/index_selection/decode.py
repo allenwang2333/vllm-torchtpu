@@ -17,6 +17,9 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import scores, streaming_topk
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.joint_fetch import (
+    joint_decode_scores as joint_fetch_scores,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
     get_decode_request_tile,
@@ -171,6 +174,7 @@ def _flat_request_kernel(
         "halfplane",
         "request_group",
         "out_window",
+        "joint_fetch",
     ),
 )
 def grouped_decode_scores(
@@ -190,6 +194,7 @@ def grouped_decode_scores(
     halfplane: bool = False,
     request_group: int = 0,
     out_window: int = 0,
+    joint_fetch: bool = False,
 ) -> jax.Array:
     """Score split-order Q [requests, queries, heads, 128] against paged keys.
 
@@ -200,7 +205,9 @@ def grouped_decode_scores(
     [requests * queries, width] output (``request_group * queries`` must be a
     multiple of 8), avoiding the T(1,128) layout of the legacy 3D output and
     its XLA relayout before top-k. ``out_window`` optionally narrows that
-    path's out block columns. Results are bitwise identical to the default.
+    path's out block columns. ``joint_fetch`` scores that path with
+    `joint_fetch.joint_decode_scores` (one key-tile loop per request group).
+    Results are bitwise identical to the default.
     """
     requests, queries, heads, dim = q.shape
     width = pages.shape[1] * page_records
@@ -228,6 +235,8 @@ def grouped_decode_scores(
         )
     ):
         raise ValueError("Expected aligned paged BF16 request-major decode inputs")
+    if joint_fetch and (not request_group or not prefetch or profile_stages):
+        raise ValueError("joint_fetch needs request_group, prefetch, no profile_stages")
     window = math.gcd(width, max(key_tile, score_window))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     if request_group:
@@ -247,6 +256,7 @@ def grouped_decode_scores(
             request_group=request_group,
             out_window=out_window,
             halfplane=halfplane,
+            joint_fetch=joint_fetch,
         )
     result = pl.pallas_call(
         functools.partial(
@@ -316,6 +326,7 @@ def _flat_decode_scores(
     request_group,
     out_window,
     halfplane=False,
+    joint_fetch=False,
 ):
     requests, queries, heads, _ = q.shape
     width = pages.shape[1] * page_records
@@ -324,6 +335,21 @@ def _flat_decode_scores(
         raise ValueError("request_group must divide requests into 8-row blocks")
     if out_window and math.gcd(window, out_window) % key_tile == 0:
         window = math.gcd(window, out_window)
+    if joint_fetch:
+        # Always masked in-kernel, so fuse_mask needs no epilogue here.
+        return joint_fetch_scores(
+            q,
+            weights,
+            pool,
+            pages,
+            lengths,
+            page_records=page_records,
+            key_tile=key_tile,
+            window=window,
+            request_group=request_group,
+            halfplane=halfplane,
+            interpret=interpret,
+        )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     result = pl.pallas_call(
         functools.partial(
@@ -483,6 +509,8 @@ def decode_indexer(
         if envs.TPU_DEEPSEEK_V41_INDEX_SCORES_2D
         else 0
     )
+    # The joint fetch replaces only the 2D path's kernel; read at trace time.
+    joint = bool(request_group_2d) and envs.TPU_DEEPSEEK_V41_INDEX_JOINT_FETCH
 
     def prepare(i):
         return jax.tree.map(
@@ -506,6 +534,7 @@ def decode_indexer(
             fuse_mask=fuse_mask,
             halfplane=halfplane,
             request_group=request_group_2d,
+            joint_fetch=joint,
         )
 
     def select(i, values):

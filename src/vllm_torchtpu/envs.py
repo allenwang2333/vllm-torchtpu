@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
     TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT: bool = True
     TPU_DEEPSEEK_V41_INDEX_SCORES_2D: bool = True
+    TPU_DEEPSEEK_V41_INDEX_JOINT_FETCH: bool = False
     TPU_DEEPSEEK_V41_CANDIDATE_FLAT: int = 8
     TPU_DEEPSEEK_V41_CANDIDATE_SKIP: bool = True
     TPU_K3_SP_PREFILL: bool = False
@@ -454,6 +455,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # trace time; results are bitwise identical.
     "TPU_DEEPSEEK_V41_INDEX_SCORES_2D": env_bool(
         "TPU_DEEPSEEK_V41_INDEX_SCORES_2D", default=True
+    ),
+    # Decode index scores (2D path only): score each request group in one
+    # key-tile loop with branch-free page copies in flight for the whole group
+    # (index_selection/joint_fetch.py). Read at trace time; results are bitwise
+    # identical.
+    "TPU_DEEPSEEK_V41_INDEX_JOINT_FETCH": env_bool(
+        "TPU_DEEPSEEK_V41_INDEX_JOINT_FETCH", default=False
     ),
     # Candidate (union) index scores: requests per grid step of the flat
     # request-major kernel (8 gives 48-row blocks with 2-D records). 0 uses the

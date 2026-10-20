@@ -301,6 +301,181 @@ def test_decode_indexer_2d_out_selection_is_identical(
     jax.tree.map(np.testing.assert_array_equal, flat, legacy)
 
 
+def _assert_joint_matches_2d(
+    seed, requests, queries, heads, width, page, key_tile, banks, pages=None, **options
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
+        flat_request_group,
+    )
+
+    q, weights, pool, random_pages, lengths = _paged_decode_inputs(
+        seed, requests, queries, heads, width, page, banks
+    )
+    pages = random_pages if pages is None else pages
+    group = options.pop("request_group", None) or flat_request_group(requests, queries)
+    assert group
+    kwargs = dict(page_records=page, key_tile=key_tile, request_group=group, **options)
+    flat = grouped_decode_scores(q, weights, pool, pages, lengths, **kwargs)
+    joint = grouped_decode_scores(
+        q, weights, pool, pages, lengths, joint_fetch=True, **kwargs
+    )
+    assert joint.shape == flat.shape == (requests * queries, width)
+    np.testing.assert_array_equal(
+        np.asarray(joint).view(np.uint32), np.asarray(flat).view(np.uint32)
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "requests,queries,group",
+    [(4, 6, None), (8, 6, None), (8, 6, 8), (8, 4, None), (8, 3, None), (2, 8, 1)],
+)
+@pytest.mark.parametrize("banks", [1, 2])
+@pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("fuse_mask", [False, True])
+@pytest.mark.parametrize("score_window,out_window", [(32768, 0), (32768, 128)])
+def test_joint_fetch_is_bitwise_2d(
+    requests, queries, group, banks, halfplane, fuse_mask, score_window, out_window
+):
+    # Ragged and zero lengths, -1 pages, odd and even tile counts per request.
+    _assert_joint_matches_2d(
+        17,
+        requests,
+        queries,
+        4,
+        512,
+        16,
+        64,
+        banks,
+        request_group=group,
+        out_window=out_window,
+        interpret=True,
+        fuse_mask=fuse_mask,
+        score_window=score_window,
+        halfplane=halfplane,
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("banks", [1, 2])
+def test_joint_fetch_clamps_out_of_range_pages_like_2d(banks):
+    # Page ids past the pool, misaligned, and straddling the bank boundary
+    # read the same clamped rows as the incumbent's clipped slices.
+    q, weights, pool, pages, lengths = _paged_decode_inputs(23, 8, 6, 4, 512, 16, banks)
+    rows = sum(b.shape[0] for b in pool) if banks == 2 else pool.shape[0]
+    pages = np.asarray(pages).copy()
+    pages[0, 1] = 2 * rows + 4096
+    pages[1, 2] = 2**30
+    pages[2, 0] = 5
+    if banks == 2:
+        pages[3, 3] = 2 * pool[0].shape[0] - 6
+    _assert_joint_matches_2d(
+        23,
+        8,
+        6,
+        4,
+        512,
+        16,
+        64,
+        banks,
+        pages=jnp.asarray(pages),
+        interpret=True,
+        fuse_mask=True,
+        halfplane=True,
+    )
+
+
+@pytest.mark.cpu_test
+def test_joint_fetch_serving_heads_and_tiles():
+    # Serving head/query/tile/page geometry with a reduced width.
+    _assert_joint_matches_2d(
+        5,
+        16,
+        6,
+        32,
+        8192,
+        128,
+        4096,
+        2,
+        interpret=True,
+        fuse_mask=True,
+        score_window=131072,
+        halfplane=True,
+    )
+
+
+@pytest.mark.cpu_test
+def test_joint_fetch_requires_the_2d_path():
+    q, weights, pool, pages, lengths = _paged_decode_inputs(0, 8, 6, 4, 256, 16, 1)
+    with pytest.raises(ValueError, match="joint_fetch"):
+        grouped_decode_scores(
+            q,
+            weights,
+            pool,
+            pages,
+            lengths,
+            page_records=16,
+            key_tile=64,
+            interpret=True,
+            joint_fetch=True,
+        )
+
+
+@pytest.mark.skipif(
+    jax.default_backend() != "tpu", reason="Production widths are TPU-sized"
+)
+@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
+@pytest.mark.parametrize("page", [128, 256])
+@pytest.mark.parametrize("halfplane", [False, True])
+def test_joint_fetch_production_shapes(requests, width, page, halfplane):
+    _assert_joint_matches_2d(
+        3,
+        requests,
+        6,
+        32,
+        width,
+        page,
+        4096,
+        2,
+        fuse_mask=True,
+        score_window=131072,
+        halfplane=halfplane,
+    )
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="SparseCore top-k")
+@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
+@pytest.mark.parametrize("candidate_count", [0, 128])
+def test_decode_indexer_joint_fetch_selection_is_identical(
+    monkeypatch, requests, width, candidate_count
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode
+
+    q, weights, pool, pages, lengths = _paged_decode_inputs(
+        9, requests, 6, 32, width, 128, 2
+    )
+    kwargs = dict(
+        page_records=128,
+        key_tile=4096,
+        request_tile=requests,
+        candidate_count=candidate_count,
+        candidate_block_size=128,
+        halfplane=True,
+    )
+
+    def run(enabled):
+        # Read at trace time: drop the other setting's trace.
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_JOINT_FETCH", enabled)
+        decode.decode_indexer.clear_cache()
+        return jax.tree.map(
+            np.asarray,
+            decode.decode_indexer(q, weights, pool, pages, lengths, **kwargs),
+        )
+
+    incumbent, joint = run("0"), run("1")
+    jax.tree.map(np.testing.assert_array_equal, joint, incumbent)
+
+
 @pytest.mark.cpu_test
 def test_candidate_union_membership_overflow_and_invalid_pages():
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
