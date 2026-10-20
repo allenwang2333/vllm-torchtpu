@@ -171,9 +171,10 @@ def test_single_host_layer_is_bit_exact_with_the_pallas_plan(rows, weight_format
                 pallas_plan_max_tokens=max_tokens,
             )
 
-        outs = [
-            np.asarray(jax.jit(run, static_argnums=0)(m, rank, bias, *inputs))
-            for m in (0, rows)
-        ]
+        jitted = jax.jit(run, static_argnums=0)
+        for m in (0, rows):
+            hlo = jitted.lower(m, rank, bias, *inputs).as_text()
+            assert ("_plan_kernel" in hlo) == bool(m), "the flag must select the path"
+        outs = [np.asarray(jitted(m, rank, bias, *inputs)) for m in (0, rows)]
     assert np.isfinite(outs[0].astype(np.float32)).all()
     np.testing.assert_array_equal(outs[0].view(np.uint16), outs[1].view(np.uint16))

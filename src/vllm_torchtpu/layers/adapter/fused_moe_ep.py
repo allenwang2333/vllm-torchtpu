@@ -770,7 +770,7 @@ def prebuild_fused_moe_ep(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
-        "token_replica_groups=%s",
+        "token_replica_groups=%s pallas_plan_max_tokens=%d",
         hidden,
         inter,
         local_experts,
@@ -787,6 +787,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         routed_scale,
         token_replica_groups,
+        envs.TPU_MOE_PALLAS_PLAN_MAX_TOKENS,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the
