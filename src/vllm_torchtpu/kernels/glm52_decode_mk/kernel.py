@@ -70,7 +70,8 @@ VMEM_LIMIT = 67_043_328          # XLA clamps the request to this on v7x [measur
 FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_partial", "router_tiebreak",
                        "rope_off_by_one", "dcp_owner", "stale_indexshare",
                        "f_ichunk", "f_slotreuse", "f_hitcap", "f_xrace", "f_nope",
-                       "f_alias_early", "f_alias_poison", "f_alias_poison_red", "f_stale_is_alias")
+                       "f_alias_poison")      # Mosaic only (the alias exists only there); WHITEBOARD.v1's
+                                              # F-ALIAS-EARLY / POISON-RED / STALE-IS-ALIAS are not built yet
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
 
 
@@ -967,7 +968,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 def _moe():
                     moe(l, slot, g_ffn, mpos)
             stage_wait(l)
-            if fault == "f_alias_poison" or fault == "f_alias_poison_red":
+            if fault == "f_alias_poison":
                 poison_alias()
             return carry
 
