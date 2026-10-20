@@ -43,7 +43,10 @@ _ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
 # per-bucket tuning (each one with its reason).
 _ALLOWED = {
     ("moe/topk.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
-    ("gqa.py", "ex.NS <= 64"): "GQ packs 128 // NS lanes per sequence (m | l) field",
+    (
+        "gqa/params.py",
+        "ex.NS <= 64",
+    ): "GQ packs 128 // NS lanes per sequence (m | l) field",
 }
 
 
