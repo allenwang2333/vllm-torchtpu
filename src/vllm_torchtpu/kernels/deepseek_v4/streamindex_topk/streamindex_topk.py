@@ -29,6 +29,8 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
+    _pick_partition,
+    _sc_topk_direct,
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
@@ -1212,6 +1214,19 @@ def merge_kv_split_topk(
     num_ranks, num_tokens, _ = local.shape
     cand = local.reshape(num_ranks, num_tokens, 2, k).transpose(2, 1, 0, 3)
     cand = cand.reshape(2, num_tokens, num_ranks * k)
+    n = num_ranks * k
+    if _pick_partition(num_tokens, n, k) == 1:
+        # The SparseCore emits the winners' indices itself: an XLA gather of
+        # them costs more than the selection.
+        return _sc_topk_direct(
+            cand[1],
+            k,
+            jnp.full((num_tokens,), n, jnp.int32),
+            p=1,
+            write_empty=True,
+            return_scores=False,
+            payload=cand[0],
+        )
     win = sparsecore_topk(cand[1], k, write_empty_rows=True)
     picked = jnp.take_along_axis(cand[0], jnp.maximum(win, 0), axis=1)
     return jnp.where(win >= 0, picked, -1)

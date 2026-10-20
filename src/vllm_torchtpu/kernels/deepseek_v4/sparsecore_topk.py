@@ -107,8 +107,11 @@ def _topk_body(
     local_idxs_hbm: Any = None,
     dyn_lengths_vmem: Any = None,
     row_words: int = 0,
+    payload_hbm: Any = None,
 ):
     dcp_merge = local_idxs_hbm is not None
+    # Winners are emitted as this array's entries instead of column numbers.
+    with_payload = payload_hbm is not None
     # Rows fetched by their own length into a `slice_len`-word buffer (p == 1).
     dyn = dyn_lengths_vmem is not None
     num_subcores = 16
@@ -224,6 +227,7 @@ def _topk_body(
         out_vmem: Any = None,
         keys_vmem: Any = None,
         local_idxs_vmem: Any = None,
+        payload_vmem: Any = None,
         *,
         w: Any = None,
         row_len: Any = None,
@@ -412,6 +416,8 @@ def _topk_body(
             if dcp_merge:
                 col_offset = local_idxs_vmem[pl.ds(i * LANES, LANES)]
                 sel = sel & (col_offset >= 0)
+            elif payload_vmem is not None:
+                col_offset = payload_vmem[pl.ds(base + i * LANES, LANES)]
             else:
                 col_offset = (
                     i * LANES + lane_iota if p == 1 else lo + i * LANES + lane_iota
@@ -687,6 +693,7 @@ def _topk_body(
                     rest_vmem[-1],
                     None,
                     rest_vmem[0] if dcp_merge else None,
+                    rest_vmem[0] if with_payload else None,
                 )
 
             out_specs = (
@@ -697,10 +704,13 @@ def _topk_body(
                 ),
             )
             extra_in = (local_idxs_hbm,) if dcp_merge else ()
+            extra_specs = out_specs if dcp_merge else ()
+            if with_payload:
+                extra_in, extra_specs = (payload_hbm,), in_specs[:1]
             pltpu.emit_pipeline(
                 pipeline_step_p1_idx,
                 grid=(num_waves,),
-                in_specs=(*in_specs, *out_specs) if dcp_merge else in_specs,
+                in_specs=(*in_specs, *extra_specs),
                 out_specs=out_specs,
             )(scores_hbm, lengths_hbm, *extra_in, out_hbm)
     else:
@@ -843,8 +853,12 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    payload: jax.Array | None = None,  # i32[b, n]
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
+
+    With ``payload`` (``p == 1``, indices only), each winner is reported as
+    its ``payload`` entry instead of its column.
 
     When ``p == 1``, each subcore processes a full row independently.
     When ``p > 1``, groups of ``p`` subcores on the same SparseCore cooperatively
@@ -882,6 +896,12 @@ def _sc_topk_direct(
         lengths_in = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1))).reshape(-1)
 
     extra_inputs = ()
+    if payload is not None:
+        assert p == 1 and local_idxs is None and not return_scores
+        payload = payload.astype(jnp.int32)
+        if pad_b > 0 or pad_n > 0:
+            payload = jnp.pad(payload, ((0, pad_b), (0, pad_n)), constant_values=-1)
+        extra_inputs = (payload.reshape(-1),)
     if local_idxs is not None:
         local_words = local_idxs.astype(jnp.int32)
         if pad_b > 0:
@@ -941,11 +961,12 @@ def _sc_topk_direct(
         write_empty=write_empty,
         return_scores=return_scores,
     )
-    if local_idxs is not None:
+    if local_idxs is not None or payload is not None:
         orig_body = body_fn
+        extra_kw = "local_idxs_hbm" if payload is None else "payload_hbm"
 
-        def body_fn(scores, lengths, idx, *rest):
-            return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
+        def body_fn(scores, lengths, extra, *rest):
+            return orig_body(scores, lengths, *rest, **{extra_kw: extra})
 
     out = pl.kernel(
         body_fn,
