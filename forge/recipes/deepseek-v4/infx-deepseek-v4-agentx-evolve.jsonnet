@@ -347,6 +347,11 @@ local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
 // turns already encoded (vllm-torchtpu segment_tokenize.py; exact ids). The full encode costs ~2.7 us per
 // prompt token on the API server, before the request reaches an engine. Empty = off.
 local segmentTokenize = cdk.var('VLLM_TPU_SEGMENT_TOKENIZE', '');
+// true: install fastokens (pinned) on every server pod if the image lacks it and set VLLM_USE_FASTOKENS=1,
+// vLLM's switch to the fastokens BPE backend for HF fast tokenizers. On DSv4 agentx prompts it encodes at
+// ~0.02-0.05 us/token vs ~2.5 for the HF backend, with identical ids on 2534 replayed prompts. Pick this or
+// VLLM_TPU_SEGMENT_TOKENIZE: with both, the piecewise split costs more than fastokens' full encode.
+local useFastokens = cdk.boolVar('USE_FASTOKENS', false);
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
@@ -527,6 +532,11 @@ local serverScript = agentx.fill(
       rm -rf /workspace/vllm-torchtpu/src && mv /tmp/vllm-torchtpu-src/src /workspace/vllm-torchtpu/src
       echo "vllm-torchtpu src replaced: $(find /workspace/vllm-torchtpu/src -name '*.py' | wc -l) .py files"
     fi
+    if [ "@USE_FASTOKENS@" = "true" ]; then
+      python3 -c 'import fastokens' 2>/dev/null || python3 -m pip install --quiet 'fastokens==0.3.4' || exit 1
+      export VLLM_USE_FASTOKENS=1
+      echo "VLLM_USE_FASTOKENS=1 with fastokens $(python3 -c 'import importlib.metadata as m; print(m.version("fastokens"))')"
+    fi
 
     # Ensure pool_tensors[0] in TPURaidenOffloadingConnector has max(page_size_bytes) (HCA 128 KiB)
     # so pre-CL-976485301 KVCacheManagerBase allocates host_size large enough for all 122 arrays.
@@ -680,6 +690,7 @@ local serverScript = agentx.fill(
   |||,
   {
     HEAD_ADDR: cdk.host(serverJobName),
+    USE_FASTOKENS: if useFastokens then 'true' else 'false',
     HOST_MEM_SAMPLE_SECONDS: hostMemSampleSeconds,
     EXPECTED_TPU: rayExpectedTpu,
     XPROF_DIR: xprofDir,
