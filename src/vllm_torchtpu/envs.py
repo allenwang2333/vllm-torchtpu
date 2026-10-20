@@ -107,6 +107,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -237,6 +240,10 @@ def env_with_choices(
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+# DeepSeek-V4 per-core decode linears at TP8 (attention TP, shared expert TP).
+FP8_LINEAR_PALLAS_DEFAULT_SITES = (
+    "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,shared_experts.gate_up_proj"
+)
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -833,6 +840,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Per-channel FP8 dense linears at decode token counts (<= fp8_skinny.MAX_M rows)
+    # run as the weight-streaming Pallas kernel (kernels/quantized_matmul/
+    # fp8_skinny.py) instead of XLA's quantize + fp8 dot, on the layers named by
+    # TPU_FP8_LINEAR_PALLAS_SITES whose (K, N) has a measured tiling. Outputs differ
+    # from the XLA path (exact f32 accumulation): tolerance-tier numerics.
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    # Comma-separated layer-prefix suffixes, "."-bounded, e.g. "attn.wo_b".
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
+    ),
+    # Of the TPU_FP8_LINEAR_PALLAS sites, those whose kernel weight operand is
+    # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
+    # Same arithmetic, bit-identical outputs; placement only.
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
