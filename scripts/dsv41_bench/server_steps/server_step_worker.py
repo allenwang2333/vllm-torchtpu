@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import topk_tap
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -85,6 +87,8 @@ def token_counts(starts: list[int], ends: list[int], prefix: int) -> dict:
 
 _ACTIVE = None
 _INSTALLED = False
+if topk_tap.enabled():
+    topk_tap.install()
 
 
 def _stage_wrapper(original: Any, stage: str) -> Any:
@@ -170,6 +174,7 @@ class Recorder:
         self.pending = None
         self.enabled = False
         self.in_flight = 0
+        self.tap = topk_tap.Dumper(rank, scenario) if topk_tap.enabled() else None
         self.execute = runner.execute_model
         self.sample = runner.sample_tokens
         runner.execute_model = self.execute_model
@@ -205,6 +210,8 @@ class Recorder:
         if self.pending is not None:
             raise RuntimeError("Previous benchmark step did not complete sampling")
         self.pending = {"start_ns": time.perf_counter_ns(), "stages": []}
+        if self.tap is not None:
+            self.pending["tap_tokens"] = scheduler_output.total_num_scheduled_tokens
         if self.scenario.name == "decode":
             self.pending["scheduled_draft_lengths"] = {
                 req: len(tokens)
@@ -226,6 +233,8 @@ class Recorder:
 
         row = self.pending
         self.pending = None
+        if self.tap is not None:
+            self.tap.after_step(self.runner, row.pop("tap_tokens"))
         self.steps.append(row)
         self.in_flight += 1
 
