@@ -33,15 +33,17 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from torch_tpu._internal import pallas
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
-from vllm.logger import init_logger
 
-from torch_tpu._internal import pallas
+from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
@@ -85,13 +87,74 @@ def segment_matmul(
     return (acc * jnp.expand_dims(w_s, 0)).astype(jnp.bfloat16)
 
 
+# Rows and columns of the output a grid step computes. A step holds its rows
+# of every segment and the weight's column block of every segment in VMEM.
+SEGMENT_BLOCK_ROWS = 512
+SEGMENT_BLOCK_COLS = 512
+
+
+def _segment_matmul_kernel(x_ref, s_ref, w_ref, ws_ref, o_ref):
+    """o = sum_r (x[r] @ w[r]) * s[:, r], times the column scales."""
+    acc = None
+    for r in range(x_ref.shape[0]):
+        part = jnp.dot(
+            x_ref[r], w_ref[r], preferred_element_type=jnp.float32
+        ) * s_ref[:, r : r + 1]
+        acc = part if acc is None else acc + part
+    o_ref[...] = (acc * ws_ref[...]).astype(o_ref.dtype)
+
+
+def segment_matmul_pallas(
+    x_q: jax.Array,
+    x_s: jax.Array,
+    w_full: jax.Array,
+    w_s: jax.Array,
+    *,
+    interpret: bool = False,
+) -> jax.Array:
+    """`segment_matmul` as one Pallas kernel: the tp segment partials
+    accumulate in float32 in VMEM instead of round-tripping HBM."""
+    k = x_q.shape[1]
+    tp = w_full.shape[0] // k
+    t = x_q.shape[0] // tp
+    n = w_full.shape[1]
+    bt = min(SEGMENT_BLOCK_ROWS, t)
+    bn = min(SEGMENT_BLOCK_COLS, n)
+    if t % bt or n % bn or bt % 8 or bn % 128:
+        return segment_matmul(x_q, x_s, w_full, w_s)
+    x = x_q.reshape(tp, t, k)
+    s = x_s.reshape(tp, t).T  # [t, tp]: a row's segment scales along lanes
+    w = w_full.reshape(tp, k, n)
+    ws = w_s.reshape(1, n).astype(jnp.float32)
+    # Rows outer, columns inner: a step's rows stay resident across the
+    # column blocks and the weight streams once per row block.
+    return pl.pallas_call(
+        _segment_matmul_kernel,
+        out_shape=jax.ShapeDtypeStruct((t, n), jnp.bfloat16),
+        grid=(t // bt, n // bn),
+        in_specs=[
+            pl.BlockSpec((tp, bt, k), lambda i, j: (0, i, 0)),
+            pl.BlockSpec((bt, tp), lambda i, j: (i, 0)),
+            pl.BlockSpec((tp, k, bn), lambda i, j: (0, 0, j)),
+            pl.BlockSpec((1, bn), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((bt, bn), lambda i, j: (i, j)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            vmem_limit_bytes=48 * 1024 * 1024,
+        ),
+        name="sp_a2a_segment_matmul",
+        interpret=pltpu.InterpretParams() if interpret else False,
+    )(x, s, w, ws)
+
+
 _segment_matmul_op = None
 
 
 def _get_segment_matmul_op():
     global _segment_matmul_op
     if _segment_matmul_op is None:
-        op = pallas.jax_op("pallas::sp_a2a_segment_matmul", segment_matmul)
+        op = pallas.jax_op("pallas::sp_a2a_segment_matmul", segment_matmul_pallas)
 
         def _fake(x_q, x_s, w_full, w_s):
             tp = w_full.shape[0] // x_q.shape[1]
