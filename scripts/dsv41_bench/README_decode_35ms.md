@@ -169,3 +169,36 @@ python scripts/dsv41_bench/bench_fp4_moe_heights.py \
 This mode compares 32, 96, 144 and 288 rows with automatic table dispatch,
 retaining compiled HLO and checking complete EP8 outputs against the 32-row
 reference. Height tuning remains automatic throughout the router sweep.
+
+## Experiments not adopted
+
+The following prototypes remain outside the production path. Unless labeled
+otherwise, times are complete device-module medians after subtracting identified
+entry barriers; operator-only measurements are explicitly identified.
+
+| Prototype | Measurement | Decision |
+| --- | --- | --- |
+| Pack activation and routing metadata into one all-gather | Whole EP8 layer 0.469 to 0.918 ms, bit-exact | Reject |
+| Compact FP4 weights with three slots and capacity 64 | Biased-gate MoE kernel 0.340 to 0.407 ms, or 0.367 to 0.448 ms, bit-exact | Reject |
+| Smaller CSA interleave groups | Synchronized host latency 0.332 to 0.339–0.380 ms, bit-exact | Retain six-query interleave |
+| Lossless FP8 candidate-key storage | Cache 576 to 297 MiB; packing plus four reindexes 1.482 to 3.584 ms after tile tuning | Reject despite smaller cache |
+| Direct FP8 candidate QK with scales moved into the head reduction | Complete FP32 score bit-equality check failed | Do not promote or claim a speedup |
+| Skip invalid candidate-tail DMA and compute | Dense synthetic unions of 3000–5400 blocks: 0.433 to 0.436 ms; full unions: 0.435 to 0.467 ms, bit-exact | Reject |
+| One 49152-key DMA window with a larger VMEM budget | Full-union scorer/selection 0.436 to 0.450 ms, bit-exact | Retain 24576-key DMA windows |
+| MoE routing rank windows of 32, 16 or 8 pairs | Whole EP8 layer 0.5125 to 0.5129–0.5139 ms, bit-exact | Retain existing rule |
+| SparseCore gather writeback overlap and 1024 rows/subcore | Isolated gather 0.705 to 0.684 ms, bit-exact | Small synthetic gain; no serving validation or production change |
+
+Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
+above ran in `exp-qg29pd6unq` after its serving process exited. The initial
+1024–1800-block tail test was faster, but that density was too low to represent
+the existing serving captures, whose maximum unions exceeded 5000 blocks.
+The dense and full-union results determine the rejection.
+
+Increasing SparseCore gather read concurrency from eight to sixteen did not
+complete within 300 seconds after the baseline variant. Only that benchmark
+process was terminated; this does not establish the cause of the stall.
+The subsequent writeback-overlap comparison retained eight reads.
+
+Dense FP8 GEMM fusion is a subsequent experiment. CPU Pallas interpretation
+matches the reference on a small case; this is not TPU numerical or performance
+validation, and no GEMM replacement is enabled by this branch.
