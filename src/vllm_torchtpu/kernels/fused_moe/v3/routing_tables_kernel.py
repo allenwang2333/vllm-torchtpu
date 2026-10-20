@@ -280,184 +280,189 @@ def _shard_tables_body(*refs,
 
         @pl.when(step < n_zero)
         def _zero(zero_ref=zero_ref):
-            zero_ref[...] = jnp.zeros_like(zero_ref)
+            with jax.named_scope("st_zero"):
+                zero_ref[...] = jnp.zeros_like(zero_ref)
 
     @pl.when(step < n_groups)
     def _histogram_phase():
-        constants = _histogram_constants(block, num_experts)
-        for i in range(blocks_per_step):
-            b = step * blocks_per_step + i
-            _histogram_and_rank(_pair_block(ids_ref, i, block), b,
-                                histogram_vmem, rank_vmem, **constants)
+        with jax.named_scope("st_histogram"):
+            constants = _histogram_constants(block, num_experts)
+            for i in range(blocks_per_step):
+                b = step * blocks_per_step + i
+                _histogram_and_rank(_pair_block(ids_ref, i, block), b,
+                                    histogram_vmem, rank_vmem, **constants)
 
     @pl.when(step == n_groups)
     def _prefix():
-        experts_per_shard = num_experts // num_shards
-        shard = shard_of()
-        prefix = _prefix_chain(histogram_vmem[...],
-                               block_offset_vmem,
-                               run_rows_ref,
-                               packed_vmem,
-                               expert_base_vmem,
-                               num_experts=num_experts,
-                               num_shards=num_shards,
-                               n_blocks=n_blocks,
-                               routed_rows_per_shard=routed_rows_per_shard,
-                               row_block=row_block,
-                               slot_field=slot_field)
-        # This shard's rows of the [E, ...] tables, picked by a one-hot f32
-        # dot (dynamic_slice does not lower in Pallas. Exact below 2**24).
-        local_index = lax.broadcasted_iota(jnp.int32,
-                                           (experts_per_shard, num_experts), 0)
-        expert_index = lax.broadcasted_iota(jnp.int32,
-                                            (experts_per_shard, num_experts),
-                                            1)
-        row_select = jnp.where(
-            expert_index == shard * experts_per_shard + local_index, 1.0, 0.0)
+        with jax.named_scope("st_prefix"):
+            experts_per_shard = num_experts // num_shards
+            shard = shard_of()
+            prefix = _prefix_chain(histogram_vmem[...],
+                                   block_offset_vmem,
+                                   run_rows_ref,
+                                   packed_vmem,
+                                   expert_base_vmem,
+                                   num_experts=num_experts,
+                                   num_shards=num_shards,
+                                   n_blocks=n_blocks,
+                                   routed_rows_per_shard=routed_rows_per_shard,
+                                   row_block=row_block,
+                                   slot_field=slot_field)
+            # This shard's rows of the [E, ...] tables, picked by a one-hot f32
+            # dot (dynamic_slice does not lower in Pallas. Exact below 2**24).
+            local_index = lax.broadcasted_iota(jnp.int32,
+                                               (experts_per_shard, num_experts), 0)
+            expert_index = lax.broadcasted_iota(jnp.int32,
+                                                (experts_per_shard, num_experts),
+                                                1)
+            row_select = jnp.where(
+                expert_index == shard * experts_per_shard + local_index, 1.0, 0.0)
 
-        def own_rows(table):
-            return jnp.dot(row_select,
-                           table.astype(jnp.float32),
-                           precision=lax.Precision.HIGHEST,
-                           preferred_element_type=jnp.float32).astype(
-                               jnp.int32)
-
-        run_rows_aligned = own_rows(prefix.run_rows_aligned)
-        run_start_aligned = own_rows(prefix.run_start_aligned)
-        run_rows = own_rows(prefix.run_rows)
-        per_dest = run_rows_aligned.sum(axis=0, keepdims=True)
-        dest_base = _exclusive_cumsum_rows(per_dest.T).T
-        outgoing_offset = dest_base + _exclusive_cumsum_rows(run_rows_aligned)
-        # recv_base[d, shard, g] for every d -> [G, d]
-        recv_flat = prefix.recv_base.reshape(num_shards,
-                                             num_shards * experts_per_shard)
-        flat_index = lax.broadcasted_iota(
-            jnp.int32, (num_shards * experts_per_shard, experts_per_shard), 0)
-        local_column = lax.broadcasted_iota(
-            jnp.int32, (num_shards * experts_per_shard, experts_per_shard), 1)
-        col_select = jnp.where(
-            flat_index == shard * experts_per_shard + local_column, 1.0, 0.0)
-        arrival_base = jnp.dot(recv_flat.astype(jnp.float32),
-                               col_select,
+            def own_rows(table):
+                return jnp.dot(row_select,
+                               table.astype(jnp.float32),
                                precision=lax.Precision.HIGHEST,
                                preferred_element_type=jnp.float32).astype(
-                                   jnp.int32)  # [d, G]
-        arrival_offset = arrival_base.T  # [G, d] rows
+                                   jnp.int32)
 
-        def blocks(rows):
-            return jnp.right_shift(rows, row_block_shift).astype(jnp.int32)
+            run_rows_aligned = own_rows(prefix.run_rows_aligned)
+            run_start_aligned = own_rows(prefix.run_start_aligned)
+            run_rows = own_rows(prefix.run_rows)
+            per_dest = run_rows_aligned.sum(axis=0, keepdims=True)
+            dest_base = _exclusive_cumsum_rows(per_dest.T).T
+            outgoing_offset = dest_base + _exclusive_cumsum_rows(run_rows_aligned)
+            # recv_base[d, shard, g] for every d -> [G, d]
+            recv_flat = prefix.recv_base.reshape(num_shards,
+                                                 num_shards * experts_per_shard)
+            flat_index = lax.broadcasted_iota(
+                jnp.int32, (num_shards * experts_per_shard, experts_per_shard), 0)
+            local_column = lax.broadcasted_iota(
+                jnp.int32, (num_shards * experts_per_shard, experts_per_shard), 1)
+            col_select = jnp.where(
+                flat_index == shard * experts_per_shard + local_column, 1.0, 0.0)
+            arrival_base = jnp.dot(recv_flat.astype(jnp.float32),
+                                   col_select,
+                                   precision=lax.Precision.HIGHEST,
+                                   preferred_element_type=jnp.float32).astype(
+                                       jnp.int32)  # [d, G]
+            arrival_offset = arrival_base.T  # [G, d] rows
 
-        run_start_ref[...] = blocks(run_start_aligned)
-        run_blocks_ref[...] = blocks(run_rows_aligned)
-        outgoing_offset_ref[...] = blocks(outgoing_offset)
-        push_blocks_ref[...] = blocks(run_rows_aligned)
-        push_destination_ref[...] = blocks(arrival_base.T)
-        push_rows_ref[...] = run_rows.astype(jnp.int32)
-        arrival_offset_ref[...] = arrival_offset.astype(jnp.int32)
+            def blocks(rows):
+                return jnp.right_shift(rows, row_block_shift).astype(jnp.int32)
 
-        expert_rows = own_rows(prefix.expert_rows_aligned[:, None])[:, 0]
-        expert_base = own_rows(prefix.expert_base[:, None])[:, 0]
-        expert_base_ref[...] = (expert_base - expert_base[0]).astype(
-            jnp.int32)[None, :]
-        expert_rows_ref[...] = expert_rows.astype(jnp.int32)[None, :]
+            run_start_ref[...] = blocks(run_start_aligned)
+            run_blocks_ref[...] = blocks(run_rows_aligned)
+            outgoing_offset_ref[...] = blocks(outgoing_offset)
+            push_blocks_ref[...] = blocks(run_rows_aligned)
+            push_destination_ref[...] = blocks(arrival_base.T)
+            push_rows_ref[...] = run_rows.astype(jnp.int32)
+            arrival_offset_ref[...] = arrival_offset.astype(jnp.int32)
 
-        mine = (jnp.arange(num_shards,
-                           dtype=jnp.int32) == shard).astype(jnp.int32)
-        other = 1 - mine
-        first = (jnp.arange(experts_per_shard,
-                            dtype=jnp.int32) == 0).astype(jnp.int32)[:, None]
-        received = prefix.run_rows.sum(axis=0).astype(jnp.int32)
-        received_aligned = prefix.rows_per_dest.sum(axis=1).astype(jnp.int32)
-        active = (expert_rows > 0).astype(jnp.int32)[:, None]
-        counts_ref[...] = jnp.concatenate([
-            (run_rows * other[None, :]).sum(axis=0, keepdims=True),
-            ((received * mine)[None, :] * first -
-             run_rows * mine[None, :]).sum(axis=0, keepdims=True),
-            (run_rows_aligned * other[None, :]).sum(axis=0, keepdims=True),
-            ((received_aligned * mine)[None, :] * first -
-             run_rows_aligned * mine[None, :]).sum(axis=0, keepdims=True),
-            (active * mine[None, :]).sum(axis=0, keepdims=True),
-        ],
-                                          axis=0).astype(jnp.int32)
+            expert_rows = own_rows(prefix.expert_rows_aligned[:, None])[:, 0]
+            expert_base = own_rows(prefix.expert_base[:, None])[:, 0]
+            expert_base_ref[...] = (expert_base - expert_base[0]).astype(
+                jnp.int32)[None, :]
+            expert_rows_ref[...] = expert_rows.astype(jnp.int32)[None, :]
 
-        # The visit order without a sort: each expert's rank under (rows
-        # descending, index ascending), inverted by a one-hot.
-        order = jnp.arange(experts_per_shard, dtype=jnp.int32)
-        key = order - expert_rows.astype(
-            jnp.int32) * jnp.int32(experts_per_shard)
-        rank = jnp.sum((key[None, :] < key[:, None]).astype(jnp.int32), axis=1)
-        inverse = jnp.sum(jnp.where(rank[None, :] == order[:, None],
-                                    order[None, :], 0),
-                          axis=1)
-        visit_order_ref[...] = jnp.minimum(
-            inverse,
-            jnp.int32(experts_per_shard - 1)).astype(jnp.int32)[None, :]
+            mine = (jnp.arange(num_shards,
+                               dtype=jnp.int32) == shard).astype(jnp.int32)
+            other = 1 - mine
+            first = (jnp.arange(experts_per_shard,
+                                dtype=jnp.int32) == 0).astype(jnp.int32)[:, None]
+            received = prefix.run_rows.sum(axis=0).astype(jnp.int32)
+            received_aligned = prefix.rows_per_dest.sum(axis=1).astype(jnp.int32)
+            active = (expert_rows > 0).astype(jnp.int32)[:, None]
+            counts_ref[...] = jnp.concatenate([
+                (run_rows * other[None, :]).sum(axis=0, keepdims=True),
+                ((received * mine)[None, :] * first -
+                 run_rows * mine[None, :]).sum(axis=0, keepdims=True),
+                (run_rows_aligned * other[None, :]).sum(axis=0, keepdims=True),
+                ((received_aligned * mine)[None, :] * first -
+                 run_rows_aligned * mine[None, :]).sum(axis=0, keepdims=True),
+                (active * mine[None, :]).sum(axis=0, keepdims=True),
+            ],
+                                              axis=0).astype(jnp.int32)
+
+            # The visit order without a sort: each expert's rank under (rows
+            # descending, index ascending), inverted by a one-hot.
+            order = jnp.arange(experts_per_shard, dtype=jnp.int32)
+            key = order - expert_rows.astype(
+                jnp.int32) * jnp.int32(experts_per_shard)
+            rank = jnp.sum((key[None, :] < key[:, None]).astype(jnp.int32), axis=1)
+            inverse = jnp.sum(jnp.where(rank[None, :] == order[:, None],
+                                        order[None, :], 0),
+                              axis=1)
+            visit_order_ref[...] = jnp.minimum(
+                inverse,
+                jnp.int32(experts_per_shard - 1)).astype(jnp.int32)[None, :]
 
     @pl.when(step > n_groups)
     def _lookup_phase():
-        # The two pair tables the layer reads: the arrival row of each of
-        # this shard's own pairs (the combine's gather index, in pair
-        # order) and every pair's row in this shard's routed rows,
-        # rebased, with a pair of another shard sent to
-        # routed_rows_per_shard (the scatter drops it).
-        group = step - n_groups - 1
-        bias = jnp.int32(LOOKUP_BIAS)
-        shard = shard_of()
-        shard_base = shard * jnp.int32(routed_rows_per_shard)
-        first_own_group = shard * jnp.int32(groups_per_shard)
-        own = jnp.logical_and(group >= first_own_group, group
-                              < first_own_group + groups_per_shard)
-        arrival_rows = []
-        for i in range(blocks_per_step):
-            b = group * blocks_per_step + i
-            pair_experts = _pair_block(ids_ref, i, block)
-            unrouted = pair_experts[None, :] == jnp.int32(num_experts)
-            picked = _table_lookups(pair_experts,
-                                    b,
-                                    blocks_per_shard=blocks_per_shard,
-                                    expert_iota_t=expert_iota_t,
-                                    block_offset_vmem=block_offset_vmem,
-                                    packed_vmem=packed_vmem,
-                                    expert_base_vmem=expert_base_vmem,
-                                    bias=bias)
-            rank = (rank_vmem[pl.ds(b, 1)] +
-                    picked[LOOKUP_BLOCK_OFFSET:LOOKUP_BLOCK_OFFSET + 1])
-            shift = picked[LOOKUP_PACKED_SHIFT:LOOKUP_PACKED_SHIFT + 1]
-            arrival = rank + jnp.right_shift(shift, slot_field_shift)
-            routed_row = (picked[LOOKUP_EXPERT_BASE:LOOKUP_EXPERT_BASE + 1] +
-                          rank + (shift & jnp.int32(slot_field - 1)))
-            # A pair that routes nowhere (index past the last expert) takes
-            # the drop row and gathers arrival row zero at weight zero.
-            arrival = jnp.where(unrouted, jnp.int32(0), arrival)
-            local = jnp.where(
-                jnp.logical_or(unrouted, routed_row < shard_base),
-                jnp.int32(routed_rows_per_shard), routed_row - shard_base)
-            routed_row_ref[pl.ds(i * block, block)] = local[0]
-            arrival_rows += [
-                arrival[:, j * LANES:(j + 1) * LANES]
-                for j in range(rows_per_block)
-            ]
+        with jax.named_scope("st_lookup"):
+            # The two pair tables the layer reads: the arrival row of each of
+            # this shard's own pairs (the combine's gather index, in pair
+            # order) and every pair's row in this shard's routed rows,
+            # rebased, with a pair of another shard sent to
+            # routed_rows_per_shard (the scatter drops it).
+            group = step - n_groups - 1
+            bias = jnp.int32(LOOKUP_BIAS)
+            shard = shard_of()
+            shard_base = shard * jnp.int32(routed_rows_per_shard)
+            first_own_group = shard * jnp.int32(groups_per_shard)
+            own = jnp.logical_and(group >= first_own_group, group
+                                  < first_own_group + groups_per_shard)
+            arrival_rows = []
+            for i in range(blocks_per_step):
+                b = group * blocks_per_step + i
+                pair_experts = _pair_block(ids_ref, i, block)
+                unrouted = pair_experts[None, :] == jnp.int32(num_experts)
+                picked = _table_lookups(pair_experts,
+                                        b,
+                                        blocks_per_shard=blocks_per_shard,
+                                        expert_iota_t=expert_iota_t,
+                                        block_offset_vmem=block_offset_vmem,
+                                        packed_vmem=packed_vmem,
+                                        expert_base_vmem=expert_base_vmem,
+                                        bias=bias)
+                rank = (rank_vmem[pl.ds(b, 1)] +
+                        picked[LOOKUP_BLOCK_OFFSET:LOOKUP_BLOCK_OFFSET + 1])
+                shift = picked[LOOKUP_PACKED_SHIFT:LOOKUP_PACKED_SHIFT + 1]
+                arrival = rank + jnp.right_shift(shift, slot_field_shift)
+                routed_row = (picked[LOOKUP_EXPERT_BASE:LOOKUP_EXPERT_BASE + 1] +
+                              rank + (shift & jnp.int32(slot_field - 1)))
+                # A pair that routes nowhere (index past the last expert) takes
+                # the drop row and gathers arrival row zero at weight zero.
+                arrival = jnp.where(unrouted, jnp.int32(0), arrival)
+                local = jnp.where(
+                    jnp.logical_or(unrouted, routed_row < shard_base),
+                    jnp.int32(routed_rows_per_shard), routed_row - shard_base)
+                routed_row_ref[pl.ds(i * block, block)] = local[0]
+                arrival_rows += [
+                    arrival[:, j * LANES:(j + 1) * LANES]
+                    for j in range(rows_per_block)
+                ]
 
-        # Own arrival rows land as whole tiles at a tile-aligned row: a row
-        # stored alone at a run-time offset is a branch, and so a matrix
-        # unit pipeline drain, per block on every step.
-        @pl.when(own)
-        def _():
-            rows = blocks_per_step * rows_per_block
-            row0 = pl.multiple_of((group - first_own_group) * rows, rows)
-            arrival_ref[pl.ds(row0, rows), :] = jnp.concatenate(arrival_rows,
-                                                                axis=0)
+            # Own arrival rows land as whole tiles at a tile-aligned row: a row
+            # stored alone at a run-time offset is a branch, and so a matrix
+            # unit pipeline drain, per block on every step.
+            @pl.when(own)
+            def _():
+                rows = blocks_per_step * rows_per_block
+                row0 = pl.multiple_of((group - first_own_group) * rows, rows)
+                arrival_ref[pl.ds(row0, rows), :] = jnp.concatenate(arrival_rows,
+                                                                    axis=0)
 
     if hosts_transport:
 
         @pl.when(step == 2 * n_groups)
         def _transport_middle():
-            shard = shard_of()
-            transport.forward_middle_rounds(
-                transport.Exchange(gathered_rows_out, send_sem, receive_sems,
-                                   shard,
-                                   gathered_rows_out.shape[0] // num_shards,
-                                   num_shards))
+            with jax.named_scope("st_transport_middle"):
+                shard = shard_of()
+                transport.forward_middle_rounds(
+                    transport.Exchange(gathered_rows_out, send_sem, receive_sems,
+                                       shard,
+                                       gathered_rows_out.shape[0] // num_shards,
+                                       num_shards))
 
 
 def shard_tables_kernel(routing_messages,
