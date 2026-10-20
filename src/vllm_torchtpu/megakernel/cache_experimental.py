@@ -9,18 +9,18 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
 (`ex.FUSED=True`):
 
 1. **On TPU (`ex.interpret == False`)**:
-   - The communicating `decode_megakernel` declares `ST[pool_state_name]` with
+   - The communicating `decode_megakernel` declares `ST[POOL_STATE_NAME]` with
      `access="r"` and sets **no** `pallas_call` `input_output_aliases` on the
      pools.
    - `GQABlock` and `GDNBlock` (via `experimental/fused_pool_io.py`, reached
-     through `blocks.fused_io_hook`) issue async HBM DMA reads and writes
-     directly against `ST[pool_state_name]`.
+     through `fused_io_hook`) issue async HBM DMA reads and writes
+     directly against `ST[POOL_STATE_NAME]`.
    - The outer `jax.jit` (`donate_argnums` on `raw_pools`) returns the donated
      input `raw_pools` references directly as outputs, relying on XLA buffer
      donation (`jax.buffer_donor = true` / `HloModule input_output_alias`) to
      alias the outer input and output buffers in-place.
    - **Important**: Because `pallas_call` does not declare a write or alias on
-     `ST[pool_state_name]` on TPU, correctness relies entirely on outer buffer
+     `ST[POOL_STATE_NAME]` on TPU, correctness relies entirely on outer buffer
      donation being honored with zero intermediate full-pool copies. Keep this
      path **opt-in** (`fused_pool_io=False` by default everywhere) and verify
      both `check_fused_pooled_step_hlo` and outer `torch_tpu` donation IR on
@@ -30,10 +30,10 @@ HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
      during warmup (eager mode included).
 
 2. **On CPU (`ex.interpret != False`)**:
-   - `GQABlock.outputs` declares `O[pool_state_name]` (`access="w"`), and
-     `kernel.build` sets `input_output_aliases` from `ST[pool_state_name]` to
-     `O[pool_state_name]` so CPU `interpret=True` mutates the aliased output
-     copy and returns it through `out_map[pool_state_name]`.
+   - `GQABlock.outputs` declares `O[POOL_STATE_NAME]` (`access="w"`), and
+     `kernel.build` sets `input_output_aliases` from `ST[POOL_STATE_NAME]` to
+     `O[POOL_STATE_NAME]` so CPU `interpret=True` mutates the aliased output
+     copy and returns it through `out_map[POOL_STATE_NAME]`.
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MegakernelConfigError
+from .fused_io_hook import fused_io_available
 from .pool import POOL_KERNEL_NAMES
 from .spec import ExecSpec, ModelSpec, PoolBackend
 
@@ -86,6 +87,10 @@ def should_fuse_pool_io(
           (`24`) or `ex.B >= min_b_hi` (`56`) and uses split I/O for `32..48`.
       max_b_low: Upper batch threshold for low-`B` fusion in `"auto"` mode.
       min_b_hi: Lower batch threshold for high-`B` fusion in `"auto"` mode.
+
+    Without a registered fused implementation (`fused_io_available()`), or when
+    the pool backend doesn't support fused I/O, `"auto"` resolves to split pool
+    I/O and an explicit `True` raises `MegakernelConfigError`.
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
@@ -120,6 +125,13 @@ def should_fuse_pool_io(
         if explicit_true:
             raise MegakernelConfigError(
                 f"ModelSpec {ms.name!r} pool_backend does not support fused_pool_io"
+            )
+        return False
+    if want_fused and not fused_io_available():
+        if explicit_true:
+            raise MegakernelConfigError(
+                "fused_pool_io=True needs a registered fused pool I/O "
+                "implementation (the megakernel experimental package is not loaded)"
             )
         return False
     return want_fused

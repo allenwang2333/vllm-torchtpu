@@ -28,7 +28,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from ..ops import I32, rup
-from ..spec import POOL_STATE_NAME, ExecSpec, PoolBackend
+from ..spec import ExecSpec, PoolBackend
 from .layout import PoolLayout
 
 GATHER_KERNEL_NAME = "gather_gdn_states"
@@ -245,7 +245,6 @@ def make_pool_backend(
         gather_states=_gather,
         scatter_states=_scatter,
         can_pool_gather=_can_pool_gather,
-        pool_state_name=POOL_STATE_NAME,
         page_table_state_name="page_table",
         supports_fused_io=supports_fused_io,
         supports_pool_gather=supports_pool_gather,

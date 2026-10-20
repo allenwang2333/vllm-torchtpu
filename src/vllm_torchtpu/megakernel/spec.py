@@ -480,8 +480,8 @@ class LayerType:
 
 
 # State name of the unified raw-pool tuple (`ST[...]` / `O[...]`). This is the
-# single definition: blocks, the kernel builder and the cache pipes reach it via
-# `PoolBackend.pool_state_name`, `KernelContext.raw_refs`, or this constant.
+# single definition: blocks, the kernel builder and the cache pipes use this
+# constant (or `KernelContext.raw_refs`).
 POOL_STATE_NAME = "raw"
 
 
@@ -498,7 +498,6 @@ class PoolBackend:
     gather_states: Any = None
     scatter_states: Any = None
     can_pool_gather: Any = None
-    pool_state_name: str = POOL_STATE_NAME
     page_table_state_name: str = "page_table"
     supports_fused_io: bool = False
     supports_pool_gather: bool = False

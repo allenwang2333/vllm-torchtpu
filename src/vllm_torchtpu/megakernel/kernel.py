@@ -140,11 +140,7 @@ def build(
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
         out_ref = O["hidden"]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
-        pool_key = (
-            model_spec.pool_backend.pool_state_name
-            if model_spec.pool_backend is not None
-            else POOL_STATE_NAME
-        )
+        pool_key = POOL_STATE_NAME
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])
             if ex.FUSED
@@ -349,11 +345,7 @@ def build(
         else 1
         for k in w_names
     )
-    pool_key = (
-        model_spec.pool_backend.pool_state_name
-        if model_spec.pool_backend is not None
-        else POOL_STATE_NAME
-    )
+    pool_key = POOL_STATE_NAME
     aliases: dict[int, int] = {}
     if ex.FUSED and bool(ex.interpret) and pool_key in st_names and pool_key in o_names:
         raw_s_offset = sum(

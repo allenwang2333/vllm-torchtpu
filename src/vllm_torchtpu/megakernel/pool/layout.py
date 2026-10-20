@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 
 from ..errors import MegakernelConfigError
-from ..ops import BF16, FP8
+from ..ops import BF16, FP8, rup
 
 if TYPE_CHECKING:
     from ..spec import ExecSpec
@@ -203,8 +203,10 @@ class PoolLayout:
     def validate(self, ex: ExecSpec | None = None) -> None:
         """Raise `MegakernelConfigError` for layouts the pool kernels can't run.
 
-        With `ex`, also checks the per-rank recurrent state fits its slot and
-        that `ex.page_size` matches the layout.
+        With `ex`, also checks that `ex.page_size` matches the layout and that
+        the per-rank recurrent state and the conv window of every pool I/O path
+        `ex` selects (split, in-kernel gather `ex.GPR`, fused `ex.FUSED`) fit
+        their slot pages.
         """
 
         def _need(ok: bool, msg: str) -> None:
@@ -281,6 +283,19 @@ class PoolLayout:
             f"per-rank conv window ({conv_rows_pad} rows) exceeds one conv "
             f"page ({self.conv_page_rows} rows)",
         )
+        # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
+        # window (fused: at least 16 rows) in the conv page.
+        qkv_rows = self.qkv_per_rank(R) // LANES
+        hr = rup(self.conv_taps + ex.T, 8)
+        for on, path, rows in (
+            (ex.GPR, "in-kernel gather (GPR)", hr * qkv_rows),
+            (ex.FUSED, "fused pool I/O", max(16, hr) * qkv_rows),
+        ):
+            _need(
+                not on or rows <= self.conv_page_rows,
+                f"{path} conv window ({rows} rows at T={ex.T}) exceeds one conv "
+                f"page ({self.conv_page_rows} rows)",
+            )
 
 
 __all__ = [

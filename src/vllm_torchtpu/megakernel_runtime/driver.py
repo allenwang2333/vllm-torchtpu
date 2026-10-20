@@ -1598,8 +1598,16 @@ class MegakernelDriver:
         # Sentinel pages for kernel variant index v (see the warmup loop): KV page
         # v and GDN pages [pps * (1 + spv * v), pps * (1 + spv * v + spp * T)),
         # with pps / spp the pool layout's pages and slots per pool and
-        # spv = spp * max T slots per variant; snapshot them all.
-        pool_lay = self.spec.pool_backend.layout
+        # spv = spp * max T slots per variant; snapshot them all. The step inputs
+        # carry three recurrent sub-layers per pool (`s0..s2` / `c0..c2`, the
+        # Qwen3.5 schedule), so the sentinel writes are wired for three too.
+        pb = self.spec.pool_backend
+        if pb is None or pb.layout is None:
+            raise MegakernelLayoutError(
+                f"MegakernelDriver: ModelSpec {self.spec.name!r} has no pool "
+                "backend layout"
+            )
+        pool_lay = pb.layout
         pps = pool_lay.pages_per_slot
         spp = pool_lay.slots_per_pool
         rpp = pool_lay.rec_pages_per_slot

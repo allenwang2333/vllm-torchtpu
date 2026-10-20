@@ -14,7 +14,7 @@
 """Experimental, opt-in megakernel features (not needed by the default path).
 
 Importing this package registers the fused pool I/O helpers with the block
-hook (`blocks.fused_io_hook`).
+hook (`fused_io_hook`).
 """
 
 from __future__ import annotations

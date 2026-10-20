@@ -44,7 +44,7 @@ def test_megakernel_portability_ast_guard():
         "kernel.py",
         "planner.py",
         "pool_alias.py",
-        "blocks/fused_io_hook.py",
+        "fused_io_hook.py",
         "blocks/gdn.py",
         "blocks/gqa.py",
         "blocks/moe.py",
@@ -121,7 +121,7 @@ def test_megakernel_portability_ast_guard():
 
 
 def test_blocks_do_not_import_experimental_code():
-    """Blocks reach fused pool I/O only via `blocks.fused_io_hook`.
+    """Blocks reach fused pool I/O only via the core `fused_io_hook` module.
 
     No module under `blocks/` may import `experimental/` (or the fused helpers)
     at any level, so GQA / GDN can land without the experimental code.
@@ -144,7 +144,7 @@ def test_blocks_do_not_import_experimental_code():
             for name in names:
                 assert "experimental" not in name and "fused_pool_io" not in name, (
                     f"blocks/{path.name}:{node.lineno} imports '{name}'; blocks "
-                    "must reach fused pool I/O through blocks.fused_io_hook"
+                    "must reach fused pool I/O through fused_io_hook"
                 )
 
 

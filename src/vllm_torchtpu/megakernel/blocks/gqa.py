@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .. import pool_alias
 from ..errors import MegakernelConfigError
+from ..fused_io_hook import fused_io
 from ..ops import (
     BF16,
     F32,
@@ -46,7 +47,6 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
-from .fused_io_hook import fused_io
 
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))
@@ -112,6 +112,28 @@ class GQABlock(Block):
     reduction = "allreduce"
     input_norm: str | None = "in_norm"
 
+    def __init__(self, pool_layout: Any = None) -> None:
+        # `PoolLayout` of the model's paged pools (None: the default page
+        # packing `(2, HD // 4, 4, page_size)`, the only one the paged reads use).
+        self.pool_layout = pool_layout
+
+    def kv_page_shape(self, g: Any, ex: ExecSpec) -> tuple[int, ...]:
+        """Shape of one pool page, from `pool_layout` when the model sets one.
+
+        Raises `MegakernelConfigError` if the layout's page packing differs from
+        the `(2, HD // 4, 4, page_size)` packing the paged KV reads assume.
+        """
+        shape = (2, g.HD // 4, 4, ex.page_size)
+        if self.pool_layout is None:
+            return shape
+        lay_shape = tuple(self.pool_layout.kv_page_shape)
+        if lay_shape != shape:
+            raise MegakernelConfigError(
+                f"GQABlock paged KV reads need pool pages {shape}, but the pool "
+                f"layout has {lay_shape}"
+            )
+        return lay_shape
+
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
@@ -136,7 +158,7 @@ class GQABlock(Block):
             st = [
                 StateDecl(
                     POOL_STATE_NAME,
-                    (ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
+                    (ex.num_pages, *self.kv_page_shape(g, ex)),
                     FP8,
                     access="r",
                     per_layer=True,

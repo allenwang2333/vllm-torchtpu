@@ -23,14 +23,14 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
 2. **Experimental opt-in 1-launch fused pool I/O (`fused_pool_io=True`)**:
    - Isolated in `cache_experimental.py` and `experimental/fused_pool_io.py`
      (disabled by default everywhere: `fused_pool_io=False`).
-   - On TPU (`ex.interpret=False`), `ST[pool_state_name]` is declared
+   - On TPU (`ex.interpret=False`), `ST[POOL_STATE_NAME]` is declared
      `access="r"` with no Pallas-level alias (avoiding Mosaic's full-pool copy
      on communicating kernels), `GQABlock` and `GDNBlock` issue async HBM DMA
-     reads/writes directly against `ST[pool_state_name]`, and the outer
+     reads/writes directly against `ST[POOL_STATE_NAME]`, and the outer
      `jax.jit` (`donate_argnums`) returns the donated input pool references
      directly as outputs (relying on outer XLA `input_output_alias` /
-     `jax.buffer_donor = true`). On CPU (`ex.interpret=True`), `O[pool_state_name]`
-     is aliased to `ST[pool_state_name]` via `pallas_call(input_output_aliases=...)`.
+     `jax.buffer_donor = true`). On CPU (`ex.interpret=True`), `O[POOL_STATE_NAME]`
+     is aliased to `ST[POOL_STATE_NAME]` via `pallas_call(input_output_aliases=...)`.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ from . import cache_experimental, kernel
 from .cache_experimental import should_fuse_pool_io
 from .errors import MegakernelConfigError
 from .pool import POOL_KERNEL_NAMES, PoolLayout, check_ckpt_bounds
-from .spec import ExecSpec, ModelSpec, PoolBackend
+from .spec import POOL_STATE_NAME, ExecSpec, ModelSpec, PoolBackend
 
 
 @jax.tree_util.register_pytree_node_class
@@ -309,6 +309,7 @@ def make_flat_pooled_step(
         fused_pool_io=use_fused,
         pool_gather=use_gpr,
     )
+    pb.layout.validate(ex_paged)
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
 
     def _get_compiled(
@@ -420,7 +421,7 @@ def make_flat_pooled_step(
             call_l, info_l = _get_compiled(act_mode_l, ckpt_2d_l, ckpt_k_l, roff_1d_l)
             p_l = info_l["plan"]
             st_map_f: dict[str, Any] = {
-                pb.pool_state_name: raw_pools,
+                POOL_STATE_NAME: raw_pools,
                 pb.page_table_state_name: page_table,
             }
             if has_rec:
@@ -434,8 +435,8 @@ def make_flat_pooled_step(
             hid = out_map_f["hidden"]
             if use_fused:
                 raw_out = (
-                    tuple(out_map_f[pb.pool_state_name])
-                    if pb.pool_state_name in out_map_f
+                    tuple(out_map_f[POOL_STATE_NAME])
+                    if POOL_STATE_NAME in out_map_f
                     else tuple(raw_pools)
                 )
                 return (hid, *raw_out)
@@ -464,7 +465,7 @@ def make_flat_pooled_step(
 
         st_map: dict[str, Any] = {
             **gathered,
-            pb.pool_state_name: raw_pools,
+            POOL_STATE_NAME: raw_pools,
             pb.page_table_state_name: page_table,
         }
         s_args = [st_map[k] for k in s_names]
@@ -536,6 +537,7 @@ def make_pooled_step(
         fused_pool_io=use_fused,
         pool_gather=use_gpr,
     )
+    pb.layout.validate(ex_paged)
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
 
     def _get_compiled(
@@ -564,7 +566,7 @@ def make_pooled_step(
     wsh = info["wshape"]
     has_rec = pb.has_recurrent_pool
     rec_slots = pb.recurrent_slots_per_pool
-    pool_key = pb.pool_state_name
+    pool_key = POOL_STATE_NAME
     pt_key = pb.page_table_state_name
     max_pt = ex_paged.resolved_max_pages_per_seq
 

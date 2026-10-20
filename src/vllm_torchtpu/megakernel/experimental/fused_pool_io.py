@@ -14,7 +14,7 @@
 """Experimental in-kernel fused KV and GDN pool I/O helpers (`ex.FUSED=True`).
 
 `GQABlock` / `GDNBlock` reach these helpers only through the block hook
-(`blocks.fused_io_hook.fused_io()`); this module registers itself there on
+(`fused_io_hook.fused_io()`); this module registers itself there on
 import, so the blocks carry no import-time dependency on experimental code.
 
 Contract & Aliasing Model (TPU vs. CPU `interpret=True`):
@@ -25,7 +25,7 @@ HBM copy before the kernel. Therefore, `ex.FUSED` uses two backend-specific
 aliasing contracts:
 
 1. **TPU (`ex.interpret == False`)**:
-   - The pool tuple `ST[pool]` (`pool = PoolBackend.pool_state_name`) is
+   - The pool tuple `ST[pool]` (`pool = POOL_STATE_NAME`) is
      declared `access="r"` on the communicating `pallas_call` (`O[pool]` is
      omitted, and `pallas_call` sets no pool `input_output_aliases`).
    - Inside the kernel, `ctx.raw_refs = ST[pool]`; `GQABlock` and `GDNBlock`
@@ -71,7 +71,7 @@ numerics); compare it against the split path with that flag enabled.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -79,21 +79,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.fused_io_hook import register_fused_io
-from ..errors import MegakernelConfigError
+from ..fused_io_hook import FusedPoolIO, register_fused_io
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
-from ..pool.layout import LANES, PoolLayout
+from ..pool.layout import LANES
 from ..spec import POOL_STATE_NAME, ExecSpec, StateDecl
-
-
-def _pool_layout(model_spec: Any) -> PoolLayout:
-    """The `PoolLayout` of `model_spec`'s pool backend (required by `ex.FUSED`)."""
-    pb = model_spec.pool_backend
-    if pb is None:
-        raise MegakernelConfigError(
-            f"fused_pool_io needs a pool_backend on ModelSpec {model_spec.name!r}"
-        )
-    return pb.layout
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -434,21 +423,12 @@ def gqa_fused_epilogue(ctx: Any) -> None:
 def gdn_fused_scratch(ex: ExecSpec, gp: Any, plan: Any) -> dict[str, Any]:
     """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`ex.FUSED=True`).
 
-    The staged checkpoint pages follow the pool backend's `PoolLayout`; the GDN
-    block's slot geometry (`GDN_PAGES` / `REC_PAGES`) must match it.
+    The staged checkpoint pages follow the pool backend's `PoolLayout`
+    (`gp.pool_layout`, checked by `GDNBlock.plan_params`), which also sets the
+    block's slot geometry (`GDN_PAGES` / `REC_PAGES`).
     """
-    layout = _pool_layout(plan.model_spec)
-    layout.validate(ex)
-    if (
-        layout.pages_per_slot,
-        layout.rec_pages_per_slot,
-    ) != (gp.GDN_PAGES, gp.REC_PAGES):
-        raise MegakernelConfigError(
-            f"GDN checkpoint slot ({gp.GDN_PAGES} pages, {gp.REC_PAGES} recurrent) "
-            f"does not match the pool layout ({layout.pages_per_slot} pages, "
-            f"{layout.rec_pages_per_slot} recurrent)"
-        )
-    page = layout.kv_page_shape
+    del plan
+    page = gp.pool_layout.kv_page_shape
     return {
         "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
         "gdn_in_page": pltpu.VMEM((gp.NGI, gp.GDN_PAGES, *page), FP8),
@@ -518,7 +498,7 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     A_conv, qkv_128, conv8_rows = gp.A_conv, gp.qkv_128, gp.conv8_rows
     l2_eps = gp.l2_eps
     interpret = bool(ex.interpret)
-    layout = _pool_layout(ctx.core_plan.plan.model_spec)
+    layout = gp.pool_layout
     page = layout.kv_page_shape
     CPR = layout.conv_page_rows
 
@@ -547,9 +527,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     def _gdn_pb_in(sub, s):
         roff = jnp.maximum(_gdn_roff(sub, s), jnp.int32(0))
         if gp.ckpt_is_3d:
-            pb = ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+            pb = layout.page_base(ST["ckpt_indices"][sub, s, roff], sub, 3)
         else:
-            pb = ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
+            pb = layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
         _kernel_debug_check(
             jnp.logical_and(pb >= 0, pb + GDN_PAGES <= ex.num_pages),
             "GDN gather checkpoint slot maps outside [0, num_pages)",
@@ -559,12 +539,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
 
     def _gdn_pb_out(sub, s, t, span: int = GDN_PAGES):
         if gp.ckpt_is_3d:
-            pb = ST["ckpt_indices"][sub, s, t + gp.ckpt_t_off] * GDN_PAGES
+            pb = layout.page_base(ST["ckpt_indices"][sub, s, t + gp.ckpt_t_off], sub, 3)
         else:
-            pb = (
-                ST["ckpt_indices"][s, t + gp.ckpt_t_off] * (GDN_PAGES * G_PER_ATT)
-                + sub * GDN_PAGES
-            )
+            pb = layout.page_base(ST["ckpt_indices"][s, t + gp.ckpt_t_off], sub, 2)
         _kernel_debug_check(
             jnp.logical_and(pb >= 0, pb + span <= ex.num_pages),
             "GDN scatter checkpoint slot maps outside [0, num_pages)",
@@ -982,4 +959,4 @@ def gdn_fused_epilogue(ctx: Any, gp: Any) -> None:
             gdn_wait_out(ctx, gp, slot_o)
 
 
-register_fused_io(sys.modules[__name__])
+register_fused_io(cast(FusedPoolIO, sys.modules[__name__]))

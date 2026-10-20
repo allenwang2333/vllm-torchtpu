@@ -90,8 +90,9 @@ def gather_gdn_states(
     vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
     QKV = layout.qkv_per_rank(ex.R)
     NS, B, T = ex.NS, ex.B, ex.T
-    CR = rup(3 * B, 8)
-    HR = rup(3 + T, 8)
+    taps = layout.conv_taps
+    CR = rup(taps * B, 8)
+    HR = rup(taps + T, 8)
     ngdn = max(1, layout.num_recurrent_layers)
     conv_shape = (ngdn, CR, QKV) if T == 1 else (ngdn, NS, HR, QKV)
     conv_dt = F32
@@ -104,12 +105,12 @@ def gather_gdn_states(
     conv_page = layout.conv_page
     conv_page_rows = layout.conv_page_rows
     ssm_u32_rows = (vh * KD) // 2
-    conv_rows = (3 * QKV) // 128
+    conv_rows = (taps * QKV) // LANES
     conv_rows_pad = ((conv_rows + 15) // 16) * 16
-    qkv_128 = QKV // 128
+    qkv_128 = QKV // LANES
     direct_conv = T > 1 and ((HR * qkv_128) % 16 == 0 or bool(interpret))
     hr_rows_128 = HR * qkv_128
-    conv_raw_shape = conv_shape if direct_conv else (ngdn, NS * conv_rows_pad, 128)
+    conv_raw_shape = conv_shape if direct_conv else (ngdn, NS * conv_rows_pad, LANES)
     conv_raw_dt = conv_dt if direct_conv else BF16
     ckpt_is_3d = ckpt_indices.ndim == 3
     roff_is_2d = read_offsets.ndim == 2
@@ -211,7 +212,9 @@ def gather_gdn_states(
                         .reshape(HR, QKV)
                         .astype(conv_dt)
                     )
-                    conv_buf[g_slot, sub, s] = jnp.where(conv_row_iota < 3, raw_hr, 0.0)
+                    conv_buf[g_slot, sub, s] = jnp.where(
+                        conv_row_iota < taps, raw_hr, 0.0
+                    )
                 else:
                     c0 = (
                         s * conv_rows_pad
@@ -236,7 +239,7 @@ def gather_gdn_states(
                         else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
                     )
                     conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = jnp.zeros(
-                        (conv_rows_pad, 128), conv_raw_dt
+                        (conv_rows_pad, LANES), conv_raw_dt
                     )
 
         total_gdn = NATT * G_PER_ATT
@@ -458,13 +461,13 @@ def gather_gdn_states(
     if direct_conv:
         return conv_raw, rec_out
     taps_all = (
-        conv_raw.reshape(ngdn, NS, conv_rows_pad, 128)[:, :, :conv_rows, :]
-        .reshape(ngdn, NS, 3, QKV)
+        conv_raw.reshape(ngdn, NS, conv_rows_pad, LANES)[:, :, :conv_rows, :]
+        .reshape(ngdn, NS, taps, QKV)
         .astype(conv_dt)
     )
     if T > 1:
-        conv_out = jnp.pad(taps_all, ((0, 0), (0, 0), (0, HR - 3), (0, 0)))
+        conv_out = jnp.pad(taps_all, ((0, 0), (0, 0), (0, HR - taps), (0, 0)))
     else:
-        conv_3b = jnp.swapaxes(taps_all, 1, 2).reshape(ngdn, 3 * B, QKV)
-        conv_out = jnp.pad(conv_3b, ((0, 0), (0, CR - 3 * B), (0, 0)))
+        conv_3b = jnp.swapaxes(taps_all, 1, 2).reshape(ngdn, taps * B, QKV)
+        conv_out = jnp.pad(conv_3b, ((0, 0), (0, CR - taps * B), (0, 0)))
     return conv_out, rec_out

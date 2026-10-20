@@ -24,6 +24,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..errors import MegakernelConfigError
+from ..fused_io_hook import fused_io
 from ..ops import (
     BF16,
     F32,
@@ -41,7 +43,6 @@ from ..spec import (
     StateDecl,
     WeightDecl,
 )
-from .fused_io_hook import fused_io
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -118,6 +119,9 @@ class GDNParams:
     GCONV_ROWS: int = 0
     conv_stage: bool = False
     head_major: bool = False
+    # Pool layout of the model's pool backend (set only for pool I/O: GPR or
+    # fused); the slot geometry above and `page_base` come from it.
+    pool_layout: Any = None
 
 
 class _GprRecIn:
@@ -428,6 +432,7 @@ class GDNBlock(Block):
         REC_PAGES = max(4, (ssm_u32_rows + 127) // 128)
         GDN_PAGES = REC_PAGES + 1
         SSM_U32_CAP = REC_PAGES * 128
+        pool_layout = None
         qkv_128 = lay.QKV // 128
         A_conv = max(16, rup(3 + T, 8))
         conv8_rows = A_conv * qkv_128
@@ -436,12 +441,11 @@ class GDNBlock(Block):
         K_ckpt = ex.ckpt_k if ex.ckpt_k > 0 else T
         ckpt_t_off = K_ckpt - T if K_ckpt > T else 0
         if ex.FUSED or GPR:
-            assert ex.page_size == 128, (
-                f"pool I/O requires page_size == 128, got {ex.page_size}"
-            )
-            assert g_per_att > 0, (
-                f"pool I/O on GDNBlock requires att_every > 1, got {g.att_every}"
-            )
+            pool_layout = self._pool_layout(plan, ex, g_per_att, ssm_u32_rows)
+            REC_PAGES = pool_layout.rec_pages_per_slot
+            GDN_PAGES = pool_layout.pages_per_slot
+            SSM_U32_CAP = pool_layout.rec_u32_rows
+            g_per_att = pool_layout.slots_per_pool
 
         return GDNParams(
             kh=lay.kh,
@@ -486,7 +490,38 @@ class GDNBlock(Block):
             GCONV_ROWS=GCONV_ROWS,
             conv_stage=bool(tiles.conv_stage),
             head_major=bool(tiles.gdn_head_major),
+            pool_layout=pool_layout,
         )
+
+    def _pool_layout(
+        self, plan: Any, ex: ExecSpec, g_per_att: int, ssm_u32_rows: int
+    ) -> Any:
+        """The model's `PoolLayout`, checked against this block's geometry.
+
+        In-kernel pool I/O (GPR / fused) reads checkpoint slots straight from
+        the pools, so the slot geometry must come from the pool backend's
+        layout; raise `MegakernelConfigError` when it can't serve this block.
+        """
+        pb = plan.model_spec.pool_backend
+        if pb is None or pb.layout is None:
+            raise MegakernelConfigError(
+                f"GDN in-kernel pool I/O needs a pool backend with a layout on "
+                f"ModelSpec {plan.model_spec.name!r}"
+            )
+        layout = pb.layout
+        layout.validate(ex)
+        if g_per_att <= 0 or layout.slots_per_pool != g_per_att:
+            raise MegakernelConfigError(
+                f"GDN in-kernel pool I/O: {g_per_att} recurrent layer(s) per "
+                f"attention layer, but the pool layout has "
+                f"slots_per_pool={layout.slots_per_pool}"
+            )
+        if ssm_u32_rows > layout.rec_u32_rows:
+            raise MegakernelConfigError(
+                f"GDN recurrent state ({ssm_u32_rows} u32 rows per rank) exceeds "
+                f"the pool layout's recurrent slot ({layout.rec_u32_rows} rows)"
+            )
+        return layout
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]
@@ -515,11 +550,16 @@ class GDNBlock(Block):
             scr["rec_sem"] = pltpu.SemaphoreType.DMA((2, gp.NRB))
             if gp.GPR:
                 scr["gpr_rec"] = pltpu.VMEM(
-                    (gp.NRB, gp.CB // ex.T, gp.REC_PAGES, 2, 64, 4, ex.page_size),
+                    (
+                        gp.NRB,
+                        gp.CB // ex.T,
+                        gp.REC_PAGES,
+                        *gp.pool_layout.kv_page_shape,
+                    ),
                     FP8,
                 )
                 scr["gpr_conv"] = pltpu.VMEM(
-                    (ex.NS, gp.GCONV_ROWS, 4, ex.page_size), FP8
+                    (ex.NS, gp.GCONV_ROWS, *gp.pool_layout.kv_page_shape[2:]), FP8
                 )
                 scr["convb16"] = pltpu.VMEM((ex.NS, gp.HR, gp.QKV), BF16)
         return scr
@@ -555,12 +595,12 @@ class GDNBlock(Block):
 
     def _gdn_pb_in(self, ctx: Any, gp: GDNParams, sub: Any, s: Any) -> Any:
         ex, ST = ctx.ex, ctx.ST
-        GDN_PAGES, G_PER_ATT = gp.GDN_PAGES, gp.G_PER_ATT
+        GDN_PAGES = gp.GDN_PAGES
         roff = jnp.maximum(self._gdn_roff(ctx, gp, sub, s), jnp.int32(0))
         if gp.ckpt_is_3d:
-            pb = ST["ckpt_indices"][sub, s, roff] * GDN_PAGES
+            pb = gp.pool_layout.page_base(ST["ckpt_indices"][sub, s, roff], sub, 3)
         else:
-            pb = ST["ckpt_indices"][s, roff] * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
+            pb = gp.pool_layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
         _kernel_debug_check(
             jnp.logical_and(pb >= 0, pb + GDN_PAGES <= ex.num_pages),
             "GDN gather checkpoint slot maps outside [0, num_pages)",
@@ -631,7 +671,7 @@ class GDNBlock(Block):
                         gp,
                         r,
                         sq,
-                        self._gdn_pb_in(ctx, gp, sub, sq) + gp.REC_PAGES,
+                        self._gdn_pb_in(ctx, gp, sub, sq) + gp.pool_layout.conv_page,
                         ctx.scr["st_sem"].at[0],
                     ).start()
 

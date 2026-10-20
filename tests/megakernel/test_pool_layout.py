@@ -13,11 +13,14 @@
 # limitations under the License.
 """Generic `pool/` tests: `PoolLayout` round trips for several layouts + guards.
 
-Covers the Qwen3.5 layout (3 recurrent slots per pool), a 1-slot layout and a
-KV-only layout (0 slots) through pack / unpack, `states_to_pool` /
-`pool_to_states`, the Pallas gather and scatter kernels (CPU interpret) with 2D
-and 3D checkpoint indices, one full pooled step with `att_every=2`, and AST
-guards that keep the pool state name and the slot stride out of core code.
+Covers the Qwen3.5 layout (3 recurrent slots per pool), a 1-slot layout, a
+2-slot layout with 3 pools and a KV-only layout (0 slots, no recurrent heads)
+through pack / unpack, `states_to_pool` / `pool_to_states`, the Pallas gather
+and scatter kernels (CPU interpret) with 2D and 3D checkpoint indices, 1 to 4
+sequences, a rank-local scatter, a cold-start `K = T + 1` checkpoint table,
+checkpoint bounds checks, the pooled-step HLO check, one full pooled step with
+`att_every=2`, and AST guards that keep the pool state name and the slot stride
+out of core code.
 """
 
 from __future__ import annotations
@@ -50,13 +53,14 @@ def _use_cpu_default_device():
 
 
 def _layout(slots: int, num_pools: int = 2) -> mk.PoolLayout:
+    """Recurrent layouts use kh=2, vh=4; a KV-only layout has no recurrent heads."""
     return mk.PoolLayout(
         num_pools=num_pools,
         slots_per_pool=slots,
         hd=256,
         kvh=1,
-        kh=2,
-        vh=4,
+        kh=2 if slots else 0,
+        vh=4 if slots else 0,
         KD=128,
         VD=128,
     )
@@ -138,7 +142,6 @@ def test_layout_derived_geometry(name: str):
     assert backend.has_recurrent_pool == (SLOTS[name] > 0)
     assert backend.recurrent_slots_per_pool == max(1, SLOTS[name])
     assert backend.ckpt_pages_per_slot == 5
-    assert backend.pool_state_name == mk.POOL_STATE_NAME
     assert backend.kernel_names == pool.POOL_KERNEL_NAMES
 
 
@@ -155,6 +158,52 @@ def test_layout_validate_rejects_unvalidated_geometry():
             bad.validate()
     with pytest.raises(mk.MegakernelConfigError, match="page_size"):
         _layout(3).validate(replace(_exec(R=2, B=2, T=1), page_size=64))
+
+
+def test_layout_validate_checks_in_kernel_conv_windows():
+    """GPR and fused stage the whole verify conv window in the conv page."""
+    lay = replace(_layout(3), kh=8, vh=8)  # 24 conv rows of 128 lanes per rank
+    split = replace(_exec(R=1, B=6, T=6), paged_kv=True)
+    lay.validate(split)  # split path: 3 taps fit
+    lay.validate(replace(split, B=4, T=4, pool_gather=True))  # 8 * 24 = 192 rows
+    with pytest.raises(mk.MegakernelConfigError, match="in-kernel gather"):
+        lay.validate(replace(split, pool_gather=True))  # 16 * 24 = 384 rows
+    with pytest.raises(mk.MegakernelConfigError, match="fused pool I/O"):
+        lay.validate(replace(split, B=1, T=1, fused_pool_io=True))  # 16 * 24 rows
+
+
+def _gpr_spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:
+    g = qwen35.Qwen35Geometry(
+        L=4, H=256, I=256, IS=256, E=128, TOPK=2, NH=4, NKV=2, HD=256, ROT=64,
+        KH=2, VH=4, KD=128, VD=128, att_every=4,
+    )  # fmt: skip
+    return qwen35.qwen35_spec(g), replace(_exec(R=2, B=8, T=4), pool_gather=True)
+
+
+def test_gdn_in_kernel_pool_io_takes_slot_geometry_from_layout():
+    spec, ex = _gpr_spec_and_exec()
+    assert ex.GPR
+    gp = mk.planner.plan(spec, ex).block_params["gdn"]
+    lay = spec.pool_backend.layout
+    assert gp.pool_layout is lay
+    assert (
+        lay.rec_pages_per_slot,
+        lay.pages_per_slot,
+        lay.slots_per_pool,
+        lay.rec_u32_rows,
+    ) == (gp.REC_PAGES, gp.GDN_PAGES, gp.G_PER_ATT, gp.SSM_U32_CAP)
+
+
+def test_gdn_in_kernel_pool_io_rejects_mismatched_layout():
+    spec, ex = _gpr_spec_and_exec()
+    lay = spec.pool_backend.layout
+    wrong = replace(
+        spec, pool_backend=mk.make_pool_backend(replace(lay, slots_per_pool=1))
+    )
+    with pytest.raises(mk.MegakernelConfigError, match="slots_per_pool=1"):
+        mk.planner.plan(wrong, ex)
+    with pytest.raises(mk.MegakernelConfigError, match="pool backend"):
+        mk.planner.plan(replace(spec, pool_backend=None), ex)
 
 
 def test_qwen35_pool_layout_matches_geometry():
@@ -258,27 +307,53 @@ def test_kv_only_backend_skips_gather():
     assert backend.gather_states(_exec(R=1, B=2, T=1), (), None, None, None) == {}
 
 
-@pytest.mark.parametrize("T", [1, 2])
-@pytest.mark.parametrize(
-    "name,ckpt_ndim",
-    [("qwen35", 3), ("qwen35", 2), ("slots1", 3), ("slots1", 2), ("kv_only", 3)],
-)
-def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
-    lay = _layout(SLOTS[name])
-    ex = _exec(R=1, B=2 * T, T=T)
-    NS, B, NATT = ex.NS, ex.B, lay.num_pools
-    st = _random_states(lay, ex, seed=31 + T)
+def _check_scatter(
+    lay: mk.PoolLayout,
+    ex: mk.ExecSpec,
+    ckpt_ndim: int,
+    seed: int,
+    *,
+    cold_start: bool = False,
+) -> None:
+    """Scatter on rank 0 of `ex.R`; check every rank's KV and checkpoints.
+
+    `cold_start` scatters through a `K = T + 1` checkpoint table whose first
+    column is a fresh read slot (`read_offsets = -1`), so checkpoint `t` goes to
+    column `t + 1`.
+    """
+    R, NS, B, T, NATT = ex.R, ex.NS, ex.B, ex.T, lay.num_pools
+    st = _random_states(lay, ex, seed=seed)
     pt, ckpt, roff = _tables(lay, ex, ckpt_ndim)
     raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
-    k = jax.random.split(jax.random.key(41 + T), 4)
+    before = pool.pool_to_states(lay, ex, raw_pools, pt, ckpt)
+    ckpt_in = ckpt
+    if cold_start and lay.has_recurrent:
+        fresh = int(jnp.max(ckpt)) + 1 + jnp.arange(ckpt[..., 0].size, dtype=ckpt.dtype)
+        ckpt_in = jnp.concatenate([fresh.reshape(ckpt[..., :1].shape), ckpt], axis=-1)
+        pool.check_ckpt_bounds(ckpt_in, ex.num_pages, lay)
+        conv0, rec0 = pool.gather_gdn_states(
+            lay,
+            ex,
+            tuple(mk.unfold(r, R)[0] for r in raw_pools),
+            ckpt_in,
+            jnp.full_like(roff, -1),
+        )
+        assert not np.any(np.asarray(conv0)) and not np.any(np.asarray(rec0))
+    k = jax.random.split(jax.random.key(seed + 10), 4)
+    # Positions stay inside `ctx`; sequences alternate between the two KV pages.
     pos = jnp.asarray(
-        [10 + 129 * s + t for s in range(NS) for t in range(T)], dtype=jnp.int32
+        [10 + 129 * (s % 2) + 3 * (s // 2) + t for s in range(NS) for t in range(T)],
+        dtype=jnp.int32,
     )
     knew = (jax.random.normal(k[0], (NATT, ex.MR, lay.hd)) * 0.3).astype(FP8)
     vnew = (jax.random.normal(k[1], (NATT, ex.MR, lay.hd)) * 0.3).astype(FP8)
     conv = rec = None
     if lay.has_recurrent:
-        ngdn, vh, qkv = lay.num_recurrent_layers, lay.vh, lay.qkv_per_rank(1)
+        ngdn, vh, qkv = (
+            lay.num_recurrent_layers,
+            lay.vh_per_rank(R),
+            lay.qkv_per_rank(R),
+        )
         conv_shape = (
             (ngdn, 8 * ((3 * B + 7) // 8), qkv)
             if T == 1
@@ -288,28 +363,34 @@ def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
         rec = (jax.random.normal(k[3], (ngdn, B * vh, lay.KD, lay.VD)) * 0.1).astype(
             jnp.bfloat16
         )
-    out_pools = pool.scatter_pool_states(
+    out_r0 = pool.scatter_pool_states(
         lay,
         ex,
-        raw_pools,
+        tuple(mk.unfold(r, R)[0] for r in raw_pools),
         pos,
         pt,
         knew,
         vnew,
         conv,
         rec,
-        ckpt if lay.has_recurrent else None,
+        ckpt_in if lay.has_recurrent else None,
+    )
+    out_pools = tuple(
+        mk.unfold(r, R).at[0].set(o).reshape(r.shape) for r, o in zip(raw_pools, out_r0)
     )
     out = pool.pool_to_states(lay, ex, out_pools, pt, ckpt)
 
-    kc_exp = np.array(_bytes(st["kc"]))
-    vc_exp = np.array(_bytes(st["vc"]))
+    # Other ranks are untouched.
+    for key, val in before.items():
+        np.testing.assert_array_equal(_bytes(out[key][1:]), _bytes(val[1:]))
+    kc_exp = np.array(_bytes(before["kc"][0]))
+    vc_exp = np.array(_bytes(before["vc"][0]))
     for b in range(B):
         s = b // T
-        kc_exp[0, :, s, int(pos[b])] = _bytes(knew[:, b])
-        vc_exp[0, :, s, int(pos[b])] = _bytes(vnew[:, b])
-    np.testing.assert_array_equal(_bytes(out["kc"]), kc_exp)
-    np.testing.assert_array_equal(_bytes(out["vc"]), vc_exp)
+        kc_exp[:, s, int(pos[b])] = _bytes(knew[:, b])
+        vc_exp[:, s, int(pos[b])] = _bytes(vnew[:, b])
+    np.testing.assert_array_equal(_bytes(out["kc"][0]), kc_exp)
+    np.testing.assert_array_equal(_bytes(out["vc"][0]), vc_exp)
     if not lay.has_recurrent:
         return
     np.testing.assert_array_equal(np.asarray(out["rec"][0]), np.asarray(rec))
@@ -321,6 +402,69 @@ def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
             else:
                 exp_taps = conv_np[:, s, 1 + t : 4 + t]
             np.testing.assert_array_equal(np.asarray(out["conv"][0, :, s, t]), exp_taps)
+
+
+@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize(
+    "name,ckpt_ndim",
+    [("qwen35", 3), ("qwen35", 2), ("slots1", 3), ("slots1", 2), ("kv_only", 3)],
+)
+def test_scatter_writes_kv_and_checkpoints(name: str, ckpt_ndim: int, T: int):
+    _check_scatter(_layout(SLOTS[name]), _exec(R=1, B=2 * T, T=T), ckpt_ndim, 31 + T)
+
+
+@pytest.mark.parametrize("NS", [1, 3, 4])
+def test_gather_and_scatter_sequence_counts(NS: int):
+    """A 2-slot, 3-pool layout with 1, 3 and 4 sequences (T=2, 3D ckpt)."""
+    lay, T = _layout(2, num_pools=3), 2
+    ex = _exec(R=1, B=NS * T, T=T)
+    st = _random_states(lay, ex, seed=51 + NS)
+    pt, ckpt, roff = _tables(lay, ex, 3)
+    raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
+    conv, rec = pool.gather_gdn_states(lay, ex, raw_pools, ckpt, roff)
+    exp = np.zeros(conv.shape, np.float32)
+    exp[:, :, :3] = np.asarray(st["conv"][0])
+    np.testing.assert_array_equal(np.asarray(conv), exp)
+    np.testing.assert_array_equal(np.asarray(rec), np.asarray(st["rec"][0]))
+    _check_scatter(lay, ex, 3, seed=61 + NS)
+
+
+@pytest.mark.parametrize("name,ckpt_ndim", [("slots1", 3), ("qwen35", 2)])
+def test_scatter_on_one_rank_of_two(name: str, ckpt_ndim: int):
+    """Rank-local scatter (`R=2`): rank 0 pools change, rank 1 pools don't."""
+    _check_scatter(_layout(SLOTS[name]), _exec(R=2, B=4, T=2), ckpt_ndim, seed=71)
+
+
+def test_cold_start_ckpt_k_plus_one():
+    """`K = T + 1` checkpoint table with `read_offsets = -1` (no prior state)."""
+    lay = _layout(2, num_pools=3)
+    ex = replace(_exec(R=1, B=6, T=2), num_pages=2 * NUM_PAGES)
+    _check_scatter(lay, ex, 3, seed=81, cold_start=True)
+
+
+def test_ckpt_bounds_rejects_out_of_range_and_shared_slots():
+    lay = _layout(2, num_pools=3)
+    ex = _exec(R=1, B=4, T=2)
+    _, ckpt, _ = _tables(lay, ex, 3)
+    pool.check_ckpt_bounds(ckpt, ex.num_pages, lay)
+    past_end = ex.num_pages // lay.pages_per_slot
+    with pytest.raises(ValueError, match="exceeds pool capacity"):
+        pool.check_ckpt_bounds(ckpt.at[1, 0, 1].set(past_end), ex.num_pages, lay)
+    with pytest.raises(ValueError, match="shared between"):
+        pool.check_ckpt_bounds(ckpt.at[1, 0, 0].set(ckpt[0, 0, 0]), ex.num_pages, lay)
+
+
+def test_check_pooled_step_hlo_uses_layout_page_shape():
+    """Full-pool copies are matched on the layout's page shape."""
+    lay = mk.PoolLayout(hd=128, kvh=2)  # pages (4, 32, 4, 128)
+    head = "tpu_custom_call tpu_custom_call scatter_pool_states\n"
+    copy_lay = head + "%c = f8e4m3fn[64,4,32,4,128] copy(%p)"
+    copy_default = head + "%c = f8e4m3fn[64,2,64,4,128] copy(%p)"
+    staging = head + "%c = f8e4m3fn[5,4,32,4,128] copy(%p)"
+    assert not mk.check_pooled_step_hlo(copy_lay, layout=lay)[0]
+    assert mk.check_pooled_step_hlo(copy_default, layout=lay)[0]
+    assert mk.check_pooled_step_hlo(staging, layout=lay)[0]
+    assert not mk.check_pooled_step_hlo(copy_default)[0]
 
 
 def test_full_pooled_step_att_every_2():
@@ -360,20 +504,25 @@ def test_full_pooled_step_att_every_2():
         jax.device_put(r, tp) for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
     )
     mk_paged_step, _ = qwen35.make_step(mesh, g, ex, donate_states=False)
-    _, mk_st = mk_paged_step(pos, hid_mk, w_mk, st_mk_paged)
+    ref_hid, mk_st = mk_paged_step(pos, hid_mk, w_mk, st_mk_paged)
 
     spec = qwen35.qwen35_spec(g)
     assert spec.pool_backend.layout == lay
+    st_before = mk.pool_to_states(g, ex, raw_pools, pt, ckpt)
     step, _ = mk.PallasWriter().make_step(mesh, spec, ex, donate=False)
     out_hid, raw_out = step(pos, hid_mk, w_mk, raw_pools, pt, ckpt, roff)
-    assert bool(jnp.all(jnp.isfinite(out_hid.astype(jnp.float32))))
+    np.testing.assert_array_equal(
+        np.asarray(out_hid.astype(jnp.float32)), np.asarray(ref_hid.astype(jnp.float32))
+    )
 
+    # Whole KV cache: the pre-step pools with each row's new K / V at `pos`.
     st_after = mk.pool_to_states(g, ex, raw_out, pt, ckpt)
-    mk_knew = mk.unfold(mk_st["knew"], ex.R)
-    for b in range(ex.B):
-        np.testing.assert_array_equal(
-            _bytes(st_after["kc"][:, :, b, int(pos[b]), :]), _bytes(mk_knew[:, :, b])
-        )
+    for key, new_key in (("kc", "knew"), ("vc", "vnew")):
+        exp = np.array(_bytes(st_before[key]))
+        new_kv = mk.unfold(mk_st[new_key], ex.R)
+        for b in range(ex.B):
+            exp[:, :, b, int(pos[b]), :] = _bytes(new_kv[:, :, b])
+        np.testing.assert_array_equal(_bytes(st_after[key]), exp)
     np.testing.assert_array_equal(
         np.asarray(st_after["rec"]), np.asarray(mk.unfold(mk_st["rec"], ex.R))
     )
@@ -400,20 +549,21 @@ def _guarded_files() -> list[Path]:
     files = [_MK_ROOT / "kernel.py", *sorted(_MK_ROOT.glob("cache*.py"))]
     files += sorted((_MK_ROOT / "blocks").glob("*.py"))
     files += sorted((_MK_ROOT / "experimental").glob("*.py"))
+    files += sorted((_MK_ROOT / "models").glob("*.py"))
     assert len(files) >= 6, files
     return files
 
 
 def test_no_raw_pool_state_literal_in_core():
-    """`"raw"` is defined once (`spec.POOL_STATE_NAME`), never repeated in core."""
+    """`"raw"` is defined once (`POOL_STATE_NAME`), never repeated elsewhere."""
     for path in _guarded_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value == "raw":
                 raise AssertionError(
                     f"{path.relative_to(_MK_ROOT)}:{node.lineno} uses the pool "
-                    "state literal 'raw'; use PoolBackend.pool_state_name, "
-                    "KernelContext.raw_refs or spec.POOL_STATE_NAME"
+                    "state literal 'raw'; use POOL_STATE_NAME or "
+                    "KernelContext.raw_refs"
                 )
 
 

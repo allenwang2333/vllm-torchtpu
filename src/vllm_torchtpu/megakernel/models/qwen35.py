@@ -40,6 +40,7 @@ from ..ops import (
     rup,
 )
 from ..spec import (
+    POOL_STATE_NAME,
     Block,
     ExecSpec,
     LayerType,
@@ -184,7 +185,7 @@ TINY_EP = dataclasses.replace(TINY, moe_tp=False)
 
 def qwen35_spec(g: Qwen35Geometry, gdn_block: Block | None = None) -> ModelSpec:
     """Construct the declarative `ModelSpec` for Qwen3.5."""
-    gqa = GQABlock()
+    gqa = GQABlock(pool_layout=qwen35_pool.qwen35_pool_layout(g))
     moe = MoEBlock()
     if g.att_every == 1:
         mixer: Block | SwitchSlot = SwitchSlot(
@@ -920,9 +921,10 @@ def pack_inputs(
         states_mk["rec"] = kernel.fold(rec_p.astype(BF16))
 
     if ex.paged_kv:
-        if "raw" in logical_states and "page_table" in logical_states:
-            states_mk["raw"] = tuple(
-                kernel.fold(r) if r.ndim == 6 else r for r in logical_states["raw"]
+        if POOL_STATE_NAME in logical_states and "page_table" in logical_states:
+            states_mk[POOL_STATE_NAME] = tuple(
+                kernel.fold(r) if r.ndim == 6 else r
+                for r in logical_states[POOL_STATE_NAME]
             )
             pt_in = logical_states["page_table"]
             max_pt = ex.resolved_max_pages_per_seq
@@ -952,14 +954,14 @@ def pack_inputs(
             raw_pools = qwen35_pool.states_to_pool(
                 g, ex, logical_states, pt, ckpt, roff
             )
-            states_mk["raw"] = raw_pools
+            states_mk[POOL_STATE_NAME] = raw_pools
             states_mk["page_table"] = jnp.tile(
                 pt[:, : ex.resolved_max_pages_per_seq], (R, 1)
             )
         else:
             raise ValueError(
-                "pack_inputs with ex.paged_kv=True requires 'raw' and "
-                "'page_table' in logical_states (or pass build_default_pool=True)."
+                f"pack_inputs with ex.paged_kv=True requires {POOL_STATE_NAME!r} "
+                "and 'page_table' in logical_states (or pass build_default_pool=True)."
             )
     elif "kc" in logical_states and "vc" in logical_states:
         states_mk["kc"] = kernel.fold(logical_states["kc"])

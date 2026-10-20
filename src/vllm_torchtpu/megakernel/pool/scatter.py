@@ -122,15 +122,16 @@ def scatter_pool_states(
         assert conv is not None and rec is not None and ckpt_indices is not None
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
-        HR = rup(3 + T, 8)
+        taps = layout.conv_taps
+        HR = rup(taps + T, 8)
         ssm_u32_rows = (vh * KD) // 2
-        conv_rows = (3 * QKV) // 128
+        conv_rows = (taps * QKV) // LANES
         conv_rows_pad = ((conv_rows + 15) // 16) * 16
-        qkv_128 = QKV // 128
+        qkv_128 = QKV // LANES
         assert T == 1 or (4 * qkv_128) % 16 != 0 or 4 + T <= HR, (
             f"T={T} exceeds direct_conv window HR={HR}"
         )
-        min_direct_rows = 4 + T if (4 * qkv_128) % 16 == 0 else 3 + T
+        min_direct_rows = 4 + T if (4 * qkv_128) % 16 == 0 else taps + T
         direct_conv = (
             T > 1
             and conv.ndim == 4
@@ -144,30 +145,30 @@ def scatter_pool_states(
         else:
             if conv.ndim == 3:
                 conv_4d = jnp.swapaxes(
-                    conv[:, : 3 * B, :].reshape(conv.shape[0], 3, B, QKV), 1, 2
+                    conv[:, : taps * B, :].reshape(conv.shape[0], taps, B, QKV), 1, 2
                 )
             else:
                 conv_4d = conv
-            conv_has_hist = conv_4d.shape[2] >= 3 + T
+            conv_has_hist = conv_4d.shape[2] >= taps + T
             if conv_has_hist:
                 conv_win = jnp.stack(
-                    [conv_4d[:, :, 1 + t : 4 + t, :] for t in range(T)], axis=2
+                    [conv_4d[:, :, 1 + t : 1 + taps + t, :] for t in range(T)], axis=2
                 )
             else:
                 conv_win = jnp.broadcast_to(
-                    conv_4d[:, :, None, 0:3, :],
-                    (conv_4d.shape[0], NS, T, 3, QKV),
+                    conv_4d[:, :, None, 0:taps, :],
+                    (conv_4d.shape[0], NS, T, taps, QKV),
                 )
             conv_flat = conv_win.astype(BF16).reshape(
-                conv_4d.shape[0], NS * T, conv_rows, 128
+                conv_4d.shape[0], NS * T, conv_rows, LANES
             )
             if conv_rows_pad > conv_rows:
                 conv_flat = jnp.pad(
                     conv_flat,
                     ((0, 0), (0, 0), (0, conv_rows_pad - conv_rows), (0, 0)),
                 )
-            conv_in = conv_flat.reshape(conv_4d.shape[0], NS * T * conv_rows_pad, 128)
-            conv_buf_shape = (2, T * conv_rows_pad, 128)
+            conv_in = conv_flat.reshape(conv_4d.shape[0], NS * T * conv_rows_pad, LANES)
+            conv_buf_shape = (2, T * conv_rows_pad, LANES)
             conv_buf_dt = BF16
         ckpt_is_3d = ckpt_indices.ndim == 3
         ckpt_k = ckpt_indices.shape[-1]
@@ -382,16 +383,16 @@ def scatter_pool_states(
                     if direct_conv:
                         if (4 * qkv_128) % 16 == 0:
                             w4 = jnp.where(
-                                w4_row_iota < 3,
+                                w4_row_iota < taps,
                                 conv_bf16[1 + t : 5 + t, :],
                                 jnp.bfloat16(0.0),
                             )
-                            conv_taps = w4.reshape(conv_rows_pad, 128)
+                            conv_taps = w4.reshape(conv_rows_pad, LANES)
                         else:
                             taps_128 = (
-                                conv_buf[slot, 0, 1 + t : 4 + t, :]
+                                conv_buf[slot, 0, 1 + t : 1 + taps + t, :]
                                 .astype(BF16)
-                                .reshape(conv_rows, 128)
+                                .reshape(conv_rows, LANES)
                             )
                             if conv_rows_pad > conv_rows:
                                 taps_128 = jnp.pad(
