@@ -25,6 +25,7 @@ from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
@@ -271,6 +272,24 @@ def _merge_kv_split_jax(gathered: jax.Array, *, k: int, kv_split: int) -> jax.Ar
     return merge_kv_split_topk(gathered.reshape(kv_split, -1, 2 * k), k)
 
 
+def merge_kv_split_shares(share, merge_op, rank: int, kv_split: int) -> torch.Tensor:
+    """Every TP rank's i32[T, 2k] share -> the unsplit i32[T, k] top-k.
+
+    With T a multiple of the group size, each rank merges only its own block
+    of T / TP tokens and the merged blocks are all-gathered: 1/TP of the
+    merge work.
+    """
+    num_tokens = share.shape[0]
+    shares = tensor_model_parallel_all_gather(share, 0)
+    if num_tokens % kv_split:
+        return merge_op(shares)
+    rows = num_tokens // kv_split
+    mine = shares.view(kv_split, num_tokens, -1)[:, rank * rows : (rank + 1) * rows]
+    return tensor_model_parallel_all_gather(
+        merge_op(mine.reshape(kv_split * rows, -1)), 0
+    )
+
+
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
     """Indexer K cache as a packed uint8 record on TPU."""
 
@@ -462,5 +481,6 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         rank = torch.full(
             (1,), get_tensor_model_parallel_rank(), dtype=torch.int32, device=q.device
         )
-        share = share_op(*args, rank)
-        return merge_op(tensor_model_parallel_all_gather(share, 0))
+        return merge_kv_split_shares(
+            share_op(*args, rank), merge_op, get_tp_group().rank_in_group, self.kv_split
+        )
