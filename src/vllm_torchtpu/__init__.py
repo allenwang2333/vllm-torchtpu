@@ -1032,12 +1032,24 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
+def _is_raiden_glm_dcp_identity_producer(kv_transfer_config) -> bool:
+    """A TPURaidenConnector producer under TPU_RAIDEN_GLM_DCP_IDENTITY."""
+    return bool(
+        envs.use_raiden_glm_admission()
+        and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
+        and kv_transfer_config.kv_connector == "TPURaidenConnector"
+        and kv_transfer_config.is_kv_producer
+        and not kv_transfer_config.is_kv_consumer
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
     Opt-in: only a single full-attention (incl. MLA) group under DCP with
-    prefix caching, no PCP, no KV connector, and an explicit
-    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
+    prefix caching, no PCP, no KV connector (but a Raiden GLM DCP identity
+    producer), and an explicit ``--prefix-match-unit`` smaller than the logical
+    block (block_size * dcp).
     Everything else keeps upstream behavior (hash == scheduler block).
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
@@ -1055,7 +1067,11 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
         # Connectors (P/D, offload) consume block hashes at block granularity.
-        or vllm_config.kv_transfer_config is not None
+        # A Raiden GLM DCP identity producer reads none: it ships whole pages.
+        or (
+            vllm_config.kv_transfer_config is not None
+            and not _is_raiden_glm_dcp_identity_producer(vllm_config.kv_transfer_config)
+        )
         or len(groups) != 1
     ):
         return None
