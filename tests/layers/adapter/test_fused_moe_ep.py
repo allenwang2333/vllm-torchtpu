@@ -171,18 +171,20 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         has_score_bias=has_bias,
         routed_scaling_factor=scale,
         token_replica_groups=groups,
+        logical_intermediate_size=2304,
     )
     replicated = bridge._build_op(*args, **options)
     assert bridge._build_op(*args, **options) is replicated
     # Every independent routing setting and the TP membership separate caches.
     for changed in (
         dict(token_replica_groups=((0,), (1,))),
+        dict(logical_intermediate_size=None),
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
+    assert len(closures) == 6
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -198,6 +200,8 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         operands += (bias,)
     assert closures[0](*operands) is x
     forwarded = kernel.call_args.kwargs
+    assert forwarded["capacity"] == 256
+    assert forwarded["logical_intermediate_size"] == 2304
     assert forwarded["token_replica_groups"] == groups
     assert forwarded["scoring_fn"] == scoring_fn
     assert forwarded["routed_scaling_factor"] == scale

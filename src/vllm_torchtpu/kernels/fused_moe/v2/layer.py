@@ -292,7 +292,7 @@ def fused_ep_moe_v2(
     logical_intermediate_size optionally excludes zero-padded intermediate
     channels from the FP4/G512 matmuls. The caller must supply zero weight
     tails in both gate/up halves and the down contraction. This requires a
-    single M128 or M256 rung and no gate/up bias; physical storage is unchanged.
+    supported M128/M256 capacity and no gate/up bias; physical storage is unchanged.
 
     weight_format names one of the kernel's accepted weight forms and
     decides everything that follows from it. w1_scale and w2_scale are per

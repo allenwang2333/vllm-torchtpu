@@ -248,7 +248,17 @@ def wire_row_and_scale(
     return down_bf16, jnp.ones((rows, 1), jnp.float32)
 
 
-def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=True):
+def _intermediate_rows(
+    acc1,
+    act_scale,
+    inter,
+    *,
+    w1s,
+    act_fn,
+    w1b,
+    requantize=True,
+    logical_intermediate_size=None,
+):
     """acc1's gate and up halves through the activation, as the second
     matmul's left-hand side.
 
@@ -275,9 +285,12 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
             scaled = scaled * w1s[:, lo:hi]
         return scaled
 
+    active_inter = (
+        inter if logical_intermediate_size is None else logical_intermediate_size
+    )
     mid_chunks, amax = [], None
-    for c0 in range(0, inter, QCHUNK):
-        c1 = min(c0 + QCHUNK, inter)
+    for c0 in range(0, active_inter, QCHUNK):
+        c1 = min(c0 + QCHUNK, active_inter)
         gate = half(c0, c1)
         up = half(inter + c0, inter + c1)
         # The gate and up biases land on the POST-SCALE halves, before the
@@ -369,6 +382,8 @@ def expert_ffn_blockscale(
     here runs on either, and a block-scaled integer-four form would reuse
     this body verbatim with a different bitcast in the reader.
     """
+    # Padding elision adapted from vllm-project/vllm-torchtpu PR #2160.
+    # Keep decode height rungs and cross-expert prefetch unchanged.
     n_blocks1, n_blocks2 = w1s_blocks.shape[0], w2s_blocks.shape[0]
     inter = w1s_blocks.shape[-1] // 2
     hidden = w2s_blocks.shape[-1]
@@ -413,7 +428,13 @@ def expert_ffn_blockscale(
     if after_gate_up is not None:
         after_gate_up()
     mid_q, mid_scale = _intermediate_rows(
-        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
+        acc1,
+        act_scale,
+        inter,
+        w1s=None,
+        act_fn=act_fn,
+        w1b=w1b,
+        logical_intermediate_size=logical_intermediate_size,
     )
     acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden, down=True)
     return acc2, mid_scale
@@ -800,10 +821,6 @@ def _build_fused_ep_moe_kernel(
     # Rows of the 128-lane scale mirror one tile owns; host.MIRROR_LANES.
     mrows = host.mirror_rows_per_tile(tile_m)
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
-    if trim_gate_up_padding and height_rungs not in ((128,), (256,)):
-        raise ValueError(
-            "logical intermediate optimization requires a single M128 or M256 rung"
-        )
 
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
@@ -1056,6 +1073,15 @@ def _build_fused_ep_moe_kernel(
 
         def w2_copy(expert, slot):
             """The down weight slab of `expert`, into weight slot `slot`."""
+            if rhs_packed4 and trim_gate_up_padding:
+                # C03's down contractions never read the padded K tail.
+                # Start and wait use the same shortened descriptor and bytes.
+                packed_active = effective_inter // PACK4
+                return pltpu.make_async_copy(
+                    w2_hbm.at[expert, pl.ds(0, packed_active), :],
+                    w2_vm.at[slot, pl.ds(0, packed_active), :],
+                    w2_sems.at[slot],
+                )
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
@@ -1421,7 +1447,7 @@ def _build_fused_ep_moe_kernel(
             def _():
                 _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs * mrows)
 
-        def prime_expert(e, lhs_slot, wslot, window_started):
+        def prime_expert(e, lhs_slot, wslot, window_started, visit_i):
             """Prime expert ``e``'s metadata and first activation tile.
 
             ``wslot`` is the scalar-memory slot this expert's group-zero index
@@ -1451,6 +1477,14 @@ def _build_fused_ep_moe_kernel(
             def _():
                 issue_gather_window(
                     slab_base + gather_payload_rows, jnp.int32(1) - wslot
+                )
+
+            # A one-tile expert has no following index group. Its alternate
+            # SMEM slot can hold the next expert's first window instead.
+            @pl.when(jnp.logical_and(rows <= tile_m, visit_i + 1 < n_visit))
+            def _():
+                issue_gather_window(
+                    expert_base_sm[visit_sm[visit_i + 1]], jnp.int32(1) - wslot
                 )
 
         def expert_tiles(e, visit_i, carry):
@@ -1729,10 +1763,9 @@ def _build_fused_ep_moe_kernel(
                             next_shift + next_within * tile_m,
                         )
 
-                    # The next expert's index window, a tile early. This is the
-                    # only arrival the kernel waits for with nothing issued
-                    # behind it, so a tile of compute is what it costs to hide.
-                    @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
+                    # The penultimate tile retires this index window; the
+                    # next expert is primed before the final tile's compute.
+                    @pl.when(jnp.logical_and(t + 2 == n_tiles, visit_i + 1 < n_visit))
                     def _():
                         issue_gather_window(
                             expert_base_sm[visit_sm[visit_i + 1]], next_wslot
@@ -1788,6 +1821,21 @@ def _build_fused_ep_moe_kernel(
                     if defer_output_finish:
                         finish_previous_expert()
                     wait_next_input_index()
+
+                # The alternate activation slot has retired its previous tile.
+                # Fill the next expert's first tile before this final FFN so
+                # its token rows and row scales travel under current compute.
+                @pl.when(
+                    jnp.logical_and(
+                        jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit),
+                        jnp.bool_(not interleave_inputs),
+                    )
+                )
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    prime_expert(
+                        nxt, other_parity, next_wslot, jnp.bool_(True), visit_i + 1
+                    )
 
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
@@ -2020,24 +2068,6 @@ def _build_fused_ep_moe_kernel(
                         w2s_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
                     w2_copy(nxt, slot).start(priority=WEIGHT_DMA_PRIORITY)
 
-            # Cross-expert lookahead: prime the next visited expert's first
-            # activation tile before this expert's commit drain and push. Its
-            # index window went out on the last tile, so this is the wait and
-            # not the round trip. Empty experts are absent from the visit list.
-            tiles_done = carry[0]
-
-            @pl.when(
-                jnp.logical_and(visit_i + 1 < n_visit, jnp.bool_(not interleave_inputs))
-            )
-            def _():
-                nxt = visit_sm[visit_i + 1]
-                prime_expert(
-                    nxt,
-                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                    next_wslot,
-                    jnp.bool_(True),
-                )
-
             return carry[:-1] + (next_wslot,)
 
         def drain_commits(carried):
@@ -2120,7 +2150,13 @@ def _build_fused_ep_moe_kernel(
 
             @pl.when(n_visit > 0)
             def _():
-                prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+                prime_expert(
+                    visit_sm[0],
+                    jnp.int32(0),
+                    jnp.int32(0),
+                    jnp.bool_(False),
+                    jnp.int32(0),
+                )
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
