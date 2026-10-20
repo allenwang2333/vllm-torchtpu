@@ -45,6 +45,7 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_rank,
     get_pcp_world_size,
 )
+from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import projection_scale
 from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
@@ -1039,10 +1040,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         elif weight.dtype == torch.float8_e4m3fn:
             if weight_scale is None or weight_scale.dtype != torch.float32:
                 raise RuntimeError("FP8 QKVZ weights require an FP32 scale.")
-            from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
-                projection_scale,
-            )
-
             try:
                 projection_scale.projection_scale_layout(
                     weight.shape, weight_scale.shape

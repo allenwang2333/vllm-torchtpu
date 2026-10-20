@@ -111,7 +111,8 @@ class FakeConfiguredGdnModel:
 class FakeCompactMambaModel:
     @staticmethod
     def get_mamba_state_shape_from_config(_):
-        # 1 physical conv row followed by 256 physical SSM rows.
+        # 2 physical conv rows (fp32 in the pool) followed by 256 physical SSM
+        # rows.
         return ((1, 512), (2, 128, 256))
 
     @staticmethod
