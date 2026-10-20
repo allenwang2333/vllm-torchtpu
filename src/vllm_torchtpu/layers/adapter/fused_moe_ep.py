@@ -185,6 +185,8 @@ def _build_op(
     onehot_scatter=False,
     pallas_plan=False,
     decode_combine=False,
+    pallas_restore=False,
+    fused_select=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -209,6 +211,8 @@ def _build_op(
         onehot_scatter,
         pallas_plan,
         decode_combine,
+        pallas_restore,
+        fused_select,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -226,6 +230,8 @@ def _build_op(
         onehot_scatter=onehot_scatter,
         pallas_plan=pallas_plan,
         decode_combine=decode_combine,
+        pallas_restore=pallas_restore,
+        fused_select=fused_select,
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
@@ -776,13 +782,15 @@ def prebuild_fused_moe_ep(
         onehot_scatter=envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
         pallas_plan=envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
         decode_combine=envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
+        pallas_restore=envs.MOE_FUSED_EP_V2_PALLAS_RESTORE,
+        fused_select=envs.MOE_FUSED_EP_V2_FUSED_SELECT,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
         "token_replica_groups=%s merged_exchange=%s onehot_scatter=%s "
-        "pallas_plan=%s decode_combine=%s",
+        "pallas_plan=%s decode_combine=%s pallas_restore=%s fused_select=%s",
         hidden,
         inter,
         local_experts,
@@ -803,6 +811,8 @@ def prebuild_fused_moe_ep(
         envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
         envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
         envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
+        envs.MOE_FUSED_EP_V2_PALLAS_RESTORE,
+        envs.MOE_FUSED_EP_V2_FUSED_SELECT,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the

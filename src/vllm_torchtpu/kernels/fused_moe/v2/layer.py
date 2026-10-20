@@ -62,7 +62,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
     build_decode_plan,
     decode_plan_supported,
 )
-from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.router_ops import (
+    pallas_select,
+    pallas_select_routed,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
 # The scoring functions the router can apply to the gate logits. These
@@ -242,12 +245,26 @@ def _gather_rows_with_meta(rows, meta, ax):
         lax.bitcast_convert_type(payload, rows.dtype), ax, axis=0, tiled=True
     )
     ep = gathered.shape[0] // (t + meta_rows)
-    meta_g = lax.slice_in_dim(
-        lax.bitcast_convert_type(gathered, jnp.uint8).reshape(ep, -1, row_bytes),
-        t,
-        t + meta_rows,
-        axis=1,
-    ).reshape(ep, -1)[:, : meta.size * 4]
+    nbytes = meta.size * 4
+    # Bytes first, then only the meta rows' leading lane blocks: a float slice
+    # may rewrite a NaN byte, and slicing the whole buffer would copy it.
+    gathered_bytes = lax.bitcast_convert_type(gathered, jnp.uint8)
+    if meta_rows == 1:
+        blocks = -(-nbytes // lanes)
+        meta_g = lax.slice(
+            gathered_bytes,
+            (t, 0, 0),
+            (gathered.shape[0], blocks, lanes),
+            (t + 1, 1, 1),
+        )
+    else:
+        meta_g = lax.slice_in_dim(
+            gathered_bytes.reshape(ep, t + meta_rows, row_bytes),
+            t,
+            t + meta_rows,
+            axis=1,
+        )
+    meta_g = meta_g.reshape(ep, -1)[:, :nbytes]
     meta_g = lax.bitcast_convert_type(meta_g.reshape(ep, meta.size, 4), jnp.int32)
     return gathered, meta_g
 
@@ -346,6 +363,8 @@ def fused_ep_moe_v2(
     onehot_scatter=False,
     pallas_plan=False,
     decode_combine=False,
+    pallas_restore=False,
+    fused_select=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -435,7 +454,10 @@ def fused_ep_moe_v2(
     by SparseCore scatter. pallas_plan builds the whole sharded routing plan
     in one Pallas call (plan_kernel.build_decode_plan) where that kernel
     covers the shape. decode_combine sums the arrivals in one Mosaic call
-    (plan_kernel.build_decode_combine). All four apply only at or below
+    (plan_kernel.build_decode_combine). pallas_restore gathers the token
+    replicas' rows back with the small Pallas all-gather. fused_select folds
+    the score-bias add and the row-routes mask into the top-k selector
+    (router_ops.pallas_select_routed). All six apply only at or below
     SMALL_BATCH_LOCAL_TOKENS local tokens and change no value.
     """
     form = weight_form(weight_format)
@@ -582,6 +604,8 @@ def fused_ep_moe_v2(
     )
     onehot_scatter = bool(onehot_scatter) and small_batch
     decode_combine = bool(decode_combine) and small_batch
+    pallas_restore = bool(pallas_restore) and small_batch
+    fused_select = bool(fused_select) and small_batch
     pallas_plan = (
         bool(pallas_plan)
         and small_batch
@@ -669,6 +693,15 @@ def fused_ep_moe_v2(
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
             if expert_slot_l is not None:
                 topk_idx = _to_slots(topk_idx, expert_slot_l, me * t_local)
+        elif fused_select:
+            topk_weights, topk_idx, fused_routes = pallas_select_routed(
+                scores,
+                gate_l,
+                topk=topk,
+                block_rows=select_rows,
+                score_bias=score_bias_l,
+                labels=select_labels,
+            )
         elif score_bias_l is None:
             topk_weights, topk_idx = pallas_select(
                 scores, topk=topk, block_rows=select_rows, labels=select_labels
@@ -699,7 +732,11 @@ def fused_ep_moe_v2(
         # routed at full weight to expert zero. Mask it explicitly instead.
         # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
         # a finite 0, so replica padding would otherwise pass the score check.
-        row_routes = _row_routes(scores, gate_l)
+        row_routes = (
+            fused_routes
+            if fused_select and hash_l is None
+            else _row_routes(scores, gate_l)
+        )
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
@@ -977,7 +1014,7 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
-        return token_layout.restore(combined, ax)
+        return token_layout.restore(combined, ax, me=me if pallas_restore else None)
 
     # The biases ride the same expert-axis sharding as the weights they
     # belong to, so no shard ever holds a bias for an expert it does not own.
@@ -1057,6 +1094,8 @@ def fused_ep_moe_v2(
         onehot_scatter,
         pallas_plan,
         decode_combine,
+        pallas_restore,
+        fused_select,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
