@@ -683,6 +683,8 @@ def _quantize_kv_components(
     value: jax.Array,  # [T, H, D]
     layout: TQLayout,
     tables: TQTables,
+    *,
+    rotated_key: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Quantizes K/V directly into lane-aligned `(k_unpacked, v_idx, meta_bytes)`."""
     v = value.astype(jnp.float32)
@@ -705,13 +707,210 @@ def _quantize_kv_components(
     else:
         k = key.astype(jnp.float32)
         norm = jnp.sqrt(jnp.sum(k * k, axis=-1, keepdims=True))
-        y = rotate(k / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard))
+        if rotated_key is not None:
+            y = rotated_key.astype(jnp.float32) / (norm + _KEY_NORM_EPS)
+        else:
+            y = rotate(k / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard))
         midpoints = jnp.asarray(tables.midpoints)
         k_unpacked = jnp.sum(y[..., None] >= midpoints, axis=-1).astype(jnp.uint8)
         k_norm_b = _f16_to_bytes(norm)[..., 0, :]
         meta_bytes = jnp.concatenate([v_scale_b, v_zero_b, k_norm_b], axis=-1)
 
     return k_unpacked, v_idx, meta_bytes
+
+
+def _update_kv_cache_fast_plane_words(
+    kv_cache: jax.Array,  # u8[num_pages, page_words, H, 128]
+    nk_u: jax.Array,  # u8[T, H, D]
+    nv_i: jax.Array,  # u8[T, H, D]
+    n_meta: jax.Array,  # u8[T, H, 4 or 6]
+    phys_pages: jax.Array,  # i32[T]
+    slot_in_page: jax.Array,  # i32[T]
+    valid_tok: jax.Array,  # bool[T]
+    page_size: int,
+    layout: TQLayout,
+) -> jax.Array:
+    """Updates only the touched 128-byte words in `kv_cache` without unpacking pages."""
+    num_pages, page_words, num_kv_heads, _ = kv_cache.shape
+    num_tokens = nk_u.shape[0]
+    total_words = num_pages * page_words
+    kv_words = kv_cache.reshape(total_words, num_kv_heads, 128)
+
+    folds = layout.head_dim // 128
+    k_words, v_words, meta_words = _plane_word_counts(page_size, layout)
+    k_wpf = k_words // folds
+    v_wpf = v_words // folds
+    base_widx = phys_pages * page_words
+    s = slot_in_page
+
+    full_widx_list: list[jax.Array] = []
+    full_val_list: list[jax.Array] = []
+    rmw_widx_list: list[jax.Array] = []
+    rmw_mask_list: list[jax.Array] = []
+    rmw_val_list: list[jax.Array] = []
+
+    def _add_packed_plane(plane_base: jax.Array, idx_f: jax.Array, bits: int) -> None:
+        if bits == 4:
+            half = page_size // 2
+            w = jnp.where(valid_tok, plane_base + (s % half), total_words)
+            is_hi = (s >= half)[:, None, None]
+            mask = jnp.broadcast_to(
+                jnp.where(is_hi, jnp.uint8(0xF0), jnp.uint8(0x0F)),
+                (num_tokens, 1, 128),
+            )
+            nib = idx_f & jnp.uint8(0x0F)
+            val = jnp.where(is_hi, nib << jnp.uint8(4), nib)
+            rmw_widx_list.append(w)
+            rmw_mask_list.append(mask)
+            rmw_val_list.append(val)
+        else:
+            assert bits == 3, bits
+            g = page_size // 8
+            r = s % g
+            k_grp = s // g
+            bshift = (k_grp * 3).astype(jnp.uint32)[:, None, None]
+            mask24 = jnp.broadcast_to(
+                jnp.uint32(0x7) << bshift, (num_tokens, 1, 128)
+            )
+            val24 = (idx_f.astype(jnp.uint32) & jnp.uint32(0x7)) << bshift
+            for byte_i in range(3):
+                w_i = jnp.where(
+                    valid_tok, plane_base + byte_i * g + r, total_words
+                )
+                mask_i = ((mask24 >> (8 * byte_i)) & jnp.uint32(0xFF)).astype(
+                    jnp.uint8
+                )
+                val_i = ((val24 >> (8 * byte_i)) & jnp.uint32(0xFF)).astype(
+                    jnp.uint8
+                )
+                rmw_widx_list.append(w_i)
+                rmw_mask_list.append(mask_i)
+                rmw_val_list.append(val_i)
+
+    for f in range(folds):
+        ku_f = nk_u[:, :, f * 128 : (f + 1) * 128]
+        vi_f = nv_i[:, :, f * 128 : (f + 1) * 128]
+        k_base = base_widx + f * k_wpf
+        v_base = base_widx + k_words + f * v_wpf
+        if layout.key_fp8:
+            full_widx_list.append(jnp.where(valid_tok, k_base + s, total_words))
+            full_val_list.append(ku_f)
+        else:
+            _add_packed_plane(k_base, ku_f, layout.key_bits)
+        _add_packed_plane(v_base, vi_f, layout.value_bits)
+
+    m_base = base_widx + k_words + v_words
+    cols = jnp.arange(128, dtype=jnp.int32)[None, None, :]
+    s_col = s[:, None, None]
+    if meta_words == 1:
+        p = page_size
+        c0 = cols == s_col
+        c1 = cols == (s_col + p)
+        c2 = cols == (s_col + 64)
+        c3 = cols == (s_col + 64 + p)
+        m_bool = c0 | c1 | c2 | c3
+        v_m0 = (
+            jnp.where(c0, n_meta[:, :, 0:1], jnp.uint8(0))
+            | jnp.where(c1, n_meta[:, :, 2:3], jnp.uint8(0))
+            | jnp.where(c2, n_meta[:, :, 1:2], jnp.uint8(0))
+            | jnp.where(c3, n_meta[:, :, 3:4], jnp.uint8(0))
+        )
+        if not layout.key_fp8:
+            c4 = cols == (s_col + 2 * p)
+            c5 = cols == (s_col + 64 + 2 * p)
+            m_bool = m_bool | c4 | c5
+            v_m0 = (
+                v_m0
+                | jnp.where(c4, n_meta[:, :, 4:5], jnp.uint8(0))
+                | jnp.where(c5, n_meta[:, :, 5:6], jnp.uint8(0))
+            )
+        rmw_widx_list.append(jnp.where(valid_tok, m_base, total_words))
+        rmw_mask_list.append(jnp.where(m_bool, jnp.uint8(0xFF), jnp.uint8(0)))
+        rmw_val_list.append(v_m0)
+    else:
+        c_lo = cols == s_col
+        c_hi = cols == (s_col + 64)
+        mask_m = jnp.where(c_lo | c_hi, jnp.uint8(0xFF), jnp.uint8(0))
+        val_m0 = jnp.where(c_lo, n_meta[:, :, 0:1], jnp.uint8(0)) | jnp.where(
+            c_hi, n_meta[:, :, 2:3], jnp.uint8(0)
+        )
+        val_m1 = jnp.where(c_lo, n_meta[:, :, 1:2], jnp.uint8(0)) | jnp.where(
+            c_hi, n_meta[:, :, 3:4], jnp.uint8(0)
+        )
+        rmw_widx_list.append(jnp.where(valid_tok, m_base, total_words))
+        rmw_mask_list.append(mask_m)
+        rmw_val_list.append(val_m0)
+        rmw_widx_list.append(jnp.where(valid_tok, m_base + 1, total_words))
+        rmw_mask_list.append(mask_m)
+        rmw_val_list.append(val_m1)
+        if not layout.key_fp8:
+            val_m2 = jnp.where(c_lo, n_meta[:, :, 4:5], jnp.uint8(0)) | jnp.where(
+                c_hi, n_meta[:, :, 5:6], jnp.uint8(0)
+            )
+            rmw_widx_list.append(jnp.where(valid_tok, m_base + 2, total_words))
+            rmw_mask_list.append(mask_m)
+            rmw_val_list.append(val_m2)
+
+    w_rmw = jnp.stack(rmw_widx_list, axis=0)  # [R, T]
+    m_rmw = jnp.stack(rmw_mask_list, axis=0)  # [R, T, 1, 128]
+    v_rmw = jnp.stack(rmw_val_list, axis=0)  # [R, T, H, 128]
+
+    if num_tokens > 1:
+        same_page = (
+            (phys_pages[:, None] == phys_pages[None, :])
+            & valid_tok[:, None]
+            & valid_tok[None, :]
+        )
+        has_shared_page = jnp.any(jnp.triu(same_page, k=1))
+
+        def _merge_shared_rmw(
+            args: tuple[jax.Array, jax.Array, jax.Array],
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            w, m, v = args
+            same_w = (
+                (w[:, :, None] == w[:, None, :])
+                & (w[:, :, None] < total_words)
+            )  # [R, T, T]
+            rep_w = jnp.argmax(same_w, axis=2)  # [R, T]
+            t_idx = jnp.arange(num_tokens, dtype=jnp.int32)[None, :]
+            is_rep_w = (w < total_words) & (t_idx == rep_w)
+            w_out = jnp.where(is_rep_w, w, total_words)
+            m_out = jnp.bitwise_or.reduce(
+                jnp.where(
+                    same_w[:, :, :, None, None], m[:, None, :, :, :], jnp.uint8(0)
+                ),
+                axis=2,
+            )
+            v_out = jnp.bitwise_or.reduce(
+                jnp.where(
+                    same_w[:, :, :, None, None], v[:, None, :, :, :], jnp.uint8(0)
+                ),
+                axis=2,
+            )
+            return w_out, m_out, v_out
+
+        w_rmw, m_rmw, v_rmw = jax.lax.cond(
+            has_shared_page,
+            _merge_shared_rmw,
+            lambda args: args,
+            (w_rmw, m_rmw, v_rmw),
+        )
+
+    flat_w_rmw = w_rmw.reshape(-1)
+    old_words = kv_words[flat_w_rmw]
+    new_rmw_words = (
+        old_words & (~m_rmw.reshape(-1, 1, 128))
+    ) | v_rmw.reshape(-1, num_kv_heads, 128)
+
+    if full_widx_list:
+        all_write_widx = jnp.concatenate(full_widx_list + [flat_w_rmw], axis=0)
+        all_write_words = jnp.concatenate(full_val_list + [new_rmw_words], axis=0)
+    else:
+        all_write_widx = flat_w_rmw
+        all_write_words = new_rmw_words
+
+    kv_words = kv_words.at[all_write_widx].set(all_write_words, mode="drop")
+    return kv_words.reshape(kv_cache.shape)
 
 
 def pack_pages_128(pages: jax.Array, layout: TQLayout) -> jax.Array:
@@ -838,49 +1037,38 @@ def tq_ragged_paged_attention(
 
     if layout.key_fp8:
         q_in, k_in = queries, keys
+        k_rot = None
     else:
         h = jnp.asarray(tables.hadamard)
         q_in = rotate(queries, h).astype(compute_dtype)
-        k_in = rotate(keys, h).astype(compute_dtype)
+        k_rot = rotate(keys.astype(jnp.float32), h)
+        k_in = k_rot.astype(compute_dtype)
 
     if minor_bytes == 128 and _use_fast_plane_layout(
         layout.page_size_from_words_128(dim1), layout
     ):
         page_size = layout.page_size_from_words_128(dim1)
         if not skip_kv_update:
-            nk_u, nv_i, n_meta = _quantize_kv_components(keys, values, layout, tables)
+            nk_u, nv_i, n_meta = _quantize_kv_components(
+                keys, values, layout, tables, rotated_key=k_rot
+            )
             local_slot, local_page = _compute_local_slot_mapping(
                 num_tokens, kv_lens, page_indices, cu_q_lens, distribution, page_size
             )
             phys_pages = page_indices[local_page]
             slot_in_page = local_slot % page_size
             valid_tok = local_slot >= 0
-
-            # Deduplicate tokens targeting the same physical page so multi-token
-            # prefills into a single page accumulate into one representative page.
-            same_page = (phys_pages[:, None] == phys_pages[None, :]) & valid_tok[None, :]
-            rep_t = jnp.argmax(same_page, axis=1)
-            is_rep = valid_tok & (jnp.arange(num_tokens, dtype=jnp.int32) == rep_t)
-            scatter_idx = jnp.where(
-                valid_tok, rep_t * page_size + slot_in_page, num_tokens * page_size
+            kv_cache = _update_kv_cache_fast_plane_words(
+                kv_cache,
+                nk_u,
+                nv_i,
+                n_meta,
+                phys_pages,
+                slot_in_page,
+                valid_tok,
+                page_size,
+                layout,
             )
-
-            tk_u, tv_i, t_meta = _unpack_planes_to_components(
-                kv_cache[phys_pages], layout
-            )
-
-            def _scatter_touched(arr: jax.Array, new_val: jax.Array) -> jax.Array:
-                flat = arr.reshape(num_tokens * page_size, *arr.shape[2:])
-                flat = flat.at[scatter_idx].set(new_val, mode="drop")
-                return flat.reshape(arr.shape)
-
-            tk_u = _scatter_touched(tk_u, nk_u)
-            tv_i = _scatter_touched(tv_i, nv_i)
-            t_meta = _scatter_touched(t_meta, n_meta)
-
-            touched_raw = _pack_planes_from_unpacked(tk_u, tv_i, t_meta, layout)
-            valid_p = jnp.where(is_rep, phys_pages, num_pages)
-            kv_cache = kv_cache.at[valid_p].set(touched_raw, mode="drop")
 
         if rpa_fn is ragged_paged_attention:
             dequant_fn = functools.partial(
