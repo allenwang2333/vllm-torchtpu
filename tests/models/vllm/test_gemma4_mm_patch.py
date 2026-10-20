@@ -231,4 +231,3 @@ def test_patch_gemma4_layer_config():
     )
     assert attn.head_dim == 512
     assert attn.num_kv_heads == 2
-
