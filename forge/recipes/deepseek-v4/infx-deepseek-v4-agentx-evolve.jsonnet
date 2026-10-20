@@ -352,6 +352,10 @@ local segmentTokenize = cdk.var('VLLM_TPU_SEGMENT_TOKENIZE', '');
 // ~0.02-0.05 us/token vs ~2.5 for the HF backend, with identical ids on 2534 replayed prompts. Pick this or
 // VLLM_TPU_SEGMENT_TOKENIZE: with both, the piecewise split costs more than fastokens' full encode.
 local useFastokens = cdk.boolVar('USE_FASTOKENS', false);
+// 1: EngineCore copies a new prompt's prefix-cache block hashes (one per 16 tokens on DSv4) from the stored
+// prompt sharing the longest token prefix instead of rehashing it (vllm-torchtpu core/block_hash_reuse.py;
+// identical hashes). CPU: 83 -> 28 ms per ~450k-token turn. Empty = off.
+local blockHashReuse = cdk.var('TPU_BLOCK_HASH_REUSE', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
@@ -869,6 +873,7 @@ local serverJob = cdk.job(
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
         [if segmentTokenize != '' then 'VLLM_TPU_SEGMENT_TOKENIZE']: segmentTokenize,
+        [if blockHashReuse != '' then 'TPU_BLOCK_HASH_REUSE']: blockHashReuse,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,

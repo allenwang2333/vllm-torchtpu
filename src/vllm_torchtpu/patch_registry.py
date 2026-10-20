@@ -100,6 +100,9 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.core.fine_prefix_hits:patch_fine_prefix_hits", _ENGINE),
     Patch(
+        "vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", ("engine_core",)
+    ),
+    Patch(
         "vllm_torchtpu.core.hca_state_checkpoint:patch_drop_hca_state_checkpoint",
         _ENGINE,
     ),

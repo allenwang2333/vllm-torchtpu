@@ -185,6 +185,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
+    TPU_BLOCK_HASH_REUSE: bool = False
+    TPU_BLOCK_HASH_REUSE_MAX_TOKENS: int = 33554432
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1111,6 +1113,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Also run the full encode for every prompt and raise if the ids differ
     # (validation runs only: it costs the full encode again).
     "VLLM_TPU_SEGMENT_TOKENIZE_VERIFY": env_bool("VLLM_TPU_SEGMENT_TOKENIZE_VERIFY"),
+    # EngineCore: copy a new prompt's prefix-cache block hashes from the stored
+    # prompt sharing the longest token prefix (core/block_hash_reuse.py).
+    "TPU_BLOCK_HASH_REUSE": env_bool("TPU_BLOCK_HASH_REUSE"),
+    # Prompt tokens that store keeps (~8.5 B/token: ids plus hash references).
+    "TPU_BLOCK_HASH_REUSE_MAX_TOKENS": env_int(
+        "TPU_BLOCK_HASH_REUSE_MAX_TOKENS", 33554432
+    ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
