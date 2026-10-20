@@ -12,7 +12,8 @@ No barrier: an aliased operand of a barrier-carrying call is copied in and out b
 nrow / rrow / irec are the megakernel's staging outputs (identical on every rank); each rank writes the rows whose
 position it owns, for every layer:
   nope: the row's 128 words -> (page, slot), one HBM -> HBM DMA per (layer, row);
-  rope: the 4-token row (page, slot >> 2) read, the quarters of every owned new token in it overlaid, written back;
+  rope: the 4-token row (page, slot >> 2) read, the quarters of every owned new token in it overlaid, written back
+        once per row (by its first owned token; the source wrote the identical row once per owned token);
   idx:  the SAL page read, the owned new tokens' record columns patched, written back (per distinct page)."""
 
 import math
@@ -78,6 +79,19 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             pos = rmeta[t_, 1]
             return jnp.logical_and(rmeta[t_, 0] > 0, (pos % G_) // ILV == me)
 
+        def gfirst(t_):
+            """t_ is the first owned new token of its 4-token rope row (same request, same pos // ILV): only it
+            writes the merged row back (one DMA per row; the source design wrote the identical merged row once per
+            owned token, a write-write overlap the interpreter's race detector reports)."""
+            pos = rmeta[t_, 1]
+            req = rmeta[t_, 2]
+
+            def chk(t2, acc):
+                dup = jnp.logical_and(jnp.logical_and(t2 < t_, mine(t2)),
+                                      jnp.logical_and(rmeta[t2, 2] == req, rmeta[t2, 1] // ILV == pos // ILV))
+                return jnp.logical_or(acc, dup)
+            return jnp.logical_not(lax.fori_loop(0, TMAX, chk, jnp.bool_(False)))
+
         def where_(t_, table):
             pos = rmeta[t_, 1]
             req = rmeta[t_, 2]
@@ -117,7 +131,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             lane = lax.broadcasted_iota(I32, (1, 128), 1)
 
             def rmerge(t_, c2):
-                @pl.when(jnp.logical_and(t_ < T, mine(t_)))
+                @pl.when(jnp.logical_and(jnp.logical_and(t_ < T, mine(t_)), gfirst(t_)))
                 def _():
                     page, sl, pos = where_(t_, bt)
                     req = rmeta[t_, 2]
@@ -190,15 +204,20 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
         if full_l:
             lax.fori_loop(0, L, per_idx_layer, 0)
 
-        n_own = jnp.int32(0)
-        for t_ in range(TMAX):
-            n_own = n_own + jnp.logical_and(t_ < T, mine(t_)).astype(I32)
+        def count(t_, c):
+            ok_ = jnp.logical_and(t_ < T, mine(t_))
+            return (c[0] + ok_.astype(I32), c[1] + jnp.logical_and(ok_, gfirst(t_)).astype(I32))
+        n_own, n_row = lax.fori_loop(0, TMAX, count, (jnp.int32(0), jnp.int32(0)))
 
-        def drain(i, c):
+        def drain_n(i, c):
             pltpu.make_async_copy(nrow.at[0, pl.ds(0, 1)], scr["rold"].at[0, pl.ds(0, 1)], scr["sem"].at[1]).wait()
+            return c
+
+        def drain_r(i, c):
             pltpu.make_async_copy(nrow.at[0, pl.ds(0, 1)], scr["rold"].at[0, pl.ds(0, 1)], scr["sem"].at[3]).wait()
             return c
-        lax.fori_loop(0, n_own * L, drain, 0)
+        lax.fori_loop(0, n_own * L, drain_n, 0)
+        lax.fori_loop(0, n_row * L, drain_r, 0)
 
     c_shapes = [jax.ShapeDtypeStruct((len(ck[k][0]) // G[k],) + ck[k][1], ck[k][2]) for k, gi in c_names]
     call = pl.pallas_call(
