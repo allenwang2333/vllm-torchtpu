@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
+    TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
@@ -860,6 +861,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlaps the second piece's scoring without scoring any extra q block.
     # Ignored when TPU_STREAMIDX_CHUNK_TOKENS chunks the call.
     "TPU_STREAMIDX_SPLIT_MIXED": env_bool("TPU_STREAMIDX_SPLIT_MIXED"),
+    # Smallest token bucket TPU_STREAMIDX_SPLIT_MIXED splits. Below it a batch
+    # without a mixed sequence would score and top-k an empty second piece.
+    "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": env_int(
+        "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS", 0
+    ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
