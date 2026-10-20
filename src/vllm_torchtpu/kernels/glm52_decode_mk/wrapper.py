@@ -224,10 +224,13 @@ def tables_from_union(cfg, uv, ureq, rmeta, qmeta, T):
 
 
 def router_ids(cfg, wtab):
-    """[M, EPAD] routing weights -> [M, TOPK] chosen experts (ascending id; the check compares sets)."""
-    e = jnp.arange(wtab.shape[-1], dtype=I32)
-    key = jnp.where(wtab > 0, e[None, :], 1 << 20)
-    return jnp.sort(key, axis=1)[:, :cfg.TOPK].astype(I32)
+    """[M, EPAD] routing weights -> [M, TOPK] chosen experts (ascending id; the check compares sets). A row with
+    fewer than TOPK nonzero weights (a padded row, or a fault) is filled with the lowest ids, so every id stays a
+    valid expert index."""
+    n = wtab.shape[-1]
+    e = jnp.arange(n, dtype=I32)
+    key = jnp.where(wtab > 0, e[None, :], n + e[None, :])
+    return (jnp.sort(key, axis=1)[:, :cfg.TOPK] % min(n, cfg.E)).astype(I32)
 
 
 def candidate_factory(tiles=None, interpret=True, stack_e=True, groups=None, delay=(-1, 0, -1),
