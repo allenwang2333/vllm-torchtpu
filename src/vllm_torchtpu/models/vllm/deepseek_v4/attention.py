@@ -393,7 +393,7 @@ class VllmDeepseekV4MLAAttention(
                     ),
                 }
                 if is_csa
-                else {}
+                else {"hca_mixed_q_block": envs.TPU_DSV4_HCA_MIXED_Q_BLOCK}
             ),
         )
 

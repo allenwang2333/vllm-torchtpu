@@ -123,12 +123,17 @@ def _attention_hca(
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
+    hca_mixed_q_block: int = 32,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
 
     `verify_q_len`: requests [distribution[0], distribution[1]) are speculative
     verify windows of exactly this many tokens; they run the kernels' static
     query-length pass instead of the mixed one.
+
+    `hca_mixed_q_block`: query tokens per block of the HCA kernel's mixed
+    (prefill) pass. Rows are independent and the KV blocking is unchanged, so
+    any value gives bit-identical results; larger blocks re-stream the KV less.
     """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -178,7 +183,12 @@ def _attention_hca(
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(32, 64, 64),
-        num_queries_per_block=(1, 32, 32),
+        # Small buckets keep 32: their mixed pass holds few query rows.
+        num_queries_per_block=(
+            1,
+            32,
+            hca_mixed_q_block if q.shape[0] >= 512 else 32,
+        ),
         chunk_prefill_size=verify_q_len,
     )
     return output, updated_sw_cache

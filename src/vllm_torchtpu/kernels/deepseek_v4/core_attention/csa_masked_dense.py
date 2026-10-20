@@ -132,12 +132,12 @@ def _mask_sc_kernel(
             for sb in range(max_kv_len // SUPER_BLOCK):
 
                 @plsc.parallel_loop(0, LANES, step=L)
-                def _pack(l, sb=sb):
+                def _pack(lane, sb=sb):
                     acc = jnp.zeros((L,), jnp.int32)
                     for b in range(WORD_BITS):
-                        bit = row_ref[pl.ds(sb * SUPER_BLOCK + b * LANES + l, L)]
+                        bit = row_ref[pl.ds(sb * SUPER_BLOCK + b * LANES + lane, L)]
                         acc = jnp.bitwise_or(acc, jnp.left_shift(bit, b))
-                    out_ref[0, pl.ds(sb * LANES + l, L)] = acc
+                    out_ref[0, pl.ds(sb * LANES + lane, L)] = acc
 
         pltpu.emit_pipeline(
             body,
@@ -218,7 +218,9 @@ def build_mask_xla(
     word = jnp.where(valid, codes // WORD_BITS, 0)
     value = jnp.where(valid, jnp.left_shift(jnp.int32(1), codes % WORD_BITS), 0)
     num_tokens = codes.shape[0]
-    token = jnp.broadcast_to(jnp.arange(num_tokens, dtype=jnp.int32)[:, None], codes.shape)
+    token = jnp.broadcast_to(
+        jnp.arange(num_tokens, dtype=jnp.int32)[:, None], codes.shape
+    )
     # Selected positions are distinct per token, so adding the bits ORs them.
     return (
         jnp.zeros((num_tokens, max_kv_len // WORD_BITS), jnp.int32)
@@ -327,7 +329,9 @@ def _kernel(
                 False,
             )
         copy(
-            mask_hbm_ref.at[pl.ds(start, sz), bkv_idx // blocks_per_super, pl.ds(0, LANES)],
+            mask_hbm_ref.at[
+                pl.ds(start, sz), bkv_idx // blocks_per_super, pl.ds(0, LANES)
+            ],
             mask_vmem.at[pl.ds(0, sz), 0, pl.ds(0, LANES)],
             sems.at[2, sem_idx],
             False,

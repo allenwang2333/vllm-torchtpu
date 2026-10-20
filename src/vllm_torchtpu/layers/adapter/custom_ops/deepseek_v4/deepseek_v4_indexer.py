@@ -287,6 +287,15 @@ def _merge_kv_split_jax(
     return merge_kv_split_topk(shares, k)
 
 
+def _merge_kv_split_a2a_jax(
+    exchanged: jax.Array, *, k: int, kv_split: int
+) -> jax.Array:
+    """i32[T, 2k] after the all-to-all (row block r = rank r's share of this
+    rank's token block) -> the unsplit top-k of this rank's block,
+    i32[T / kv_split, k]."""
+    return merge_kv_split_topk(exchanged.reshape(kv_split, -1, 2 * k), k)
+
+
 def tp_rank_as_data(group, device: torch.device) -> torch.Tensor:
     """This rank's index in `group` as an i32[1] device value, so that every
     rank compiles the same program."""
@@ -295,13 +304,21 @@ def tp_rank_as_data(group, device: torch.device) -> torch.Tensor:
     return funcol.wait_tensor(got)[:1]
 
 
-def merge_kv_split_shares(share, merge_op, rank, kv_split: int) -> torch.Tensor:
+def merge_kv_split_shares(
+    share, merge_op, rank, kv_split: int, a2a_merge_op=None, group=None
+) -> torch.Tensor:
     """Every TP rank's i32[T, 2k] share -> the unsplit i32[T, k] top-k.
 
     With T a multiple of the group size, each rank merges only its own block
     of T / TP tokens and the merged blocks are all-gathered: 1/TP of the
-    merge work.
+    merge work. With `a2a_merge_op`, each rank receives just the shares of its
+    own block (an all-to-all over `group`) instead of every rank's whole share.
     """
+    if a2a_merge_op is not None and share.shape[0] % kv_split == 0:
+        exchanged = funcol.wait_tensor(
+            funcol.all_to_all_single(share, None, None, group.device_group)
+        )
+        return tensor_model_parallel_all_gather(a2a_merge_op(exchanged), 0)
     merged = merge_op(tensor_model_parallel_all_gather(share, 0), rank)
     if share.shape[0] % kv_split:
         return merged
@@ -436,7 +453,24 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 )
 
             merge_op.register_fake(_fake_merge)
-            indexer_jax_op = (indexer_jax_op, merge_op)
+            a2a_merge_op = pallas.jax_op(
+                f"pallas::deepseek_v4_indexer_merge_a2a_k{self.topk_tokens}_s{kv_split}",
+                functools.partial(
+                    _merge_kv_split_a2a_jax, k=self.topk_tokens, kv_split=kv_split
+                ),
+                mesh=mesh,
+                input_partition_specs=(P(),),
+            )
+
+            def _fake_merge_a2a(exchanged):
+                return torch.empty(
+                    (exchanged.shape[0] // kv_split, self.topk_tokens),
+                    dtype=torch.int32,
+                    device=exchanged.device,
+                )
+
+            a2a_merge_op.register_fake(_fake_merge_a2a)
+            indexer_jax_op = (indexer_jax_op, merge_op, a2a_merge_op)
 
         _indexer_op_cache[op_name] = indexer_jax_op
         return indexer_jax_op
@@ -498,8 +532,13 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         )
         if self.kv_split == 1 or q.shape[0] < self.kv_split_min_tokens:
             return self.indexer_op(*args)
-        share_op, merge_op = self.indexer_split_ops
+        share_op, merge_op, a2a_merge_op = self.indexer_split_ops
         rank = tp_rank_as_data(get_tp_group(), q.device)
         return merge_kv_split_shares(
-            share_op(*args, rank), merge_op, rank, self.kv_split
+            share_op(*args, rank),
+            merge_op,
+            rank,
+            self.kv_split,
+            a2a_merge_op if envs.TPU_DSV4_INDEXER_KV_SPLIT_A2A else None,
+            get_tp_group(),
         )

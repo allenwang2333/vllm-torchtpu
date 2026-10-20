@@ -13,7 +13,6 @@
 # limitations under the License.
 """Masked-dense CSA attention against the sparse gather kernel."""
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -52,8 +51,9 @@ def _case(rng, seqs):
     n = int(cu[-1])
     _, nope, rope = create_cache(rng, total_pages, PAGE_SIZE, HEAD_DIM, jnp.bfloat16)
     return dict(
-        q=(jnp.array(rng.standard_normal((n, HEADS, HEAD_DIM), np.float32)) * 0.05)
-        .astype(jnp.bfloat16),
+        q=(
+            jnp.array(rng.standard_normal((n, HEADS, HEAD_DIM), np.float32)) * 0.05
+        ).astype(jnp.bfloat16),
         nope=nope,
         rope=rope,
         topk=jnp.array(np.stack(topk)),
