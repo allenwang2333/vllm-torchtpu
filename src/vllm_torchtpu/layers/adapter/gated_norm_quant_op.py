@@ -36,7 +36,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import gated_norm_quant as gnq
-from vllm_torchtpu.layers.adapter import linear_common
+from vllm_torchtpu.layers.adapter import linear_common, sp_a2a_oproj
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 
@@ -168,6 +168,18 @@ def output_projection(
     out_proj = layer.out_proj
     if z.ndim == 3:
         z = z.reshape(core_attn_out.shape[0], -1)
+    if sp_a2a_oproj.has_full_weight(out_proj):
+        from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+            _rows_are_sequence_parallel,
+        )
+
+        if _rows_are_sequence_parallel(core_attn_out.shape[0]):
+            # This rank's rows, already reduced: the layer skips its
+            # reduce-scatter.
+            q, s = _norm_ops[float(layer.norm.eps)](core_attn_out, z, layer.norm.weight)
+            return sp_a2a_oproj.project(
+                q.reshape(core_attn_out.shape[0], -1), s, out_proj
+            )
     output = _out_proj_ops[float(layer.norm.eps)](
         core_attn_out,
         z,

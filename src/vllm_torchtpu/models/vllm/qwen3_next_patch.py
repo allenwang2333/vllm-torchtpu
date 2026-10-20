@@ -95,6 +95,7 @@ from vllm_torchtpu.layers.adapter import (
     linear_common,
     sequence_parallel,
     small_all_reduce_op,
+    sp_a2a_oproj,
 )
 from vllm_torchtpu.layers.adapter.attention import batched_rpa_schedule_scope
 from vllm_torchtpu.layers.adapter.linear_common import (
@@ -446,6 +447,14 @@ def _apply_pal_gate_q_o_proj(
     k = attn_output.shape[-1]
     attn_2d = attn_output.reshape(-1, k)
     gate_2d = gate.reshape(-1, k)
+    if (
+        attn_output.ndim == 2
+        and sp_a2a_oproj.has_full_weight(o_proj)
+        and _rows_are_sequence_parallel(attn_2d.shape[0])
+    ):
+        # This rank's rows, already reduced: the layer skips its reduce-scatter.
+        q, s = _get_sigmoid_gate_quant_op()(attn_2d, gate_2d)
+        return sp_a2a_oproj.project(q, s, o_proj)
     output = _get_sigmoid_gate_o_proj_op()(
         attn_2d, gate_2d, o_proj.weight, o_proj.weight_scale
     )
@@ -1198,9 +1207,27 @@ def setup_qwen3_next_v6_after_loading(model: Any) -> None:
             greedy_top_tokens.quantize_lm_head(module, mode="fp8", in_place=True)
     if hoisted_norm_tensors:
         synchronize_tensors(hoisted_norm_tensors)
+    if not is_mtp_wrapper and sequence_parallel.enabled():
+        sp_a2a_oproj.install(model, _sp_a2a_oproj_layers(model))
     # Reclaim what the weight rewrites above left behind before the KV cache
     # is sized.
     gc.collect()
+
+
+def _sp_a2a_oproj_layers(model: Any) -> list[tuple[Any, Any]]:
+    """(decoder layer, output projection) for every sequence-parallel layer
+    whose projection is an fp8 per-channel (k, n) linear."""
+    layers = []
+    for module in model.modules():
+        if not getattr(module, "use_attn_reduce_scatter_for_moe", False):
+            continue
+        if getattr(module, "layer_type", None) == "full_attention":
+            proj = getattr(getattr(module, "self_attn", None), "o_proj", None)
+        else:
+            proj = getattr(getattr(module, "linear_attn", None), "out_proj", None)
+        if proj is not None and _is_fp8_per_channel_linear(proj):
+            layers.append((module, proj))
+    return layers
 
 
 def _takes_prequant_rows(proj: Any) -> bool:
@@ -1508,7 +1535,10 @@ def patched_decoder_layer_forward(
 
     if self.use_attn_reduce_scatter_for_moe:
         if sp:
-            hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
+            # A mixer that projected through sp_a2a_oproj returned this rank's
+            # rows already reduced.
+            if hidden_states.shape[0] == full_num_tokens:
+                hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
             if not input_is_sliced:
                 residual = _sp_chunk(self, residual)
         else:
