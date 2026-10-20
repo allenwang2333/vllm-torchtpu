@@ -833,7 +833,7 @@ def make(E):
                 return c
             lax.fori_loop(0, nrow, rrow, 0)
             req[b, 0] = n
-            req[b, 2] = nuo
+            req[b, 2] = n if fault == "kv_read_before_write" else nuo   # FAULT: every entry resolved as an old row
             st[4] = r0 + nrow
 
     def union_upto(bw0, bw1, limit_row):
