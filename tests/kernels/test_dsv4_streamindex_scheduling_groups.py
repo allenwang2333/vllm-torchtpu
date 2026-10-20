@@ -93,6 +93,7 @@ def test_slot_ids_stay_clear_of_the_counter_and_each_other():
     first = config.slot_scheduling_group_ids(0, 15)
     second = config.slot_scheduling_group_ids(1, 15)
     assert first >= config.SLOT_ID_BASE
+    assert first > config.indexer_layer_scheduling_group(1023)
     assert second - first == config.MAX_IDS_PER_SLOT
     with pytest.raises(ValueError):
         config.slot_scheduling_group_ids(-1, 1)

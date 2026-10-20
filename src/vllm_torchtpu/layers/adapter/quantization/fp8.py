@@ -72,6 +72,9 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
@@ -85,6 +88,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
+    FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
@@ -108,7 +112,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -397,18 +401,13 @@ def _quantize_and_format_single_moe_weight(
     w = w.transpose(1, 2).contiguous()
 
     # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
+    # The `unsqueeze(2)` view is backed by the 3-D scale buffer, which
+    # torch_tpu would re-materialize as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. `fresh_buffer` gives the
+    # persistent parameter a plain 4-D buffer of its own.
     if w_scale is not None:
         s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+        w_scale = fresh_buffer(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -1163,6 +1162,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+            moe_tp_decode_forward,
+            moe_tp_decode_supported,
+        )
+
+        if moe_tp_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return moe_tp_decode_forward(self, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1201,6 +1209,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
+
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+            fused_moe_decode,
+            fused_moe_decode_supported,
+        )
+
+        if fused_moe_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
 
@@ -1331,6 +1349,14 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
         if site and (prefix == site or prefix.endswith("." + site)):
             return True
     return False
+
+
+def _fp8_pallas_sched_group(prefix: str) -> int | None:
+    """TPU_IDX_TOPK_SCHED_GROUPS: G2 for the q_b_proj of a DCP indexer layer (its
+    indexer op, built at model init, registered the layer), else None."""
+    if not envs.TPU_IDX_TOPK_SCHED_GROUPS or not prefix.endswith(".q_b_proj"):
+        return None
+    return streamidx_config.registered_layer_scheduling_group(prefix)
 
 
 def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
@@ -1625,17 +1651,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
-        # The dequant/requant chain may leave views backed by higher-rank PJRT
-        # buffers. Allocate fresh contiguous persistent parameters so the
-        # matmul boundary sees plain row-major buffers.
-        weight = torch.empty(
-            weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
-        ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        # The dequant/requant chain may leave views backed by buffers of a
+        # different shape (e.g. a squeezed [n_out, 1] scale). Give the
+        # persistent parameters buffers of their own shape so the matmul
+        # boundary needs no per-step `tt_jit_as_strided` program.
+        weight = fresh_buffer(weight)
+        weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -1660,8 +1681,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
             if padded_copy:
                 _set_fp8_pallas_copy(layer)
+            sched_group = _fp8_pallas_sched_group(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if sched_group is not None:
+                setattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, sched_group)
             get_fp8_linear_pallas_op(
-                padded_copy
+                padded_copy, sched_group
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1716,12 +1742,19 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            # Only a DCP indexer layer's q_b_proj under TPU_IDX_TOPK_SCHED_GROUPS
+            # carries a group; every other call is unchanged.
+            sched_group = getattr(layer, FP8_PALLAS_SCHED_GROUP_ATTR, None)
+            sched_kwargs = (
+                {} if sched_group is None else {"scheduling_group_id": sched_group}
+            )
             out = quantized_matmul_pallas(
                 x,
                 weight,
                 layer.weight_scale,
                 getattr(layer, FP8_PALLAS_WEIGHT, None),
                 getattr(layer, FP8_PALLAS_SCALE, None),
+                **sched_kwargs,
             )
         else:
             out = quantized_matmul(x, weight, layer.weight_scale)

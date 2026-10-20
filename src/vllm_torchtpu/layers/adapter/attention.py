@@ -40,8 +40,8 @@ from vllm_torchtpu.block_major_pool import (
     kernel_view,
     unified_block_major_enabled,
 )
+from vllm_torchtpu.distributed.dcp import dcp_rank_operand, get_or_create_dcp_mesh
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
-from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     indexer_kv_layout,
@@ -61,6 +61,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -100,6 +101,15 @@ from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
+    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
+_absorb_q.register_fake(_fake_absorb_q)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -1750,10 +1760,26 @@ class PallasMLAttentionBackend(AttentionBackend):
         """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
         kv_packing = get_dtype_packing(_resolve_kv_cache_dtype(cache_dtype_str))
+        nope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT)
+        rope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT)
+        packed_rope = envs.TPU_SPARSE_MLA_PACKED_ROPE
+        if packed_rope and (
+            nope_layout is not KVCacheLayout.SPARSECORE
+            or rope_layout is not KVCacheLayout.SPARSECORE
+        ):
+            # Only the native SparseCore gather reads packed rope rows; the
+            # TensorCore dsa_gather and masked-dense paths assume one padded
+            # 128-byte row per token.
+            raise ValueError(
+                "TPU_SPARSE_MLA_PACKED_ROPE=1 requires "
+                "TPU_SPARSE_MLA_NOPE_LAYOUT=sparsecore and "
+                "TPU_SPARSE_MLA_ROPE_LAYOUT=sparsecore, got "
+                f"{nope_layout.value} and {rope_layout.value}"
+            )
         return (
             SparseMLAKVCacheSpec.create(
                 KVCacheType.NOPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                nope_layout,
                 num_blocks,
                 block_size,
                 head_size - rope_dim,
@@ -1761,13 +1787,31 @@ class PallasMLAttentionBackend(AttentionBackend):
             ),
             SparseMLAKVCacheSpec.create(
                 KVCacheType.ROPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                rope_layout,
                 num_blocks,
                 block_size,
                 rope_dim,
                 kv_packing,
+                packed_rope=packed_rope,
             ),
         )
+
+    @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches.
+
+        Equal to `get_kv_cache_page_size_bytes` (one 128-lane-padded latent
+        row per token) unless `TPU_SPARSE_MLA_PACKED_ROPE` drops the rope
+        padding.
+        """
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -1989,6 +2033,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     "let a contiguous run of winners land on fewer ranks."
                 )
             self._dcp_mesh = get_or_create_dcp_mesh()
+            if envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS:
+                # Register the merge's ragged exchange op before any trace.
+                _cp_mla_attention.prebuild_ragged_all_to_all(self.dcp_size)
 
     def _get_kv_scales(
         self, layer: Any
@@ -2216,7 +2263,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_impl
 
-    def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int, interleave_size: int):
+    def _build_sparse_mla_dcp_op(
+        self, layer: Any, dcp_size: int, interleave_size: int, q_rope: bool = False
+    ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
         In DCP the queries are replicated. `kv_c_normed`/`k_pe` in particular
@@ -2240,8 +2289,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
             _, k_scale, _ = self._get_kv_scales(layer)
+        # TPU_DCP_RANK_OPERAND: this rank's DCP index as a sharded i32 operand
+        # (built here, outside Dynamo) instead of the iota all_to_all.
+        rank_tensor = dcp_rank_operand() if envs.TPU_DCP_RANK_OPERAND else None
+        # TPU_MTP_DCP_MERGE_SIZED: the drafter's merge op, registered here
+        # (model build, outside any trace).
+        _cp_mla_attention.prebuild_sized_merge(dcp_size)
 
-        def sparse_mla_attention_core_tpu_dcp(
+        def _sparse_mla_attention_dcp_run(
             kv_cache_nope: jax.Array,
             kv_cache_rope: jax.Array,
             ql_nope: jax.Array,
@@ -2253,6 +2308,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
+            rope_table: jax.Array | None,
+            rank_ids: jax.Array | None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
@@ -2274,17 +2331,159 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 k_scale=k_scale,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
+                q_rope_table=rope_table,
+                dcp_rank_ids=rank_ids,
             )
+
+        # The torch op schema is inferred from the signature: no varargs or
+        # defaults, so each (q_rope, rank operand) variant states its extra
+        # inputs explicitly. Trailing operand order: rope table, then rank ids.
+        # Flags off = exactly the original operands.
+        def sparse_mla_attention_core_tpu_dcp(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                None,
+                None,
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_qrope(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                None,
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_rank(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                None,
+                rank_ids,
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+            )
+
+        core_fn = {
+            (False, False): sparse_mla_attention_core_tpu_dcp,
+            (True, False): sparse_mla_attention_core_tpu_dcp_qrope,
+            (False, True): sparse_mla_attention_core_tpu_dcp_rank,
+            (True, True): sparse_mla_attention_core_tpu_dcp_qrope_rank,
+        }[(bool(q_rope), rank_tensor is not None)]
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
         )
+        if q_rope:
+            op_name += "_qrope"
+        if rank_tensor is not None:
+            op_name += "_rank"
+        input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
+        if q_rope:
+            input_specs = input_specs + (P(),)  # rope table, replicated
+        if rank_tensor is not None:
+            input_specs = input_specs + (P(DCP_AXIS_NAME),)  # rank ids, sharded
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
-            sparse_mla_attention_core_tpu_dcp,
+            core_fn,
             donate_argnums=(0, 1),
             mesh=mesh,
-            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+            input_partition_specs=input_specs,
             output_partition_specs=_SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS,
         )
 
@@ -2315,7 +2514,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             block_tables: torch.Tensor,
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
+            *rope_table: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            assert len(rope_table) == int(q_rope), "rope table iff q_rope"
             nope_cache, rope_cache = kv_cache
             new_nope, new_rope, outputs, lse = sparse_mla_jax_op(
                 nope_cache,
@@ -2329,6 +2530,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 block_tables,
                 query_start_loc,
                 request_distribution,
+                *rope_table,
+                *(() if rank_tensor is None else (rank_tensor,)),
             )
             nope_cache.copy_(new_nope)
             rope_cache.copy_(new_rope)
@@ -2379,12 +2582,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and self.dcp_size > 1
             and topk_indices is not None
         )
+        q_rope_table: list[torch.Tensor] = []
         if use_qrep:
             assert layer.W_UK_T_dcp_qrep is not None, (
                 "q_dcp_replicated was passed but W_UK_T_dcp_qrep was never "
                 "built; `process_weights_after_loading` must run first."
             )
-            q_nope, q_pe = q_dcp_replicated
+            # TPU_MLA_DECODE_PROLOGUE hands a third element: the per-token
+            # rope table, with q_pe then the raw (un-roped) q head view.
+            q_nope, q_pe, *q_rope_table = q_dcp_replicated
             w_uk_t_src = layer.W_UK_T_dcp_qrep
             w_uk_t_scale = layer.W_UK_T_dcp_qrep_scale
         else:
@@ -2392,21 +2598,30 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
         # W_UV runs before the DCP merge, so the merge carries v_head_dim.
-        uv_first = use_qrep and getattr(layer, "W_UV_dcp_qrep", None) is not None
+        # Not in the MTP drafter under TPU_MTP_DCP_MERGE_SIZED: the drafter's
+        # projected partial stays f32, and the sized merge only takes a 2-byte
+        # partial, so it would silently fall back to the f32 reduce-scatter.
+        uv_first = (
+            use_qrep
+            and getattr(layer, "W_UV_dcp_qrep", None) is not None
+            and (
+                not envs.TPU_MTP_DCP_MERGE_SIZED
+                or vllm_compilation_backends.model_tag == "backbone"
+            )
+        )
+        pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        q_nope_t = q_nope.transpose(0, 1)
-        w_uk_t = (
-            w_uk_t_src.to(q_nope_t.dtype)
-            if w_uk_t_src.dtype != q_nope_t.dtype
-            else w_uk_t_src
-        )
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+            ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+        else:
+            q_nope_t = q_nope.transpose(0, 1)
+            ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
+            if w_uk_t_scale is not None:
+                ql_nope = ql_nope * w_uk_t_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
@@ -2420,7 +2635,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
-        q_pe_flat = q_pe.view(-1, attn_heads, layer.qk_rope_head_dim)
+        q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
         kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
         k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
 
@@ -2456,7 +2671,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
-                partial, lse = layer.sparse_mla_dcp_op(
+                dcp_op = layer.sparse_mla_dcp_op
+                if q_rope_table:
+                    # TPU_MLA_DECODE_PROLOGUE: raw q head + rope table.
+                    dcp_op = layer.sparse_mla_dcp_rope_op
+                    assert dcp_op is not None, (
+                        "TPU_MLA_DECODE_PROLOGUE rope op was never built"
+                    )
+                partial, lse = dcp_op(
                     kv_cache,
                     ql_nope_dcp,
                     q_pe_dcp,
@@ -2467,6 +2689,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.block_tables,
                     attn_metadata.query_start_loc,
                     attn_metadata.request_distribution,
+                    *q_rope_table,
                 )
                 # The scatter undoes the head all-gather above.
                 #
@@ -2479,14 +2702,23 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # comparison would pin its graph to the first size, and the
                 # large buckets fail with ShapeSpecializationError. So the
                 # drafter keeps the reduce-scatter, as with the flag off.
+                is_backbone = vllm_compilation_backends.model_tag == "backbone"
+                wire_dtype = partial.dtype
                 if uv_first:
+                    # A narrowed merge rounds to the wire dtype anyway.
+                    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
                     partial = project_uv_heads(
-                        partial, layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale
+                        partial,
+                        layer.W_UV_dcp_qrep,
+                        layer.W_UV_dcp_qrep_scale,
+                        out_dtype=wire_dtype if narrow else torch.float32,
                     )
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
-                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    is_backbone=is_backbone,
+                    wire_dtype=wire_dtype,
+                    query_start_loc=attn_metadata.query_start_loc,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
