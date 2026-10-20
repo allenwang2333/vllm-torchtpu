@@ -7,8 +7,14 @@ from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
 from vllm.models.deepseek_v41.nvidia.model import DeepseekV4MoE
 
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
     VllmDeepseekV4Fp8Config,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+    VllmDeepseekV4Mxfp4MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
@@ -46,6 +52,11 @@ class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
+    # The TPU factory and device hooks construct these concrete modules.
+    experts: VllmMoERunner  # pyrefly: ignore[bad-override-mutable-attribute]
+    # pyrefly: ignore[bad-override-mutable-attribute]
+    shared_experts: DeepseekV4MLP | None
+
     def __init__(self, vllm_config, *args, **kwargs):
         if vllm_config.parallel_config.enable_eplb:
             raise NotImplementedError("V4.1 TPU MoE does not support EPLB")
@@ -65,7 +76,24 @@ class DeepseekV41MoE(DeepseekV4MoE):
         ):
             super().__init__(vllm_config, *args, **kwargs)
 
-    def forward(self, hidden_states, input_ids=None, mega_gate_metadata=None):
+    def supports_fp8_hidden_input(self) -> bool:
+        method = self.experts._quant_method
+        return (
+            isinstance(method, (VllmDeepseekV4Mxfp4MoEMethod, VllmFp8MoEMethodTPU))
+            and fused_moe_ep_supported(method)
+            and not self.experts.do_naive_dispatch_combine
+            and self.experts.routed_input_transform is None
+        )
+
+    def forward(
+        self,
+        hidden_states,
+        input_ids=None,
+        mega_gate_metadata=None,
+        *,
+        hidden_states_q=None,
+        hidden_states_scale=None,
+    ):
         if (
             self.use_sequence_parallel
             and input_ids is not None
@@ -77,4 +105,13 @@ class DeepseekV41MoE(DeepseekV4MoE):
             # the runner gathers those over the EP group (TpuDeviceCommunicator)
             # but passes input_ids through as this rank's shard.
             input_ids = get_ep_group().all_gather(input_ids, dim=0)
+        if hidden_states_q is not None:
+            output = self.experts.forward_prequantized(
+                hidden_states,
+                hidden_states,
+                input_ids=input_ids,
+                hidden_states_q=hidden_states_q,
+                hidden_states_scale=hidden_states_scale,
+            )
+            return output.view(hidden_states.shape)
         return super().forward(hidden_states, input_ids, mega_gate_metadata)

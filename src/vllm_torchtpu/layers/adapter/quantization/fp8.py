@@ -1064,6 +1064,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        hidden_states_q: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         layer = cast("TpuRoutedExperts", layer)
@@ -1113,6 +1116,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                hidden_states_q=hidden_states_q,
+                hidden_states_scale=hidden_states_scale,
             )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->

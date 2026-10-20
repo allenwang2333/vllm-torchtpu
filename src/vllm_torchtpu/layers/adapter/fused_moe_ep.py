@@ -43,7 +43,7 @@ usual story for anything that scales with hidden size.
 """
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -109,6 +109,7 @@ FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 # and the caller records it on the layer's own quant method; see
 # `fused_moe_ep_supported`.
 _OPS: dict[tuple, Any] = {}
+_PREQUANTIZED_OPS: dict[Any, Any] = {}
 # This is a fact about the mesh, not about a layer, so one copy for the process
 # is what it is: every layer in a deployment sees the same EP group.
 # This rank's mesh index, as a device tensor. The kernel needs it as data;
@@ -184,6 +185,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
+    prequantized=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -202,6 +204,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        prequantized,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -301,6 +304,82 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_prequantized(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hidden_states_q: jax.Array,
+        hidden_states_scale: jax.Array,
+    ) -> jax.Array:
+        result = call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hidden_states_q=hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+        )
+        return cast(jax.Array, result)
+
+    def moe_prequantized_score_bias(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        hidden_states_q: jax.Array,
+        hidden_states_scale: jax.Array,
+    ) -> jax.Array:
+        result = call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            hidden_states_q=hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+        )
+        return cast(jax.Array, result)
+
+    def moe_prequantized_hash_ids(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        hash_ids: jax.Array,
+        hidden_states_q: jax.Array,
+        hidden_states_scale: jax.Array,
+    ) -> jax.Array:
+        result = call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            hash_topk_ids=hash_ids.astype(jnp.int32),
+            hidden_states_q=hidden_states_q,
+            hidden_states_scale=hidden_states_scale,
+        )
+        return cast(jax.Array, result)
+
     assert not (has_score_bias and has_hash_ids)
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
@@ -315,6 +394,7 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((spec,) * 2 if prequantized else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -328,14 +408,22 @@ def _build_op(
         fn = moe_with_hash_ids
     else:
         fn = moe
+    if prequantized:
+        if has_score_bias:
+            fn = moe_prequantized_score_bias
+        elif has_hash_ids:
+            fn = moe_prequantized_hash_ids
+        else:
+            fn = moe_prequantized
     op = jax_op(
         name,
         fn,
         mesh=mesh,
         # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
         # -- and the single output is sharded on axis 0 like x.
-        input_partition_specs=input_specs,
-        output_partition_specs=spec,
+        # The pinned runtime accepts PartitionSpec trees, unlike its annotation.
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], input_specs),
+        output_partition_specs=cast(tuple[tuple[str, ...], ...], spec),
     )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
@@ -359,6 +447,9 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    *,
+    hidden_states_q: torch.Tensor | None = None,
+    hidden_states_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -374,8 +465,15 @@ def fused_moe_ep(
     thing on the layer -- prebuild built the op's signature around that.
     Getting it wrong is a torch arity error at the first call, not a wrong
     answer.
+
+    The optional activation pair is e4m3fn [tokens, hidden] plus float32
+    [tokens, 1], matching hidden_states' row order and sharding.
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    if (hidden_states_q is None) != (hidden_states_scale is None):
+        raise ValueError("hidden_states_q and hidden_states_scale must be paired")
+    if hidden_states_q is not None:
+        op = _PREQUANTIZED_OPS[op]
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N] (or the kernel's row-padded
         # flat [E * rows, N]). Even a single block must retain its axis; the
@@ -387,6 +485,8 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w2_scale),
         )
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    if hidden_states_q is not None:
+        extra += (hidden_states_q, hidden_states_scale)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -674,6 +774,22 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
+    )
+    _PREQUANTIZED_OPS[op] = _build_op(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        mesh_expert_order,
+        sharded_plan,
+        weight_format,
+        rhs_qb,
+        scoring_fn,
+        has_score_bias,
+        routed_scale,
+        has_hash_ids,
+        token_replica_groups=token_replica_groups,
+        prequantized=True,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

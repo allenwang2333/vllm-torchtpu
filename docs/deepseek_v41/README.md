@@ -39,6 +39,42 @@ silently move it to GMM. Unsupported weight/mesh/hardware contracts stop loading
 with an error; the generic `gmm` choice remains available. Other models retain
 their existing MoE admission behavior.
 
+### V2 producer-side MoE activation quantization
+
+The V2 adapter can pass prequantized FP8 activations and FP32 row scales explicitly
+to the routed MoE kernel, skipping local `rowquant_fp8` inside `quantize_local`.
+
+Shifted mHC produces normalized BF16 values together with the routed-MoE FP8
+representation (`moe_q`, `moe_scale`) in its epilogue. Router gates retain BF16.
+Routed MoE preserves its original quantization arithmetic: FP32 scale (`amax / 448`),
+BF16 reciprocal multiplication, and zero/nonfinite handling. Dispatch accepts the
+routed representation directly, preserving token layout, routing exchange, expert
+calculation, and output combine.
+
+Preserving the quantization formula does not establish bitwise equivalence of the
+surrounding program. Small FP32 mHC gate differences (≤4 ULP) at T288 remain an
+unresolved variance.
+
+### Cache ownership
+
+Cache ownership and compression order remain V4.1's. SWA retains BF16 values;
+compressed KV uses V4's native FP8 NoPE packing with separate BF16 RoPE storage.
+Bindings retain the original tensor owners. Both eager and compiled auxiliary
+operations use the canonical 2D `int32[..., 128]` pool; SWA and main attention
+derive their native 3D kernel shapes from that owner. Cache operations
+derive physical record indices using layout constants validated at binding time.
+Like V4, the attention and compressor paths consume the shared TPU
+`AttentionMetadata`; model adapters select logical slots from each cache's block
+table and compression geometry. The indexer resolves its block table inside the
+existing update-and-select operation, avoiding a Torch-side full-context slot
+matrix. CED derives only its fixed 128-token SWA window on the Torch side, where
+replay masks are already available. Its record conversion stays inside the op.
+Frozen record geometry is unpacked into scalar constants at each JAX bridge.
+Overlay validation checks both arrays by storage identity within each cache
+group; cross-group sharing follows the scheduler's disjoint block ownership.
+Engram retains its separate int32 token
+history, and the indexer uses native FP8 key packing and scoring.
+
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder
 rows, publishes global KV, and evaluates the decoder prompt tail. Prefix caching
