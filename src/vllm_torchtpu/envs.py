@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
+    TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -806,6 +807,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # v_head_dim (256) instead of kv_lora_rank (512). Replicates W_UV per rank.
     "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
         "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
+    # With TPU_DCP_MLA_UV_BEFORE_MERGE: apply W_UV before the merge only on
+    # the backbone's buckets of at least this many tokens (`T > bucket_gate_edge`;
+    # the prefill-sized ones, as #1935's TPU_DCP_MERGE_VSPACE did from 1024).
+    # The smaller buckets keep the latent merge and with it the decode send
+    # layout / fused small all-to-all, which carry the latent partial. The MTP
+    # drafter, traced once for every bucket, then keeps the latent merge. 0 =
+    # every bucket (and the drafter, as before).
+    "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", 0
     ),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins

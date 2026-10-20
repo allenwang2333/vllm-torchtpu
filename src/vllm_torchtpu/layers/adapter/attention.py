@@ -117,6 +117,20 @@ _absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
 _absorb_q.register_fake(_fake_absorb_q)
 
 
+def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """Whether a W_UV-before-merge layer (TPU_DCP_MLA_UV_BEFORE_MERGE) applies
+    W_UV ahead of the DCP merge for this bucket (fixed at trace time).
+
+    TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS=m > 0: only the backbone's buckets
+    `T > bucket_gate_edge(m)`; the backbone is traced once per bucket, so the
+    comparison is static. The MTP drafter has one graph for every bucket, so it
+    never compares and keeps the latent merge. m = 0: every bucket."""
+    min_tokens = envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS
+    if min_tokens <= 0:
+        return True
+    return is_backbone and num_tokens > envs.bucket_gate_edge(min_tokens)
+
+
 def _sparse_mla_trace_config(layer: Any) -> tuple[Any, Any, bool]:
     """What the sparse MLA kernel reads from its layer when it is traced.
 
@@ -2826,6 +2840,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             and (
                 not envs.TPU_MTP_DCP_MERGE_SIZED
                 or vllm_compilation_backends.model_tag == "backbone"
+            )
+            and _uv_before_merge_applies(
+                q_nope.shape[0], vllm_compilation_backends.model_tag == "backbone"
             )
         )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
