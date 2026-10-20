@@ -511,6 +511,30 @@ class PallasAllReduce:
             for s in range(ctx.N_AR_SLOTS):
                 pl.semaphore_wait(ctx.scr["ag_credit"].at[s], 3)
 
+    def ar_begin(self, slot, x, first):
+        """AR_DEFER (wide step, hier=2, unfolded payload): pack x [MR, H] into this slot and
+        start round 0; ar0_mid and ar0_end complete it."""
+        ctx = self.ctx
+        scr, me, sc, HC2 = ctx.scr, ctx.me, ctx.sc, ctx.HC2
+        send, recv = scr["send"], scr["recv"]
+        c_idx = lax.rem(me, 2)
+        assert ctx.AR_DEFER and ctx.WAR
+        with sc("ar_pack"):
+            val = x[:ctx.MR]
+
+            @pl.when(jnp.logical_not(first))
+            def _():
+                for rnd_i in self.ar_rounds(slot):
+                    for d in self.ar_copies(slot, rnd_i):
+                        d.wait_send()
+
+            send[slot, 0] = val[:, :HC2].astype(BF16)
+            send[slot, 1] = val[:, HC2:].astype(BF16)
+            recv[slot, c_idx] = send[slot, c_idx]
+        with sc("ar_comm"):
+            for d in self.ar_copies(slot, 0):
+                d.start()
+
     def ar0_mid(self, slot, first):
         """AR0S hier=2, deferred (wide step): wait and sum round 0, start round 1."""
         ctx = self.ctx

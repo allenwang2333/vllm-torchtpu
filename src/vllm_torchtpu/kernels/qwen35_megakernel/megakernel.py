@@ -509,7 +509,30 @@ def kernel_wide(ctx: MKBuildContext, refs):
                     res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
             return carry_m
 
-        lax.fori_loop(0, N_MB, moe_ar, 0)
+        def moe_ar_begin(m):
+            ars, first = ar_slot(l * (2 * N_MB) + N_MB + m)
+            with sc("moe_ar_begin", 3):
+                allreduce_blk.ar_begin(ars, part_all[rows(m)], first)
+                allreduce_blk.ar0_mid(ars, first)
+
+        def moe_ar_end(m, carry_m):
+            ars, _ = ar_slot(l * (2 * N_MB) + N_MB + m)
+            with sc("moe_ar_end", 3):
+                tot = allreduce_blk.ar0_end(ars)
+                with sc("ar_res"):
+                    res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
+            return carry_m
+
+        def moe_ar_piped(m, carry_m):
+            """Microbatch m + 1's all-reduce is under way before m's completes."""
+            pl.when(m + 1 < N_MB)(lambda: moe_ar_begin(m + 1))
+            return moe_ar_end(m, carry_m)
+
+        if AR_DEFER:
+            moe_ar_begin(0)
+            lax.fori_loop(0, N_MB, moe_ar_piped, 0)
+        else:
+            lax.fori_loop(0, N_MB, moe_ar, 0)
         return carry
 
     def layer_scoped(l, carry):
