@@ -539,12 +539,24 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # input exists in every CED step so the compiled graph does not
             # depend on whether prefix caching is on.
             window_starts = _window_starts(first, positions)
+            encoder_kwargs = {"deepseek_v41_window_starts": window_starts}
+            if envs.TPU_MOE_SPREAD_PADDED_ROWS:
+                # One element, present in every step (warmup included): a
+                # per-token tensor would add a second token dimension to the
+                # guard-free graph.
+                encoder_kwargs["moe_valid_rows"] = (
+                    first.query_start_loc[-1:]
+                    if first is not None
+                    else torch.full(
+                        (1,),
+                        positions.shape[0],
+                        dtype=torch.int32,
+                        device=positions.device,
+                    )
+                )
             encoder_context = replace(
                 context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
+                additional_kwargs={**context.additional_kwargs, **encoder_kwargs},
             )
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:

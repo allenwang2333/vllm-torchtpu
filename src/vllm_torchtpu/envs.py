@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_EXPERT_PERM_PATH: str = ""
+    TPU_MOE_SPREAD_PADDED_ROWS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -727,6 +728,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # JSON file of static per-layer MoE expert permutations, applied to the
     # checkpoint at weight load (expert_permutation.py). Unset: off.
     "TPU_MOE_EXPERT_PERM_PATH": lambda: os.getenv("TPU_MOE_EXPERT_PERM_PATH", ""),
+    # Fused EP MoE: route the padding rows of stages that publish their real
+    # row count (DSv4.1 v2 encoder) to consecutive experts, row by row,
+    # instead of letting identical padding rows all pick the same experts.
+    "TPU_MOE_SPREAD_PADDED_ROWS": env_bool("TPU_MOE_SPREAD_PADDED_ROWS"),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is

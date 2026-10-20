@@ -49,6 +49,7 @@ import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
 from torch_tpu._internal.pallas import jax_op
+from vllm.forward_context import get_forward_context, is_forward_context_available
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -376,8 +377,49 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
+    if envs.TPU_MOE_SPREAD_PADDED_ROWS:
+        router_logits, hash_ids = spread_padded_rows(
+            router_logits, hash_ids, owner.moe.experts_per_token
+        )
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+# Larger than any router logit plus score-correction bias, small enough for bf16.
+_SPREAD_LOGIT = 1.0e4
+
+
+def spread_padded_rows(
+    router_logits: torch.Tensor, hash_ids: torch.Tensor | None, topk: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Send padding row r to experts r*topk .. r*topk+topk-1 (mod experts).
+
+    Padding rows are identical, so the router sends all of them to the same
+    top-k experts, and the fused kernel then runs every padding row of every
+    rank on those few shards. Spread out, they cost the kernel what the same
+    number of real rows costs. Real rows keep their logits and ids; padding
+    output is discarded. A stage opts in by putting its real row count in the
+    forward context's `moe_valid_rows` ([1] int32, so the graph gains no
+    per-token input); rows from that count on are padding.
+    """
+    if not is_forward_context_available():
+        return router_logits, hash_ids
+    valid = get_forward_context().additional_kwargs.get("moe_valid_rows")
+    if valid is None:
+        return router_logits, hash_ids
+    rows, experts = router_logits.shape
+    row = torch.arange(rows, device=router_logits.device)[:, None]
+    padded = row >= valid[0]
+    first = row * topk % experts
+    column = torch.arange(experts, device=router_logits.device)[None, :]
+    chosen = (column - first) % experts < topk
+    spread = torch.where(chosen, _SPREAD_LOGIT, -_SPREAD_LOGIT).to(router_logits.dtype)
+    router_logits = torch.where(padded, spread, router_logits)
+    if hash_ids is not None:
+        slot = torch.arange(hash_ids.shape[1], device=hash_ids.device)[None, :]
+        spread_ids = ((first + slot) % experts).to(hash_ids.dtype)
+        hash_ids = torch.where(padded, spread_ids, hash_ids)
+    return router_logits, hash_ids
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and

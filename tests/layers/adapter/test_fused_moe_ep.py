@@ -1076,3 +1076,36 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+def _with_valid_rows(monkeypatch, valid_rows):
+    valid = torch.tensor([valid_rows], dtype=torch.int32)
+    context = SimpleNamespace(additional_kwargs={"moe_valid_rows": valid})
+    monkeypatch.setattr(bridge, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(bridge, "get_forward_context", lambda: context)
+
+
+def test_spread_padded_rows_routes_padding_to_consecutive_experts(monkeypatch):
+    rows, experts, topk = 6, 8, 3
+    logits = torch.randn(rows, experts, dtype=torch.bfloat16)
+    hash_ids = torch.randint(0, experts, (rows, topk), dtype=torch.int32)
+    _with_valid_rows(monkeypatch, 2)
+    spread, ids = bridge.spread_padded_rows(logits, hash_ids, topk)
+    assert torch.equal(spread[:2], logits[:2]) and torch.equal(ids[:2], hash_ids[:2])
+    for row in range(2, rows):
+        want = sorted((row * topk + j) % experts for j in range(topk))
+        assert sorted(spread[row].float().topk(topk).indices.tolist()) == want
+        assert sorted(ids[row].tolist()) == want
+    # Every expert is used equally often by the padding rows (12 picks / 8).
+    picks = torch.bincount(ids[2:].flatten().long(), minlength=experts)
+    assert picks.max() - picks.min() <= 1
+
+
+def test_spread_padded_rows_without_a_mask_is_identity(monkeypatch):
+    logits = torch.randn(4, 8)
+    monkeypatch.setattr(bridge, "is_forward_context_available", lambda: False)
+    assert bridge.spread_padded_rows(logits, None, 2)[0] is logits
+    monkeypatch.setattr(bridge, "is_forward_context_available", lambda: True)
+    context = SimpleNamespace(additional_kwargs={"token_padding_mask": None})
+    monkeypatch.setattr(bridge, "get_forward_context", lambda: context)
+    assert bridge.spread_padded_rows(logits, None, 2)[0] is logits
