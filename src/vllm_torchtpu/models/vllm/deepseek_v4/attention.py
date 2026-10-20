@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
@@ -383,6 +384,9 @@ class VllmDeepseekV4MLAAttention(
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
+            **(
+                {"csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD} if is_csa else {}
+            ),
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")

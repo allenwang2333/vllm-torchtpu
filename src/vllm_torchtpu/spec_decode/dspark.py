@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch
 from vllm.config import VllmConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
@@ -81,6 +82,12 @@ class DSparkProposer(DFlashProposer):
                 "DSpark on TPU does not support draft_sample_method="
                 f"{spec.draft_sample_method!r}."
             )
+        self._vocab_parallel_markov = envs.TPU_DSPARK_VOCAB_PARALLEL_MARKOV
+        if self._vocab_parallel_markov and self._probabilistic:
+            raise ValueError(
+                "TPU_DSPARK_VOCAB_PARALLEL_MARKOV implements greedy drafting "
+                "only; set draft_sample_method='greedy'."
+            )
         # Width of compute_draft_logits: a reduced-vocab draft samples in its
         # own vocabulary and remaps after, which draws the same token as
         # upstream's scatter into target space (the other columns are -inf).
@@ -88,7 +95,9 @@ class DSparkProposer(DFlashProposer):
             "vocab_size"
         )
         if self._probabilistic and not self._draft_vocab_size:
-            raise ValueError("Probabilistic DSpark drafting needs the draft vocab size.")
+            raise ValueError(
+                "Probabilistic DSpark drafting needs the draft vocab size."
+            )
         # Keyed by padded request count: the all-greedy inputs of dummy
         # forwards.
         self._dummy_sample_inputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -129,6 +138,14 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if self._vocab_parallel_markov:
+            if not hasattr(self.draft_model, "prepare_vocab_parallel_markov"):
+                raise RuntimeError(
+                    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV: "
+                    f"{type(self.draft_model).__name__} has no vocabulary-parallel "
+                    "Markov head."
+                )
+            self.draft_model.prepare_vocab_parallel_markov()
 
     def _num_sampled(self, block_size: int) -> int:
         return block_size if self.sample_from_anchor else block_size - 1
@@ -221,17 +238,30 @@ class DSparkProposer(DFlashProposer):
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
-        # Draft-vocab logits for every slot; the Markov bias is added in
-        # draft space and ids are remapped to target vocab after sampling.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
-
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
         prev = ids_3d[:, 0]
         draft_tokens = []
         sample_start = 0 if self.sample_from_anchor else 1
+        if self._vocab_parallel_markov:
+            # Greedy on this rank's vocabulary shard; one (max, argmax) pair
+            # per rank and row is exchanged per draft position.
+            logits = self.draft_model.compute_draft_logits_local(valid_hidden)
+            logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+            for i in range(sample_start, block_size):
+                bias = self.draft_model.markov_bias_local(
+                    self.draft_model.markov_embed(prev)
+                )
+                step = self.draft_model.vocab_parallel_argmax(logits_3d[:, i] + bias)
+                draft_tokens.append(step)
+                prev = step
+            return torch.stack(draft_tokens, dim=1), hidden
+
+        # Draft-vocab logits for every slot; the Markov bias is added in
+        # draft space and ids are remapped to target vocab after sampling.
+        logits = self.draft_model.compute_draft_logits(valid_hidden)
+        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
         for j, i in enumerate(range(sample_start, block_size)):
             bias = self.draft_model.markov_bias(self.draft_model.markov_embed(prev))
             step = self.draft_model.map_draft_to_target(
