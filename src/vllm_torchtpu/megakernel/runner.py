@@ -344,12 +344,18 @@ class MegakernelModelRunner(TPUModelRunner):
             )
         self._update_states(scheduler_output)
         self._finished_req_ids_pending.update(scheduler_output.finished_req_ids)
-        if self.scheduler_config.async_scheduling:
-            self._flush_disjoint_async_results()
+        # The KV connector before the flush: the flush waits for the previous
+        # step's tokens (the device), and a prefill registers the blocks of the
+        # requests it finished for their transfer in the connector's setup.
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
+                if self.scheduler_config.async_scheduling:
+                    self._flush_disjoint_async_results()
                 return EMPTY_MODEL_RUNNER_OUTPUT
-            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            if self.scheduler_config.async_scheduling:
+                self._flush_disjoint_async_results()
+            return output
         with set_forward_context(None, self.vllm_config):
             raiden_inline = dist_utils.get_raiden_inline_load()
             self.maybe_setup_kv_connector(
@@ -357,6 +363,8 @@ class MegakernelModelRunner(TPUModelRunner):
                 wait_for_completion=raiden_inline,
                 report_completion=not raiden_inline,
             )
+        if self.scheduler_config.async_scheduling:
+            self._flush_disjoint_async_results()
         step_input = self._prepare_step_input(scheduler_output)
         assert self.program is not None
         if (
