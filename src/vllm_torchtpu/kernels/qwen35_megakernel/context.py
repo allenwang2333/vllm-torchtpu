@@ -107,6 +107,11 @@ WIDE_TILE_REUSE = True
 # expert only), so a parity against the no-experts kernel shows whether the loop itself disturbs
 # later phases.
 WIDE_SCATTER = True
+# Fold each gathered row's routing weight into the expert's activated intermediate (the down
+# projection is linear), so the scatter-add is a plain one-hot matmul over CAP rows instead of
+# the weight's bf16 high and low parts over 2 * CAP rows. Rounds w * mid to bf16 before the
+# down projection (and the weighted output to bf16) instead of rounding the unweighted output.
+WIDE_WEIGHT_MID = True
 
 
 class MKBuildContext:
@@ -706,6 +711,7 @@ class MKBuildContext:
         self.AR_XLAYER = AR_XLAYER
         self.WIDE_TILE_REUSE = WIDE_TILE_REUSE
         self.WIDE_SCATTER = WIDE_SCATTER
+        self.WIDE_WEIGHT_MID = WIDE_WEIGHT_MID
         self.BLIVE = c_wide.B  # live rows of the wide step (the rest of the tail is padding)
         self.vshape, self.vdtype = vshape, vdtype
         self.scratch = scratch

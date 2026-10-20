@@ -880,6 +880,8 @@ class MoEBlock:
                 v = v + jnp.where(lane >= sh, pltpu.roll(v, sh, 1), 0)
             return v
 
+        WMID = bool(ctx.WIDE_WEIGHT_MID and ctx.WIDE_SCATTER and ctx.WIDE_SCATTER_TN)
+
         def expert_w(i, carry):
             with sc("ew_iter", 3):
                 return expert_w_body(i, carry)
@@ -933,9 +935,8 @@ class MoEBlock:
                             accw[0:CAP, 0:BN] += m13
                         pl.when(last)(lambda t=t: egive(base_u + t, l, t))
                     h = accw[0:CAP, 0:BN] * es[:, :BN]
-                    midw[0:CAP, 0:IR] = rnd(
-                        rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])
-                    ).astype(BF16)
+                    mid = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+                    midw[0:CAP, 0:IR] = (mid * w if WMID else mid).astype(BF16)
                     for t in range(T2):
                         m2 = mm(midw[0:CAP, t * TK2:(t + 1) * TK2], w2[t][...])
                         if t == 0:
@@ -953,6 +954,13 @@ class MoEBlock:
                     # transposed one-hot scatter-add in 64-row pieces of part_all
                     if not ctx.WIDE_SCATTER:
                         part_all[0:8, 0:128] += 0.0 * y[0:8, 0:128]  # keeps the expert work live
+                    elif WMID:  # y carries the weights: one-hot over the CAP rows
+                        yb = y.astype(BF16)
+                        for r0 in range(0, BWP, 64):
+                            part_all[r0:r0 + 64, :] += lax.dot_general(
+                                gm[:, r0:r0 + 64], yb, (((0,), (0,)), ((), ())),
+                                preferred_element_type=F32,
+                            )
                     elif ctx.WIDE_SCATTER_TN:
                         gwb = gw.astype(BF16)
                         for r0 in range(0, BWP, 64):
