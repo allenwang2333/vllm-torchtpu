@@ -150,12 +150,15 @@ def _row_slice_for(name: str) -> tuple[int, int] | None:
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
+    from vllm_torchtpu.expert_permutation import relabelled_expert_id
+
     expert_id = parse_expert_id(name)
     if expert_id is None:
         return False
     if not name.endswith(_EXPERT_WEIGHT_SUFFIXES):
         return False
-    return expert_id not in local_expert_ids
+    # A relabelled layer keeps the experts whose NEW id is local.
+    return relabelled_expert_id(name, expert_id) not in local_expert_ids
 
 
 def _should_skip_weight_tpu(

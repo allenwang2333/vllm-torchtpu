@@ -13,6 +13,7 @@ from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.expert_permutation import relabel_checkpoint
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -1184,3 +1185,8 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
         )
+
+    def load_weights(self, weights):
+        # TPU_MOE_EXPERT_PERM_PATH relabels experts in the checkpoint stream;
+        # off, the stream passes through unchanged.
+        return super().load_weights(relabel_checkpoint(weights))
