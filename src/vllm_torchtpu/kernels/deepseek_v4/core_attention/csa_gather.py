@@ -198,7 +198,7 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k",))
+@functools.partial(jax.jit, static_argnames=("top_k", "trim_padding"))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -206,6 +206,7 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    trim_padding: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -222,6 +223,10 @@ def csa_gather(
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      trim_padding: N is padded up to the kernel's block (32 * top_k rows on
+        tpu7x); True slices the outputs back to N rows, which is a copy of
+        the whole gathered buffer. False returns the padded buffers: rows
+        past N are unwritten, for consumers that index rows explicitly.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -314,4 +319,6 @@ def csa_gather(
             name="sc_csa_gather",
         )(nope_cache, rope_cache, indices, valid_indices),
     )  # pyrefly: ignore[not-iterable]
+    if not trim_padding:
+        return nope_out, rope_out
     return nope_out[:out_size], rope_out[: out_size // 4]

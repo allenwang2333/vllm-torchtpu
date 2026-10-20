@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -258,6 +259,7 @@ def _attention_csa(
         # chunk's attention); batches of 8 win throughout.
         gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 64,
         attention_kernel_batch_size=8,
+        keep_gather_padding=envs.TPU_DSV4_CSA_KEEP_GATHER_PADDING,
     )
     return output, updated_sw_cache
 

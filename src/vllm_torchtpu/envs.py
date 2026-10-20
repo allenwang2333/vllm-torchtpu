@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
     VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS: int = 0
+    TPU_DSV4_CSA_KEEP_GATHER_PADDING: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -890,6 +891,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": env_with_choices(
         "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has", ["has", "sal"]
     ),
+    # DeepSeek-V4 CSA: hand the SparseCore gather's block-padded output to the
+    # attention kernel as is, skipping the slice that copies the gathered
+    # buffer back to the chunk size (8 MB per CSA layer at 16 tokens).
+    "TPU_DSV4_CSA_KEEP_GATHER_PADDING": env_bool("TPU_DSV4_CSA_KEEP_GATHER_PADDING"),
     # DeepSeek-V4 mHC: run the Sinkhorn/post/comb gates inside the Pallas
     # pre/seam kernels (instead of as ~150 tiny XLA ops per call) for token
     # buckets up to this size. 0 keeps them in XLA.

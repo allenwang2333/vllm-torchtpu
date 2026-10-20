@@ -652,6 +652,7 @@ def prepare_outputs(
         "attention_kernel_batch_size",
         "gather_and_attention_chunk_size",
         "vmem_limit_bytes",
+        "keep_gather_padding",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -672,6 +673,7 @@ def sparse_ragged_paged_attention(
     gather_and_attention_chunk_size: int = 128,
     attention_kernel_batch_size: int = 16,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    keep_gather_padding: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -690,6 +692,9 @@ def sparse_ragged_paged_attention(
         k is also the total number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      keep_gather_padding: hand the gather's block-padded buffers to the
+        attention kernel instead of slicing them to the chunk (see
+        `csa_gather.csa_gather(trim_padding=...)`).
 
     Returns:
       The output of attention.
@@ -921,9 +926,12 @@ def sparse_ragged_paged_attention(
             indices,
             num_valid_indices=num_valid_indices,
             top_k=topk,
+            # The kernel reads rows relative to start_pos, never past chunk_size.
+            trim_padding=not keep_gather_padding,
         )
-        gathered_nope_buffer = gathered_nope_buffer.reshape(chunk_size, topk, -1)
-        gathered_rope_buffer = gathered_rope_buffer.reshape(chunk_size, topk // 4, -1)
+        lanes = gathered_nope_buffer.shape[-1]
+        gathered_nope_buffer = gathered_nope_buffer.reshape(-1, topk, lanes)
+        gathered_rope_buffer = gathered_rope_buffer.reshape(-1, topk // 4, lanes)
 
         q = run_mla_kernel(
             q,
