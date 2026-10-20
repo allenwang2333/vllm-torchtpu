@@ -1165,6 +1165,58 @@ def convert_cache_to_seq_along_lane(
     )
 
 
+def _token_seq_ids(
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]
+    num_tokens: int,
+    max_num_seqs: int,
+) -> jax.Array:  # i32[num_tokens]
+    """Sequence of each token row (rows past the batch get `distribution[2]`)."""
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
+    seq_mask = jnp.where(
+        jnp.arange(max_num_seqs)[None, :] < distribution[2], seq_mask, False
+    )
+    return jnp.sum(seq_mask, axis=1)
+
+
+def kv_split_window(
+    seq_lens: jax.Array,  # i32[max_num_seqs]
+    rank: jax.Array | int,
+    *,
+    kv_split: int,
+    compression_ratio: int,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """(first row, row count) of rank `rank`'s share of each sequence's
+    compressed positions: contiguous whole pages, the same count per rank."""
+    kv_len = seq_lens // compression_ratio
+    pages = cdiv(kv_len, page_size)
+    per_rank = cdiv(pages, kv_split)
+    start = jnp.minimum(rank * per_rank, pages) * page_size
+    return start, jnp.clip(kv_len - start, 0, per_rank * page_size)
+
+
+def merge_kv_split_topk(
+    local: jax.Array,  # i32[kv_split, T, 2 * k]: (indices, score bits) per rank
+    k: int,
+) -> jax.Array:  # i32[T, k]
+    """Global top-k from every rank's `kv_split` top-k, in column order.
+
+    A global winner is beaten by fewer than k positions, so by fewer than k on
+    its own rank, and survives there. Ranks own increasing column ranges and
+    each lists its winners in column order, so the rank-major candidate list
+    is in column order and the merge breaks ties toward the lowest column,
+    as the unsplit top-k does.
+    """
+    num_ranks, num_tokens, _ = local.shape
+    cand = local.reshape(num_ranks, num_tokens, 2, k).transpose(2, 1, 0, 3)
+    cand = cand.reshape(2, num_tokens, num_ranks * k)
+    win = sparsecore_topk(cand[1], k, write_empty_rows=True)
+    picked = jnp.take_along_axis(cand[0], jnp.maximum(win, 0), axis=1)
+    return jnp.where(win >= 0, picked, -1)
+
+
 def _effective_row_lengths(
     seq_lens: jax.Array,  # i32[max_num_seqs]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -1175,18 +1227,18 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    kv_window: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
     Under context parallelism the score matrix is rank-local, so the row length
-    is the number of globally-visible positions that *this* rank owns.
+    is the number of globally-visible positions that *this* rank owns. With a
+    `kv_window` (per-sequence first row and row count) it is the number of
+    visible positions inside the window.
     """
-    max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
     token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    seq_mask = token_ids[:, None] >= cu_q_lens[None, 1 : max_num_seqs + 1]
-    seq_mask = jnp.where(jnp.arange(max_num_seqs)[None, :] < num_seqs, seq_mask, False)
-    seq_ids = jnp.sum(seq_mask, axis=1)
+    seq_ids = _token_seq_ids(cu_q_lens, distribution, num_tokens, seq_lens.shape[0])
 
     q_start = cu_q_lens[seq_ids]
     q_len = cu_q_lens[seq_ids + 1] - q_start
@@ -1195,6 +1247,9 @@ def _effective_row_lengths(
     kv_len = seq_len // compression_ratio
     visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
+    if kv_window is not None:
+        win_start, win_len = kv_window
+        visible = jnp.clip(visible - win_start[seq_ids], 0, win_len[seq_ids])
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
 
@@ -1219,6 +1274,7 @@ def _effective_row_lengths(
         "split_mixed_blocks",
         "sc_topk_one_launch",
         "sc_topk_coop_max_rows",
+        "kv_split",
     ),
 )
 def streamindex_topk(
@@ -1251,6 +1307,8 @@ def streamindex_topk(
     split_mixed_blocks: bool = False,
     sc_topk_one_launch: bool = False,
     sc_topk_coop_max_rows: int = 0,
+    kv_split: int = 1,
+    kv_split_rank: jax.Array | int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1323,6 +1381,10 @@ def streamindex_topk(
         `chunk_tokens` chunks the call.
       sc_topk_one_launch: `sparsecore_topk`'s `one_launch`.
       sc_topk_coop_max_rows: `sparsecore_topk`'s `coop_max_rows`.
+      kv_split: score only rank `kv_split_rank`'s share of every sequence's
+        compressed positions (`kv_split_window`) of a cache every rank holds
+        whole. Returns that share's top-k as global columns, with scores;
+        `merge_kv_split_topk` over all ranks' results is the unsplit top-k.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1425,6 +1487,30 @@ def streamindex_topk(
         _, page_size_per_kv_packing, kv_packing, _ = cache_kv.shape
         page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
+
+    kv_window = None
+    global_seq_lens = seq_lens
+    if kv_split > 1:
+        if cp_size > 1 or enable_early_exit:
+            raise NotImplementedError("kv_split needs cp_size == 1, no early exit.")
+        return_scores = True
+        kv_window = kv_split_window(
+            seq_lens,
+            kv_split_rank,
+            kv_split=kv_split,
+            compression_ratio=compression_ratio,
+            page_size=page_size,
+        )
+        # The passes see each sequence as its window alone: the page table
+        # row starts at the window's first page, the length is the window's.
+        first_page = kv_window[0] // page_size
+        cols = jnp.arange(pages_per_seq, dtype=jnp.int32)[None, :] + first_page[:, None]
+        page_indices = jnp.take_along_axis(
+            page_indices.reshape(max_num_seqs, pages_per_seq),
+            jnp.minimum(cols, pages_per_seq - 1),
+            axis=1,
+        ).reshape(-1)
+        seq_lens = kv_window[1] * compression_ratio
 
     for bkv_p in num_kv_pages_per_blocks:
         bkv_sz = page_size * bkv_p
@@ -1732,7 +1818,7 @@ def streamindex_topk(
 
         num_positions = max(num_sublanes_total * 128, k)
         eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
+            seq_lens=global_seq_lens,
             cu_q_lens=cu_q_lens,
             distribution=distribution,
             num_tokens=max_num_tokens,
@@ -1741,6 +1827,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            kv_window=kv_window,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1854,6 +1941,12 @@ def streamindex_topk(
             return pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces)
 
         out = assemble(topk_idxs)[:max_num_tokens, :k]
+        if kv_window is not None:
+            seq_ids = _token_seq_ids(
+                cu_q_lens, distribution, max_num_tokens, max_num_seqs
+            )
+            first_row = jnp.pad(kv_window[0], (0, 1))[seq_ids]
+            out = jnp.where(out >= 0, out + first_row[:, None], -1)
 
         if cp_size == 1 and not return_scores:
             return out

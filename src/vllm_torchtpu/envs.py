@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
     TPU_DSV4_SC_TOPK_ONE_LAUNCH: bool = False
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
+    TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -932,6 +933,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # row over a group of subcores (the cooperative pass) instead of giving
     # each row one subcore: a decode batch holds a few long rows. 0 = off.
     "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": env_int("TPU_DSV4_SC_TOPK_COOP_MAX_ROWS", 0),
+    # Token buckets from which the DSv4 indexer splits each sequence's
+    # compressed positions over the TP ranks (each scores its share of the
+    # replicated K cache, then the ranks merge their top-k). 0 = off.
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": env_int(
+        "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS", 0
+    ),
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
     "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
