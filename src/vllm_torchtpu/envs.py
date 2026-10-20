@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_SEGMENT_TOKENIZE_VERIFY_EVERY: int = 0
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1135,6 +1136,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Every N-th segment-tokenized prompt is also fully encoded and compared;
+    # a difference raises. 0 disables the check.
+    "VLLM_TPU_SEGMENT_TOKENIZE_VERIFY_EVERY": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_VERIFY_EVERY", 0
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.

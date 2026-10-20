@@ -5,12 +5,21 @@ The piecewise path must return the same ids as the backend's own
 ``encode(text, add_special_tokens=False)`` for every input, cold or cached.
 """
 
+import json
 import os
 import random
 
 import pytest
 import tokenizers
-from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, trainers
+from tokenizers import (
+    AddedToken,
+    Tokenizer,
+    decoders,
+    models,
+    normalizers,
+    pre_tokenizers,
+    trainers,
+)
 
 from vllm_torchtpu.segment_tokenize import SegmentTokenizer
 
@@ -152,10 +161,45 @@ def test_shared_backend_truncation_does_not_leak():
     assert seg.encode(text) == want
 
 
-@pytest.mark.parametrize("flag", ["lstrip", "rstrip", "single_word", "normalized"])
+@pytest.mark.parametrize("flag", ["lstrip", "rstrip", "single_word"])
 def test_ineligible_added_tokens(flag):
     tok = _toy_tokenizer(extra_added=[AddedToken("<x>", **{flag: True})])
     assert SegmentTokenizer.eligible(tok) is not None
+
+
+def test_normalized_added_tokens_need_identity_normalizer():
+    tok = _toy_tokenizer(extra_added=[AddedToken("<x>", normalized=True)])
+    assert SegmentTokenizer.eligible(tok) is None
+    tok.normalizer = normalizers.Sequence([])
+    assert SegmentTokenizer.eligible(tok) is None
+    tok.normalizer = normalizers.Lowercase()
+    assert SegmentTokenizer.eligible(tok) is not None
+
+
+# normalized=True tokens that overlap the normalized=False ones: tokenizers
+# matches normalized=False first over the whole text, so "q<a>bq" is
+# "q" + "<a>b" + "q", while one leftmost-longest pass would take "q<a" first.
+NORMALIZED = ["q<a", "<a>bq", "zz", "<|user|>x"]
+
+
+def test_normalized_and_raw_added_tokens_match_full_encode():
+    tok = _toy_tokenizer(
+        extra_added=[AddedToken(s, normalized=True) for s in NORMALIZED]
+    )
+    tok.normalizer = normalizers.Sequence([])  # as in DeepSeek tokenizer.json
+    assert SegmentTokenizer.eligible(tok) is None
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000)
+    for text in ["q<a>bq", "q<a", "zzz<|user|>x", "<a>bq<a>bqzz", "q<a>b<a"]:
+        assert seg.encode(text) == tok.encode(text, add_special_tokens=False).ids
+    rng = random.Random(4)
+    for _ in range(2000):
+        text = "".join(
+            rng.choice(NORMALIZED + ["q", "<a", ">", "z"]) + _random_text(rng, 2)
+            for _ in range(rng.randrange(1, 12))
+        )
+        want = tok.encode(text, add_special_tokens=False).ids
+        assert seg.encode(text) == want, repr(text)
+        assert seg.encode(text) == want, repr(text)
 
 
 def test_encode_special_tokens_ineligible():
@@ -244,8 +288,22 @@ def test_glm_same_block_hashes():
     assert len(a) >= 256 and hashes(a) == hashes(b)
 
 
-def test_renderer_patch_routes_and_falls_back(monkeypatch):
+@pytest.fixture
+def restore_renderers(monkeypatch):
+    """Undo patch_renderer_segment_tokenize on both patched renderer classes."""
     pytest.importorskip("vllm")
+    from vllm.renderers.base import BaseRenderer
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+
+    for cls, name in (
+        (BaseRenderer, "_tokenize_prompt"),
+        (DeepseekV4Renderer, "_apply_chat_template"),
+    ):
+        monkeypatch.setattr(cls, name, cls.__dict__[name])
+        monkeypatch.setattr(cls, "_tpu_segment_tokenize", False, raising=False)
+
+
+def test_renderer_patch_routes_and_falls_back(monkeypatch, restore_renderers):
     from vllm.renderers import base as renderer_base
 
     from vllm_torchtpu import envs
@@ -311,3 +369,125 @@ def test_renderer_patch_routes_and_falls_back(monkeypatch):
         cls._tokenize_prompt = saved
         cls._tpu_segment_tokenize = False
         assert envs.VLLM_TPU_SEGMENT_TOKENIZE is True
+
+
+# A local DeepSeek-V4 tokenizer directory (tokenizer.json + tokenizer_config.json).
+DSV4 = os.environ.get("SEGMENT_TOKENIZE_TEST_DSV4_TOKENIZER")
+
+
+def _dsv4_tokenizer():
+    if not DSV4:
+        pytest.skip("SEGMENT_TOKENIZE_TEST_DSV4_TOKENIZER is not set")
+    pytest.importorskip("vllm")
+    from vllm.tokenizers.deepseek_v4 import DeepseekV4Tokenizer
+
+    return DeepseekV4Tokenizer.from_pretrained(DSV4)
+
+
+DSV4_ATOMS = [
+    "<｜User｜>",
+    "<｜Assistant｜>",
+    "<｜end▁of▁sentence｜>",
+    "<｜begin▁of▁sentence｜>",
+    "<think>",
+    "</think>",
+    "｜DSML｜",
+    "<｜DSML｜",
+    "<｜User",
+    "｜>",
+    "<tool_result>",
+    "\n\n",
+    "😀",
+    "东京",
+]
+
+
+def _dsv4_conversation(rng, n_msgs, words):
+    vocab = CORPUS.split() + DSV4_ATOMS
+    body = lambda n: " ".join(rng.choice(vocab) for _ in range(n))  # noqa: E731
+    msgs = [{"role": "system", "content": body(words)}]
+    for i in range(n_msgs):
+        if i % 3 == 1:
+            call = {"name": "Bash", "arguments": json.dumps({"command": body(8)})}
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": body(rng.randrange(1, words)),
+                    "tool_calls": [
+                        {"id": f"c{i}", "type": "function", "function": call}
+                    ],
+                }
+            )
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": body(40)})
+        else:
+            role = "assistant" if msgs[-1]["role"] in ("user", "tool") else "user"
+            msgs.append({"role": role, "content": body(rng.randrange(1, words))})
+    if msgs[-1]["role"] == "assistant":
+        msgs.append({"role": "user", "content": "go on"})
+    return msgs
+
+
+def test_dsv4_chat_prompts_match_full_encode():
+    """DeepSeek-V4 marks its chat tokens normalized=True over an empty normalizer."""
+    tok = _dsv4_tokenizer()
+    assert SegmentTokenizer.eligible(tok.backend_tokenizer) is None
+    seg = SegmentTokenizer(tok.backend_tokenizer, max_cached_tokens=1 << 22)
+    rng = random.Random(5)
+    for _ in range(30):
+        msgs = _dsv4_conversation(rng, rng.randrange(1, 20), 300)
+        for _turn in range(3):
+            want = tok.apply_chat_template(msgs, conversation=msgs)
+            text = tok.apply_chat_template(msgs, conversation=msgs, tokenize=False)
+            assert seg.encode(text) == want
+            msgs = msgs + _dsv4_conversation(rng, 2, 200)[1:]
+    assert seg.hits > 0
+
+
+def test_dsv4_renderer_patch_routes_and_falls_back(monkeypatch, restore_renderers):
+    tok = _dsv4_tokenizer()
+    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
+
+    from vllm_torchtpu import segment_tokenize as st
+
+    cls = DeepseekV4Renderer
+    saved = cls.__dict__["_apply_chat_template"]
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE", "1")
+    monkeypatch.setenv("VLLM_TPU_SEGMENT_TOKENIZE_VERIFY_EVERY", "1")
+    monkeypatch.setattr(st, "_INSTANCES", {})
+    calls = []
+
+    def spy(self, *args, **kwargs):
+        calls.append(kwargs.get("tokenize", True))
+        return saved(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "_apply_chat_template", spy)
+    st.patch_renderer_segment_tokenize()
+    assert cls.__dict__["_tpu_segment_tokenize"]
+    r = object.__new__(cls)
+    r.get_tokenizer = lambda: tok
+    msgs = _dsv4_conversation(random.Random(6), 8, 100)
+    want = tok.apply_chat_template(msgs, conversation=msgs)
+    out = r._apply_chat_template(conversation=msgs, messages=msgs)
+    # Rendered as text by the tokenizer, encoded piecewise, checked.
+    assert out == want and calls == [False]
+    assert st.get_segment_tokenizer(tok, 0).misses > 0
+    assert r._apply_chat_template(
+        conversation=msgs, messages=msgs, tokenize=False
+    ) == tok.apply_chat_template(msgs, conversation=msgs, tokenize=False)
+    r._apply_chat_template(conversation=msgs, messages=msgs, max_length=8)
+    assert calls == [False, False, True]
+
+
+def test_verify_raises_on_difference():
+    from vllm_torchtpu.segment_tokenize import _Engaged
+
+    tok = _toy_tokenizer()
+    seg = SegmentTokenizer(tok, max_cached_tokens=10_000)
+    engaged = _Engaged(verify_every=2)
+    text = "<|user|>" + CORPUS
+    want = tok.encode(text, add_special_tokens=False).ids
+    assert engaged.encode(seg, text, lambda: 1 / 0) == want  # 1st: not checked
+    assert engaged.encode(seg, text, lambda: want) == want  # 2nd: checked
+    engaged.encode(seg, text, lambda: 1 / 0)
+    with pytest.raises(RuntimeError, match="first difference at 1"):
+        engaged.encode(seg, text, lambda: want[:1] + [-1] + want[2:])

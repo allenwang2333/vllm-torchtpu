@@ -10,11 +10,14 @@ the engine -- directly on TTFT, with the device idle. Consecutive turns of a
 conversation share almost all of that text.
 
 How (and why it is exact): an HF ``tokenizers`` pipeline first splits the
-input on added-token occurrences (leftmost-longest), then normalizes,
-pre-tokenizes and BPE-encodes each remaining piece independently. When every
-added token is ``normalized=False``, ``lstrip=False``, ``rstrip=False`` and
-``single_word=False``, and the tokenizer does not encode special tokens as
-text, that first split is a pure function of the raw string, so
+input on added-token occurrences -- leftmost-longest over the
+``normalized=False`` tokens, then, inside the remaining pieces, over the
+``normalized=True`` ones -- then normalizes, pre-tokenizes and BPE-encodes
+each remaining piece independently. When every added token is
+``lstrip=False``, ``rstrip=False`` and ``single_word=False``, no
+``normalized=True`` token exists unless the normalizer is the identity, and
+the tokenizer does not encode special tokens as text, that split is a pure
+function of the raw string, so
 
     encode(text) == concat(encode(piece) for piece in split(text))
 
@@ -26,13 +29,20 @@ only new pieces -- in one ``encode_batch`` call, so a cold long prompt is
 also encoded across cores. Tokenizers that do not satisfy the conditions
 above, or requests that need offsets, special-token insertion or tokenizer
 truncation, take vLLM's original path unchanged.
+
+Two entry points use it: ``BaseRenderer._tokenize_prompt`` (renderers that
+return the chat prompt as text, e.g. HF Jinja templates) and
+``DeepseekV4Renderer._apply_chat_template`` (DeepSeek-V4 renders and encodes
+the chat inside its tokenizer's ``apply_chat_template``).
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import re
 import threading
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -56,11 +66,14 @@ class SegmentTokenizer:
         self._backend.no_padding()
         added = self._backend.get_added_tokens_decoder()
         self._added_id = {tok.content: tid for tid, tok in added.items()}
-        alts = sorted(self._added_id, key=len, reverse=True)
-        # Python's alternation takes the first alternative matching at the
-        # leftmost position; longest-first order makes that leftmost-longest,
-        # the same rule as tokenizers' Aho-Corasick added-token matcher.
-        self._split = re.compile("|".join(re.escape(a) for a in alts))
+        # tokenizers matches the normalized=False tokens on the whole input
+        # first, then the normalized=True ones inside the pieces left over.
+        self._split_raw = _alternation(
+            t.content for t in added.values() if not t.normalized
+        )
+        self._split_norm = _alternation(
+            t.content for t in added.values() if t.normalized
+        )
         # Cached pieces are lists over one shared table of int objects: 8 B
         # per cached token, and ``list.extend`` copies pointers instead of
         # boxing a fresh int per token.
@@ -81,21 +94,28 @@ class SegmentTokenizer:
         """Return why ``backend`` cannot use the piecewise path, or None."""
         if getattr(backend, "encode_special_tokens", False):
             return "encode_special_tokens is set"
+        identity_normalizer = None
         for tok in backend.get_added_tokens_decoder().values():
-            if tok.normalized or tok.lstrip or tok.rstrip or tok.single_word:
+            if tok.lstrip or tok.rstrip or tok.single_word:
                 return f"added token {tok.content!r} is not a hard split point"
+            if tok.normalized:
+                if identity_normalizer is None:
+                    spec = json.loads(backend.to_str())["normalizer"]
+                    identity_normalizer = _is_identity_normalizer(spec)
+                if not identity_normalizer:
+                    return (
+                        f"added token {tok.content!r} is matched after a "
+                        "non-identity normalizer"
+                    )
         return None
 
     def encode(self, text: str) -> list[int]:
         pieces: list[tuple[bool, str]] = []  # (is_added_token, text)
-        pos = 0
-        for m in self._split.finditer(text):
-            if m.start() > pos:
-                pieces.append((False, text[pos : m.start()]))
-            pieces.append((True, m.group()))
-            pos = m.end()
-        if pos < len(text):
-            pieces.append((False, text[pos:]))
+        for is_added, piece in _split_on(self._split_raw, text):
+            if is_added:
+                pieces.append((True, piece))
+            else:
+                pieces.extend(_split_on(self._split_norm, piece))
 
         with self._lock:
             found: dict[str, list[int]] = {}
@@ -138,6 +158,37 @@ class SegmentTokenizer:
         while self._cached_tokens > self._max_cached_tokens:
             _, old = self._cache.popitem(last=False)
             self._cached_tokens -= len(old)
+
+
+def _alternation(contents) -> re.Pattern[str] | None:
+    alts = sorted(contents, key=len, reverse=True)
+    if not alts:
+        return None
+    # Python's alternation takes the first alternative matching at the
+    # leftmost position; longest-first order makes that leftmost-longest,
+    # the same rule as tokenizers' Aho-Corasick added-token matcher.
+    return re.compile("|".join(re.escape(a) for a in alts))
+
+
+def _split_on(pattern: re.Pattern[str] | None, text: str):
+    """Yield ``(is_match, piece)`` covering ``text``, without empty pieces."""
+    pos = 0
+    if pattern is not None:
+        for m in pattern.finditer(text):
+            if m.start() > pos:
+                yield False, text[pos : m.start()]
+            yield True, m.group()
+            pos = m.end()
+    if pos < len(text):
+        yield False, text[pos:]
+
+
+def _is_identity_normalizer(spec: dict | None) -> bool:
+    if spec is None:
+        return True
+    return spec.get("type") == "Sequence" and all(
+        _is_identity_normalizer(n) for n in spec.get("normalizers", ())
+    )
 
 
 def _backend_of(tokenizer: Any) -> Any:
@@ -184,23 +235,83 @@ def get_segment_tokenizer(tokenizer: Any, max_cached_tokens: int):
         return seg
 
 
+_STATS_EVERY = 500
+
+
+class _Engaged:
+    """Per-prompt bookkeeping: periodic stats log and optional exactness check."""
+
+    def __init__(self, verify_every: int):
+        self._verify_every = verify_every
+        self._lock = threading.Lock()
+        self._prompts = self._tokens = self._seconds = self._verified = 0
+
+    def encode(self, seg: SegmentTokenizer, text: str, reference) -> list[int]:
+        """``seg.encode(text)``; every ``verify_every``-th prompt also runs
+        ``reference()`` (the original full encode) and raises on any difference."""
+        t0 = time.perf_counter()
+        ids = seg.encode(text)
+        dt = time.perf_counter() - t0
+        with self._lock:
+            self._prompts += 1
+            self._tokens += len(ids)
+            self._seconds += dt
+            n = self._prompts
+            check = self._verify_every > 0 and n % self._verify_every == 0
+        if check:
+            want = reference()
+            if want != ids:
+                first = next(
+                    (i for i, (a, b) in enumerate(zip(ids, want)) if a != b),
+                    min(len(ids), len(want)),
+                )
+                raise RuntimeError(
+                    "VLLM_TPU_SEGMENT_TOKENIZE: piecewise ids differ from the full "
+                    f"encode ({len(ids)} vs {len(want)} ids, first difference at "
+                    f"{first})"
+                )
+            with self._lock:
+                self._verified += 1
+        if n % _STATS_EVERY == 0:
+            logger.info(
+                "VLLM_TPU_SEGMENT_TOKENIZE: %d prompts, %.1f M tokens, %.2f ms/prompt "
+                "(%.3f us/token), piece cache hits %d / misses %d, %d prompts "
+                "verified identical to the full encode.",
+                n,
+                self._tokens / 1e6,
+                1e3 * self._seconds / n,
+                1e6 * self._seconds / max(self._tokens, 1),
+                seg.hits,
+                seg.misses,
+                self._verified,
+            )
+        return ids
+
+
 def patch_renderer_segment_tokenize() -> None:
-    """Route eligible ``BaseRenderer._tokenize_prompt`` calls through the cache.
+    """Route eligible prompt tokenization through the segment cache.
 
     Must run before the renderer is constructed: ``BaseRenderer.__init__``
-    binds ``self._tokenize_prompt`` into its async wrapper.
+    binds ``self._tokenize_prompt`` (and DeepseekV4Renderer
+    ``self._apply_chat_template``) into async wrappers.
     """
     from vllm_torchtpu import envs
 
     if not envs.VLLM_TPU_SEGMENT_TOKENIZE:
         return
+    max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
+    engaged = _Engaged(envs.VLLM_TPU_SEGMENT_TOKENIZE_VERIFY_EVERY)
+    _patch_base_renderer(max_cached, engaged)
+    _patch_deepseek_v4_renderer(max_cached, engaged)
+
+
+def _patch_base_renderer(max_cached: int, engaged: _Engaged) -> None:
     from vllm.renderers import base as renderer_base
 
     cls = renderer_base.BaseRenderer
-    if getattr(cls, "_tpu_segment_tokenize", False):
+    if cls.__dict__.get("_tpu_segment_tokenize", False):
         return
     orig = cls._tokenize_prompt
-    max_cached = envs.VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS
 
     def _tokenize_prompt(self, prompt, params):
         kwargs = params.get_encode_kwargs()
@@ -209,7 +320,11 @@ def patch_renderer_segment_tokenize() -> None:
         seg = get_segment_tokenizer(self.get_tokenizer(), max_cached)
         if seg is None:
             return orig(self, prompt, params)
-        ids = seg.encode(prompt["prompt"])
+        ids = engaged.encode(
+            seg,
+            prompt["prompt"],
+            lambda: list(orig(self, dict(prompt), params)["prompt_token_ids"]),
+        )
         max_length = kwargs.get("max_length")
         if (
             kwargs.get("truncation")
@@ -223,3 +338,36 @@ def patch_renderer_segment_tokenize() -> None:
     cls._tokenize_prompt = _tokenize_prompt
     cls._tpu_segment_tokenize = True
     logger.info("VLLM_TPU_SEGMENT_TOKENIZE: patched BaseRenderer._tokenize_prompt")
+
+
+def _patch_deepseek_v4_renderer(max_cached: int, engaged: _Engaged) -> None:
+    from vllm.renderers import deepseek_v4
+
+    cls = deepseek_v4.DeepseekV4Renderer
+    if cls.__dict__.get("_tpu_segment_tokenize", False):
+        return
+    orig = cls._apply_chat_template
+
+    def _apply_chat_template(self, *args, **kwargs):
+        # The tokenizer renders the prompt and, unless tokenize=False, returns
+        # encode(prompt, add_special_tokens=False) truncated as requested.
+        if (
+            kwargs.get("tokenize", True) is not True
+            or "truncation" in kwargs
+            or "max_length" in kwargs
+        ):
+            return orig(self, *args, **kwargs)
+        tokenizer = self.get_tokenizer()
+        seg = get_segment_tokenizer(tokenizer, max_cached)
+        if seg is None:
+            return orig(self, *args, **kwargs)
+        text = orig(self, *args, **{**kwargs, "tokenize": False})
+        return engaged.encode(
+            seg, text, lambda: tokenizer.encode(text, add_special_tokens=False)
+        )
+
+    cls._apply_chat_template = _apply_chat_template
+    cls._tpu_segment_tokenize = True
+    logger.info(
+        "VLLM_TPU_SEGMENT_TOKENIZE: patched DeepseekV4Renderer._apply_chat_template"
+    )
