@@ -356,6 +356,9 @@ local useFastokens = cdk.boolVar('USE_FASTOKENS', false);
 // prompt sharing the longest token prefix instead of rehashing it (vllm-torchtpu core/block_hash_reuse.py;
 // identical hashes). CPU: 83 -> 28 ms per ~450k-token turn. Empty = off.
 local blockHashReuse = cdk.var('TPU_BLOCK_HASH_REUSE', '');
+// 1: the API server logs one "request timing:" line per request (TTFT split into front / queued / prefill,
+// with ISL and cached tokens). Diagnostic; empty = off.
+local requestTimingLog = cdk.var('TPU_REQUEST_TIMING_LOG', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
@@ -874,6 +877,7 @@ local serverJob = cdk.job(
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
         [if segmentTokenize != '' then 'VLLM_TPU_SEGMENT_TOKENIZE']: segmentTokenize,
         [if blockHashReuse != '' then 'TPU_BLOCK_HASH_REUSE']: blockHashReuse,
+        [if requestTimingLog != '' then 'TPU_REQUEST_TIMING_LOG']: requestTimingLog,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,

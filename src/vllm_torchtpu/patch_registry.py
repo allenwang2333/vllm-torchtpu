@@ -153,6 +153,7 @@ PATCHES = (
     ),
     # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
     Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    Patch("vllm_torchtpu.request_timing_log:patch_request_timing_log", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

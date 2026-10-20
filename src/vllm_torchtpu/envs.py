@@ -187,6 +187,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
     TPU_BLOCK_HASH_REUSE: bool = False
     TPU_BLOCK_HASH_REUSE_MAX_TOKENS: int = 33554432
+    TPU_REQUEST_TIMING_LOG: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1120,6 +1121,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_BLOCK_HASH_REUSE_MAX_TOKENS": env_int(
         "TPU_BLOCK_HASH_REUSE_MAX_TOKENS", 33554432
     ),
+    # API server: log each finished request's TTFT split (request_timing_log.py).
+    "TPU_REQUEST_TIMING_LOG": env_bool("TPU_REQUEST_TIMING_LOG"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
