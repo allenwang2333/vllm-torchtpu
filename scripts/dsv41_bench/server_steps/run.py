@@ -113,7 +113,11 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--startup-timeout", type=float, default=3000)
     parser.add_argument(
-        "--scenario", choices=["encoder_extend", "decode"], default="encoder_extend"
+        "--scenario",
+        choices=["encoder_extend", "decode", "gsm8k"],
+        default="encoder_extend",
+        help="gsm8k: the decode scenario's server, then full GSM8K through "
+        "gsm8k_client.py; --input is the directory holding train/test.jsonl",
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
@@ -159,7 +163,10 @@ def main() -> None:
         TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="disabled",
     )
     env["KV_BYTES"] = "auto"
-    decode = args.scenario == "decode"
+    gsm8k = args.scenario == "gsm8k"
+    # GSM8K is an accuracy gate for the decode serving configuration, so it
+    # launches exactly the decode scenario's server.
+    decode = args.scenario in ("decode", "gsm8k")
     # Steady target verification is exactly local_concurrency * (K + 1) rows;
     # padding it to 384 runs every layer on 25% padding rows.
     verify_rows = DECODE_SCENARIO.local_concurrency * (
@@ -284,6 +291,29 @@ def main() -> None:
                 startup_seconds=time.monotonic() - started,
             )
             (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
+            if gsm8k:
+                timing["formal_status"] = "failed"
+                with (args.out / "client-gsm8k.log").open("w") as client_log:
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(here / "gsm8k_client.py"),
+                            "client",
+                            "--data",
+                            str(args.input),
+                            "--out",
+                            str(args.out / "gsm8k"),
+                            "--concurrency",
+                            str(8 * DECODE_SCENARIO.local_concurrency),
+                        ],
+                        env=env,
+                        stdout=client_log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                    )
+                timing["formal_status"] = "passed"
+                timing["completed"] = True
+                return
             base = [
                 sys.executable,
                 str(here / ("bench_decode.py" if decode else "bench_cached_extend.py")),
