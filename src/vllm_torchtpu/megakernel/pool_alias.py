@@ -38,7 +38,7 @@ from jax._src.state import types
 @tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
 class Reinterpret(types.ReshapeTransform):
-    pass
+    """Ref transform marking a raw `(8, 128)`-tiled VMEM shape reinterpretation."""
 
 
 _original = lowering._reshape_memref
@@ -87,6 +87,7 @@ def _install() -> None:
 
 
 def storage_size(shape, dtype):
+    """Bytes occupied by `(8, 128)`-tiled layout (rounding second-minor dim)."""
     bits = dtype.itemsize * 8
     packing = 32 // bits
     rows = 8 * packing
@@ -95,6 +96,10 @@ def storage_size(shape, dtype):
 
 
 def view(ref, shape, dtype):
+    """Return a `shape`/`dtype` view aliasing `ref`'s physical tiled storage.
+
+    The returned view must be fully overwritten before it is read.
+    """
     _install()
     ref = ref.bitcast(dtype)
     # pyrefly: ignore[bad-argument-count]

@@ -48,7 +48,14 @@ def test_pool_alias_reinterpret_mosaic_lowering():
     assert pool_alias._installed
     assert lowering._reshape_memref is pool_alias._lower
 
-    for dtype, target_shape in [(F32, (16, 256)), (BF16, (32, 256)), (FP8, (64, 256))]:
+    cases = [
+        (F32, (16, 256), "#tpu.tiled<(8,128),[2,1]>"),
+        (BF16, (32, 256), "#tpu.tiled<(16,128)(2,1),[2,1]>"),
+        (FP8, (64, 256), "#tpu.tiled<(32,128)(4,1),[2,1]>"),
+        (BF16, (2, 16, 256), "#tpu.tiled<(16,128)(2,1),[2,2,1]>"),
+        (BF16, (2, 32, 256), "#tpu.tiled<(16,128)(2,1),[4,2,1]>"),
+    ]
+    for dtype, target_shape, expected_layout in cases:
         nbytes = pool_alias.storage_size(target_shape, jnp.dtype(dtype))
         itemsize = jnp.dtype(dtype).itemsize
         flat_elems = nbytes // itemsize
@@ -88,6 +95,11 @@ def test_pool_alias_reinterpret_mosaic_lowering():
                     out_type = ir.MemRefType(out_val.type)
                     assert tuple(out_type.shape) == target_shape
                     assert out_type.memory_space == vmem_attr
+                    rc_op = block.operations[0]
+                    assert rc_op.name == "tpu.reinterpret_cast"
+                    rc_type = ir.MemRefType(rc_op.result.type)
+                    assert str(rc_type.layout) == expected_layout
                 asm = str(func_op)
                 assert "tpu.reinterpret_cast" in asm
                 assert "tpu.erase_memref_layout" in asm
+                assert expected_layout in asm
