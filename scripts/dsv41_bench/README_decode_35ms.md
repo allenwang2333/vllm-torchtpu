@@ -202,3 +202,12 @@ The subsequent writeback-overlap comparison retained eight reads.
 Dense FP8 GEMM fusion is a subsequent experiment. CPU Pallas interpretation
 matches the reference on a small case; this is not TPU numerical or performance
 validation, and no GEMM replacement is enabled by this branch.
+
+```bash
+python scripts/dsv41_bench/bench_dense_fp8.py \
+  --out /tmp/dense-fp8 --seed 1028 --profile
+```
+
+Use a fresh output directory. The benchmark records every numerical failure and
+compilation error, and times only bit-exact candidates. `--interpret-check` runs
+the small CPU check instead of TPU timing.
