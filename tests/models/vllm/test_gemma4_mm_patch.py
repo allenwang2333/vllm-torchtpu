@@ -147,3 +147,83 @@ def test_patch_registry_contains_gemma4_mm_patch():
     )
     assert patch.stages == ("platform_activation", "model_load")
     assert patch.model_config is True
+
+
+def test_patch_gemma4_layer_config():
+    import sys
+    import types
+
+    from vllm_torchtpu.models.vllm.gemma4_mm_patch import patch_gemma4_layer_config
+
+    # Mock vllm.transformers_utils.configs.gemma4 if not present in test environment
+    if "vllm.transformers_utils.configs.gemma4" not in sys.modules:
+        vllm_mock = types.ModuleType("vllm")
+        tu_mock = types.ModuleType("vllm.transformers_utils")
+        cfg_mock = types.ModuleType("vllm.transformers_utils.configs")
+        g4_cfg_mock = types.ModuleType("vllm.transformers_utils.configs.gemma4")
+        g4_cfg_mock.gemma4_layer_config = (
+            lambda text_config, layer_idx: SimpleNamespace(
+                head_dim=256, num_key_value_heads=8
+            )
+        )
+        cfg_mock.gemma4 = g4_cfg_mock
+        tu_mock.configs = cfg_mock
+        vllm_mock.transformers_utils = tu_mock
+        sys.modules["vllm"] = vllm_mock
+        sys.modules["vllm.transformers_utils"] = tu_mock
+        sys.modules["vllm.transformers_utils.configs"] = cfg_mock
+        sys.modules["vllm.transformers_utils.configs.gemma4"] = g4_cfg_mock
+
+    patch_gemma4_layer_config()
+    patch_gemma4_layer_config()
+
+    import vllm.transformers_utils.configs.gemma4 as g4_cfg_mod
+
+    text_cfg = SimpleNamespace(
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        global_head_dim=512,
+        num_global_key_value_heads=2,
+        attention_k_eq_v=True,
+    )
+    l0 = g4_cfg_mod.gemma4_layer_config(text_cfg, 0)
+    assert l0.head_dim == 256
+    assert l0.num_key_value_heads == 8
+
+    l5 = g4_cfg_mod.gemma4_layer_config(text_cfg, 5)
+    assert l5.head_dim == 512
+    assert l5.num_key_value_heads == 2
+
+    # Also test Gemma4Attention __init__ patching
+    g4_mod_mock = types.ModuleType("vllm.model_executor.models.gemma4")
+    g4_mod_mock.extract_layer_index = lambda prefix: 5
+
+    class MockAttention:
+        def __init__(
+            self,
+            config,
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            *args,
+            **kwargs,
+        ):
+            self.head_dim = head_dim
+            self.num_kv_heads = num_kv_heads
+
+    g4_mod_mock.Gemma4Attention = MockAttention
+    sys.modules["vllm.model_executor.models.gemma4"] = g4_mod_mock
+
+    patch_gemma4_layer_config()
+    attn = g4_mod_mock.Gemma4Attention(
+        text_cfg, 1024, 8, 8, 256, prefix="model.layers.5.self_attn"
+    )
+    assert attn.head_dim == 512
+    assert attn.num_kv_heads == 2

@@ -52,7 +52,10 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
 
     from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
+        patch_gemma4_layer_config,
         patch_gemma4_mm_model_classes,
     )
 
+    patch_gemma4_layer_config()
     patch_gemma4_mm_model_classes()
+

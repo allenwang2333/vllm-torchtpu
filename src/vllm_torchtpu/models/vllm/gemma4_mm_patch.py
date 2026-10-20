@@ -67,6 +67,152 @@ def patch_gemma4_mm_model_classes() -> None:
         pass
 
 
+def patch_gemma4_attention_init() -> None:
+    """Ensure Gemma4Attention instances for full-attention layers use
+    global_head_dim.
+    """
+    try:
+        import inspect
+
+        from vllm.model_executor.models import gemma4 as gemma4_mod
+
+        orig_init = getattr(gemma4_mod.Gemma4Attention, "_orig_init", None)
+        if orig_init is None:
+            orig_init = gemma4_mod.Gemma4Attention.__init__
+            gemma4_mod.Gemma4Attention._orig_init = orig_init
+
+        sig = inspect.signature(orig_init)
+
+        def patched_init(self, *args, **kwargs):
+            bound = sig.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            config = bound.arguments.get("config")
+            prefix = bound.arguments.get("prefix", "")
+            layer_idx = gemma4_mod.extract_layer_index(prefix)
+            layer_types = getattr(config, "layer_types", None)
+            is_full = (
+                layer_types is not None
+                and layer_idx < len(layer_types)
+                and layer_types[layer_idx] == "full_attention"
+            )
+            if is_full:
+                global_head_dim = getattr(config, "global_head_dim", None) or getattr(
+                    config, "full_attention_head_dim", None
+                )
+                if global_head_dim is not None:
+                    bound.arguments["head_dim"] = global_head_dim
+                if getattr(config, "attention_k_eq_v", False):
+                    global_kv = getattr(
+                        config, "num_global_key_value_heads", None
+                    ) or getattr(config, "full_attention_num_key_value_heads", None)
+                    if global_kv is not None:
+                        bound.arguments["num_kv_heads"] = global_kv
+            return orig_init(*bound.args, **bound.kwargs)
+
+        gemma4_mod.Gemma4Attention.__init__ = patched_init
+    except (ImportError, AttributeError):
+        pass
+
+
+def patch_gemma4_layer_config() -> None:
+    """Ensure full attention layers receive global_head_dim and global KV heads."""
+    try:
+        import sys
+        from copy import copy
+
+        import vllm.transformers_utils.configs.gemma4 as gemma4_cfg_mod
+
+        orig_fn = getattr(gemma4_cfg_mod, "_orig_gemma4_layer_config", None)
+        if orig_fn is None:
+            orig_fn = gemma4_cfg_mod.gemma4_layer_config
+            gemma4_cfg_mod._orig_gemma4_layer_config = orig_fn
+
+        def patched_gemma4_layer_config(text_config, layer_idx: int):
+            layer_types = getattr(text_config, "layer_types", None)
+            is_full = (
+                layer_types is not None
+                and layer_idx < len(layer_types)
+                and layer_types[layer_idx] == "full_attention"
+            )
+
+            # Resolve base layer config
+            if getattr(text_config, "is_heterogeneous", False):
+                per_layer = getattr(text_config, "per_layer_config", None)
+                if per_layer and layer_idx < len(per_layer):
+                    layer = copy(per_layer[layer_idx])
+                else:
+                    layer = copy(text_config)
+            else:
+                layer = orig_fn(text_config, layer_idx)
+
+            if is_full:
+                global_head_dim = getattr(
+                    text_config, "global_head_dim", None
+                ) or getattr(text_config, "full_attention_head_dim", None)
+                if global_head_dim is None:
+                    per_layer = getattr(text_config, "per_layer_config", None)
+                    if per_layer and layer_idx < len(per_layer):
+                        plc = per_layer[layer_idx]
+                        global_head_dim = (
+                            plc.get("head_dim")
+                            if isinstance(plc, dict)
+                            else getattr(plc, "head_dim", None)
+                        )
+                if global_head_dim is not None:
+                    layer.head_dim = global_head_dim
+
+                global_kv_heads = getattr(
+                    text_config, "num_global_key_value_heads", None
+                ) or getattr(text_config, "full_attention_num_key_value_heads", None)
+                if global_kv_heads is None:
+                    per_layer = getattr(text_config, "per_layer_config", None)
+                    if per_layer and layer_idx < len(per_layer):
+                        plc = per_layer[layer_idx]
+                        global_kv_heads = (
+                            plc.get("num_key_value_heads")
+                            if isinstance(plc, dict)
+                            else getattr(plc, "num_key_value_heads", None)
+                        )
+                if global_kv_heads is not None and getattr(
+                    text_config, "attention_k_eq_v", False
+                ):
+                    layer.num_key_value_heads = global_kv_heads
+            else:
+                if getattr(layer, "head_dim", None) is None:
+                    layer.head_dim = getattr(text_config, "head_dim", None)
+                if getattr(layer, "num_key_value_heads", None) is None:
+                    layer.num_key_value_heads = getattr(
+                        text_config, "num_key_value_heads", None
+                    )
+
+            return layer
+
+        gemma4_cfg_mod.gemma4_layer_config = patched_gemma4_layer_config
+        gemma4_cfg_mod._tpu_layer_config_patched = True
+
+        for mod_name in [
+            "vllm.model_executor.models.gemma4",
+            "vllm.model_executor.models.gemma4_mtp",
+            "vllm.model_executor.models.gemma4_dspark",
+            "vllm.transformers_utils.model_arch_config_convertor",
+        ]:
+            if mod_name in sys.modules:
+                mod = sys.modules[mod_name]
+                if hasattr(mod, "gemma4_layer_config"):
+                    setattr(  # noqa: B010
+                        mod, "gemma4_layer_config", patched_gemma4_layer_config
+                    )
+
+        patch_gemma4_attention_init()
+
+        logger.info(
+            "Applied TPU patch: patched gemma4_layer_config and Gemma4Attention "
+            "for heterogeneous layers."
+        )
+    except (ImportError, AttributeError):
+        pass
+
+
 def _is_gemma4_mm_model(model_config: "ModelConfig | None") -> bool:
     """Check if the provided ModelConfig corresponds to a Gemma4 multimodal model."""
     if model_config is None:
@@ -106,6 +252,7 @@ def maybe_patch_gemma4_mm(model_config: "ModelConfig | None" = None) -> bool | N
         return False
 
     patch_gemma4_mm_model_classes()
+    patch_gemma4_layer_config()
 
     if model_config is not None:
         model_info = getattr(model_config, "_model_info", None)
