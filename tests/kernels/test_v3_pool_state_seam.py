@@ -395,6 +395,8 @@ class TestPooledSpecWindows:
     on compact slot groups, fed byte-equal initial states: matching outputs
     across multi-step schedules prove the pooled DMA wrote each window
     position's checkpoint to the block the next step's read offset names.
+    Runs with fp32 and bf16 SSM state; bf16 SSM with verify windows is the
+    MTP serving configuration.
     """
 
     NUM_SPEC = 1
@@ -445,8 +447,11 @@ class TestPooledSpecWindows:
             ),
         ]
 
+    @pytest.mark.parametrize(
+        "ssm_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32_ssm", "bf16_ssm"]
+    )
     @pytest.mark.parametrize("split", [6, 1], ids=["kernel_grained", "manager"])
-    def test_pooled_spec_matches_dense(self, split):
+    def test_pooled_spec_matches_dense(self, split, ssm_dtype):
         n, window = self.N, self.WINDOW
         pool = self._pool(split)
         # Checkpoint 0 is the request's state block; the rest are ordinary
@@ -456,9 +461,11 @@ class TestPooledSpecWindows:
         ckpt_indices = jnp.array([[4, 7], [1, 9], [3, 5]], dtype=jnp.int32)
 
         keys = iter(jax.random.split(jax.random.key(21), 2))
-        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V))
+        ssm0 = jax.random.normal(next(keys), (n, N_V, D_K, D_V)).astype(ssm_dtype)
         conv0 = jax.random.normal(next(keys), (n, KERNEL_SIZE - 1, DIM))
-        pool = _write_states(pool, ssm0, conv0, pool_idx, split=split)
+        pool = _write_states(
+            pool, ssm0, conv0, pool_idx, split=split, ssm_dtype=ssm_dtype
+        )
 
         # Dense reference: compact slot groups of `window` consecutive
         # slots, byte-equal initial states at each group's base. Garbage in
@@ -470,10 +477,10 @@ class TestPooledSpecWindows:
             rng.standard_normal((num_slots, KERNEL_SIZE - 1, DIM)), dtype=jnp.float32
         )
         dense_rec = jnp.asarray(
-            rng.standard_normal((num_slots, N_V, D_K, D_V)), dtype=jnp.float32
+            rng.standard_normal((num_slots, N_V, D_K, D_V)), dtype=ssm_dtype
         )
         dense_conv = dense_conv.at[dense_base].set(conv0)
-        dense_rec = dense_rec.at[dense_base].set(ssm0.astype(jnp.float32))
+        dense_rec = dense_rec.at[dense_base].set(ssm0)
 
         for step_num, step in enumerate(self._steps()):
             kwargs = _rand_inputs(30 + step_num, step["num_tokens"]) | dict(
@@ -492,7 +499,7 @@ class TestPooledSpecWindows:
                 state_indices=pool_idx,
                 ckpt_indices=ckpt_indices,
                 conv_dtype=jnp.float32,
-                recurrent_dtype=jnp.float32,
+                recurrent_dtype=ssm_dtype,
                 **kwargs,
             )
             pool = _split(pool, pool_shape)
