@@ -247,7 +247,7 @@ def wire_row_and_scale(
     return down_bf16, jnp.ones((rows, 1), jnp.float32)
 
 
-def _intermediate_rows(
+def _intermediate_chunks(
     acc1,
     act_scale,
     inter,
@@ -258,21 +258,11 @@ def _intermediate_rows(
     requantize=True,
     logical_intermediate_size=None,
 ):
-    """acc1's gate and up halves through the activation, as the second
-    matmul's left-hand side.
+    """Return activated BF16 chunks and their shared per-row maximum.
 
-    Returns that left-hand side and the row scale the caller still owes what
-    the second matmul produces. Every weight format shares this; what
-    differs is what the halves owe before the activation and whether the
-    result goes back through a quantization on the way out.
-
-    act_scale is the activation row scale a quantized activation owes its
-    accumulator, and is None where the rows were never quantized. w1s is the
-    per-channel weight scale the eight-bit and integer paths still owe their
-    halves, which the four-bit path has already folded into acc1 and passes
-    as None. requantize is False for the formats whose second matmul takes
-    bf16 rows directly; those return a row scale of None, because the
-    accumulator they produce is already the true value.
+    Preserve post-scale/bias activation and BF16 rounding before the row
+    reduction. The FP4 path prepares its first down weight between this
+    reduction and the dependent FP8 quantization.
     """
 
     def half(lo, hi):
@@ -304,8 +294,37 @@ def _intermediate_rows(
         if requantize:
             chunk_amax = _absmax_rows(chunk)
             amax = chunk_amax if amax is None else jnp.maximum(amax, chunk_amax)
+    return mid_chunks, amax
+
+
+def _intermediate_rows(
+    acc1,
+    act_scale,
+    inter,
+    *,
+    w1s,
+    act_fn,
+    w1b,
+    requantize=True,
+    logical_intermediate_size=None,
+):
+    mid_chunks, amax = _intermediate_chunks(
+        acc1,
+        act_scale,
+        inter,
+        w1s=w1s,
+        act_fn=act_fn,
+        w1b=w1b,
+        requantize=requantize,
+        logical_intermediate_size=logical_intermediate_size,
+    )
     if not requantize:
         return jnp.concatenate(mid_chunks, axis=-1), None
+    return _quantize_intermediate(mid_chunks, amax)
+
+
+def _quantize_intermediate(mid_chunks, amax):
+    """Quantize every chunk with the same full-row scale."""
     mid_scale, mid_sinv, usable = _row_scale(amax)
     sinv_bf16 = mid_sinv.astype(jnp.bfloat16)
     mid_q = jnp.concatenate(
@@ -385,7 +404,9 @@ def expert_ffn_blockscale(
     inter = w1s_blocks.shape[-1] // 2
     hidden = w2s_blocks.shape[-1]
 
-    def contract(lhs, rhs_block, scales, n_blocks, n_out, *, down=False):
+    def contract(
+        lhs, rhs_block, scales, n_blocks, n_out, *, down=False, first_rhs=None
+    ):
         chunks = []
         for n_start in range(0, n_out, FP4_OUTPUT_CHUNK):
             n_end = min(n_start + FP4_OUTPUT_CHUNK, n_out)
@@ -404,9 +425,17 @@ def expert_ffn_blockscale(
                 active_k = qb
                 if down and logical_intermediate_size is not None:
                     active_k = min(qb, logical_intermediate_size - b * qb)
-                    rhs = rhs_block(b, n_start, n_end, block_rows=active_k)
+                    rhs = (
+                        first_rhs
+                        if b == 0 and n_start == 0 and first_rhs is not None
+                        else rhs_block(b, n_start, n_end, block_rows=active_k)
+                    )
                 else:
-                    rhs = rhs_block(b, n_start, n_end)
+                    rhs = (
+                        first_rhs
+                        if b == 0 and n_start == 0 and first_rhs is not None
+                        else rhs_block(b, n_start, n_end)
+                    )
                 part = lax.dot_general(
                     lhs[:, b * qb : b * qb + active_k],
                     rhs,
@@ -420,7 +449,7 @@ def expert_ffn_blockscale(
         return jnp.concatenate(chunks, axis=-1)
 
     acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
-    mid_q, mid_scale = _intermediate_rows(
+    mid_chunks, amax = _intermediate_chunks(
         acc1,
         act_scale,
         inter,
@@ -429,7 +458,23 @@ def expert_ffn_blockscale(
         w1b=w1b,
         logical_intermediate_size=logical_intermediate_size,
     )
-    acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden, down=True)
+    # Keep the reader's DMA wait after activation, but before quantization.
+    first_n = min(FP4_OUTPUT_CHUNK, hidden)
+    first_rhs = (
+        w2_block(0, 0, first_n)
+        if logical_intermediate_size is None
+        else w2_block(0, 0, first_n, block_rows=min(qb, logical_intermediate_size))
+    )
+    mid_q, mid_scale = _quantize_intermediate(mid_chunks, amax)
+    acc2 = contract(
+        mid_q,
+        w2_block,
+        w2s_blocks,
+        n_blocks2,
+        hidden,
+        down=True,
+        first_rhs=first_rhs,
+    )
     return acc2, mid_scale
 
 
