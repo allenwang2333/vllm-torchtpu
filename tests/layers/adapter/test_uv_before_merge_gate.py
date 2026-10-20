@@ -46,3 +46,30 @@ def test_min_tokens_takes_backbone_buckets_from_the_edge(monkeypatch):
 def test_min_tokens_never_takes_the_drafter(monkeypatch, tokens):
     monkeypatch.setattr(envs, "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", 1024)
     assert not attention._uv_before_merge_applies(tokens, False)
+
+
+def test_retain_buffers_reads_each_buffer_in_warmup_only(monkeypatch):
+    import torch
+
+    from vllm_torchtpu.compilation import shape_variants
+
+    out = torch.ones(4, 8, dtype=torch.bfloat16)
+    w = torch.full((2, 3, 5), 2.0)
+    scale = torch.full((1,), 0.5)
+
+    monkeypatch.setattr(shape_variants, "in_warmup", lambda: False)
+    assert attention._retain_buffers(out, w, scale, None) is out
+
+    reads = []
+    real_reshape = torch.Tensor.reshape
+
+    def reshape(self, *shape):
+        if self is w or self is scale:
+            reads.append(self)
+        return real_reshape(self, *shape)
+
+    monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
+    monkeypatch.setattr(torch.Tensor, "reshape", reshape)
+    got = attention._retain_buffers(out, w, scale, None)
+    assert torch.equal(got, out)
+    assert reads == [w, scale]

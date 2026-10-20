@@ -131,6 +131,22 @@ def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     return is_backbone and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
+def _retain_buffers(out: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
+    """`out` plus a zero read from each buffer, on the token-count branch that
+    does not use them: the backbone warmup hands a bucket over only between
+    traces that lift the same buffers (as `cp_mla_attention._retain_rank`). A
+    dead read would be eliminated, so the zero rides on `out`."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    if not shape_variants.in_warmup():
+        return out
+    for buf in buffers:
+        if buf is not None:
+            value = buf.reshape(-1)[0].to(out.dtype)
+            out = out + (value - value)
+    return out
+
+
 def _sparse_mla_trace_config(layer: Any) -> tuple[Any, Any, bool]:
     """What the sparse MLA kernel reads from its layer when it is traced.
 
@@ -3077,6 +3093,19 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 out_proj.transpose(0, 1)
                 .to(input_dtype)
                 .reshape(-1, layer.num_heads * layer.v_head_dim)
+            )
+        if envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0 and (
+            getattr(layer, "W_UV_dcp_qrep", None) is not None
+        ):
+            # Gated by token count, the two branches project with different
+            # W_UV buffers; each reads the other's too (see _retain_buffers).
+            outputs = _retain_buffers(
+                outputs,
+                *(
+                    (layer.W_UV, getattr(layer, "W_UV_scale", None))
+                    if uv_first
+                    else (layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale)
+                ),
             )
 
         if output is not None and outputs is not output:
