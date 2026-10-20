@@ -8,15 +8,78 @@ does not occur exactly once refuses, so an arm can never silently measure the
 unmodified kernel. The copy is imported as a fresh module (its own build
 cache) and its ``build_fused_ep_moe_kernel`` is installed into ``layer``.
 
+`pin_source_rev(rev)` makes every arm, base included, read kernel.py and
+layer.py from a git rev rather than the working tree.
+
 Every arm is a TIMING probe only: its outputs are garbage by construction.
 """
 
 import importlib.util
 import pathlib
+import subprocess
 import sys
 
 from vllm_torchtpu.kernels.fused_moe.v2 import kernel as _kernel_mod
 from vllm_torchtpu.kernels.fused_moe.v2 import layer as _layer_mod
+
+# The repository the installed package lives in, and the files the patched
+# kernel/layer copies import by package name rather than carry themselves.
+_REPO = pathlib.Path(_kernel_mod.__file__).resolve().parents[5]
+_IMPORTED_AS_IS = (
+    "src/vllm_torchtpu/kernels/fused_moe/v2/host.py",
+    "src/vllm_torchtpu/kernels/fused_moe/v2/router_ops.py",
+    "src/vllm_torchtpu/kernels/fused_moe/v2/token_parallel.py",
+    "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
+)
+# None: kernel.py / layer.py are read from the working tree. A git rev: they
+# are read from that rev (see pin_source_rev).
+_SOURCE_REV = None
+
+
+def _git_show(rev, relpath):
+    return subprocess.run(
+        ["git", "-c", "safe.directory=*", "-C", str(_REPO), "show", f"{rev}:{relpath}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
+def tree_head():
+    """HEAD of the installed tree, plus '+dirty' if src/ has local changes."""
+    git = ["git", "-c", "safe.directory=*", "-C", str(_REPO)]
+    head = subprocess.run(
+        git + ["rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        git + ["status", "--porcelain", "--", "src"], capture_output=True, text=True
+    ).stdout.strip()
+    return head + ("+dirty" if dirty else "")
+
+
+def pin_source_rev(rev):
+    """Read kernel.py and layer.py from git `rev` instead of the working tree.
+
+    Keeps the arms pinned while someone edits the kernel elsewhere. The files
+    the copies import by package name (host.py, ...) still come from the
+    installed tree, so they must equal the rev's or this refuses.
+    """
+    global _SOURCE_REV
+    for rel in _IMPORTED_AS_IS:
+        if (_REPO / rel).read_text() != _git_show(rev, rel):
+            raise RuntimeError(
+                f"{rel} in the working tree differs from {rev}; the pinned "
+                "kernel would run against a different host module"
+            )
+    _SOURCE_REV = rev
+
+
+def _source(mod):
+    path = pathlib.Path(mod.__file__).resolve()
+    if _SOURCE_REV is None:
+        return path.read_text()
+    return _git_show(_SOURCE_REV, str(path.relative_to(_REPO)))
+
 
 # Weight slabs never stream: slot contents are whatever VMEM held. The small
 # per-expert scale tables still stream so the scale reads are unchanged.
@@ -158,6 +221,65 @@ _LOOPBACK = [
     ),
 ]
 
+# The same for the two-hop transport (tile -> contribution slab -> push per
+# expert run), which builds whose visits carry several tiles use (prefill).
+_LOOPBACK += [
+    (
+        """                        pltpu.make_async_remote_copy(
+                            src_ref=contrib_hbm.at[
+                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                            ],
+                            dst_ref=recv_hbm.at[
+                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                            ],
+                            send_sem=send_sem,
+                            recv_sem=recv_sem,
+                            device_id=(jnp.int32(d),),
+                            device_id_type=pl.DeviceIdType.MESH,
+                        ).start()
+""",
+        """                        pltpu.make_async_copy(
+                            contrib_hbm.at[
+                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                            ],
+                            recv_hbm.at[pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)],
+                            send_sem,
+                        ).start()
+""",
+    ),
+    (
+        """                    pltpu.make_async_remote_copy(
+                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        send_sem=send_scl_sem,
+                        recv_sem=recv_scl_sem,
+                        device_id=(jnp.int32(d),),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+""",
+        """                    pltpu.make_async_copy(
+                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
+                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        send_scl_sem,
+                    ).start()
+""",
+    ),
+    (
+        """            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ROWS))
+            _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
+""",
+        """            _rows_wait(send_sem, contrib_hbm, count(host.COUNT_SEND_ROWS))
+""",
+    ),
+    (
+        """            _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
+            _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
+""",
+        """            _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
+""",
+    ),
+]
+
 # Every tile computes at the full tile height (M = 128) instead of the
 # smallest rung covering its live rows.
 _FULL_HEIGHT = [
@@ -261,8 +383,8 @@ def arm_pieces(arm):
     )
 
 
-def _patched(path, subs, arm):
-    src = pathlib.Path(path).read_text()
+def _patched(mod, subs, arm):
+    src = _source(mod)
     for old, new in subs:
         n = src.count(old)
         if n != 1:
@@ -291,12 +413,10 @@ def install(arm):
     """
     kernel_subs, layer_subs = arm_pieces(arm)
     tag = arm.replace("+", "_")
-    kmod = _load(
-        f"_moe_abl_kernel_{tag}", _patched(_kernel_mod.__file__, kernel_subs, arm)
-    )
+    kmod = _load(f"_moe_abl_kernel_{tag}", _patched(_kernel_mod, kernel_subs, arm))
     lmod = (
-        _load(f"_moe_abl_layer_{tag}", _patched(_layer_mod.__file__, layer_subs, arm))
-        if layer_subs
+        _load(f"_moe_abl_layer_{tag}", _patched(_layer_mod, layer_subs, arm))
+        if layer_subs or _SOURCE_REV is not None
         else _layer_mod
     )
     lmod.build_fused_ep_moe_kernel = kmod.build_fused_ep_moe_kernel

@@ -49,6 +49,7 @@ from vllm_torchtpu.kernels.fused_moe.v2 import layer as served_layer  # noqa: E4
 from vllm_torchtpu.kernels.megablox.gmm_v2 import silu_and_mul_with_clamp  # noqa: E402
 
 EP = 8
+# `tokens` is the GLOBAL row count, set from --tokens-per-rank in main().
 GEO = dict(tokens=2304, hidden=5120, inter=2560, e_total=384, topk=6, qb=512)
 CAPACITY = 128
 ACT = "silu_and_mul_with_clamp"
@@ -98,6 +99,34 @@ def make_fp4_weights(mesh, seed, *, hidden, inter, e_total, qb):
     )(jnp.zeros((EP,), jnp.float32))
 
 
+def to_scale_form(mesh, w, form):
+    """(w1, w2, s1, s2) with the fp4 scale tables in `form`: "3d" as built,
+    [E, K / qb, N], or "flat", the row-padded flat [E * rows, N] serving passes
+    since #2150 (rows = host.fp4_scale_rows(K, qb, padded=True), zero pad)."""
+    if form == "3d":
+        return w
+    w1, w2, s1, s2 = w
+
+    def flat(s):
+        g, blocks, n = s.shape
+        rows = host.align_up(blocks, host.U32_SUBLANE_TILE)
+        return jnp.pad(s, ((0, 0), (0, rows - blocks), (0, 0))).reshape(g * rows, n)
+
+    s1, s2 = jax.jit(
+        jax.shard_map(
+            lambda a, b: (flat(a), flat(b)),
+            mesh=mesh,
+            in_specs=(P(AXIS),) * 2,
+            out_specs=(P(AXIS),) * 2,
+            check_vma=False,
+        )
+    )(s1, s2)
+    for s, k in ((s1, GEO["hidden"]), (s2, GEO["inter"])):
+        rows = host.fp4_scale_rows(k, GEO["qb"], padded=True)
+        assert s.shape[0] == GEO["e_total"] * rows, (s.shape, rows)
+    return w1, w2, s1, s2
+
+
 def make_inputs(
     mesh, seed, *, tokens, hidden, e_total, n_layers, skew, corr=0.0, rows_per_req=6
 ):
@@ -118,9 +147,10 @@ def make_inputs(
     for layer in range(n_layers):
         kl, ko, kr = jax.random.split(jax.random.fold_in(kg, layer), 3)
         offset = jax.random.normal(ko, (1, e_total)) * skew
-        req = jnp.repeat(
-            jax.random.normal(kr, (tokens // rows_per_req, e_total)), rows_per_req, 0
-        )
+        n_req = -(-tokens // rows_per_req)
+        req = jnp.repeat(jax.random.normal(kr, (n_req, e_total)), rows_per_req, 0)[
+            :tokens
+        ]
         own = jax.random.normal(kl, (tokens, e_total))
         logits = corr * req + jnp.sqrt(1.0 - corr * corr) * own + offset
         gates.append(jax.device_put(logits, shard))
@@ -452,8 +482,9 @@ def worst_token_rel_l2(a, b):
     return float(per.max())
 
 
-def run_check(mesh, seed):
-    """The served build at the served shape against the dense reference."""
+def run_check(mesh, seed, scale_form):
+    """The served build at the served shape against the dense reference
+    (which reads the 3-D scale tables; the kernel gets `scale_form`)."""
     global moe_layer
     _, moe_layer = ablate.install("base")
     w = make_fp4_weights(
@@ -474,7 +505,7 @@ def run_check(mesh, seed):
         skew=0.0,
     )
     out = jax.jit(lambda x, w, g: moe_call(x, w, g, None, mesh, scoring_fn="softmax"))(
-        x, w, gates[0]
+        x, to_scale_form(mesh, w, scale_form), gates[0]
     )
     out = np.asarray(out.astype(jnp.float32))
     ref = np.asarray(
@@ -528,12 +559,36 @@ def main():
         default=None,
         help="replay expert ids from an npz with topk_ids [L, T, topk]",
     )
+    ap.add_argument(
+        "--scale-form",
+        default="flat",
+        choices=("flat", "3d"),
+        help="fp4 scale operand: row-padded flat [E*rows, N] (served since #2150) "
+        "or [E, K/qb, N]",
+    )
+    ap.add_argument(
+        "--tokens-per-rank",
+        type=int,
+        default=288,
+        help="local rows per EP rank (288 = C384 decode; 2048 = prefill chunk)",
+    )
+    ap.add_argument(
+        "--kernel-rev",
+        default=None,
+        help="read kernel.py/layer.py from this git rev instead of the working tree",
+    )
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--out", default=None, help="append one JSON line per result")
     args = ap.parse_args()
 
+    GEO["tokens"] = EP * args.tokens_per_rank
+    if args.kernel_rev:
+        ablate.pin_source_rev(args.kernel_rev)
     mesh = mesh8()
     meta = dict(
+        kernel_rev=args.kernel_rev,
+        tree_head=ablate.tree_head(),
+        scale_form=args.scale_form,
         jax=jax.__version__,
         devices=[str(d) for d in mesh.devices.flat],
         geo=GEO,
@@ -553,7 +608,7 @@ def main():
                 f.write(line + "\n")
 
     if args.check:
-        emit(run_check(mesh, args.seed))
+        emit(run_check(mesh, args.seed, args.scale_form))
         return
 
     depths = tuple(
@@ -598,13 +653,17 @@ def main():
         stats = routing_stats(gates[0], bias, topk=GEO["topk"], e_total=GEO["e_total"])
     n_sets = N_WEIGHT_SETS if args.mode in ("layer", "glue") else 1
     wsets = [
-        make_fp4_weights(
+        to_scale_form(
             mesh,
-            args.seed + 100 + i,
-            hidden=GEO["hidden"],
-            inter=GEO["inter"],
-            e_total=GEO["e_total"],
-            qb=GEO["qb"],
+            make_fp4_weights(
+                mesh,
+                args.seed + 100 + i,
+                hidden=GEO["hidden"],
+                inter=GEO["inter"],
+                e_total=GEO["e_total"],
+                qb=GEO["qb"],
+            ),
+            args.scale_form,
         )
         for i in range(n_sets)
     ]
