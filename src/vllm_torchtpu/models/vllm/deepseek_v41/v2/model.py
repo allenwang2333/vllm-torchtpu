@@ -275,6 +275,33 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+_ZERO_WINDOW_STARTS: dict[tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
+
+
+def _window_starts(first, positions: torch.Tensor) -> torch.Tensor:
+    """Per-request SWA replay starts for the encoder (zero without a prefix hit)."""
+    requests = first.seq_lens.shape[0] if first is not None else 1
+    hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+    if envs.TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D and not any(hits):
+        # Steady decode has no hits: reuse one read-only device zeros tensor
+        # per batch size instead of an H2D on the head-launch critical path.
+        key = (requests, positions.dtype, positions.device)
+        zeros = _ZERO_WINDOW_STARTS.get(key)
+        if zeros is None:
+            zeros = torch.zeros(
+                requests, dtype=positions.dtype, device=positions.device
+            )
+            if zeros.device.type == "tpu":
+                synchronize_tensors((zeros,))
+            _ZERO_WINDOW_STARTS[key] = zeros
+        return zeros
+    return torch.tensor(
+        hits + (0,) * (requests - len(hits)),
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+
+
 def _stage_engram_layers(layers, gathered_hashes: torch.Tensor) -> None:
     """Look up and upload the Engram rows of ``layers`` before their graph."""
     pending = []
@@ -510,13 +537,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # hit's replay start and leaves cached KV of replayed tokens. The
             # input exists in every CED step so the compiled graph does not
             # depend on whether prefix caching is on.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
+            window_starts = _window_starts(first, positions)
             encoder_context = replace(
                 context,
                 additional_kwargs={

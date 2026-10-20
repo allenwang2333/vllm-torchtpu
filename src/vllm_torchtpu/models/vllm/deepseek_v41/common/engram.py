@@ -30,6 +30,15 @@ from .host_exchange import PendingRowExchange, start_exchange_rows
 logger = init_logger(__name__)
 
 
+def _record_upload_fence(device: torch.device):
+    """An event covering the H2D transfers issued so far (None on CPU)."""
+    if device.type == "cpu":
+        return None
+    fence = torch.tpu.Event()
+    fence.record()
+    return fence
+
+
 def _alloc_packed_staging(nbytes: int, huge: bool) -> torch.Tensor:
     """The packed H2D source; see `host_pages` for why its pages matter."""
     if huge:
@@ -630,6 +639,7 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
+        self._host_upload_fence = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -717,6 +727,7 @@ class Engram(upstream.Engram):
     def start_prepare_embeddings(self, hash_ids: torch.Tensor) -> HostEngramStaging:
         """Look up host rows and enqueue redistribution without waiting."""
         assert self._staged_raw is not None
+        self._wait_host_upload()
         dp_size = self.embed_tokens.dp_size
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
         if remainder or num_tokens > self._host_raw.shape[0]:
@@ -773,8 +784,21 @@ class Engram(upstream.Engram):
             self._host_scale_buf[: scale_words * 4].view(torch.int32)
         )
         staged = self._staged_tensors(num_tokens)
-        staged.copy_(host_words[: raw_words + scale_words])
+        words = host_words[: raw_words + scale_words]
+        if envs.TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D:
+            # Returns before the DMA has read `words`; the consumer graph waits
+            # for it on device. The host buffers stay fenced until then.
+            staged.copy_(words, non_blocking=True)
+            self._host_upload_fence = _record_upload_fence(staged.device)
+        else:
+            staged.copy_(words)
         self._active_raw = self._staged_views(num_tokens)
+
+    def _wait_host_upload(self) -> None:
+        """Block until the last non-blocking upload has read the host buffers."""
+        fence, self._host_upload_fence = self._host_upload_fence, None
+        if fence is not None:
+            fence.synchronize()
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:

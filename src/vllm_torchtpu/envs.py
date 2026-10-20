@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_SPLIT: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ATTENTION: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
@@ -373,6 +374,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CED encoder as two graphs split at the last host-offloaded Engram layer:
     # that layer's host lookup, DP exchange and H2D upload overlap the head.
     "TPU_DEEPSEEK_V41_ENGRAM_SPLIT": env_bool("TPU_DEEPSEEK_V41_ENGRAM_SPLIT"),
+    # Upload host Engram rows with a non-blocking H2D that the consumer graph
+    # orders after on device, and reuse a cached zero `window_starts` when no
+    # request has a prefix hit, so the encoder head launch waits on neither.
+    "TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D": env_bool("TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D"),
     # Default to full-row FP8 + paged SWA on supported v2 configurations.
     # Use native to retain the original KV quantization (restart required).
     "TPU_DEEPSEEK_V41_ATTENTION": env_with_choices(
