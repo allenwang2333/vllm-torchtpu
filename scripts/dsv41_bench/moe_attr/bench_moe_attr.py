@@ -482,11 +482,12 @@ def worst_token_rel_l2(a, b):
     return float(per.max())
 
 
-def run_check(mesh, seed, scale_form):
-    """The served build at the served shape against the dense reference
-    (which reads the 3-D scale tables; the kernel gets `scale_form`)."""
+def run_check(mesh, seed, scale_form, arm="base"):
+    """The arm's build at the served shape against the dense reference
+    (which reads the 3-D scale tables; the kernel gets `scale_form`). A
+    non-base arm is also compared bit for bit with the base build -- only
+    meaningful for arms that should not change arithmetic (e.g. vmempush)."""
     global moe_layer
-    _, moe_layer = ablate.install("base")
     w = make_fp4_weights(
         mesh,
         seed,
@@ -504,10 +505,23 @@ def run_check(mesh, seed, scale_form):
         n_layers=1,
         skew=0.0,
     )
-    out = jax.jit(lambda x, w, g: moe_call(x, w, g, None, mesh, scoring_fn="softmax"))(
-        x, to_scale_form(mesh, w, scale_form), gates[0]
-    )
-    out = np.asarray(out.astype(jnp.float32))
+
+    def run(which):
+        global moe_layer
+        _, moe_layer = ablate.install(which)
+        y = jax.jit(
+            lambda x, w, g: moe_call(x, w, g, None, mesh, scoring_fn="softmax")
+        )(x, to_scale_form(mesh, w, scale_form), gates[0])
+        return np.asarray(y.astype(jnp.float32))
+
+    out = run(arm)
+    vs_base = None
+    if arm != "base":
+        base = run("base")
+        vs_base = dict(
+            bitexact=bool(np.array_equal(out, base)),
+            max_abs_diff=float(np.abs(out - base).max()),
+        )
     ref = np.asarray(
         dense_reference(mesh, x, w, gates[0], topk=GEO["topk"], qb=GEO["qb"])
     )
@@ -517,6 +531,8 @@ def run_check(mesh, seed, scale_form):
     )
     res = dict(
         mode="check",
+        arm=arm,
+        vs_base=vs_base,
         finite=bool(np.isfinite(out).all() and np.isfinite(ref).all()),
         out_checksum=float(np.abs(out).sum()),
         ref_checksum=float(np.abs(ref).sum()),
@@ -608,7 +624,8 @@ def main():
                 f.write(line + "\n")
 
     if args.check:
-        emit(run_check(mesh, args.seed, args.scale_form))
+        for arm in args.arms.split(","):
+            emit(run_check(mesh, args.seed, args.scale_form, arm))
         return
 
     depths = tuple(

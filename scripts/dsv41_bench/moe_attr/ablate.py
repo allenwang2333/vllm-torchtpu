@@ -223,6 +223,8 @@ _LOOPBACK = [
 
 # The same for the two-hop transport (tile -> contribution slab -> push per
 # expert run), which builds whose visits carry several tiles use (prefill).
+# Not a "no transport" arm at prefill: 55 MB of local HBM->HBM copies measured
+# slower than the fabric push (~2.0 vs 1.2 ms/layer); use `nopush` there.
 _LOOPBACK += [
     (
         """                        pltpu.make_async_remote_copy(
@@ -276,6 +278,37 @@ _LOOPBACK += [
             _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
 """,
         """            _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
+""",
+    ),
+]
+
+# Two-hop transport only (prefill): the per-run remote pushes and their
+# scale mirrors are not issued and nothing waits for them; tiles are still
+# committed to the contribution slab and the own-destination hop still runs.
+# Conflicts with `loop` (same anchors).
+_NO_PUSH = [
+    (
+        _LOOPBACK[3][0],
+        """                        pass
+""",
+    ),
+    (
+        _LOOPBACK[4][0],
+        """                    pass
+""",
+    ),
+    (_LOOPBACK[5][0], ""),
+    (_LOOPBACK[6][0], ""),
+]
+
+# Every build ships each tile straight from its VMEM staging slot (the
+# one-hop transport small builds use) instead of committing it to the HBM
+# contribution slab and pushing per expert run.
+_VMEM_PUSH = [
+    (
+        """    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
+""",
+        """    push_from_vmem = True
 """,
     ),
 ]
@@ -354,6 +387,8 @@ _NO_ALLGATHER = [
 _LAYER_PIECES = {"noag": _NO_ALLGATHER}
 
 _PIECES = {
+    "nopush": _NO_PUSH,
+    "vmempush": _VMEM_PUSH,
     "nogather": _NO_GATHER,
     "now": _NO_WEIGHTS,
     "nodq": _NO_DEQUANT,
