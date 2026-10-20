@@ -300,11 +300,48 @@ def test_single_host_replica_routing_options(
         )
 
 
+def test_single_host_meta_rows_carry_every_byte(single_host_mesh):
+    """Every int32 bit pattern survives the e4m3 rows it rides in."""
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _gather_rows_with_meta
+
+    mesh = single_host_mesh
+    ep = mesh.shape[AXIS]
+    rng = np.random.default_rng(0)
+    # All 256 byte values in every byte position, plus random words.
+    words = np.arange(256, dtype=np.uint32) * 0x01010101
+    meta = np.concatenate([words, rng.integers(0, 2**32, 64, dtype=np.uint32)])
+    meta = np.tile(meta.view(np.int32), (ep, 1))
+    rows = rng.normal(size=(ep * 2, 4, 128)).astype(jnp.float8_e4m3fn)
+
+    def gather(r, m):
+        g, mg = _gather_rows_with_meta(r, m.reshape(-1), AXIS)
+        return g[None], mg[None]
+
+    sharding = NamedSharding(mesh, P(AXIS))
+    g, mg = jax.jit(
+        jax.shard_map(
+            gather,
+            mesh=mesh,
+            in_specs=(P(AXIS), P(AXIS)),
+            out_specs=(P(AXIS), P(AXIS)),
+            check_vma=False,
+        )
+    )(jax.device_put(rows, sharding), jax.device_put(meta, sharding))
+    np.testing.assert_array_equal(np.asarray(mg)[0], meta)
+    gathered = np.asarray(g)[0].view(np.uint8).reshape(ep, -1, 4, 128)
+    np.testing.assert_array_equal(
+        gathered[:, :2], rows.view(np.uint8).reshape(ep, 2, 4, 128)
+    )
+
+
 _DECODE_GLUE = {
     "merged": dict(merge_exchange=True),
     "onehot": dict(onehot_scatter=True),
     "plan": dict(pallas_plan=True),
-    "all": dict(merge_exchange=True, onehot_scatter=True, pallas_plan=True),
+    "combine": dict(decode_combine=True),
+    "all": dict(
+        merge_exchange=True, onehot_scatter=True, pallas_plan=True, decode_combine=True
+    ),
 }
 
 

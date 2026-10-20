@@ -58,6 +58,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import (
+    build_decode_combine,
     build_decode_plan,
     decode_plan_supported,
 )
@@ -96,7 +97,7 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype, decode=False
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -118,11 +119,19 @@ def _combine_arrivals(
     Both paths fold the arrival row's scale and the router weight into one
     coefficient over K * t_local values, so each of the K * t_local * hidden
     elements is multiplied once rather than twice.
+
+    `decode` takes plan_kernel.build_decode_combine instead, which DMAs the
+    few rows a decode bucket combines rather than gathering them on the
+    SparseCore.
     """
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
     hidden = lane_blocks * lanes
+    if decode:
+        return build_decode_combine(
+            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+        ).reshape(t_local, hidden)
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
@@ -208,17 +217,17 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
 
 
 def _gather_rows_with_meta(rows, meta, ax):
-    """All-gather one-byte token rows [t, lane blocks, 128] and an i32 vector.
+    """All-gather e4m3 token rows [t, lane blocks, 128] and an i32 vector.
 
     The vector rides as trailing rows, so one collective carries both. It is
     packed as bytes, since a float concatenate or pad may rewrite a NaN bit
-    pattern and an integer one cannot, while the collective moves the rows'
+    pattern and an integer one does not, while the collective moves the rows'
     own dtype: the SparseCore all-gather offload is only exercised with that.
     Returns the gathered rows -- each source's `t + meta rows` rows in turn,
     its tokens first -- and the gathered vectors [ep, len(meta)].
     """
-    if rows.dtype.itemsize != 1:
-        raise ValueError(f"the vector rides one-byte rows; got {rows.dtype}")
+    if rows.dtype != jnp.float8_e4m3fn:
+        raise ValueError(f"the vector rides e4m3 rows; got {rows.dtype}")
     t, lane_blocks, lanes = rows.shape
     row_bytes = lane_blocks * lanes
     meta_rows = -(-meta.size * 4 // row_bytes)
@@ -336,6 +345,7 @@ def fused_ep_moe_v2(
     merge_exchange=False,
     onehot_scatter=False,
     pallas_plan=False,
+    decode_combine=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -424,7 +434,8 @@ def fused_ep_moe_v2(
     onehot_scatter builds the two slab tables on the TensorCore rather than
     by SparseCore scatter. pallas_plan builds the whole sharded routing plan
     in one Pallas call (plan_kernel.build_decode_plan) where that kernel
-    covers the shape. All three apply only at or below
+    covers the shape. decode_combine sums the arrivals in one Mosaic call
+    (plan_kernel.build_decode_combine). All four apply only at or below
     SMALL_BATCH_LOCAL_TOKENS local tokens and change no value.
     """
     form = weight_form(weight_format)
@@ -562,15 +573,15 @@ def fused_ep_moe_v2(
         )
     replicated = has_expert_slot and expert_slot.shape[1] > 1
     small_batch = t_local <= SMALL_BATCH_LOCAL_TOKENS
-    # One-byte rows only: e4m3 has a single NaN encoding per sign, so no
-    # float data path can rewrite a meta byte that lands on one.
+    # e4m3 rows only; see _gather_rows_with_meta.
     merge_exchange = (
         bool(merge_exchange)
         and small_batch
         and sharded_plan
-        and jnp.dtype(form.wire_dtype).itemsize == 1
+        and jnp.dtype(form.wire_dtype) == jnp.float8_e4m3fn
     )
     onehot_scatter = bool(onehot_scatter) and small_batch
+    decode_combine = bool(decode_combine) and small_batch
     pallas_plan = (
         bool(pallas_plan)
         and small_batch
@@ -955,7 +966,13 @@ def fused_ep_moe_v2(
         )
 
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            x_l.dtype,
+            decode=decode_combine,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -1039,6 +1056,7 @@ def fused_ep_moe_v2(
         merge_exchange,
         onehot_scatter,
         pallas_plan,
+        decode_combine,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

@@ -184,6 +184,7 @@ def _build_op(
     merge_exchange=False,
     onehot_scatter=False,
     pallas_plan=False,
+    decode_combine=False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -207,6 +208,7 @@ def _build_op(
         merge_exchange,
         onehot_scatter,
         pallas_plan,
+        decode_combine,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -223,6 +225,7 @@ def _build_op(
         merge_exchange=merge_exchange,
         onehot_scatter=onehot_scatter,
         pallas_plan=pallas_plan,
+        decode_combine=decode_combine,
     )
 
     def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
@@ -772,13 +775,14 @@ def prebuild_fused_moe_ep(
         merge_exchange=envs.MOE_FUSED_EP_V2_MERGED_EXCHANGE,
         onehot_scatter=envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
         pallas_plan=envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
+        decode_combine=envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
         "token_replica_groups=%s merged_exchange=%s onehot_scatter=%s "
-        "pallas_plan=%s",
+        "pallas_plan=%s decode_combine=%s",
         hidden,
         inter,
         local_experts,
@@ -798,6 +802,7 @@ def prebuild_fused_moe_ep(
         envs.MOE_FUSED_EP_V2_MERGED_EXCHANGE,
         envs.MOE_FUSED_EP_V2_ONEHOT_SCATTER,
         envs.MOE_FUSED_EP_V2_PALLAS_PLAN,
+        envs.MOE_FUSED_EP_V2_DECODE_COMBINE,
     )
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the
