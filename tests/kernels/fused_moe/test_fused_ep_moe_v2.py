@@ -891,3 +891,96 @@ def test_fp4_row_padded_flat_scales_refuse_the_wrong_row_count():
             weight_format=WeightFormat.FP4,
             rhs_qb=rhs_qb,
         )
+
+
+# --------------------------------------------------------------------------- #
+# The pipelined visit loop (MOE_FUSED_EP_V2_PIPELINED_VISITS).
+#
+# It issues the same copies at the same offsets and only moves where the next
+# expert's first tile is issued, so it has to give the default build's output
+# bit for bit. A path that skipped the issue would not drift: it would hang on
+# the arrival wait, or compute another expert's rows.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # Several experts per shard over a tile, so visits run multi-tile and
+        # the build pushes whole runs from the HBM slab.
+        dict(STREAM, weight_format=WeightFormat.FP4, rhs_qb=STREAM_QB, depth=None),
+        # The same at weight-prefetch depth zero, where the next expert's
+        # gate/up slab starts from inside this expert's block reader.
+        dict(STREAM, weight_format=WeightFormat.FP4, rhs_qb=STREAM_QB, depth=0),
+        # Under a tile per expert, so tiles push themselves from VMEM.
+        dict(
+            hidden=1024,
+            inter=512,
+            e_total=32,
+            topk=4,
+            tokens=256,
+            weight_format=WeightFormat.FP4,
+            rhs_qb=STREAM_QB,
+            depth=None,
+        ),
+        dict(
+            hidden=1024,
+            inter=512,
+            e_total=32,
+            topk=4,
+            tokens=256,
+            weight_format=WeightFormat.FP8,
+            rhs_qb=None,
+            depth=None,
+        ),
+    ],
+    ids=["fp4-slab", "fp4-slab-depth0", "fp4-vmem", "fp8-vmem"],
+)
+def test_pipelined_visits_are_bit_exact(case, monkeypatch, at_prefetch_depth):
+    """The pipelined visit loop gives the default build's output, bit for bit,
+    and builds a kernel of its own."""
+    mesh = _mesh()
+    if case["weight_format"] == WeightFormat.FP4:
+        weights, scales, _ = _make_fp4_weights(
+            mesh,
+            48,
+            hidden=case["hidden"],
+            inter=case["inter"],
+            e_total=case["e_total"],
+            rhs_qb=case["rhs_qb"],
+        )
+        operands = (*weights, *scales)
+    else:
+        operands = _make_weights(
+            mesh,
+            48,
+            hidden=case["hidden"],
+            inter=case["inter"],
+            e_total=case["e_total"],
+            weight_format=case["weight_format"],
+        )
+    x, gating = _make_inputs(
+        mesh, 49, tokens=case["tokens"], hidden=case["hidden"], e_total=case["e_total"]
+    )
+    common = dict(
+        topk=case["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=case["weight_format"],
+        rhs_qb=case["rhs_qb"],
+        sharded_plan=True,
+    )
+    outs = {}
+    for pipelined in (False, True):
+        monkeypatch.setenv("MOE_FUSED_EP_V2_PIPELINED_VISITS", str(int(pipelined)))
+        if case["depth"] is None:
+            kernel._BUILD_CACHE.clear()
+            layer._LAYER_SM_CACHE.clear()
+        else:
+            at_prefetch_depth(case["depth"])
+        outs[pipelined] = np.asarray(fused_ep_moe_v2(x, *operands, gating, **common))
+        built = [dict(key)["pipelined_visits"] for key in kernel._BUILD_CACHE]
+        assert built == [pipelined], built
+    assert np.isfinite(outs[False].astype(np.float32)).all()
+    np.testing.assert_array_equal(outs[True], outs[False])

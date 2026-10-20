@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     MAX_ROUTING_BLOCK,
@@ -456,6 +457,8 @@ def fused_ep_moe_v2(
                 "hash_topk_ids are expert ids and must be an integer dtype; "
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
+    # Read at trace time: a static of the build and of the cache key below.
+    pipelined_visits = envs.MOE_FUSED_EP_V2_PIPELINED_VISITS
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -469,6 +472,7 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
+        pipelined_visits=pipelined_visits,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -796,6 +800,7 @@ def fused_ep_moe_v2(
         w2.dtype,
         form.has_scales and w1_scale.dtype,
         pad_scale_rows,
+        pipelined_visits,
         gating.dtype,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,

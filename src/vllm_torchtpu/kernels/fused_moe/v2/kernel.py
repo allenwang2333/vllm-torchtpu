@@ -298,6 +298,17 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
     return mid_q, mid_scale
 
 
+def _call(hook):
+    """Run an FFN body's between-matmuls hook, where the caller passed one.
+
+    The hook is kernel side effects only -- DMA issues and waits -- placed
+    between the two matmuls so that they have a matmul on either side to
+    hide behind; it returns nothing and the FFN's arithmetic is unchanged.
+    """
+    if hook is not None:
+        hook()
+
+
 def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     """Contract lhs against a weight handed over one contraction chunk at a
     time, summing the chunks' partial products.
@@ -319,7 +330,9 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
+def expert_ffn_fp8(
+    act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None, between=None
+):
     """One expert's FFN on eight-bit weights: the gate/up matmul, the
     activation, the intermediate requantization and the down matmul.
 
@@ -332,6 +345,7 @@ def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
     )
+    _call(between)
     acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
     return acc2, mid_scale
 
@@ -347,6 +361,7 @@ def expert_ffn_blockscale(
     qb=QB4,
     act_fn="silu",
     w1b=None,
+    between=None,
 ):
     """One expert's FFN on block-scaled weights: the same body as
     expert_ffn_fp8 with each matmul summed over contraction blocks carrying
@@ -378,6 +393,7 @@ def expert_ffn_blockscale(
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
     )
+    _call(between)
     acc2 = None
     for b in range(n_blocks2):
         part = lax.dot_general(
@@ -391,7 +407,7 @@ def expert_ffn_blockscale(
     return acc2, mid_scale
 
 
-def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
+def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None, between=None):
     """One expert's FFN on unquantized sixteen-bit weights.
 
     Nothing here is quantized and nothing is dequantized. The rows arrive as
@@ -408,6 +424,7 @@ def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
     mid, _ = _intermediate_rows(
         acc1, None, inter, w1s=None, act_fn=act_fn, w1b=w1b, requantize=False
     )
+    _call(between)
     acc2 = lax.dot_general(mid, w2, DN, preferred_element_type=jnp.float32)
     return acc2, None
 
@@ -423,6 +440,7 @@ def expert_ffn_int8(
     kb=host.WIDEN_KCHUNK,
     act_fn="silu",
     w1b=None,
+    between=None,
 ):
     """One expert's FFN on eight-bit INTEGER weights with per-channel scales.
 
@@ -448,6 +466,7 @@ def expert_ffn_int8(
     mid, _ = _intermediate_rows(
         acc1, None, inter, w1s=w1s, act_fn=act_fn, w1b=w1b, requantize=False
     )
+    _call(between)
     acc2 = _chunked_dot(mid, w2_chunk, n_chunks2, kb)
     return acc2, None
 
@@ -529,8 +548,16 @@ def _build_fused_ep_moe_kernel(
     has_w1_bias=False,
     has_w2_bias=False,
     pad_scale_rows=False,
+    pipelined_visits=False,
 ):
     """Build the pallas_call and the function that invokes it.
+
+    `pipelined_visits` issues the next visited expert's first activation tile
+    from between the two matmuls of this expert's last tile instead of after
+    the tile loop, where the rows, the scale window and the index window it
+    waits for land with nothing left to hide behind. The copies, their
+    offsets and the arithmetic are unchanged, so the output is the same bits;
+    only where the issue sits moves (MOE_FUSED_EP_V2_PIPELINED_VISITS).
 
     `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
     rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
@@ -1251,6 +1278,32 @@ def _build_fused_ep_moe_kernel(
                     slab_base + gather_payload_rows, jnp.int32(1) - wslot
                 )
 
+        # prime_expert in two halves, for a pipelined visit loop that issues
+        # the first tile from inside the previous expert's last tile.
+        def issue_first_tile(e, lhs_slot, wslot):
+            """Land expert ``e``'s group-zero index window, which the previous
+            expert started a tile early, and issue its first activation tile
+            into ``lhs_slot``."""
+            rows = expert_rows_sm[e]
+            slab_base = expert_base_sm[e]
+            wait_gather_window(slab_base, wslot)
+            _, shift = gather_dma_coords(slab_base)
+            lhs_issue_tile(
+                slab_base, jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot, wslot, shift
+            )
+
+        def issue_second_window(e, wslot):
+            """Start expert ``e``'s group-one index window, as prime_expert
+            does after the first tile."""
+            rows = expert_rows_sm[e]
+            slab_base = expert_base_sm[e]
+
+            @pl.when(rows > gather_payload_rows)
+            def _():
+                issue_gather_window(
+                    slab_base + gather_payload_rows, jnp.int32(1) - wslot
+                )
+
         def expert_tiles(e, visit_i, carry):
             """One expert step: a fori_loop over its [tile_m, H] tiles."""
             # carry = (tile_count, <per-parity outstanding counts>, wslot):
@@ -1519,6 +1572,21 @@ def _build_fused_ep_moe_kernel(
                         expert_base_sm[visit_sm[visit_i + 1]], next_wslot
                     )
 
+                def between():
+                    """The next visited expert's first tile, from between the
+                    matmuls of this expert's last tile; its index window went
+                    out at this tile's head, a gate/up matmul ago."""
+
+                    last_with_next = jnp.logical_and(
+                        t + 1 == n_tiles, visit_i + 1 < n_visit
+                    )
+
+                    @pl.when(last_with_next)
+                    def _():
+                        issue_first_tile(
+                            visit_sm[visit_i + 1], other_parity, next_wslot
+                        )
+
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
 
@@ -1572,6 +1640,7 @@ def _build_fused_ep_moe_kernel(
                             qb=rhs_qb,
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            between=between if pipelined_visits else None,
                         )
                     elif weight_format == host.WeightFormat.INT8:
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
@@ -1584,6 +1653,7 @@ def _build_fused_ep_moe_kernel(
                             n_chunks2=inter // host.WIDEN_KCHUNK,
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            between=between if pipelined_visits else None,
                         )
                     elif weight_format == host.WeightFormat.BF16:
                         acc2, mid_scale = expert_ffn_bf16(
@@ -1592,6 +1662,7 @@ def _build_fused_ep_moe_kernel(
                             w2_vm[slot],
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            between=between if pipelined_visits else None,
                         )
                     else:
                         acc2, mid_scale = expert_ffn_fp8(
@@ -1602,6 +1673,7 @@ def _build_fused_ep_moe_kernel(
                             w1s_vm[pl.ds(slot, 1), :],
                             act_fn=act_fn,
                             w1b=w1b_row,
+                            between=between if pipelined_visits else None,
                         )
                     # The destination applies the router weight, not this.
                     # Four-bit weights carry w2s inside the block sums; the
@@ -1712,12 +1784,16 @@ def _build_fused_ep_moe_kernel(
             @pl.when(visit_i + 1 < n_visit)
             def _():
                 nxt = visit_sm[visit_i + 1]
-                prime_expert(
-                    nxt,
-                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                    next_wslot,
-                    jnp.bool_(True),
-                )
+                if pipelined_visits:
+                    # The first tile went out from the last tile's FFN.
+                    issue_second_window(nxt, next_wslot)
+                else:
+                    prime_expert(
+                        nxt,
+                        lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
+                        next_wslot,
+                        jnp.bool_(True),
+                    )
 
             return carry[:-1] + (next_wslot,)
 
@@ -1985,6 +2061,7 @@ def _build_fused_ep_moe_kernel(
             f"{'' if act_fn == 'silu' else '_' + act_fn}"
             f"{bias_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
+            f"{'_pv' if pipelined_visits else ''}"
         )
         return pl.pallas_call(
             kernel,
