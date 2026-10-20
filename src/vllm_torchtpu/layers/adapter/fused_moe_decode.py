@@ -768,10 +768,11 @@ def arm_runner_models(model_runner: Any) -> int:
     model (the MTP layer). Called once after the drafter has loaded, when every
     module has its final weight layout."""
     armed = arm_fused_moe_decode(model_runner.model, "target model")
-    for name in ("drafter", "_async_drafter"):
-        drafter = getattr(model_runner, name, None)
-        draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
-        if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
-            armed += arm_fused_moe_decode(draft, "draft model")
-            break
+    # `drafter` only: TPUModelRunner's `_async_drafter` is a property over it
+    # that asserts an EAGLE / DFlash drafter, so getattr() on a runner without
+    # one raises instead of returning the default.
+    drafter = getattr(model_runner, "drafter", None)
+    draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
+    if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
+        armed += arm_fused_moe_decode(draft, "draft model")
     return armed
