@@ -824,7 +824,7 @@ def _build_fused_ep_moe_kernel(
     interleave_inputs = (
         rhs_packed4
         and not push_from_vmem
-        and tile_m in (128, 256)
+        and tile_m == 256
         and hidden >= 4096
         and host.TOKEN_GATHER_TILES_PER_WINDOW == 1
     )
