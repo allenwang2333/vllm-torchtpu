@@ -186,6 +186,7 @@ def _build_op(
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     oneshot_routing_gather = envs.TPU_MOE_ONESHOT_ROUTING_GATHER
+    pallas_plan_max_tokens = envs.TPU_MOE_PALLAS_PLAN_MAX_TOKENS
     key = (
         topk,
         renormalize,
@@ -203,6 +204,7 @@ def _build_op(
         scales_expert_second_minor,
         has_expert_slot,
         has_order_after,
+        pallas_plan_max_tokens,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -244,6 +246,7 @@ def _build_op(
             oneshot_routing_gather=oneshot_routing_gather,
             token_replica_groups=token_replica_groups,
             scales_expert_second_minor=scales_expert_second_minor,
+            pallas_plan_max_tokens=pallas_plan_max_tokens,
             **bias_kw,
             **routing_kw,
         )

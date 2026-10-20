@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
     VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS: int = 0
     TPU_DSV4_CSA_KEEP_GATHER_PADDING: bool = False
+    TPU_MOE_PALLAS_PLAN_MAX_TOKENS: int = 0
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -901,6 +902,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS": env_int(
         "VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS", 0
     ),
+    # Fused EP MoE with MOE_FUSED_EP_V2_SHARDED_PLAN: build the routing plan
+    # in one Pallas call (kernels/fused_moe/v2/plan_kernel.py) for steps of at
+    # most this many tokens per DP rank. 0 = off. Same operands, bit for bit.
+    "TPU_MOE_PALLAS_PLAN_MAX_TOKENS": env_int("TPU_MOE_PALLAS_PLAN_MAX_TOKENS", 0),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

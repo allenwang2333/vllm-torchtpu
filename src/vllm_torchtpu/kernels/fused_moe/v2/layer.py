@@ -18,6 +18,7 @@ expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
 import threading
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -57,6 +58,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.oneshot_gather import oneshot_all_gather
+from vllm_torchtpu.kernels.fused_moe.v2.plan_kernel import pallas_plan
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
@@ -245,6 +247,223 @@ def _relabel_expert_ids_to_mesh_order(topk_idx, *, g_local, mesh_ep_ranks):
     return mesh_block * g_local + topk_idx % g_local
 
 
+class RoutingOperands(NamedTuple):
+    """Everything the kernel call and the combine read from the routing plan."""
+
+    kernel_tables: tuple
+    token_gather: jax.Array
+    expert_rows: jax.Array
+    slab_base: jax.Array
+    scale_slab: jax.Array | None
+    visit: jax.Array
+    counts: jax.Array
+    pos: jax.Array
+    mirror_pos: jax.Array
+    q_g: jax.Array
+
+
+def _xla_routing_operands(
+    exchange,
+    me,
+    local_blocks,
+    block_hist,
+    q_g,
+    *,
+    layout,
+    T,
+    t_local,
+    topk,
+    e_total,
+    ep,
+    block,
+    capacity,
+    ragged_stride,
+    sharded_plan,
+    quantized_activations,
+):
+    """The routing plan built by XLA from the gathered payload.
+
+    `q_g` passes through, ordered behind the slab index where that pays.
+    """
+    g_local = e_total // ep
+    pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
+        exchange, layout, t_local, topk, e_total
+    )
+    gathered = GatheredPairs(
+        expert_blocks=pairs_g.reshape(T * topk // block, block),
+        local_blocks=local_blocks,
+        block_hist=block_hist,
+        rows_by_dest=rows_by_dest,
+        n_tokens=T,
+        topk=topk,
+    )
+
+    plan_kw = dict(
+        e_total=e_total,
+        ep=ep,
+        t_local=t_local,
+        block=block,
+        tile_m=capacity,
+        shard_stride=ragged_stride,
+    )
+    if sharded_plan:
+        routing = build_routing_tables_sharded(None, me, gathered=gathered, **plan_kw)
+    else:
+        routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
+    block_tables = shard_transport_tables_in_blocks(routing, me, e_total=e_total, ep=ep)
+    row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+    # Both slab tables scatter onto this shard's own slab. The rows of
+    # the other shards are dropped where they are computed rather than
+    # built into a replicated slab and sliced away afterwards.
+    slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
+    # The two slab scatters and the activation all-gather are offloaded to
+    # the SAME SparseCore. Ordering the scatters behind the collective
+    # enqueues it 129 us earlier and costs them the cover they had; that
+    # trade measures +2.80% at 2048 local tokens and negative at every
+    # smaller shape, so it is taken only where the routing plan in front
+    # of the collective is longer than the scatters behind it. Same bits
+    # either way; only the queue moves.
+    if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
+    token_gather = shard_token_gather(
+        routing, me, shard_stride=ragged_stride, rows=slab_row
+    )
+    # The kernel DMA-aligns each logical expert window down by as much as
+    # 127 int32 rows and always copies a full fixed window. Pad after the
+    # scatter (rather than enlarging its destination) so the off-shard
+    # sentinel remains out of range and cannot write a live padding row.
+    token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
+    # The activation row scale, scattered onto the slab row each routed
+    # pair computes on. It exists only where the rows were quantized.
+    #
+    # The slab is built flat and handed over in the dense lane-block
+    # view, which is the same bytes in the same order and so costs
+    # nothing. A column would cost a copy of the whole slab: [rows, 1]
+    # is padded out to a full lane block on the way to the kernel, and
+    # that copy is the largest single piece of glue above a thousand
+    # rows. The kernel rebuilds the column a tile at a time instead.
+    #
+    # The scatter runs the length of the view rather than of the slab.
+    # Those extra elements are past the slab's last row, so a pair the
+    # rebase sent past the end lands on one of them instead of being
+    # dropped; nothing reads them, and the slab's own rows are the same
+    # either way.
+    if quantized_activations:
+        scale_bits = jnp.repeat(scale_bits_g, topk)
+        scale_rows = act_scale_slab_rows(ragged_stride)
+        scale_slab = lax.bitcast_convert_type(
+            jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+            .at[slab_row]
+            .add(scale_bits, mode="drop"),
+            jnp.float32,
+        ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
+    else:
+        scale_slab = None
+    expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+    # The empty experts drop out of the visit list, so an empty
+    # expert's weight slab never streams. How MANY are visited is a
+    # row of the count table rather than its own reduction, so this
+    # builder's second value is not read; it leaves the program with
+    # the rest of the dead code, and its own test still sees it.
+    visit, _ = expert_visit_list(expert_rows, g_local)
+    # One pass builds every count the kernel needs, still spread over
+    # the expert-parallel axis; the kernel's scalar core closes them.
+    counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
+
+    # The kernel takes four of the seven transport tables and one of the
+    # three push tables. The two totals are rows of `counts`, and three
+    # more are the same array as one already here -- push_src is the
+    # commit offset, push_len is the commit length, and the receive row
+    # offset is the push destination in rows -- so each goes over once and
+    # the kernel derives the rest. Every table shipped is another blocking
+    # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
+    # fit in 1 MB of SMEM.
+    kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+    # The destination's own table: one arrival row per selection slot.
+    pos = (
+        routing.pos
+        if sharded_plan
+        else lax.dynamic_slice(routing.arrival_row, (me * t_local, 0), (t_local, topk))
+    )
+    mirror_pos = (
+        routing.mirror_pos
+        if sharded_plan
+        else lax.dynamic_slice(routing.mirror_row, (me * t_local, 0), (t_local, topk))
+    )
+    return RoutingOperands(
+        kernel_tables,
+        token_gather,
+        expert_rows,
+        slab_base,
+        scale_slab,
+        visit,
+        counts,
+        pos,
+        mirror_pos,
+        q_g,
+    )
+
+
+def _pallas_routing_operands(
+    exchange,
+    rank,
+    q_g,
+    *,
+    layout,
+    T,
+    t_local,
+    topk,
+    e_total,
+    ep,
+    block,
+    capacity,
+    ragged_stride,
+    interpret=False,
+):
+    """`_xla_routing_operands` for the sharded plan of quantized rows, with
+    the plan in one Pallas call (plan_kernel.py); every operand is identical.
+
+    Only a few reshapes remain XLA ops.
+    """
+    if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        raise ValueError("the Pallas routing plan is for buckets below the AGQ hoist")
+    scale_at, count_at, _ = layout
+    plan = pallas_plan(
+        exchange,
+        rank,
+        ep=ep,
+        e_total=e_total,
+        t_local=t_local,
+        topk=topk,
+        block=block,
+        tile_m=capacity,
+        shard_stride=ragged_stride,
+        scale_at=scale_at,
+        count_at=count_at,
+        interpret=interpret,
+    )
+    g_local = e_total // ep
+    n = t_local * topk
+    return RoutingOperands(
+        (
+            plan.run_start,
+            plan.aligned_rows,
+            plan.contrib_off,
+            plan.push_dst,
+            plan.true_rows,
+        ),
+        plan.token_gather.reshape(-1),
+        plan.expert_rows.reshape(g_local),
+        plan.slab_base.reshape(g_local),
+        plan.scale_slab,
+        plan.visit.reshape(g_local),
+        plan.counts,
+        plan.pos[:, :n].reshape(t_local, topk),
+        plan.mirror_pos[:, :n].reshape(t_local, topk),
+        q_g,
+    )
+
+
 # Local tokens at or above which the activation all-gather is enqueued ahead
 # of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
 # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
@@ -289,6 +508,7 @@ def fused_ep_moe_v2(
     expert_slot=None,
     order_after=None,
     oneshot_routing_gather=False,
+    pallas_plan_max_tokens=0,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -336,6 +556,9 @@ def fused_ep_moe_v2(
     oneshot_routing_gather swaps the all-gather of the routing payload for
     ``oneshot_all_gather`` (one barrier, then direct remote DMAs to every
     shard). Same bits; only the collective's latency changes.
+    pallas_plan_max_tokens builds the sharded routing plan of quantized rows
+    in one Pallas call (plan_kernel.py) instead of ~100 small XLA ops, for
+    steps of at most this many tokens per shard; 0 never does. Same bits.
 
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
@@ -509,6 +732,12 @@ def fused_ep_moe_v2(
             f"{tuple(expert_slot.shape)}"
         )
     replicated = has_expert_slot and expert_slot.shape[1] > 1
+    use_pallas_plan = (
+        sharded_plan
+        and form.quantized_activations
+        and token_layout.input_rows <= pallas_plan_max_tokens
+        and t_local < AGQ_MIN_LOCAL_TOKENS
+    )
     kfn = build_fused_ep_moe_kernel(
         g_local=g_local,
         capacity=capacity,
@@ -658,116 +887,44 @@ def fused_ep_moe_v2(
             exchange = lax.all_gather(payload, ax, axis=0, tiled=True).reshape(
                 ep, layout[-1]
             )
-        pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
-            exchange, layout, t_local, topk, e_total
-        )
-        gathered = GatheredPairs(
-            expert_blocks=pairs_g.reshape(T * topk // block, block),
-            local_blocks=local_blocks,
-            block_hist=block_hist,
-            rows_by_dest=rows_by_dest,
-            n_tokens=T,
-            topk=topk,
-        )
-
         plan_kw = dict(
+            layout=layout,
+            T=T,
+            t_local=t_local,
+            topk=topk,
             e_total=e_total,
             ep=ep,
-            t_local=t_local,
             block=block,
-            tile_m=capacity,
-            shard_stride=ragged_stride,
+            capacity=capacity,
+            ragged_stride=ragged_stride,
         )
-        if sharded_plan:
-            routing = build_routing_tables_sharded(
-                None, me, gathered=gathered, **plan_kw
+        if use_pallas_plan:
+            ops = _pallas_routing_operands(exchange, rank_l, q_g, **plan_kw)
+        else:
+            ops = _xla_routing_operands(
+                exchange,
+                me,
+                local_blocks,
+                block_hist,
+                q_g,
+                sharded_plan=sharded_plan,
+                quantized_activations=form.quantized_activations,
+                **plan_kw,
             )
-        else:
-            routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
-        block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
-        )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
-        # Both slab tables scatter onto this shard's own slab. The rows of
-        # the other shards are dropped where they are computed rather than
-        # built into a replicated slab and sliced away afterwards.
-        slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
-        # The two slab scatters and the activation all-gather are offloaded to
-        # the SAME SparseCore. Ordering the scatters behind the collective
-        # enqueues it 129 us earlier and costs them the cover they had; that
-        # trade measures +2.80% at 2048 local tokens and negative at every
-        # smaller shape, so it is taken only where the routing plan in front
-        # of the collective is longer than the scatters behind it. Same bits
-        # either way; only the queue moves.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
-            slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
-        # The kernel DMA-aligns each logical expert window down by as much as
-        # 127 int32 rows and always copies a full fixed window. Pad after the
-        # scatter (rather than enlarging its destination) so the off-shard
-        # sentinel remains out of range and cannot write a live padding row.
-        token_gather = jnp.pad(token_gather, (0, token_gather_window_rows(capacity)))
-        # The activation row scale, scattered onto the slab row each routed
-        # pair computes on. It exists only where the rows were quantized.
-        #
-        # The slab is built flat and handed over in the dense lane-block
-        # view, which is the same bytes in the same order and so costs
-        # nothing. A column would cost a copy of the whole slab: [rows, 1]
-        # is padded out to a full lane block on the way to the kernel, and
-        # that copy is the largest single piece of glue above a thousand
-        # rows. The kernel rebuilds the column a tile at a time instead.
-        #
-        # The scatter runs the length of the view rather than of the slab.
-        # Those extra elements are past the slab's last row, so a pair the
-        # rebase sent past the end lands on one of them instead of being
-        # dropped; nothing reads them, and the slab's own rows are the same
-        # either way.
-        if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
-            scale_rows = act_scale_slab_rows(ragged_stride)
-            scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
-            ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
-        else:
-            scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
+        q_g = ops.q_g
         recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
         bias_it = operands
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
-        # The empty experts drop out of the visit list, so an empty
-        # expert's weight slab never streams. How MANY are visited is a
-        # row of the count table rather than its own reduction, so this
-        # builder's second value is not read; it leaves the program with
-        # the rest of the dead code, and its own test still sees it.
-        visit, _ = expert_visit_list(expert_rows, g_local)
-        # One pass builds every count the kernel needs, still spread over
-        # the expert-parallel axis; the kernel's scalar core closes them.
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
-
-        # The kernel takes four of the seven transport tables and one of the
-        # three push tables. The two totals are rows of `counts`, and three
-        # more are the same array as one already here -- push_src is the
-        # commit offset, push_len is the commit length, and the receive row
-        # offset is the push destination in rows -- so each goes over once and
-        # the kernel derives the rest. Every table shipped is another blocking
-        # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
-        # fit in 1 MB of SMEM.
-        kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
         arrivals, arrival_scales = kfn(
-            kernel_tables,
-            token_gather,
-            expert_rows,
-            slab_base,
+            ops.kernel_tables,
+            ops.token_gather,
+            ops.expert_rows,
+            ops.slab_base,
             q_g,
-            scale_slab,
+            ops.scale_slab,
             w1_l,
             w2_l,
             w1s_l,
@@ -775,28 +932,13 @@ def fused_ep_moe_v2(
             w1b_k,
             w2b_k,
             recv_rows=recv_rows,
-            visit=visit,
-            counts=counts,
+            visit=ops.visit,
+            counts=ops.counts,
             rank=rank_l,
         )
 
-        # The destination's own table: one arrival row per selection slot.
-        pos = (
-            routing.pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                routing.arrival_row, (me * t_local, 0), (t_local, topk)
-            )
-        )
-        mirror_pos = (
-            routing.mirror_pos
-            if sharded_plan
-            else lax.dynamic_slice(
-                routing.mirror_row, (me * t_local, 0), (t_local, topk)
-            )
-        )
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
+            arrivals, arrival_scales, ops.pos, ops.mirror_pos, topk_weights, x_l.dtype
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -878,6 +1020,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         bool(scales_expert_second_minor),
         bool(oneshot_routing_gather),
+        use_pallas_plan,
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:
