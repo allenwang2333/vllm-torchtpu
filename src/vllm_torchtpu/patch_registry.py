@@ -100,6 +100,9 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.core.fine_prefix_hits:patch_fine_prefix_hits", _ENGINE),
     Patch(
+        "vllm_torchtpu.core.block_hash_reuse:patch_block_hash_reuse", ("engine_core",)
+    ),
+    Patch(
         "vllm_torchtpu.core.hca_state_checkpoint:patch_drop_hca_state_checkpoint",
         _ENGINE,
     ),
@@ -148,6 +151,9 @@ PATCHES = (
         "vllm_torchtpu.platforms.tpu_platform:_patch_api_server_kernel_reload_endpoint",
         _ACTIVE,
     ),
+    # API-server prompt tokenization (VLLM_TPU_SEGMENT_TOKENIZE).
+    Patch("vllm_torchtpu.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE),
+    Patch("vllm_torchtpu.request_timing_log:patch_request_timing_log", _ACTIVE),
     # Model-specific patches.
     # Append patches for new models here with
     # stages=("platform_activation", "model_load") and model_config=True.

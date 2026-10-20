@@ -192,6 +192,12 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
+    TPU_BLOCK_HASH_REUSE: bool = False
+    TPU_BLOCK_HASH_REUSE_MAX_TOKENS: int = 33554432
+    TPU_REQUEST_TIMING_LOG: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1145,6 +1151,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # API server: tokenize chat prompts piecewise between added tokens and
+    # cache message-body pieces across turns (segment_tokenize.py). Exact;
+    # raises for ineligible tokenizers.
+    "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
+    # Token budget of that cache (~12 B/token: id pointers plus piece text).
+    "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Also run the full encode for every prompt and raise if the ids differ
+    # (validation runs only: it costs the full encode again).
+    "VLLM_TPU_SEGMENT_TOKENIZE_VERIFY": env_bool("VLLM_TPU_SEGMENT_TOKENIZE_VERIFY"),
+    # EngineCore: copy a new prompt's prefix-cache block hashes from the stored
+    # prompt sharing the longest token prefix (core/block_hash_reuse.py).
+    "TPU_BLOCK_HASH_REUSE": env_bool("TPU_BLOCK_HASH_REUSE"),
+    # Prompt tokens that store keeps (~8.5 B/token: ids plus hash references).
+    "TPU_BLOCK_HASH_REUSE_MAX_TOKENS": env_int(
+        "TPU_BLOCK_HASH_REUSE_MAX_TOKENS", 33554432
+    ),
+    # API server: log each finished request's TTFT split (request_timing_log.py).
+    "TPU_REQUEST_TIMING_LOG": env_bool("TPU_REQUEST_TIMING_LOG"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
