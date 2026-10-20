@@ -216,6 +216,18 @@ def _attention_csa(
     swa_page_indices = swa_page_indices.flatten()
     main_page_indices = main_page_indices.flatten()
 
+    # Where the top-k is first used decides what hides its SparseCore latency
+    # and what hides the CSA gather's. Tied to q, the top-k completes behind
+    # the q path and the gather (which does not read the SWA cache unless the
+    # two share a buffer) behind SWA; tied to the SWA output, the top-k gets
+    # SWA too and the gather nothing. The second suits long prefill top-ks.
+    tie_topk_to_q = (
+        not two_caches_same_buffer
+        and q.shape[0] <= envs.TPU_DSV4_CSA_TOPK_TIE_Q_MAX_TOKENS
+    )
+    if tie_topk_to_q:
+        extra, q = jax.lax.optimization_barrier((extra, q))
+
     swa_output, updated_sw_cache, swa_l, swa_m = _run_swa(
         q=q,
         new_kv=new_kv,
@@ -236,10 +248,11 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    # First use of the top-k after the SWA pass: the indexer's SparseCore
-    # top-k then completes behind the q projection and SWA, which do not need
-    # it, instead of stalling the TensorCore before them.
-    extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+    if not tie_topk_to_q:
+        # First use of the top-k after the SWA pass: the indexer's SparseCore
+        # top-k then completes behind the q projection and SWA, which do not
+        # need it, instead of stalling the TensorCore before them.
+        extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
 
     output = sparse_ragged_paged_attention(
         q=q,
