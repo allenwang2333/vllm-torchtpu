@@ -101,7 +101,7 @@ WIDE_AR_DEFER = True
 WIDE_AR_XLAYER = True
 # GatedDeltaNet input-state prefetch slots of a wide step's microbatch, and whether the routed
 # expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
-WIDE_NGI = 1
+WIDE_NGI = 2
 WIDE_TILE_REUSE = True
 # Bisect switch: False runs the expert loop but drops its output (part_all keeps the shared
 # expert only), so a parity against the no-experts kernel shows whether the loop itself disturbs
