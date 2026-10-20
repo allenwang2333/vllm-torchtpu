@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS: int = 0
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
@@ -654,6 +655,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
+    # Phased profiler: prefill-carrying phases start a capture only on steps
+    # padded to at least this many tokens (0 = any step).
+    "TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS": env_int(
+        "TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS", 0
+    ),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server

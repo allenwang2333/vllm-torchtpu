@@ -1098,6 +1098,7 @@ class TPUModelRunner(GPUModelRunner):
             num_decode_steps_to_skip=profiler_config.delay_iterations,
             decode_kv_len_threshold=decode_kv_len_threshold,
             prefill_kv_len_threshold=prefill_kv_len_threshold,
+            prefill_min_padded_tokens=envs.TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS,
             standard_opts=standard_opts,
             advanced_opts=advanced_opts,
         )

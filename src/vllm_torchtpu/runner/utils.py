@@ -159,6 +159,7 @@ class PhaseBasedProfiler:
         num_decode_steps_to_skip: int = PHASED_PROFILER_NUM_DECODE_STEPS_TO_SKIP,
         decode_kv_len_threshold: int = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD,
         prefill_kv_len_threshold: int = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD,
+        prefill_min_padded_tokens: int = 0,
         standard_opts: dict[str, Any] | None = None,
         advanced_opts: dict[str, Any] | None = None,
     ):
@@ -175,6 +176,9 @@ class PhaseBasedProfiler:
         # Same idea for chunked prefill: without this the capture always lands
         # on batch 1, where the sequence is one chunk long.
         self.prefill_kv_len_threshold: int = prefill_kv_len_threshold
+        # Phases that carry prefill arm only on batches padded to at least this
+        # many tokens, so a capture can target the large chunked-prefill steps.
+        self.prefill_min_padded_tokens: int = prefill_min_padded_tokens
         self.standard_opts = standard_opts or {}
         self.advanced_opts = advanced_opts or {}
         self.profile_dir: str = profile_dir
@@ -277,6 +281,13 @@ class PhaseBasedProfiler:
                         kv_len_threshold,
                     )
                     break
+
+            if (
+                phase not in (InferencePhase.DECODE_ONLY, InferencePhase.DECODE_HEAVY)
+                and batch_composition_stats["padded_total_num_scheduled_tokens"]
+                < self.prefill_min_padded_tokens
+            ):
+                break
 
             self.inference_phase_seen[phase] = True
             self.profiling_n_steps_left = self.num_steps_to_profile_for
