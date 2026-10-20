@@ -25,7 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import layout as LY
-from .kernel import bswitch, cache_groups, cache_names
+from .kernel import VMEM_LIMIT, bswitch, cache_groups, cache_names
 
 I32, U32, U8 = jnp.int32, jnp.uint32, jnp.uint8
 WRITER_NAME = "glm52_decode_mk_writer"
@@ -51,6 +51,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
         "rold": pltpu.VMEM((L, TMAX, 128), U32), "rnew": pltpu.VMEM((L, TMAX, 128), U32),
         "ipage": pltpu.VMEM((IR4, 4, pg), U8), "rec_v": pltpu.VMEM((TMAX, 256), I32),
         "rec_s": pltpu.SMEM((TMAX, 256), I32),
+        "own": pltpu.SMEM((3, TMAX), I32),           # per-step ownership flags, computed once (see `flags`)
         "sem": pltpu.SemaphoreType.DMA((4,)),
     }
     s_names = list(scratch)
@@ -77,20 +78,42 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
 
         def mine(t_):
             pos = rmeta[t_, 1]
-            return jnp.logical_and(rmeta[t_, 0] > 0, (pos % G_) // ILV == me)
+            return jnp.logical_and(jnp.logical_and(t_ < T, rmeta[t_, 0] > 0), (pos % G_) // ILV == me)
 
-        def gfirst(t_):
-            """t_ is the first owned new token of its 4-token rope row (same request, same pos // ILV): only it
-            writes the merged row back (one DMA per row; the source design wrote the identical merged row once per
-            owned token, a write-write overlap the interpreter's race detector reports)."""
-            pos = rmeta[t_, 1]
-            req = rmeta[t_, 2]
+        def flags():
+            """Per-step ownership flags, once per call (they depend on rmeta only, not on the layer):
+              own[0, t] = token t is live and its position is this rank's;
+              own[1, t] = t is the first owned token of its 4-token rope row (same request, same pos // ILV): only
+                          it writes the merged row back (one DMA per row; the source design wrote the identical
+                          merged row once per owned token, a write-write overlap the race detector reports);
+              own[2, t] = for such a first token, the last owned token of its row (the merge loop's upper bound).
+            One TMAX^2 / 2 scalar pass per call; the per-layer loops read one SMEM word per token."""
+            def init(t_, c):
+                scr["own"][0, t_] = mine(t_).astype(I32)
+                scr["own"][1, t_] = jnp.int32(0)
+                scr["own"][2, t_] = t_
+                return c
+            lax.fori_loop(0, TMAX, init, 0)
 
-            def chk(t2, acc):
-                dup = jnp.logical_and(jnp.logical_and(t2 < t_, mine(t2)),
-                                      jnp.logical_and(rmeta[t2, 2] == req, rmeta[t2, 1] // ILV == pos // ILV))
-                return jnp.logical_or(acc, dup)
-            return jnp.logical_not(lax.fori_loop(0, TMAX, chk, jnp.bool_(False)))
+            def per_t(t_, c):
+                pos = rmeta[t_, 1]
+                req = rmeta[t_, 2]
+
+                def lead(t2, acc):              # the smallest owned t2 <= t_ in t_'s row (t_ itself if none)
+                    same = jnp.logical_and(jnp.logical_and(scr["own"][0, t2] > 0, rmeta[t2, 2] == req),
+                                           rmeta[t2, 1] // ILV == pos // ILV)
+                    return jnp.where(jnp.logical_and(same, acc == t_), t2, acc)
+                ld = lax.fori_loop(0, t_, lead, t_)
+
+                @pl.when(scr["own"][0, t_] > 0)
+                def _():
+                    scr["own"][1, t_] = (ld == t_).astype(I32)
+                    scr["own"][2, ld] = t_                 # t_ ascends: the last write is the row's last token
+                return c
+            lax.fori_loop(0, TMAX, per_t, 0)
+
+        def owned(t_):
+            return scr["own"][0, t_] > 0
 
         def where_(t_, table):
             pos = rmeta[t_, 1]
@@ -100,11 +123,12 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
 
         cp = pltpu.make_async_copy(rrow, scr["rnew"], scr["sem"].at[0])
         cp.start()
+        flags()
         cp.wait()
 
         def per_layer(l, c):
             def nope(t_, c2):
-                @pl.when(jnp.logical_and(t_ < T, mine(t_)))
+                @pl.when(owned(t_))
                 def _():
                     page, sl, _p = where_(t_, bt)
                     csel("nope", l, lambda r: pltpu.make_async_copy(
@@ -113,7 +137,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             lax.fori_loop(0, TMAX, nope, 0)
 
             def rread(t_, c2):
-                @pl.when(jnp.logical_and(t_ < T, mine(t_)))
+                @pl.when(owned(t_))
                 def _():
                     page, sl, _p = where_(t_, bt)
                     csel("rope", l, lambda r: pltpu.make_async_copy(
@@ -122,7 +146,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             lax.fori_loop(0, TMAX, rread, 0)
 
             def rwait(t_, c2):
-                @pl.when(jnp.logical_and(t_ < T, mine(t_)))
+                @pl.when(owned(t_))
                 def _():
                     pltpu.make_async_copy(rrow.at[0, pl.ds(0, 1)], scr["rold"].at[0, pl.ds(0, 1)],
                                           scr["sem"].at[2]).wait()
@@ -131,20 +155,20 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             lane = lax.broadcasted_iota(I32, (1, 128), 1)
 
             def rmerge(t_, c2):
-                @pl.when(jnp.logical_and(jnp.logical_and(t_ < T, mine(t_)), gfirst(t_)))
+                @pl.when(scr["own"][1, t_] > 0)
                 def _():
                     page, sl, pos = where_(t_, bt)
                     req = rmeta[t_, 2]
                     row = scr["rold"][l, pl.ds(t_, 1), :]
 
-                    def ov(t2, row_):
+                    def ov(t2, row_):                   # the row's owned tokens lie in [t_, own[2, t_]]
                         pos2 = rmeta[t2, 1]
-                        same = jnp.logical_and(jnp.logical_and(t2 < T, mine(t2)), jnp.logical_and(
+                        same = jnp.logical_and(owned(t2), jnp.logical_and(
                             rmeta[t2, 2] == req, pos2 // ILV == pos // ILV))
                         q2 = pos2 & 3
                         new = scr["rnew"][l, pl.ds(t2, 1), :]
                         return jnp.where(jnp.logical_and(same, lane // 32 == q2), new, row_)
-                    row = lax.fori_loop(0, TMAX, ov, row)
+                    row = lax.fori_loop(t_, scr["own"][2, t_] + 1, ov, row)
                     scr["rold"][l, pl.ds(t_, 1), :] = row
                     csel("rope", l, lambda r: pltpu.make_async_copy(
                         scr["rold"].at[l, pl.ds(t_, 1)], r.at[page, pl.ds(sl >> 2, 1)], scr["sem"].at[3]).start())
@@ -169,7 +193,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
                 cp_.wait()
 
                 def body(t_, cur):
-                    ok = jnp.logical_and(t_ < T, mine(t_))
+                    ok = owned(t_)
                     page, sl, _p = where_(t_, bti)
 
                     @pl.when(ok)
@@ -205,8 +229,7 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
             lax.fori_loop(0, L, per_idx_layer, 0)
 
         def count(t_, c):
-            ok_ = jnp.logical_and(t_ < T, mine(t_))
-            return (c[0] + ok_.astype(I32), c[1] + jnp.logical_and(ok_, gfirst(t_)).astype(I32))
+            return (c[0] + scr["own"][0, t_], c[1] + scr["own"][1, t_])
         n_own, n_row = lax.fori_loop(0, TMAX, count, (jnp.int32(0), jnp.int32(0)))
 
         def drain_n(i, c):
@@ -219,6 +242,14 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
         lax.fori_loop(0, n_own * L, drain_n, 0)
         lax.fori_loop(0, n_row * L, drain_r, 0)
 
+    # scoped VMEM: request exactly the v7x maximum XLA grants (VMEM_LIMIT = 67,043,328 B; the old 64 MiB request was
+    # clamped to it with an INVALID_ARGUMENT log line). Not smaller: the reservation is what keeps memory-space
+    # assignment from prefetching the writer's HBM operands into VMEM -- a 14 MiB request (2 x scratch + 8 MiB) let
+    # MSA move nrow / irec to S(1) via copy-start / copy-done (MSA static gate FAIL, 20 ENTRY copies, program VMEM
+    # 63.94M) [aot: scratch/stageA_fix/aot_fix_B_32.log].
+    vmem_scr = sum(math.prod(v.shape) * jnp.dtype(v.dtype).itemsize for v in scratch.values()
+                   if str(getattr(v, "memory_space", "")).lower().endswith("vmem"))
+    vmem_limit = VMEM_LIMIT
     c_shapes = [jax.ShapeDtypeStruct((len(ck[k][0]) // G[k],) + ck[k][1], ck[k][2]) for k, gi in c_names]
     call = pl.pallas_call(
         kernel,
@@ -229,8 +260,8 @@ def build_writer(cfg, *, max_pages, nb, nbi, interpret=False, groups=None, fault
         out_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * n_c,
         scratch_shapes=[scratch[k] for k in s_names],
         input_output_aliases={n_fixed + i: i for i in range(n_c)},
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024, disable_bounds_checks=True),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit, disable_bounds_checks=True),
         interpret=(interpret if isinstance(interpret, pltpu.InterpretParams) else pltpu.InterpretParams())
         if interpret else False,
     )
-    return call, dict(c_names=c_names, ck=ck, groups=G)
+    return call, dict(c_names=c_names, ck=ck, groups=G, vmem_limit=vmem_limit, vmem_scratch_bytes=vmem_scr)

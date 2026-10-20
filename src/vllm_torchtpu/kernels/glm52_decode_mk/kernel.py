@@ -70,8 +70,10 @@ VMEM_LIMIT = 67_043_328          # XLA clamps the request to this on v7x [measur
 FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_partial", "router_tiebreak",
                        "rope_off_by_one", "dcp_owner", "stale_indexshare",
                        "f_ichunk", "f_slotreuse", "f_hitcap", "f_xrace", "f_nope",
-                       "f_alias_poison")      # Mosaic only (the alias exists only there); WHITEBOARD.v1's
-                                              # F-ALIAS-EARLY / POISON-RED / STALE-IS-ALIAS are not built yet
+                       "f_alias_poison",      # alias layout only (Mosaic, or interpret via interp_alias)
+                       "f_alias_poison_red", "f_stale_is_alias")   # own_uv placed in the alias (+ poison)
+                                              # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
+                                              # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
 
 
@@ -88,7 +90,10 @@ class Tiles:
     scan_sd: int = 4
     scan_np: int = 16
     pv: str = "f32"              # WHITEBOARD.v1 A5: f32 PV (served formula)
-    recip: str = "approx"        # attention 1 / l: "approx" (EUP, as the served kernel) | "exact" (CPU oracle build)
+    recip: str = "exact"         # attention 1 / l: "exact" (production since the fix pass: the approximate EUP form
+                                 # failed the TINY_tpu core-vs-f64 gate in interpret, 4.441e-3 > 4.404e-3, and costs
+                                 # one (QN, 1) reciprocal per request per layer either way) | "approx" (the served
+                                 # sparse kernel's form; an A1 arm)
     thr_switch: int = 512        # Sigma np above which the threshold uses 2-bit digits (G1 design §3.3, §11.2)
     gunroll: int = 16
     xkc: int = 512
@@ -97,6 +102,9 @@ class Tiles:
     alias_dsa: bool = True       # Mosaic: DSA layer-transient scratch as epool views (False: native scratch, the
                                  # AOT negative control -- WHITEBOARD.v1 §7.2 says it cannot fit)
     cid: int = COLLECTIVE_ID
+    scan_unroll: int = 4         # DSA scan inner unroll (was the MKD_SCAN_UNROLL env var: outside every cache key)
+    interp_alias: bool = True    # interpret mode: run the Mosaic alias layout (dpool / epool views) through
+                                 # interp_alias.install() instead of separate typed buffers (alias=False: typed)
 
 
 def bf(x):
@@ -220,6 +228,15 @@ def cache_names(ck, G):
     return [(k, gi) for k in ck for gi in range(G[k])]
 
 
+def aliased_names(tiles):
+    """The DSA buffers that are epool views. Fault builds F-STALE-IS-ALIAS / F-ALIAS-POISON-RED also place the
+    IndexShare table `own_uv` (persistent by design) in the alias, after the layer-transient set."""
+    if not tiles.alias_dsa:
+        return ()
+    extra = ("own_uv",) if tiles.fault in ("f_stale_is_alias", "f_alias_poison_red") else ()
+    return DSA.ALIASED + extra
+
+
 def epool_layout(cfg, tiles, max_pages):
     """Byte offsets of the expert-slot views and the aliased DSA views in the u8 pool `epool` (WHITEBOARD.v1 §7.1):
     every view's pool_alias storage equals its raw bytes, offsets are 4096-B aligned and non-overlapping within each
@@ -238,9 +255,12 @@ def epool_layout(cfg, tiles, max_pages):
     ring_b = off
     dsa_specs = DSA.scratch(cfg, tiles, max_pages, cfg.BMAX)
     off = 0
-    for nm in (DSA.ALIASED if tiles.alias_dsa else ()):
+    for nm in aliased_names(tiles):
         spec = dsa_specs[nm]
         s, d = tuple(spec.shape), spec.dtype
+        if nm not in DSA.ALIASED:            # fault-only view (own_uv): round its rows up to the dtype's row tile,
+            rt = 8 * max(1, 4 // jnp.dtype(d).itemsize)      # since a pool_alias view cannot pad
+            s = s[:-2] + (-(-s[-2] // rt) * rt, s[-1])
         sz = pool_alias.storage_size(s, jnp.dtype(d))
         assert sz == math.prod(s) * jnp.dtype(d).itemsize, ("alias view pads", nm, s, sz)
         assert off % 4096 == 0
@@ -287,8 +307,14 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     NBLK = H // QB
     QB8 = 8
     NBD, NBE = tiles.nbd, tiles.nbe
-    typed = bool(interpret) or not tiles.alias
-    assert typed or (H // R) % 128 == 0, "all-reduce column chunks must be lane aligned on the Mosaic path"
+    # typed: separate typed buffers per dense kind / expert slot / DSA buffer. The Mosaic path (and, through
+    # interp_alias, the interpret path) instead runs the shared-storage layout: dense banks shared across kinds in
+    # `dpool`, expert slots and the aliased DSA set as views of `epool`.
+    typed = not tiles.alias or (bool(interpret) and not tiles.interp_alias)
+    if interpret and not typed:
+        from . import interp_alias
+        interp_alias.install()
+    assert bool(interpret) or (H // R) % 128 == 0, "all-reduce column chunks must be lane aligned on the Mosaic path"
     assert nb < (1 << (MB_SH - 8)), nb
     lay, S = LY.smalls_layout(cfg)
     BANK = LY.bank_bytes(cfg, tiles.bank)
@@ -372,7 +398,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         epool_rows, eviews, ring_b, dsa_b = epool_layout(cfg, tiles, max_pages)
         scratch["epool"] = pltpu.VMEM((epool_rows, 128), U8)
         for nm, sp in dsa_specs.items():
-            if nm not in DSA.ALIASED or not tiles.alias_dsa:
+            if nm not in aliased_names(tiles):
                 scratch[nm] = sp
         EPOOL = dict(rows=epool_rows, views=eviews, ring_bytes=ring_b, dsa_bytes=dsa_b)
     if fault == "f_nope":
@@ -426,7 +452,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 r0, shp, dt = EPOOL["views"][name]
                 return pool_alias.view(scr["epool"].at[pl.ds(r0, pool_alias.storage_size(shp, jnp.dtype(dt)) // 128)],
                                        shp, dt)
-            for nm in (DSA.ALIASED if tiles.alias_dsa else ()):
+            for nm in aliased_names(tiles):
                 scr[nm] = eview(nm)
             _, shp13, _ = EPOOL["views"]["w13_0"]
             r2_0, shp2, _ = EPOOL["views"]["w2_0"]
@@ -968,13 +994,14 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 def _moe():
                     moe(l, slot, g_ffn, mpos)
             stage_wait(l)
-            if fault == "f_alias_poison":
+            if fault in ("f_alias_poison", "f_alias_poison_red"):
                 poison_alias()
             return carry
 
         def poison_alias():
-            """F-ALIAS-POISON (Mosaic only): after each layer's MoE, the whole alias window holds 0x7E bytes
-            (finite fp8 448 / f32 8.4e37), so a buffer wrongly assumed persistent reads garbage."""
+            """F-ALIAS-POISON (alias layout only): after each layer's MoE, the whole alias window holds 0x7E bytes
+            (finite fp8 448 / f32 8.4e37), so a buffer wrongly assumed persistent reads garbage. Must stay
+            bit-identical to clean; its pairing F-ALIAS-POISON-RED also places own_uv in the window -> RED."""
             if typed:
                 return
             n_ = EPOOL["dsa_bytes"] // 128
@@ -1066,7 +1093,10 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                         @pl.when(nxt < count)
                         def _():
                             ewait(nxt)
-                        a1n = gate_up(lax.rem(nxt, NBE))
+                        # the last unit has no successor: skip its gate_up (was one wasted unit per MoE layer,
+                        # reading a stale slot)
+                        a1n = lax.cond(nxt < count, lambda: gate_up(lax.rem(nxt, NBE)),
+                                       lambda: jnp.zeros((M, 2 * IR), BF16))
                         if fault == "f_slotreuse":          # FAULT: refill before this unit's down-proj read
                             @pl.when(step + NBE < count)
                             def _():

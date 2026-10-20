@@ -12,8 +12,8 @@ geometry and the exchange protocol are unchanged. Changes for the composed kerne
   * `ALIASED` names the layer-transient buffers the kernel places on the idle expert ring (`epool` views); the
     kernel allocates them, this module only declares them;
   * debug export of the pre-resolution union lists (`E.dbg_uv`) for the per-row top-k contract;
-  * `tiles.recip`: "exact" 1 / l for the CPU oracle build (interpret lowers approx=True to a bf16 reciprocal;
-    production keeps the approximate EUP reciprocal, as the served sparse-attention kernel does);
+  * `tiles.recip`: "exact" 1 / l (the default and the production build since the stage-A fix pass) | "approx" (the
+    served sparse-attention kernel's EUP reciprocal; interpret lowers approx=True to a bf16 reciprocal);
   * fault controls added for the composed kernel's oracle: causal_mask, page_off_by_one, kv_read_before_write, topk_swap,
     scale_twice (WHITEBOARD.v1 §11.2), and an F-DELAY hook `E.delay(group, round)` in the count exchange.
 
@@ -261,9 +261,10 @@ def make(E):
     sub8 = lax.broadcasted_iota(I32, (8, 128), 0)
     lane8 = lax.broadcasted_iota(I32, (8, 128), 1)
     NEG = jnp.finfo(F32).min
+    sub128 = lax.broadcasted_iota(I32, (128, 1), 0)
     UNR = max(1, tiles.gunroll)
     MAXP_OK = E.max_pages <= 256
-    SCAN_UNROLL = int(__import__("os").environ.get("MKD_SCAN_UNROLL", "4"))                       # per-lane tile counts <= 256: exact bf16 MXU lane sums
+    SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
 
     def T_():
         return E.scal[0]
@@ -1039,8 +1040,13 @@ def make(E):
         scr["att_acc"][...] = jnp.zeros((QN, KL), F32)
 
     def dec8(b):
-        """fp8 byte (in i32) -> bf16, without the NaN-code fix: gathered rows are written cache rows (writes clip
-        to +-448) and the ring is zeroed once per step, so a masked tail row is stale-but-finite, never NaN."""
+        """fp8 byte (in i32) -> bf16, without the NaN-code fix. Valid gathered rows are written cache rows (writes
+        clip to +-448: never a NaN code). A partial granule's tail rows (>= the request's entry count) are NOT
+        gathered this layer and hold stale bytes: on the Mosaic path g_nope / g_rope are epool views overlapping
+        expert slots 2-3, so after a MoE layer those rows hold expert-weight bytes (any byte, incl. the e4m3fn NaN
+        codes 0x7F / 0xFF), and at step start whatever VMEM held. `front` therefore zeroes the nope words of the
+        tail rows before decoding them (p = 0 x stale NaN would otherwise put NaN into P.V); stale rope words only
+        reach scores of masked columns, which the NEG select replaces."""
         return lax.bitcast_convert_type(b.astype(U8), FP8).astype(BF16)
 
     def front(r, buf, ks):
@@ -1051,6 +1057,7 @@ def make(E):
         nu = req[b, 0]
         base = pl.multiple_of((r % GR) * 128, 128)
         w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(base, 128), :], I32)
+        w = jnp.where(j * 128 + sub128 < nu, w, 0)        # stale tail rows -> fp8 0 (dec8); valid rows unchanged
         for b_ in range(4):
             scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128] = dec8(shr(w, 8 * b_) & 0xFF)
         s = jnp.zeros((QN, 128), F32)

@@ -30,7 +30,7 @@ from vllm_torchtpu.kernels.glm52_decode_mk import pool_alias
 def test_admission():
     C.FULL.check()
     C.FULL_B16.check()
-    for bad in (dict(ILV=2), dict(page=128), dict(QMAX=5), dict(TMAX=24), dict(R=3)):
+    for bad in (dict(ILV=2), dict(page=128), dict(QMAX=5), dict(QMAX=2), dict(TMAX=24), dict(R=3)):
         with pytest.raises(AssertionError):
             dataclasses.replace(C.FULL, **bad).check()
 

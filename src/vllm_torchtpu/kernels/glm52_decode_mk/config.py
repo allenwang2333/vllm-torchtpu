@@ -121,12 +121,13 @@ class MKConfig:
 
     def check(self):
         """Admission asserts for the couplings the kernel hard-codes (WHITEBOARD.v1 §18 / task: ILV % 4 == 0,
-        block <= 256, QMAX <= 4). Raises AssertionError on an unsupported configuration."""
+        block <= 256, QMAX == 4). Raises AssertionError on an unsupported configuration."""
         assert self.ILV % 4 == 0, ("rope staging packs 4-token rows: ILV % 4 == 0", self.ILV)
         assert self.page == 256, ("the batched DSA core's (8, 128) key tile is 2 x 128 positions of a 256 page",
                                   self.page)
         assert self.page % self.ILV == 0
-        assert 2 <= self.QMAX <= 4, ("4-row key tiles / 4 membership bits per request", self.QMAX)
+        assert self.QMAX == 4, ("the DSA core's 4-row key tile is built for MTP K = 3 (dsa.make asserts QMAX == 4); "
+                                "other K decline here (adapter: Unsupported)", self.QMAX)
         assert self.TMAX % 16 == 0 and self.TMAX <= 64, self.TMAX
         assert self.NH % self.R == 0 and self.I % self.R == 0 and self.IS % self.R == 0 and self.ID % self.R == 0
         assert self.H % self.QB == 0 and self.H % 512 == 0 and self.H % 128 == 0, self.H
