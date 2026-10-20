@@ -140,29 +140,16 @@ def prebuild() -> None:
     )
 
 
-_LOGGED: set[tuple] = set()
-
-
-def _log_once(*key) -> None:
-    if key not in _LOGGED:
-        _LOGGED.add(key)
-        logger.info("Small TP all-reduce: %s", " | ".join(map(str, key)))
-
-
 def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     """The sum of ``x`` over the group ``ranks``: the op for a 2-D bf16 block
     of the TP group in a compiled trace, ``fallback(x)`` otherwise."""
-    if _OP is None or tuple(int(r) for r in ranks) != _TP_RANKS:
-        return fallback(x)
-    if not torch.compiler.is_compiling():
-        _log_once("eager call left to XLA", str(x.shape), x.dtype)
+    if _OP is None or tuple(ranks) != _TP_RANKS:
         return fallback(x)
     if (
-        x.dim() != 2
+        not torch.compiler.is_compiling()
+        or x.dim() != 2
         or x.dtype != torch.bfloat16
         or not all_reduce.supports(1, x.shape[1], _CORES)
     ):
-        _log_once("block left to XLA", str(x.shape), x.dtype)
         return fallback(x)
-    _log_once("kernel (XLA above max_rows)", str(x.shape), x.dtype)
     return _OP(x, _RANK, _PEERS)
