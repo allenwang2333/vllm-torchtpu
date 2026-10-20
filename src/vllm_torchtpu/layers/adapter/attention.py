@@ -2821,8 +2821,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         **kwargs: Any,
-    ) -> torch.Tensor:
-        """Executes complete TPU multi-head latent attention evaluation."""
+    ) -> torch.Tensor | list[tuple[torch.Tensor, torch.Tensor]]:
+        """Executes complete TPU multi-head latent attention evaluation.
+
+        A large qrep step under TPU_DCP_MLA_OPROJ_ALL_REDUCE returns the
+        unmerged, quantized `weight_lse_partials` instead of the output."""
         assert isinstance(q, tuple) and len(q) == 2, (
             "q must be a tuple of (q_nope, q_pe)"
         )
@@ -3081,10 +3084,28 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                                 out_dtype=wire_dtype if narrow else torch.float32,
                             )
                         if oproj_all_reduce:
-                            # Every group head, unsummed: the wrapper's o_proj
-                            # all-reduce sums the ranks
-                            # (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
-                            outputs = weight_lse_partials(partial, lse)
+                            # Every group head, unsummed and quantized by token
+                            # chunk: the wrapper's o_proj all-reduce sums the
+                            # ranks (TPU_DCP_MLA_OPROJ_ALL_REDUCE).
+                            chunks = weight_lse_partials(
+                                partial,
+                                lse,
+                                layer.W_O_dcp_qrep.dtype,
+                                envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE_CHUNK_TOKENS
+                                or partial.shape[0],
+                            )
+                            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS > 0:
+                                # The latent-merge buckets' W_UV, as at the end.
+                                q, s = chunks[0]
+                                chunks[0] = (
+                                    q,
+                                    _retain_buffers(
+                                        s,
+                                        layer.W_UV,
+                                        getattr(layer, "W_UV_scale", None),
+                                    ),
+                                )
+                            return chunks
                         else:
                             outputs = merge_lse_partials_scatter_heads(
                                 partial,
@@ -3130,7 +3151,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             )
 
         if uv_first:
-            outputs = outputs.to(input_dtype).flatten(1)
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
         else:
             outputs_t = outputs.reshape(
                 -1, layer.num_heads, layer.kv_lora_rank
