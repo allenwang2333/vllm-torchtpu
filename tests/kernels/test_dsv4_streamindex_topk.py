@@ -26,6 +26,7 @@ import pytest
 # function rather than the submodule, so it is imported by name here.
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     KVLayout,
+    merge_kv_split_topk,
     streamindex_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
@@ -1265,6 +1266,46 @@ def test_split_mixed_blocks_matches_unsplit(T_list, uniform_q_len, kv_layout):
     hlo = streamindex_topk.lower(**kwargs, split_mixed_blocks=True).as_text()
     assert "_scheduling_group_id" in hlo, "split_mixed_blocks did not split"
     actual = np.array(streamindex_topk(**kwargs, split_mixed_blocks=True))
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("kv_split", [2, 4])
+@pytest.mark.parametrize(
+    "T_list, uniform_q_len",
+    [
+        ((7, 7, 114), 7),
+        ((7, 9), 7),
+        ((40, 88), None),
+        ((1, 1, 126), None),
+    ],
+    ids=["2verify+114", "verify+9", "2mixed", "decodes+1mixed"],
+)
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_kv_split_merge_matches_unsplit(T_list, uniform_q_len, kv_layout, kv_split):
+    """Every rank's kv_split share, merged, is the unsplit top-k: the same
+    indices in the same order, through both merge paths (payload-emitting
+    SparseCore top-k for >= 32 rows, gather below)."""
+    page_size, H_I, D = 128, 4, 128
+    comp_ratio, bq_sz, bkv_p = 1, (1, 8, 8), (2, 2, 2)
+    S_list = tuple(200 + 100 * (i % 4) for i in range(len(T_list)))
+    k = 64
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, comp_ratio, bq_sz, bkv_p, kv_layout, None
+    )
+    if uniform_q_len is not None:
+        num_verify = sum(1 for t in T_list if t == uniform_q_len)
+        kwargs["distribution"] = (0, num_verify, len(T_list))
+        kwargs["uniform_q_len"] = uniform_q_len
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    expected = np.array(streamindex_topk(**kwargs))
+    shares = [
+        jnp.concatenate(
+            streamindex_topk(**kwargs, kv_split=kv_split, kv_split_rank=r), axis=1
+        )
+        for r in range(kv_split)
+    ]
+    actual = np.array(merge_kv_split_topk(jnp.stack(shares), k))
     np.testing.assert_array_equal(actual, expected)
 
 
