@@ -49,6 +49,7 @@ nav:
   - 'Home': README.md
   - 'Features & Usage':
     - 'TorchTPU Compilation Cache': torch_tpu_compilation.md
+    - 'Explicit Mamba Cache Checkpoint': explicit_cache_checkpoint.md
     - 'Docker': docker.md
   - 'Developers Guides':
     - 'Contributing to vLLM TorchTPU': developers_guide/contributing.md

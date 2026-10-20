@@ -30,6 +30,8 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
     [:octicons-arrow-right-24: TorchTPU Compilation Cache](torch_tpu_compilation.md)
 
+    [:octicons-arrow-right-24: Explicit Mamba Cache Checkpoint](explicit_cache_checkpoint.md)
+
     [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
 
 - :material-code-tags:{ .lg .middle } __I Want to Build__
