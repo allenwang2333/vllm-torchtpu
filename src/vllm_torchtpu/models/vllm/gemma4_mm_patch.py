@@ -73,13 +73,15 @@ def patch_gemma4_attention_init() -> None:
     """
     try:
         import inspect
+        import sys
 
-        from vllm.model_executor.models import gemma4 as gemma4_mod
+        gemma4_mod = sys.modules.get("vllm.model_executor.models.gemma4")
+        if gemma4_mod is None:
+            from vllm.model_executor.models import gemma4 as gemma4_mod
 
-        orig_init = getattr(gemma4_mod.Gemma4Attention, "_orig_init", None)
-        if orig_init is None:
-            orig_init = gemma4_mod.Gemma4Attention.__init__
-            gemma4_mod.Gemma4Attention._orig_init = orig_init
+        orig_init = gemma4_mod.Gemma4Attention.__init__
+        if getattr(orig_init, "_tpu_gemma4_attn_patched", False):
+            return
 
         sig = inspect.signature(orig_init)
 
@@ -109,6 +111,7 @@ def patch_gemma4_attention_init() -> None:
                         bound.arguments["num_kv_heads"] = global_kv
             return orig_init(*bound.args, **bound.kwargs)
 
+        setattr(patched_init, "_tpu_gemma4_attn_patched", True)  # noqa: B010
         gemma4_mod.Gemma4Attention.__init__ = patched_init
     except (ImportError, AttributeError):
         pass
@@ -221,10 +224,9 @@ def patch_rpa_block_sizes() -> None:
             kernel as rpa_kernel_mod,
         )
 
-        orig_fn = getattr(rpa_kernel_mod, "_orig_get_default_block_sizes", None)
-        if orig_fn is None:
-            orig_fn = rpa_kernel_mod.get_default_block_sizes
-            rpa_kernel_mod._orig_get_default_block_sizes = orig_fn
+        orig_fn = rpa_kernel_mod.get_default_block_sizes
+        if getattr(orig_fn, "_tpu_rpa_block_sizes_patched", False):
+            return
 
         def patched_get_default_block_sizes(*args, **kwargs):
             sizes = orig_fn(*args, **kwargs)
@@ -250,6 +252,7 @@ def patch_rpa_block_sizes() -> None:
                     sizes["bkv_csz"] = sizes["bkv_sz"]
             return sizes
 
+        setattr(patched_get_default_block_sizes, "_tpu_rpa_block_sizes_patched", True)  # noqa: B010
         rpa_kernel_mod.get_default_block_sizes = patched_get_default_block_sizes
     except Exception as e:
         logger.debug("Failed to patch RPA block sizes: %s", e)

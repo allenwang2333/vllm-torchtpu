@@ -222,6 +222,8 @@ def test_patch_gemma4_layer_config():
 
     g4_mod_mock.Gemma4Attention = MockAttention
     sys.modules["vllm.model_executor.models.gemma4"] = g4_mod_mock
+    if "vllm.model_executor.models" in sys.modules:
+        setattr(sys.modules["vllm.model_executor.models"], "gemma4", g4_mod_mock)  # noqa: B010
 
     patch_gemma4_layer_config()
     attn = g4_mod_mock.Gemma4Attention(
