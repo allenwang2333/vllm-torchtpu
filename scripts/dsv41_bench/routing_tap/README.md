@@ -32,3 +32,13 @@ scripts/dsv41_bench/routing_tap -q`.
 
 The ids are recomputed from the logits and the staged score bias with `lax.top_k`. They can differ from the kernel's
 own selector only on exact f32 ties.
+
+## Static expert placement (`TPU_MOE_EXPERT_PERM_PATH`)
+
+- `solve_placement.py <routing dir> <out.json> [--cal round1] [--eval round0]` solves one placement per layer. Each
+  device gets 48 experts, and the per-expert tile-model cost of the calibration rows is balanced (LPT plus swaps). It
+  writes the file the switch reads and reports the tile model's kernel time as routed and as placed, on both the
+  calibration and the evaluation steps.
+- `check_relabel.py --perm <file> --routing-npz <routing_round0.npz> --layers 22,10 --kernel-rev <rev>` relabels the
+  harness weights, gate columns and bias the way weight load does. On the device it byte-compares the MoE layer
+  output against the unrelabelled layer, and runs the gate matmul under the same relabelling.
