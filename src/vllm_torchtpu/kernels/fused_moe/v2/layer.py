@@ -278,6 +278,7 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    logical_intermediate_size=None,
     stage="fused",
     routed=None,
     gather_positions=None,
@@ -287,6 +288,11 @@ def fused_ep_moe_v2(
     x [tokens, hidden], w1 [experts, hidden, 2 * inter], w2 [experts,
     inter, hidden] and gating [tokens, experts], all sharded over the mesh
     axis. Returns [tokens, hidden], sharded like x.
+
+    logical_intermediate_size optionally excludes zero-padded intermediate
+    channels from the FP4/G512 matmuls. The caller must supply zero weight
+    tails in both gate/up halves and the down contraction. This requires a
+    single M128 or M256 rung and no gate/up bias; physical storage is unchanged.
 
     weight_format names one of the kernel's accepted weight forms and
     decides everything that follows from it. w1_scale and w2_scale are per
@@ -518,6 +524,7 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
+        logical_intermediate_size=logical_intermediate_size,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -985,6 +992,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        logical_intermediate_size,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
