@@ -5780,6 +5780,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             "kv_pull_time": [1200.0, 5400.0, 12000.0],
             "mb_transferred": [128.0, 256.0, 2048.0],
             "num_failed_transfers": [0, 1, 2],
+            "num_evicted_blocks": [2, 5],
         }
 
         self.metrics.observe(mock_data, engine_idx=0)
@@ -5925,6 +5926,26 @@ class TestTPUConnectorStats(unittest.TestCase):
     def test_prometheus_counter_num_failed_transfers(self):
         counter = self.metrics.counter_tpu_num_failed_transfers[0]
         assert counter._value.get() == 3.0
+
+    def test_prometheus_counter_kv_cache_evictions(self):
+        counter = self.metrics.counter_kv_cache_evictions[0]
+        assert counter._value.get() == 7.0
+
+    def test_scheduler_stats_drain_block_pool_evictions(self):
+        pool = SimpleNamespace(_tpu_num_evicted_blocks=0)
+        connector = SimpleNamespace()
+        TPUConnector.bind_gpu_block_pool(connector, pool)
+        assert TPUConnector._take_scheduler_stats(connector) is None
+
+        pool._tpu_num_evicted_blocks = 4
+        stats = TPUConnector._take_scheduler_stats(connector)
+        assert stats is not None
+        assert stats.data["num_evicted_blocks"] == [4]
+        assert pool._tpu_num_evicted_blocks == 0
+        assert TPUConnector._take_scheduler_stats(connector) is None
+
+    def test_scheduler_stats_without_block_pool(self):
+        assert TPUConnector._take_scheduler_stats(SimpleNamespace()) is None
 
     def test_tpu_stats_aggregation_queue_lengths(self):
         stats = TpuKVConnectorStats()

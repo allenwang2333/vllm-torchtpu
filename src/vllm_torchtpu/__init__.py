@@ -1942,6 +1942,51 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
+def _patch_vllm_block_pool_eviction_counter() -> None:
+    """Count cached blocks that `BlockPool.get_new_blocks` evicts.
+
+    Each pool accumulates the count in `_tpu_num_evicted_blocks`; the
+    scheduler-side `TPUConnector` drains it every step into its stats, which
+    export it as `vllm:kv_cache_evictions`.
+
+    `_maybe_evict_cached_block` also drops hashes outside allocation
+    (`evict_blocks` after a failed KV load, Mamba checkpoint hash drops), so
+    only evictions made while `get_new_blocks` hands out blocks are counted.
+    Remove once upstream vLLM exports an eviction counter.
+    """
+    import functools
+
+    from vllm.v1.core.block_pool import BlockPool
+
+    original_get_new_blocks = BlockPool.get_new_blocks
+    original_maybe_evict = BlockPool._maybe_evict_cached_block
+    if getattr(original_get_new_blocks, "_tpu_eviction_counter_patch", False):
+        return
+
+    @functools.wraps(original_get_new_blocks)
+    def get_new_blocks(self, num_blocks: int):
+        self._tpu_allocating = True
+        try:
+            return original_get_new_blocks(self, num_blocks)
+        finally:
+            self._tpu_allocating = False
+
+    @functools.wraps(original_maybe_evict)
+    def _maybe_evict_cached_block(self, block) -> bool:
+        evicted = original_maybe_evict(self, block)
+        if evicted and self._tpu_allocating:
+            self._tpu_num_evicted_blocks += 1
+        return evicted
+
+    for wrapper in (get_new_blocks, _maybe_evict_cached_block):
+        wrapper.__dict__["_tpu_eviction_counter_patch"] = True
+    BlockPool._tpu_allocating = False
+    BlockPool._tpu_num_evicted_blocks = 0
+    BlockPool.get_new_blocks = get_new_blocks
+    BlockPool._maybe_evict_cached_block = _maybe_evict_cached_block
+    logger.info("Applied TPU patch: count KV cache block evictions.")
+
+
 def _patch_vllm_vocab_parallel_embedding() -> None:
     """Register shard index bounds as module buffers in VocabParallelEmbedding.
 

@@ -75,6 +75,7 @@ from vllm_torchtpu.tracing.annotation import TraceAnnotation
 
 if TYPE_CHECKING:
     from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.request import Request
 
@@ -946,8 +947,28 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         Get the KV transfer stats for the connector.
         """
         if self.connector_worker is None:
-            return None
+            return self._take_scheduler_stats()
         return self.connector_worker.get_kv_connector_stats()
+
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        self._gpu_block_pool = gpu_block_pool
+
+    def _take_scheduler_stats(self) -> TpuKVConnectorStats | None:
+        """Drain the HBM block evictions counted since the last step.
+
+        `_patch_vllm_block_pool_eviction_counter` does the counting; vLLM
+        merges scheduler-side connector stats into the step's stats.
+        """
+        pool = getattr(self, "_gpu_block_pool", None)
+        if pool is None:
+            return None
+        num_evicted_blocks = getattr(pool, "_tpu_num_evicted_blocks", 0)
+        if not num_evicted_blocks:
+            return None
+        pool._tpu_num_evicted_blocks = 0
+        stats = TpuKVConnectorStats()
+        stats.record_evicted_blocks(num_evicted_blocks)
+        return stats
 
     @classmethod
     def build_kv_connector_stats(
