@@ -3442,6 +3442,7 @@ def prepare_outputs(
         "out_pieces",
         "out_pieces_fault",
         "out_pieces_gather_first",
+        "packed_rope",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -3450,7 +3451,7 @@ def sparse_ragged_paged_attention(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/4, 128] (page_size/8 with packed_rope).
     cache_kv_rope: jax.Array,
     topk_indices: jax.Array,  # i32[max_num_tokens, csa_topk]
     page_indices: jax.Array | None,  # i32[max_num_seqs * pages_per_seq]
@@ -3502,6 +3503,7 @@ def sparse_ragged_paged_attention(
     send_exchange: tuple | None = None,
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
+    packed_rope: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3616,7 +3618,8 @@ def sparse_ragged_paged_attention(
       kv_write: TPU_MLA_KV_WRITE_IN_GATHER, fused-prep decode buckets only:
         `(dst_rows i32[T], nope_rows u32[T, 128], rope_rows u32[T, 32])`, this
         step's tokens packed for the SparseCore caches, or the same in
-        `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form.
+        `native_sc_gather.pack_write_rows`' one-operand u32[3 * Tp, 128] form
+        (rope_rows u32[T, 16] with `packed_rope`).
         The SparseCore gather writes them into both caches in place before it
         gathers (see `native_sc_gather.dsa_gather_native_sc`), and the updated
         caches are returned after the other outputs.
@@ -3673,6 +3676,11 @@ def sparse_ragged_paged_attention(
       out_pieces_gather_first: With `out_pieces` taken: issue every chunk's
         gather before any attention and tie the gathers of the chunks after
         piece 0 to piece 0's buffers with an optimization barrier. Same values.
+      packed_rope: SparseCore layout only. `cache_kv_rope` stores each token's
+        rope in 16 words, eight tokens per row
+        (`SparseMLAKVCacheSpec.packed_rope`); the gather expands it to the
+        padded rows the attention body reads, so the scores are unchanged.
+        `kv_write` then writes 16-word rope tokens.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3685,6 +3693,8 @@ def sparse_ragged_paged_attention(
             f"{SPARSECORE_CACHE_LAYOUT!r}, got {cache_layout!r}"
         )
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
+    # Tokens per ROPE cache row: four padded 128-byte rows, or eight packed.
+    rope_tokens_per_row = 8 if packed_rope else 4
     if sparsecore_layout:
         if (
             cache_kv_nope.dtype != jnp.uint32
@@ -3700,9 +3710,12 @@ def sparse_ragged_paged_attention(
             or cache_kv_rope.shape[-1] != 128
         ):
             raise ValueError(
-                "sparsecore ROPE cache must be uint32[pages,page_size/4,128]"
+                "sparsecore ROPE cache must be uint32"
+                f"[pages,page_size/{rope_tokens_per_row},128]"
             )
     else:
+        if packed_rope:
+            raise ValueError("packed_rope needs the sparsecore cache layout")
         if (
             cache_kv_nope.dtype != jnp.uint8
             or cache_kv_nope.ndim != 4
@@ -3719,14 +3732,14 @@ def sparse_ragged_paged_attention(
             raise ValueError(
                 "tensorcore ROPE cache must be uint8[pages,page_size/4,4,128]"
             )
-    if cache_kv_nope.size != 4 * cache_kv_rope.size:
+    if cache_kv_nope.size != rope_tokens_per_row * cache_kv_rope.size:
         raise ValueError(
             f"NOPE cache size ({cache_kv_nope.size}) must be exactly "
-            f"4 * ROPE cache size ({cache_kv_rope.size})"
+            f"{rope_tokens_per_row} * ROPE cache size ({cache_kv_rope.size})"
         )
     if (
         cache_kv_nope.shape[0] != cache_kv_rope.shape[0]
-        or cache_kv_nope.shape[1] != 4 * cache_kv_rope.shape[1]
+        or cache_kv_nope.shape[1] != rope_tokens_per_row * cache_kv_rope.shape[1]
     ):
         raise ValueError(
             "NOPE and ROPE caches must have matching page counts and page geometry"
@@ -4155,6 +4168,7 @@ def sparse_ragged_paged_attention(
                 if mixed_union_gather and group_tab is not None
                 else None
             ),
+            packed_rope=packed_rope,
             **extra,
         )
 
@@ -4302,7 +4316,7 @@ def sparse_attention_chunk(
     # SparseCore: u32[pages, page_size, 128].
     cache_kv_nope: jax.Array,
     # TensorCore: u8[pages, page_size/4, 4, 128].
-    # SparseCore: u32[pages, page_size/4, 128].
+    # SparseCore: u32[pages, page_size/4, 128] (page_size/8 with packed_rope).
     cache_kv_rope: jax.Array,
     kv_lens: jax.Array,  # i32[max_num_tokens]
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]
@@ -4353,6 +4367,7 @@ def sparse_attention_chunk(
     send_exchange: tuple | None = None,
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
+    packed_rope: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -4396,6 +4411,9 @@ def sparse_attention_chunk(
     `gather_only`: issue the chunk's gather and return its buffers
     `(nope, rope, live_views)` instead of attending; `pre_gathered` is that
     tuple, handed back to attend without gathering again.
+    `packed_rope` (SparseCore layout only): the rope cache holds 16 words per
+    token (and `kv_write` writes 16-word rope tokens); the gather returns the
+    same padded rows either way.
     """
     if kv_write is not None and not gather_live_in_indices:
         raise ValueError("kv_write rides the fused-prep capped gather only")
@@ -4413,6 +4431,8 @@ def sparse_attention_chunk(
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if topk_cap is not None and not sparsecore_layout:
         raise ValueError("topk_cap requires the sparsecore cache layout")
+    if packed_rope and not sparsecore_layout:
+        raise ValueError("packed_rope requires the sparsecore cache layout")
     if topk_cap is not None and (topk_cap % GATHER_ATOM_ROWS or topk % topk_cap):
         raise ValueError(
             f"topk_cap ({topk_cap}) must be a multiple of {GATHER_ATOM_ROWS} "
@@ -4969,6 +4989,8 @@ def sparse_attention_chunk(
                 union_gather is not None
                 and group_tab is not None
                 and kv_write is None
+                # The union gather reads padded rope rows only.
+                and not packed_rope
                 and not gather_live_in_indices
                 and start_pos % chunk_size == 0
                 and native_sc_gather.union_gather_supported(
@@ -5008,6 +5030,7 @@ def sparse_attention_chunk(
                     * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
                     kv_write=kv_write,
                     write_fault=kv_write_fault,
+                    packed_rope=packed_rope,
                     **live_kwargs,
                 )
             gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
@@ -5061,6 +5084,7 @@ def sparse_attention_chunk(
                     wait_mode=sparsecore_gather_wait_mode,
                     serve_pipelined=sparsecore_gather_pipelined,
                     **({"is_dcp_mode": True} if is_dcp_mode else {}),
+                    packed_rope=packed_rope,
                     **live_kwargs,
                 )
             )
