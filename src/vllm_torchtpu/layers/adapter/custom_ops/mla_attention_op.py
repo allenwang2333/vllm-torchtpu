@@ -1794,6 +1794,8 @@ class VllmTPUMLAAttention(MLAAttention):
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
+        self.W_UV_dcp_qrep = None
+        self.W_UV_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1808,6 +1810,16 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
+            # The group's W_UV too, so W_UV can run before the merge
+            # (TPU_DCP_MLA_UV_BEFORE_MERGE).
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # TPU_MLA_ABSORB_TOKEN_MAJOR: register the absorb ops here, outside
         # Dynamo (building one takes a lock).
@@ -1823,7 +1835,15 @@ class VllmTPUMLAAttention(MLAAttention):
         # W_UK_T_dcp_qrep). Sparse DCP layers only -- the merge's only user.
         self.W_UV_dcp_vspace = None
         self.W_UV_dcp_vspace_scale = None
-        if envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
+        if (
+            envs.TPU_DCP_MERGE_VSPACE
+            and self.dcp_q_replicate
+            and self.W_UV_dcp_qrep is not None
+        ):
+            # TPU_DCP_MLA_UV_BEFORE_MERGE gathered the same buffer already.
+            self.W_UV_dcp_vspace = self.W_UV_dcp_qrep
+            self.W_UV_dcp_vspace_scale = self.W_UV_dcp_qrep_scale
+        elif envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             assert dcp_group is not None
             self.W_UV_dcp_vspace = fresh_buffer(
@@ -1847,16 +1867,20 @@ class VllmTPUMLAAttention(MLAAttention):
             tensors = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
-            tensors.extend(
-                t
-                for t in (
-                    self.W_UK_T_dcp_qrep,
-                    self.W_UK_T_dcp_qrep_scale,
-                    self.W_UV_dcp_vspace,
-                    self.W_UV_dcp_vspace_scale,
-                )
-                if t is not None
+            extra = (
+                self.W_UK_T_dcp_qrep,
+                self.W_UK_T_dcp_qrep_scale,
+                self.W_UV_dcp_qrep,
+                self.W_UV_dcp_qrep_scale,
+                self.W_UV_dcp_vspace,
+                self.W_UV_dcp_vspace_scale,
             )
+            # The vspace buffers may alias the qrep ones; synchronize each once.
+            seen: set[int] = set()
+            for t in extra:
+                if t is not None and id(t) not in seen:
+                    seen.add(id(t))
+                    tensors.append(t)
             synchronize_tensors(tensors)
 
         impl = cast(PallasMLAttentionBackendImpl, self.impl)

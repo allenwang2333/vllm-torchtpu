@@ -902,6 +902,9 @@ def test_decode_prologue_impl_routes_to_rope_op(monkeypatch):
     layer.W_UK_T_dcp_qrep_scale = None
     layer.W_UV = torch.randn(h, KV_LORA, V_DIM, generator=gen).bfloat16()
     del layer.W_UV_scale
+    # TPU_DCP_MLA_UV_BEFORE_MERGE off: no gathered W_UV (a MagicMock attribute
+    # would read as built).
+    layer.W_UV_dcp_qrep = None
     for name in ("sparse_mla_dcp_op", "sparse_mla_dcp_rope_op"):
         setattr(
             layer,

@@ -85,6 +85,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
+    project_uv_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -2917,6 +2918,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        # TPU_DCP_MLA_UV_BEFORE_MERGE: W_UV runs before the DCP merge, so the
+        # merge carries v_head_dim. Not in the MTP drafter under
+        # TPU_MTP_DCP_MERGE_SIZED: the drafter's projected partial stays f32,
+        # and the sized merge only takes a 2-byte partial, so it would silently
+        # fall back to the f32 reduce-scatter. Taken on the plain dcp_op path
+        # only (below); the send-layout / fused small-a2a paths carry the
+        # latent and apply W_UV after their merge as before.
+        uv_first = (
+            use_qrep
+            and getattr(layer, "W_UV_dcp_qrep", None) is not None
+            and (
+                not envs.TPU_MTP_DCP_MERGE_SIZED
+                or vllm_compilation_backends.model_tag == "backbone"
+            )
+        )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
@@ -3087,7 +3103,37 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
                     w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
-                    if w_uv_vspace is not None and use_qrep:
+                    if uv_first:
+                        # TPU_DCP_MLA_UV_BEFORE_MERGE (upstream #1931 + its
+                        # follow-ups): project every partial through the DCP
+                        # group's W_UV, then merge [T, H, v_head_dim]. A
+                        # narrowed merge rounds to the wire dtype anyway, so
+                        # the backbone projects straight into it. Takes
+                        # precedence over TPU_DCP_MERGE_VSPACE (the same
+                        # projection, inside the chunked merge).
+                        wire_dtype = partial.dtype
+                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                        partial = project_uv_heads(
+                            partial,
+                            layer.W_UV_dcp_qrep,
+                            layer.W_UV_dcp_qrep_scale,
+                            out_dtype=wire_dtype if narrow else torch.float32,
+                        )
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=is_backbone,
+                            query_start_loc=attn_metadata.query_start_loc,
+                            wire_dtype=wire_dtype,
+                        )
+                        # Buckets of the same range that keep the latent lift
+                        # the local W_UV; lift it here too, unread
+                        # (`_retain_buffers`).
+                        outputs = _retain_buffers(
+                            outputs, layer.W_UV, getattr(layer, "W_UV_scale", None)
+                        )
+                        projected = True
+                    elif w_uv_vspace is not None and use_qrep:
                         # The decode buckets' trace lifts the local W_UV;
                         # lift it here too, unread (`_retain_buffers`).
                         w_uv_vspace = _retain_buffers(
@@ -3169,6 +3215,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # gathered W_UV; lift it here too, unread (`_retain_buffers`).
             w_uv_src = _retain_buffers(
                 w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+            )
+        qrep_w = getattr(layer, "W_UV_dcp_qrep", None)
+        if use_qrep and qrep_w is not None and qrep_w is not vspace_w:
+            # TPU_DCP_MLA_UV_BEFORE_MERGE: the plain-path buckets' trace lifts
+            # the gathered W_UV; lift it here too, unread.
+            w_uv_src = _retain_buffers(
+                w_uv_src, qrep_w, getattr(layer, "W_UV_dcp_qrep_scale", None)
             )
         w_uv = (
             w_uv_src.to(outputs_t.dtype)

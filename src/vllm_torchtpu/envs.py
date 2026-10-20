@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_VSPACE_MIN_TOKENS: int = 1024
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
+    TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 32
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = True
     TPU_DCP_MLA_FUSED_PREP: bool = True
@@ -849,6 +850,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = one token per step.
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 4),
+    # Under qrep, apply W_UV before the DCP merge, so the merge carries
+    # v_head_dim (256) instead of kv_lora_rank (512). Replicates W_UV per rank
+    # (the DCP group's heads). Plain dcp_op path only: the send-layout and
+    # fused small-a2a paths (TPU_DCP_MLA_SEND_LAYOUT, TPU_MLA_FUSED_SMALL_A2A)
+    # keep the latent; takes precedence over TPU_DCP_MERGE_VSPACE.
+    "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
+        "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
     # DCP sparse MLA: chunks of at most this many query tokens take the
     # decode-sized (small-chunk) path -- TPU_DCP_MLA_SMALL_CHUNK_BATCH tokens
     # per grid step and the one-atom live-bounded SparseCore gather
