@@ -1243,7 +1243,11 @@ def test_unstacked_expert_weights_equivalence(T: int, B: int):
             )
 
 
-@pytest.mark.parametrize("T,B", [(1, 2), (2, 4)])
+@pytest.mark.parametrize(
+    "T,B",
+    # T=2 re-checks the T=1 EPLB path (EPLB is also pinned by the golden harness).
+    [(1, 2), pytest.param(2, 4, marks=pytest.mark.slow)],
+)
 def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     """Verify `split_hf_weights` (R=1 vs R=2), `encode_ecopy`, EPLB, and TP MoE."""
     # Verify encode_ecopy warns when an expert has > 1 secondary replicas

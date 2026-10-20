@@ -269,10 +269,18 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
     }.get(field)
 
 
+# WIDE re-checks of flags already flipped at (T=2, B=4): local tiers skip them.
+_SLOW_FLIPS = {"pair_kv-wide", "kv_ering-wide", "gqa_qv-wide"}
+
+
 @pytest.mark.parametrize(
     "field,value,tb,extra",
-    [c[1:] for c in EXACT_FLIPS],
-    ids=[c[0] for c in EXACT_FLIPS],
+    [
+        pytest.param(
+            *c[1:], id=c[0], marks=pytest.mark.slow if c[0] in _SLOW_FLIPS else ()
+        )
+        for c in EXACT_FLIPS
+    ],
 )
 def test_exact_tile_fields_reproduce_model_default(
     field: str, value: Any, tb: tuple[int, int], extra: dict
@@ -390,7 +398,13 @@ _GPR_AUTO = mk.get_profile(_QWEN35_DEFAULT).with_overrides(pool_gather=None)
 
 
 @pytest.mark.parametrize(
-    "prof,B", [(_GPR_ELIGIBLE, 8), (_GPR_ELIGIBLE, 16), (_GPR_AUTO, 24)]
+    "prof,B",
+    [
+        (_GPR_ELIGIBLE, 8),
+        (_GPR_ELIGIBLE, 16),
+        # Auto GPR at B=24 is also pinned by the golden harness (def_t4_b24_gpr).
+        pytest.param(_GPR_AUTO, 24, marks=pytest.mark.slow),
+    ],
 )
 def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
     """In-kernel GDN gather (GPR) vs split gather at T=4, Qwen3.5 baseline (CPU).
