@@ -363,11 +363,11 @@ def fused_ep_moe_v2(
     FP4 values, lowest nibble first: w1 [E, H/8, 2*I], w2 [E, I/8, H].
     Scales retain the ordinary FP4 layout and meaning.
 
-    logical_inter declares a loader-verified zero-padded intermediate: gate/up
-    channels [logical_inter, I) in both halves and down rows in that range
-    must be zero. Cropping is enabled only for the measured prefill workload;
-    omitted metadata preserves the full stored intermediate width.
-    It also sets logical_intermediate_size; if both are supplied, they must agree.
+    logical_intermediate_size certifies zero-padded gate/up channels in both
+    halves and down rows in [logical_intermediate_size, I). Matching tuned
+    prefill workloads use the optimized FFN; other workloads retain the
+    ordinary path. logical_inter is a compatibility alias restricted to the
+    tuned workload when cropping; if both are supplied, they must agree.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)

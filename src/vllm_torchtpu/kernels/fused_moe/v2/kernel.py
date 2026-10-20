@@ -832,7 +832,7 @@ def _build_fused_ep_moe_kernel(
                 has_w1_bias or has_w2_bias,
             )
         )
-    fp4_prefill = tuned_rungs is not None and logical_inter is not None
+    fp4_prefill = tuned_rungs is not None and logical_intermediate_size is not None
     if logical_inter is not None and active_inter != inter and not fp4_prefill:
         raise ValueError(
             "logical_inter cropping requires a tuned FP4 prefill workload and "
