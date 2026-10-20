@@ -162,17 +162,10 @@ def test_drafter_mode_without_shared_slots_is_a_noop():
 # ---------------------------------------------------------------- TPU: the real op
 
 
-def _tpu_available():
-    try:
-        import torch_tpu  # noqa: F401
-
-        torch.empty(1).to("tpu")
-        return True
-    except Exception:  # noqa: BLE001
-        return False
-
-
-tpu = pytest.mark.skipif(not _tpu_available(), reason="needs a TPU (torch_tpu)")
+# The TPU lane's marker, not a probe: probing at import (a tensor moved to
+# "tpu") creates the PJRT client in the pytest process during collection,
+# which then holds the chips, so every test that spawns TPU workers fails.
+tpu = pytest.mark.tpu_test
 
 KH, KV = 6144, 9680
 
