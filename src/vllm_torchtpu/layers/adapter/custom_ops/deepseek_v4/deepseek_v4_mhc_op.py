@@ -19,6 +19,7 @@ pre as a single kernel.
 """
 
 import functools
+import math
 from typing import Any, NamedTuple
 
 import jax
@@ -26,6 +27,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
     post_kernel,
@@ -57,11 +59,19 @@ def _gate_suffix(
     sinkhorn_repeat: int,
 ) -> str:
     """The gate constants are baked into the traced op, so they name it."""
+    fused = envs.VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS
     return (
         f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
         f"_s{_name_float(hc_sinkhorn_eps)}"
         f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
+        + (f"_fg{fused}" if fused else "")
     )
+
+
+def _fuse_gates(residual: jax.Array) -> bool:
+    """Gates go in-block for token buckets up to the env threshold (static)."""
+    num_tokens = math.prod(residual.shape[:-2])
+    return num_tokens <= envs.VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -90,6 +100,7 @@ def _mhc_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        fuse_gates=_fuse_gates(residual),
     )
 
 
@@ -134,6 +145,7 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        fuse_gates=_fuse_gates(residual),
     )
 
 

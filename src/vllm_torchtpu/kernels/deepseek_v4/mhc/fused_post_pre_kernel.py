@@ -35,8 +35,8 @@ def _fused_kernel(
     sc_ref,
     hb_ref,
     newres_ref,
-    mixes_ref,
-    sqrsum_ref,
+    out0_ref,
+    out1_ref,
     layer_ref,
     *,
     hc_mult,
@@ -44,8 +44,13 @@ def _fused_kernel(
     gemm_precision,
     rms_eps,
     hc_pre_eps,
+    gates,
 ):
-    """One token block: recombine, store once, 3-pass GEMM, collapse."""
+    """One token block: recombine, store once, 3-pass GEMM, collapse.
+
+    (out0, out1) are the raw (mixes, sqrsum) for the XLA gates, or with
+    ``gates`` the in-block (post_mix, comb_mix).
+    """
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
@@ -82,10 +87,23 @@ def _fused_kernel(
         acc = acc + jax.lax.dot_general(
             g_bf, fn_lo_ref[...], dn, preferred_element_type=jnp.float32
         )
-    mixes_ref[...] = acc
     gf = g_bf.astype(jnp.float32)  # f32 for the squared sum + collapse
     sqr = jnp.sum(gf * gf, axis=-1, keepdims=True)
-    sqrsum_ref[...] = sqr
+    if gates is None:
+        out0_ref[...] = acc
+        out1_ref[...] = sqr
+    else:
+        utils.store_gates_block(
+            acc,
+            sqr,
+            sc_ref,
+            hb_ref,
+            out0_ref,
+            out1_ref,
+            hc_mult=hc_mult,
+            hidden_size=hidden_size,
+            gates=gates,
+        )
 
     m, h = hc_mult, hidden_size
     scaled = acc[:, :m] * jax.lax.rsqrt(sqr / (m * h) + rms_eps)
@@ -104,6 +122,7 @@ def _fused_kernel(
         "token_block_size",
         "gemm_precision",
         "vmem_limit_bytes",
+        "gates",
     ),
 )
 def fused_post_pre_mixes(
@@ -120,6 +139,7 @@ def fused_post_pre_mixes(
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    gates: utils.GateConsts | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The Pallas seam kernel: post recombine fused with pre's mix GEMM
     and in-block collapse.
@@ -143,6 +163,9 @@ def fused_post_pre_mixes(
         gemm_precision: "highest" (3-pass exact decomposition, the
             default) or "default" (hi-chunk pass only; pre_mix and the
             collapse then also see the hi-only mixes).
+        gates: static; if set, the Sinkhorn/post/comb gates run in-block
+            and the mixes/sqrsum outputs are replaced by post_mix
+            (num_tokens, hc_mult) and comb_mix (num_tokens, hc_mult**2).
 
     Returns:
         new_res2d: (num_tokens, hc_mult * hidden_size), bfloat16.
@@ -179,8 +202,9 @@ def fused_post_pre_mixes(
         disable_bounds_checks=True,
     )
 
+    w0, w1 = (hc_mult3, 1) if gates is None else (hc_mult, hc_mult * hc_mult)
     resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
-    new_res, mixes, sqrsum, layer2d = pl.pallas_call(
+    new_res, out0, out1, layer2d = pl.pallas_call(
         functools.partial(
             _fused_kernel,
             hc_mult=hc_mult,
@@ -188,6 +212,7 @@ def fused_post_pre_mixes(
             gemm_precision=gemm_precision,
             rms_eps=rms_eps,
             hc_pre_eps=hc_pre_eps,
+            gates=gates,
         ),
         grid=(padded_tokens // tb,),
         in_specs=[
@@ -203,14 +228,14 @@ def fused_post_pre_mixes(
         ],
         out_specs=[
             pl.BlockSpec((tb, hc_hidden), lambda i: (i, 0)),
-            pl.BlockSpec((tb, hc_mult3), lambda i: (i, 0)),
-            pl.BlockSpec((tb, 1), lambda i: (i, 0)),
+            pl.BlockSpec((tb, w0), lambda i: (i, 0)),
+            pl.BlockSpec((tb, w1), lambda i: (i, 0)),
             pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)),
         ],
         out_shape=[
             jax.ShapeDtypeStruct((padded_tokens, hc_hidden), jnp.bfloat16),
-            jax.ShapeDtypeStruct((padded_tokens, hc_mult3), jnp.float32),
-            jax.ShapeDtypeStruct((padded_tokens, 1), jnp.float32),
+            jax.ShapeDtypeStruct((padded_tokens, w0), jnp.float32),
+            jax.ShapeDtypeStruct((padded_tokens, w1), jnp.float32),
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
@@ -218,7 +243,7 @@ def fused_post_pre_mixes(
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
-        utils.trim_to(num_tokens, new_res, mixes, sqrsum, layer2d),
+        utils.trim_to(num_tokens, new_res, out0, out1, layer2d),
     )
 
 
@@ -239,8 +264,10 @@ def mhc_fused_post_pre(
     token_block_size: int = 32,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    fuse_gates: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue.
+    """Fused seam op: Pallas post+GEMM+collapse kernel, XLA gates epilogue
+    (in-block instead with ``fuse_gates``).
     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
     """
     assert residual.dtype == jnp.bfloat16
@@ -253,7 +280,14 @@ def mhc_fused_post_pre(
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 
-    new_res2d, mixes, sqrsum, layer_input_cur = fused_post_pre_mixes(
+    gates = (
+        utils.GateConsts(
+            rms_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        if fuse_gates
+        else None
+    )
+    new_res2d, out0, out1, layer_input_cur = fused_post_pre_mixes(
         x2d,
         res2d,
         post2d,
@@ -266,20 +300,24 @@ def mhc_fused_post_pre(
         token_block_size=token_block_size,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
+        gates=gates,
     )
-    _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
-        mixes,
-        sqrsum,
-        hc_mult,
-        hidden_size,
-        hc_scale,
-        hc_base,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-    )
+    if gates is not None:
+        post_mix_cur, comb_mix_cur = out0, out1
+    else:
+        _, post_mix_cur, comb_mix_cur = utils.mhc_pre_gates(
+            out0,
+            out1,
+            hc_mult,
+            hidden_size,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
 
     return (
         new_res2d.reshape(*outer_shape, hc_mult, hidden_size),

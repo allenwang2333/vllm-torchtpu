@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
+    VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS: int = 0
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -883,6 +884,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #          token along lanes, 132 B read per token.
     "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": env_with_choices(
         "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has", ["has", "sal"]
+    ),
+    # DeepSeek-V4 mHC: run the Sinkhorn/post/comb gates inside the Pallas
+    # pre/seam kernels (instead of as ~150 tiny XLA ops per call) for token
+    # buckets up to this size. 0 keeps them in XLA.
+    "VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS": env_int(
+        "VLLM_TPU_DSV4_MHC_FUSED_GATES_MAX_TOKENS", 0
     ),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True

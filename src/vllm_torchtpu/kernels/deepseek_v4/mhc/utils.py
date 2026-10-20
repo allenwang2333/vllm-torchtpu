@@ -147,3 +147,62 @@ def mhc_pre_gates(
             jnp.sum(comb_mix, axis=-2, keepdims=True) + hc_sinkhorn_eps
         )
     return pre_mix, post_mix, comb_mix
+
+
+class GateConsts(NamedTuple):
+    """The static constants of ``mhc_pre_gates``' post/comb half."""
+
+    rms_eps: float
+    hc_sinkhorn_eps: float
+    hc_post_mult_value: float
+    sinkhorn_repeat: int
+
+
+def store_gates_block(
+    acc: jax.Array,
+    sqr: jax.Array,
+    sc_ref,
+    hb_ref,
+    post_ref,
+    comb_ref,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+    gates: GateConsts,
+) -> None:
+    """In-kernel twin of ``mhc_pre_gates``' post/comb outputs for one block.
+
+    Runs on the raw (tb, hc_mult3) mixes and (tb, 1) squared sums a kernel
+    already holds, so the tiny gate math costs no extra launch. comb is kept
+    as hc_mult row slices (tb, hc_mult) — row i is comb[:, i, :] — so the
+    row sums are lane reductions and the column sums elementwise adds.
+    Stores post_mix (tb, hc_mult) and comb_mix (tb, hc_mult * hc_mult),
+    row-major (i, j), the layout the post/fused kernels read.
+    """
+    m = hc_mult
+    eps = gates.hc_sinkhorn_eps
+    mixes = acc * jax.lax.rsqrt(sqr / (m * hidden_size) + gates.rms_eps)
+
+    post_logits = mixes[:, m : 2 * m] * sc_ref[0, 1] + hb_ref[:, m : 2 * m]
+    post_ref[...] = jax.nn.sigmoid(post_logits) * gates.hc_post_mult_value
+
+    rows = []
+    for i in range(m):
+        lo = 2 * m + i * m
+        logits = mixes[:, lo : lo + m] * sc_ref[0, 2] + hb_ref[:, lo : lo + m]
+        # jax.nn.softmax's own formulation.
+        e = jnp.exp(logits - jnp.max(logits, axis=-1, keepdims=True))
+        rows.append(e / jnp.sum(e, axis=-1, keepdims=True) + eps)
+
+    def col_normalize(rows):
+        col = rows[0]
+        for r in rows[1:]:
+            col = col + r
+        return [r / (col + eps) for r in rows]
+
+    rows = col_normalize(rows)
+    for _ in range(gates.sinkhorn_repeat - 1):
+        rows = [r / (jnp.sum(r, axis=-1, keepdims=True) + eps) for r in rows]
+        rows = col_normalize(rows)
+    for i, r in enumerate(rows):
+        comb_ref[:, i * m : (i + 1) * m] = r

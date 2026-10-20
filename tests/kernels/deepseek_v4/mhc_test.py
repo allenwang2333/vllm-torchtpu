@@ -590,5 +590,62 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+class MhcFusedGatesInterpretTest(parameterized.TestCase):
+    """In-block gates (``fuse_gates``) vs the XLA gates epilogue, both
+    through the same kernel in TPU interpret mode, so it runs on CPU.
+
+    Only the gate arithmetic differs: same ops, but the 4-term row/column
+    sums may associate differently, so f32 gates agree to a few ulp and the
+    bf16 outputs (which do not depend on the gates) bit-exactly."""
+
+    @parameterized.product(num_tokens=[1, 16, 40], sinkhorn_repeat=[1, 20])
+    def test_pre(self, num_tokens, sinkhorn_repeat):
+        from jax.experimental.pallas import tpu as pltpu
+
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import pre_kernel
+
+        rng = np.random.default_rng(11)
+        residual, fn, hc_scale, hc_base = _make_pre_inputs(rng, num_tokens, 256)
+        args = (
+            jnp.asarray(residual).astype(jnp.bfloat16),
+            jnp.asarray(fn),
+            jnp.asarray(hc_scale),
+            jnp.asarray(hc_base),
+            RMS_EPS,
+            HC_PRE_EPS,
+            HC_SINKHORN_EPS,
+            HC_POST_MULT_VALUE,
+            sinkhorn_repeat,
+        )
+        with pltpu.force_tpu_interpret_mode():
+            want = pre_kernel.mhc_pre(*args)
+            got = pre_kernel.mhc_pre(*args, fuse_gates=True)
+        for g, w in zip(got[:2], want[:2]):
+            self.assertEqual(g.shape, w.shape)
+            np.testing.assert_allclose(_to_np(g), _to_np(w), rtol=1e-6, atol=1e-7)
+        np.testing.assert_array_equal(_to_np(got[2]), _to_np(want[2]))
+
+    @parameterized.product(num_tokens=[1, 16, 40], sinkhorn_repeat=[1, 20])
+    def test_fused_post_pre(self, num_tokens, sinkhorn_repeat):
+        from jax.experimental.pallas import tpu as pltpu
+
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = _fused_args(
+            np.random.default_rng(12), num_tokens, 256, sinkhorn_repeat
+        )
+        fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
+        with pltpu.force_tpu_interpret_mode():
+            want = fused_fn(*args)
+            got = fused_fn(*args, fuse_gates=True)
+        for k in (0, 3):  # residual, layer input: gate-independent
+            np.testing.assert_array_equal(_to_np(got[k]), _to_np(want[k]))
+        for k in (1, 2):  # post_mix, comb_mix
+            self.assertEqual(got[k].shape, want[k].shape)
+            np.testing.assert_allclose(
+                _to_np(got[k]), _to_np(want[k]), rtol=1e-6, atol=1e-7
+            )
+
+
 if __name__ == "__main__":
     absltest.main()
