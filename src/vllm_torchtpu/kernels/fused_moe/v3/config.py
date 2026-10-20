@@ -82,7 +82,12 @@ WEIGHT_DMA_PRIORITIES = (0, 1)
 # top_k): the fields tuned off the defaults for that shape and nothing else.
 # The layer consults it when the caller passes no Config; a caller's own
 # Config is taken as it is.
-TUNED_BY_SHAPE = {}
+TUNED_BY_SHAPE = {
+    # Qwen3.5-397B at EP8: the per-row fetch hides under the result push at
+    # 1024 tokens a shard, so the sparse-core sort, its separate exchange
+    # finish and the live-row index are pure added latency.
+    (4096, 1024, 64, 10): {"sorted_rows": False},
+}
 
 
 @dataclasses.dataclass(frozen=True)
