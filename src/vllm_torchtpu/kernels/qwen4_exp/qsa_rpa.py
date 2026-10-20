@@ -189,6 +189,25 @@ def qsa_attention(
         from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
             get_sparse_prefill_tiles,
         )
+        from vllm_torchtpu.kernels.sparse_gqa_prefill.adaptive import (
+            adaptive_prefill,
+            is_supported_by_adaptive_prefill,
+        )
+
+        if is_supported_by_adaptive_prefill(
+            query,
+            gate,
+            blocks,
+            lengths,
+            table,
+            cache,
+            starts,
+            kv_heads=kv_heads,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        ):
+            return adaptive_prefill(query, gate, blocks, lengths, table, cache, starts)
 
         query_block, kv_tile = get_sparse_prefill_tiles(
             query, cache, kv_heads=kv_heads, ratio=ratio

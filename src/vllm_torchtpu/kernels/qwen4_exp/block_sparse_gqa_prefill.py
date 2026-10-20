@@ -10,7 +10,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
-from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
+from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import (
+    PAIRED_PAGE_VMEM_MIB,
+    supports_paired_prefill,
+)
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
@@ -282,20 +285,19 @@ def block_sparse_gqa_prefill(
         raise ValueError("Token rows must form aligned query blocks")
     paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
     if paired_pages:
-        if (
-            query_heads != 24
-            or kv_heads != 2
-            or head_dim != 256
-            or cache.dtype != jnp.float8_e4m3fn
-            or query_block not in PAIRED_PAGE_VMEM_MIB
-            or not bf16_io
+        if not bf16_io or not supports_paired_prefill(
+            query, cache, kv_heads=kv_heads, ratio=ratio, query_block=query_block
         ):
-            raise ValueError("Paired pages require BF16 Q24/KV2/D256 with FP8 cache")
+            raise ValueError(
+                "Paired pages require BF16 queries, native BF16/FP8 KV, "
+                "128-aligned pages/dimensions and a TPU7x tile "
+                "within the paired VMEM footprint"
+            )
     elif kv_tile // ratio != 32 or max(physical_page_size, kv_tile) % min(
         physical_page_size, kv_tile
     ):
         raise ValueError(
-            "Each KV tile must use one selection word or two FP8 mask segments"
+            "Each KV tile must use one selection word or two mask segments"
         )
     if query_heads % kv_heads or cache_dim < head_dim:
         raise ValueError("QSA query and KV geometry is inconsistent")
@@ -311,7 +313,11 @@ def block_sparse_gqa_prefill(
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
-    if paired_pages and query_block == 256 and tokens * words * 4 >= 16 * 1024**2:
+    if (
+        (paired_pages or cache.dtype == jnp.bfloat16)
+        and query_block == 256
+        and tokens * words * 4 >= 16 * 1024**2
+    ):
         batch = 8
         while batch > 1 and batch * query_block * words * 4 >= 16 * 1024**2:
             batch //= 2
@@ -425,7 +431,7 @@ def block_sparse_gqa_prefill(
         # tile can serve twice as many queries.  The compiled production
         # kernel needs about 40.44 MB at the full T8192 production shape, just
         # above the effective limit produced by a 36 MiB setting.
-        # Paired pages need 61.13 MiB at Q256 on v7; the tuned allowance
+        # FP8 paired pages need 61.13 MiB at Q256 on v7; the tuned allowance
         # remains below its 64 MiB per core. Preserve the KV128 budgets.
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
@@ -536,7 +542,9 @@ def block_sparse_gqa_attention(
         output = run_with_padding(None)
     else:
         output = lax.cond(
-            jnp.all(real % query_block == 0),
+            # Only starts of nonempty requests must align. The final request
+            # may end inside a tile whose remaining token rows are inactive.
+            jnp.all((starts[:-1] % query_block == 0) | (real == 0)),
             run_aligned,
             run_with_padding,
             None,
