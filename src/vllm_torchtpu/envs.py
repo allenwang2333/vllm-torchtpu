@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_RPA_NATIVE_FP8_PREFILL: str = ""
+    TPU_RPA_PREFILL_BLOCKS: str = ""
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     USE_MOE_FUSED_EP_KERNEL: bool = False
@@ -795,6 +796,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # operand optionally suffixed "s" for its static scale (e.g. "qkpvs").
     # Empty: bf16 matmuls. See kernels/experimental/batched_rpa/configs.py.
     "TPU_RPA_NATIVE_FP8_PREFILL": lambda: os.getenv("TPU_RPA_NATIVE_FP8_PREFILL", ""),
+    # "bq,bq_c,bkv,batch": replaces the batched RPA prefill/mixed tile sizes that
+    # calculate_block_sizes picks (empty: the heuristic). See wrapper.prefill_block_override.
+    "TPU_RPA_PREFILL_BLOCKS": lambda: os.getenv("TPU_RPA_PREFILL_BLOCKS", ""),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is
