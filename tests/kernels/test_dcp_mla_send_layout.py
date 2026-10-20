@@ -225,9 +225,16 @@ def _merge_send_every_rank(sends, real, tokens):
         local.group = _Group(rank)
         return cp_mla.merge_send_layout(sends[rank], qsl, tokens)
 
+    # The stand-in replaces the ragged exchange only: the other exchanges of
+    # the send buffer (on by default since trials 4, 5 and 6) are pinned off.
     with (
         mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
         mock.patch.object(cp_mla, "get_dcp_group", lambda: local.group),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_SMALL_A2A", False),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_DENSE", False),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_GROUP_ROWS", 0),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_LAYOUT_MERGE", False),
+        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", False),
         concurrent.futures.ThreadPoolExecutor(world) as pool,
     ):
         return torch.cat(list(pool.map(run, range(world))), dim=1)
