@@ -469,6 +469,10 @@ def _pack_planes_from_unpacked(
         pad = 64 - x.shape[-1]
         return jnp.pad(x, [(0, 0), (0, 0), (0, pad)]) if pad > 0 else x
 
+    def _pad32(x: jax.Array) -> jax.Array:
+        pad = 32 - x.shape[-1]
+        return jnp.pad(x, [(0, 0), (0, 0), (0, pad)]) if pad > 0 else x
+
     if meta_words == 1:
         if layout.key_fp8:
             lo_part = _pad64(jnp.concatenate([vs_lo, vz_lo], axis=-1))
@@ -480,8 +484,24 @@ def _pack_planes_from_unpacked(
             hi_part = _pad64(jnp.concatenate([vs_hi, vz_hi, kn_hi], axis=-1))
         meta_plane = jnp.concatenate([lo_part, hi_part], axis=-1)[:, None, :, :]
     else:
-        r0 = jnp.concatenate([_pad64(vs_lo), _pad64(vz_lo)], axis=-1)
-        r1 = jnp.concatenate([_pad64(vs_hi), _pad64(vz_hi)], axis=-1)
+        r0 = jnp.concatenate(
+            [
+                _pad32(vs_lo[..., :32]),
+                _pad32(vz_lo[..., :32]),
+                _pad32(vs_hi[..., :32]),
+                _pad32(vz_hi[..., :32]),
+            ],
+            axis=-1,
+        )
+        r1 = jnp.concatenate(
+            [
+                _pad32(vs_lo[..., 32:]),
+                _pad32(vz_lo[..., 32:]),
+                _pad32(vs_hi[..., 32:]),
+                _pad32(vz_hi[..., 32:]),
+            ],
+            axis=-1,
+        )
         rows = [r0, r1]
         if not layout.key_fp8:
             kn_lo = m_nh[..., :, 4]
@@ -539,10 +559,12 @@ def _unpack_planes_to_components(
     else:
         r0 = meta_plane[:, 0]
         r1 = meta_plane[:, 1]
-        vs_lo = r0[..., 0:p]
-        vz_lo = r0[..., 64 : 64 + p]
-        vs_hi = r1[..., 0:p]
-        vz_hi = r1[..., 64 : 64 + p]
+        p0 = min(p, 32)
+        p1 = max(p - 32, 0)
+        vs_lo = jnp.concatenate([r0[..., 0:p0], r1[..., 0:p1]], axis=-1)
+        vz_lo = jnp.concatenate([r0[..., 32 : 32 + p0], r1[..., 32 : 32 + p1]], axis=-1)
+        vs_hi = jnp.concatenate([r0[..., 64 : 64 + p0], r1[..., 64 : 64 + p1]], axis=-1)
+        vz_hi = jnp.concatenate([r0[..., 96 : 96 + p0], r1[..., 96 : 96 + p1]], axis=-1)
         if layout.key_fp8:
             m_nh = jnp.stack([vs_lo, vs_hi, vz_lo, vz_hi], axis=-1)
         else:
@@ -563,21 +585,38 @@ def _u16_to_f32_vreg(u16: jax.Array) -> jax.Array:
     """Converts IEEE-754 fp16 bits in `u32` VREGs to `f32` without `i16->f16` bitcast."""
     from jax.experimental.pallas import tpu as pltpu
 
-    sign = (u16 >> 15) & 1
-    exp = (u16 >> 10) & 0x1F
-    mant = u16 & 0x3FF
-
-    normal_bits = (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+    sign_f32 = (u16 & 0x8000) << 16
+    abs_u16 = u16 & 0x7FFF
+    normal_bits = sign_f32 | ((abs_u16 << 13) + (112 << 23))
     normal_f32 = pltpu.bitcast(normal_bits, jnp.float32)
 
-    sub_f32 = mant.astype(jnp.float32) * np.float32(2.0**-24)
-    sub_f32 = jnp.where(sign != 0, -sub_f32, sub_f32)
-    return jnp.where(exp == 0, sub_f32, normal_f32)
+    sub_bits = sign_f32 | ((abs_u16 << 13) + (113 << 23))
+    sub_base = sign_f32 | (113 << 23)
+    sub_f32 = pltpu.bitcast(sub_bits, jnp.float32) - pltpu.bitcast(
+        sub_base, jnp.float32
+    )
+    return jnp.where(abs_u16 < 0x0400, sub_f32, normal_f32)
 
 
 def _lookup_centroids_vreg(idx: jax.Array, bits: int, centroids: np.ndarray) -> jax.Array:
-    """VREG binary-tree select of `centroids[idx]` (7 selects for 3-bit, 15 for 4-bit)."""
-    vals = [jnp.full(idx.shape, float(c), dtype=jnp.float32) for c in centroids]
+    """VREG binary-tree select of `centroids[idx]` exploiting antisymmetry."""
+    c_arr = np.asarray(centroids, dtype=np.float32)
+    if bits >= 2 and np.allclose(c_arr, -c_arr[::-1], rtol=0.0, atol=1e-7):
+        half = 1 << (bits - 1)
+        top_bit = (idx & half) != 0
+        fold_idx = jnp.where(top_bit, ~idx, idx)
+        vals = [
+            jnp.full(idx.shape, float(c), dtype=jnp.float32) for c in c_arr[:half]
+        ]
+        for b in range(bits - 1):
+            bit_set = (fold_idx & (1 << b)) != 0
+            vals = [
+                jnp.where(bit_set, vals[2 * j + 1], vals[2 * j])
+                for j in range(len(vals) // 2)
+            ]
+        return jnp.where(top_bit, -vals[0], vals[0])
+
+    vals = [jnp.full(idx.shape, float(c), dtype=jnp.float32) for c in c_arr]
     for b in range(bits):
         bit_set = (idx & (1 << b)) != 0
         vals = [
@@ -627,27 +666,32 @@ def _dequant_tq_page_vreg(
         mt = jnp.transpose(jnp.broadcast_to(meta_plane[0:1], (128, 128))).astype(
             jnp.uint32
         )
-        vs_u16 = mt[0:p] | (mt[64 : 64 + p] << 8)
-        vz_u16 = mt[p : 2 * p] | (mt[64 + p : 64 + 2 * p] << 8)
+        f32_meta = _u16_to_f32_vreg(mt[0:64] | (mt[64:128] << 8))
+        v_scale = f32_meta[0:p]
+        v_zero = f32_meta[p : 2 * p]
         if not layout.key_fp8:
-            kn_u16 = mt[2 * p : 3 * p] | (mt[64 + 2 * p : 64 + 3 * p] << 8)
+            k_norm = f32_meta[2 * p : 3 * p]
     else:
+        p0 = min(p, 32)
+        p1 = max(p - 32, 0)
         mt0 = jnp.transpose(jnp.broadcast_to(meta_plane[0:1], (128, 128))).astype(
             jnp.uint32
         )
         mt1 = jnp.transpose(jnp.broadcast_to(meta_plane[1:2], (128, 128))).astype(
             jnp.uint32
         )
-        vs_u16 = mt0[0:p] | (mt1[0:p] << 8)
-        vz_u16 = mt0[64 : 64 + p] | (mt1[64 : 64 + p] << 8)
+        u16_0 = mt0[0:64] | (mt0[64:128] << 8)
+        u16_1 = mt1[0:64] | (mt1[64:128] << 8)
+        vs_u16 = jnp.concatenate([u16_0[0:p0], u16_1[0:p1]], axis=0)
+        vz_u16 = jnp.concatenate([u16_0[32 : 32 + p0], u16_1[32 : 32 + p1]], axis=0)
+        v_scale = _u16_to_f32_vreg(vs_u16)
+        v_zero = _u16_to_f32_vreg(vz_u16)
         if not layout.key_fp8:
             mt2 = jnp.transpose(jnp.broadcast_to(meta_plane[2:3], (128, 128))).astype(
                 jnp.uint32
             )
             kn_u16 = mt2[0:p] | (mt2[64 : 64 + p] << 8)
-
-    v_scale = _u16_to_f32_vreg(vs_u16)
-    v_zero = _u16_to_f32_vreg(vz_u16)
+            k_norm = _u16_to_f32_vreg(kn_u16)
 
     dv_folds = []
     k_folds = []
@@ -671,7 +715,6 @@ def _dequant_tq_page_vreg(
             sq_sum = jnp.sum(c * c, axis=-1, keepdims=True)
             inv_norm = jax.lax.rsqrt(sq_sum + _CENTROID_NORM_EPS)
             c = c * jnp.broadcast_to(inv_norm, c.shape)
-        k_norm = _u16_to_f32_vreg(kn_u16)
         if folds > 1:
             k_norm = jnp.concatenate([k_norm] * folds, axis=1)
         dk = (c * k_norm).astype(kv_dtype)
@@ -742,6 +785,15 @@ def _update_kv_cache_fast_plane_words(
     v_wpf = v_words // folds
     base_widx = phys_pages * page_words
     s = slot_in_page
+
+    if num_tokens > 1:
+        same_slot = (
+            (phys_pages[:, None] == phys_pages[None, :])
+            & (s[:, None] == s[None, :])
+            & valid_tok[:, None]
+            & valid_tok[None, :]
+        )
+        valid_tok = valid_tok & ~jnp.any(jnp.triu(same_slot, k=1), axis=1)
 
     full_widx_list: list[jax.Array] = []
     full_val_list: list[jax.Array] = []
@@ -828,72 +880,62 @@ def _update_kv_cache_fast_plane_words(
         rmw_mask_list.append(jnp.where(m_bool, jnp.uint8(0xFF), jnp.uint8(0)))
         rmw_val_list.append(v_m0)
     else:
-        c_lo = cols == s_col
-        c_hi = cols == (s_col + 64)
-        mask_m = jnp.where(c_lo | c_hi, jnp.uint8(0xFF), jnp.uint8(0))
-        val_m0 = jnp.where(c_lo, n_meta[:, :, 0:1], jnp.uint8(0)) | jnp.where(
-            c_hi, n_meta[:, :, 2:3], jnp.uint8(0)
+        s_half = (s & 31)[:, None, None]
+        c0 = cols == s_half
+        c1 = cols == (s_half + 32)
+        c2 = cols == (s_half + 64)
+        c3 = cols == (s_half + 96)
+        mask_v = jnp.where(c0 | c1 | c2 | c3, jnp.uint8(0xFF), jnp.uint8(0))
+        val_v = (
+            jnp.where(c0, n_meta[:, :, 0:1], jnp.uint8(0))
+            | jnp.where(c1, n_meta[:, :, 2:3], jnp.uint8(0))
+            | jnp.where(c2, n_meta[:, :, 1:2], jnp.uint8(0))
+            | jnp.where(c3, n_meta[:, :, 3:4], jnp.uint8(0))
         )
-        val_m1 = jnp.where(c_lo, n_meta[:, :, 1:2], jnp.uint8(0)) | jnp.where(
-            c_hi, n_meta[:, :, 3:4], jnp.uint8(0)
-        )
-        rmw_widx_list.append(jnp.where(valid_tok, m_base, total_words))
-        rmw_mask_list.append(mask_m)
-        rmw_val_list.append(val_m0)
-        rmw_widx_list.append(jnp.where(valid_tok, m_base + 1, total_words))
-        rmw_mask_list.append(mask_m)
-        rmw_val_list.append(val_m1)
+        rmw_widx_list.append(jnp.where(valid_tok, m_base + (s >> 5), total_words))
+        rmw_mask_list.append(mask_v)
+        rmw_val_list.append(val_v)
         if not layout.key_fp8:
-            val_m2 = jnp.where(c_lo, n_meta[:, :, 4:5], jnp.uint8(0)) | jnp.where(
+            c_lo = cols == s_col
+            c_hi = cols == (s_col + 64)
+            mask_k = jnp.where(c_lo | c_hi, jnp.uint8(0xFF), jnp.uint8(0))
+            val_k = jnp.where(c_lo, n_meta[:, :, 4:5], jnp.uint8(0)) | jnp.where(
                 c_hi, n_meta[:, :, 5:6], jnp.uint8(0)
             )
             rmw_widx_list.append(jnp.where(valid_tok, m_base + 2, total_words))
-            rmw_mask_list.append(mask_m)
-            rmw_val_list.append(val_m2)
+            rmw_mask_list.append(mask_k)
+            rmw_val_list.append(val_k)
 
     w_rmw = jnp.stack(rmw_widx_list, axis=0)  # [R, T]
     m_rmw = jnp.stack(rmw_mask_list, axis=0)  # [R, T, 1, 128]
     v_rmw = jnp.stack(rmw_val_list, axis=0)  # [R, T, H, 128]
 
     if num_tokens > 1:
-        same_page = (
-            (phys_pages[:, None] == phys_pages[None, :])
-            & valid_tok[:, None]
-            & valid_tok[None, :]
-        )
-        has_shared_page = jnp.any(jnp.triu(same_page, k=1))
-
-        def _merge_shared_rmw(
-            args: tuple[jax.Array, jax.Array, jax.Array],
-        ) -> tuple[jax.Array, jax.Array, jax.Array]:
-            w, m, v = args
-            same_w = (
-                (w[:, :, None] == w[:, None, :])
-                & (w[:, :, None] < total_words)
-            )  # [R, T, T]
-            rep_w = jnp.argmax(same_w, axis=2)  # [R, T]
-            t_idx = jnp.arange(num_tokens, dtype=jnp.int32)[None, :]
-            is_rep_w = (w < total_words) & (t_idx == rep_w)
-            w_out = jnp.where(is_rep_w, w, total_words)
-            m_out = jnp.bitwise_or.reduce(
-                jnp.where(
-                    same_w[:, :, :, None, None], m[:, None, :, :, :], jnp.uint8(0)
-                ),
-                axis=2,
-            )
-            v_out = jnp.bitwise_or.reduce(
-                jnp.where(
-                    same_w[:, :, :, None, None], v[:, None, :, :, :], jnp.uint8(0)
-                ),
-                axis=2,
-            )
-            return w_out, m_out, v_out
-
-        w_rmw, m_rmw, v_rmw = jax.lax.cond(
-            has_shared_page,
-            _merge_shared_rmw,
-            lambda args: args,
-            (w_rmw, m_rmw, v_rmw),
+        r_cnt = w_rmw.shape[0]
+        same_w = (w_rmw[:, :, None] == w_rmw[:, None, :]) & (
+            w_rmw[:, :, None] < total_words
+        )  # [R, T, T]
+        rep_w = jnp.argmax(same_w, axis=2)  # [R, T]
+        t_idx = jnp.arange(num_tokens, dtype=jnp.int32)[None, :]
+        is_rep_w = (w_rmw < total_words) & (t_idx == rep_w)
+        w_rmw = jnp.where(is_rep_w, w_rmw, total_words)
+        same_w_f = (same_w & is_rep_w[:, :, None]).astype(jnp.bfloat16)
+        mv_in = jnp.concatenate(
+            [
+                m_rmw.reshape(r_cnt, num_tokens, 128),
+                v_rmw.reshape(r_cnt, num_tokens, num_kv_heads * 128),
+            ],
+            axis=-1,
+        ).astype(jnp.bfloat16)
+        mv_out = jnp.einsum(
+            "rij,rjd->rid",
+            same_w_f,
+            mv_in,
+            preferred_element_type=jnp.float32,
+        ).astype(jnp.uint8)
+        m_rmw = mv_out[:, :, :128].reshape(r_cnt, num_tokens, 1, 128)
+        v_rmw = mv_out[:, :, 128:].reshape(
+            r_cnt, num_tokens, num_kv_heads, 128
         )
 
     flat_w_rmw = w_rmw.reshape(-1)

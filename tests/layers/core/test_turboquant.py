@@ -249,8 +249,8 @@ def test_slot_mapping_matches_python():
     np.testing.assert_array_equal(got, want)
 
 
-def _attention_case(preset, dtype=jnp.float32):
-    head_dim, page_size, pages_per_seq, max_num_seqs = 128, 16, 4, 4
+def _attention_case(preset, dtype=jnp.float32, page_size=16):
+    head_dim, pages_per_seq, max_num_seqs = 128, 4, 4
     num_q_heads, num_kv_heads, num_pages, num_tokens = 4, 2, 24, 48
     cfg, layout, tables = _layout_and_tables(preset, head_dim)
     rng = np.random.default_rng(5)
@@ -396,10 +396,11 @@ def test_skip_kv_update_leaves_cache_untouched():
     np.testing.assert_array_equal(np.asarray(new_cache), c["cache"])
 
 
+@pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("preset", PRESETS)
-def test_tq_ragged_paged_attention_128_packed_pages(preset):
+def test_tq_ragged_paged_attention_128_packed_pages(preset, page_size):
     """128-byte minor-axis page layout produces identical cache and attention."""
-    c = _attention_case(preset)
+    c = _attention_case(preset, page_size=page_size)
     sm_scale = c["cfg"].head_dim ** -0.5
     packed_cache = tq.pack_pages_128(jnp.asarray(c["cache"]), c["layout"])
     np.testing.assert_array_equal(
