@@ -193,7 +193,13 @@ def compute_batched_seq_metadata(
             pl.cdiv(chunk_tokens, seq_batch_size * bq_sz)
             + min(max_seq_tiles, chunk_tokens),
         )
-        req_max_steps = num_chunks * per_chunk_bq * max_bkv
+        # The chunks sit back to back, so their blocks together are the
+        # unchunked pass's blocks plus one seam block per cut: a cut splits a
+        # tile's tokens a + b, and cdiv(a) + cdiv(b) <= cdiv(a + b) + 1. Summing
+        # per_chunk_bq instead charges every chunk the whole pass, which at
+        # 4096 tokens x 32 seqs puts 3 x 512 KiB of schedule in 1 MiB of SMEM.
+        all_chunks_bq = min(num_chunks * per_chunk_bq, total_max_bq + num_chunks - 1)
+        req_max_steps = all_chunks_bq * max_bkv
     else:
         req_max_steps = total_max_bq * max_bkv
     req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024

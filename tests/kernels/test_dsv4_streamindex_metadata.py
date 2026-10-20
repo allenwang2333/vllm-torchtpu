@@ -489,6 +489,44 @@ class ChunkedMetadataTest(parameterized.TestCase):
         self.assertGreaterEqual(int(num_steps.sum()), 1)
         self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
 
+    @parameterized.named_parameters(
+        ("mns16_4096", 16, 4096),
+        ("mns32_4096", 32, 4096),
+        ("mns64_2048", 64, 2048),
+    )
+    def test_decode_chunk_sweep_fits_smem(self, max_num_seqs, max_num_tokens):
+        """The schedule is sized by the pass's work, not chunks x the pass.
+
+        Served shape (GLM-5.2 TP16 x DCP8): the single-sequence decode pass,
+        bq 1, 256-token chunks, 512 pages per seq at 2 pages per kv block.
+        Charging every chunk the whole pass made three s32[131072] arrays at
+        mns 32 x 4096 (and mns 64 x 2048), past the 1 MiB of SMEM the kernel
+        prefetches them into, and the server died compiling that bucket.
+        """
+        q_len, chunk_tokens = 1, 256
+        cu_q_lens = np.arange(max_num_seqs + 1) * q_len
+        starts = tuple(range(0, max_num_tokens, chunk_tokens))
+        meta_ = metadata.compute_metadata(
+            seq_lens=jnp.full((max_num_seqs,), 512 * 64, dtype=jnp.int32),
+            cu_q_lens=jnp.array(cu_q_lens, dtype=jnp.int32),
+            start_seq_idx=0,
+            end_seq_idx=max_num_seqs,
+            bq_sz=1,
+            bkv_sz=2 * 64,
+            pages_per_seq=512,
+            page_size=64,
+            max_num_tokens=max_num_tokens,
+            static_q_len=q_len,
+            seq_batch_size=1,
+            chunk_token_start=starts,
+            chunk_tokens=chunk_tokens,
+        )
+        max_steps = meta_.bq_idx.shape[0]
+        # Three s32 schedule arrays next to page_indices (mns x 512 s32).
+        smem = 3 * 4 * max_steps + 4 * max_num_seqs * 512
+        self.assertLessEqual(smem, 512 * 1024)
+        self.assertLessEqual(int(np.sum(np.array(meta_.num_steps))), max_steps)
+
     def test_empty_pass_returns_a_zero_per_chunk(self):
         """The empty branch has to agree with the schedule branch on shape."""
         meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
