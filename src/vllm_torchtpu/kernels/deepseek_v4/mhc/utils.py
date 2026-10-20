@@ -17,6 +17,7 @@ from typing import NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -158,6 +159,27 @@ class GateConsts(NamedTuple):
     sinkhorn_repeat: int
 
 
+# Lane count of a vreg: comb is padded to it so the butterfly rolls are
+# native whole-vreg lane rotations (rolls of a 16-lane value measured
+# ~2x slower than the XLA gates they replace).
+_LANES = 128
+
+
+def _xor_lane(x: jax.Array, lane: jax.Array, k: int) -> jax.Array:
+    """x at lane ``lane ^ k``, for k a power of two below the lane count."""
+    return jnp.where((lane & k) == 0, pltpu.roll(x, _LANES - k, 1), pltpu.roll(x, k, 1))
+
+
+def _group_reduce(x: jax.Array, lane: jax.Array, ks: list[int], op) -> jax.Array:
+    """Butterfly reduce over the lanes that differ only in the bits of ``ks``.
+
+    Every lane of a group ends with the same value, (a+b)+(c+d) for four.
+    """
+    for k in ks:
+        x = op(x, _xor_lane(x, lane, k))
+    return x
+
+
 def store_gates_block(
     acc: jax.Array,
     sqr: jax.Array,
@@ -173,36 +195,44 @@ def store_gates_block(
     """In-kernel twin of ``mhc_pre_gates``' post/comb outputs for one block.
 
     Runs on the raw (tb, hc_mult3) mixes and (tb, 1) squared sums a kernel
-    already holds, so the tiny gate math costs no extra launch. comb is kept
-    as hc_mult row slices (tb, hc_mult) — row i is comb[:, i, :] — so the
-    row sums are lane reductions and the column sums elementwise adds.
-    Stores post_mix (tb, hc_mult) and comb_mix (tb, hc_mult * hc_mult),
-    row-major (i, j), the layout the post/fused kernels read.
+    already holds, so the gate math costs no extra launch. comb is one
+    lane-dense value, lane i*hc_mult + j = comb[:, i, j] (lanes past
+    hc_mult**2 are padding): the 2 * sinkhorn_repeat dependent
+    normalisations then cost one divide per vreg each, and the row (lane
+    bits below hc_mult) and column (bits above) sums are lane-roll
+    butterflies. Stores post_mix (tb, hc_mult) and comb_mix
+    (tb, hc_mult**2), row-major (i, j), the layout the post/fused kernels
+    read.
     """
     m = hc_mult
+    mm = m * m
+    assert m & (m - 1) == 0 and mm <= _LANES, m
     eps = gates.hc_sinkhorn_eps
     mixes = acc * jax.lax.rsqrt(sqr / (m * hidden_size) + gates.rms_eps)
 
     post_logits = mixes[:, m : 2 * m] * sc_ref[0, 1] + hb_ref[:, m : 2 * m]
-    post_ref[...] = jax.nn.sigmoid(post_logits) * gates.hc_post_mult_value
+    # Explicit 1/(1+exp(-x)): matches the XLA gates bit-for-bit on TPU, where
+    # jax.nn.sigmoid inside a Pallas kernel was measured up to ~5e-5 off.
+    sigmoid = 1.0 / (1.0 + jnp.exp(-post_logits))
+    post_ref[...] = sigmoid * gates.hc_post_mult_value
 
-    rows = []
-    for i in range(m):
-        lo = 2 * m + i * m
-        logits = mixes[:, lo : lo + m] * sc_ref[0, 2] + hb_ref[:, lo : lo + m]
-        # jax.nn.softmax's own formulation.
-        e = jnp.exp(logits - jnp.max(logits, axis=-1, keepdims=True))
-        rows.append(e / jnp.sum(e, axis=-1, keepdims=True) + eps)
+    logits = mixes[:, 2 * m :] * sc_ref[0, 2] + hb_ref[:, 2 * m :]
+    tb = logits.shape[0]
+    # Padding lanes hold 1.0 so they stay finite; no valid lane reads them.
+    comb = jnp.concatenate([logits, jnp.ones((tb, _LANES - mm), jnp.float32)], axis=1)
+    lane = jax.lax.broadcasted_iota(jnp.int32, comb.shape, 1)
+    row_ks = [1 << b for b in range(m.bit_length() - 1)]
+    col_ks = [m * k for k in row_ks]
 
-    def col_normalize(rows):
-        col = rows[0]
-        for r in rows[1:]:
-            col = col + r
-        return [r / (col + eps) for r in rows]
+    def row_sum(x):
+        return _group_reduce(x, lane, row_ks, jnp.add)
 
-    rows = col_normalize(rows)
+    def col_normalize(x):
+        return x / (_group_reduce(x, lane, col_ks, jnp.add) + eps)
+
+    # Row softmax, in jax.nn.softmax's own formulation.
+    e = jnp.exp(comb - _group_reduce(comb, lane, row_ks, jnp.maximum))
+    comb = col_normalize(e / row_sum(e) + eps)
     for _ in range(gates.sinkhorn_repeat - 1):
-        rows = [r / (jnp.sum(r, axis=-1, keepdims=True) + eps) for r in rows]
-        rows = col_normalize(rows)
-    for i, r in enumerate(rows):
-        comb_ref[:, i * m : (i + 1) * m] = r
+        comb = col_normalize(comb / (row_sum(comb) + eps))
+    comb_ref[...] = comb[:, :mm]

@@ -314,9 +314,7 @@ def mhc_pre(
     x2d = residual.reshape(-1, hc_mult * hidden_size)
 
     gates = (
-        utils.GateConsts(
-            rms_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        )
+        utils.GateConsts(rms_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
         if fuse_gates
         else None
     )

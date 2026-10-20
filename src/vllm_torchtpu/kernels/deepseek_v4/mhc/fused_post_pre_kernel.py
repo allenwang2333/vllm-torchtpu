@@ -281,9 +281,7 @@ def mhc_fused_post_pre(
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
 
     gates = (
-        utils.GateConsts(
-            rms_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-        )
+        utils.GateConsts(rms_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat)
         if fuse_gates
         else None
     )

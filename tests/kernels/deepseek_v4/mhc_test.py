@@ -631,9 +631,7 @@ class MhcFusedGatesInterpretTest(parameterized.TestCase):
 
         from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
 
-        args = _fused_args(
-            np.random.default_rng(12), num_tokens, 256, sinkhorn_repeat
-        )
+        args = _fused_args(np.random.default_rng(12), num_tokens, 256, sinkhorn_repeat)
         fused_fn = fused_post_pre_kernel.mhc_fused_post_pre
         with pltpu.force_tpu_interpret_mode():
             want = fused_fn(*args)
