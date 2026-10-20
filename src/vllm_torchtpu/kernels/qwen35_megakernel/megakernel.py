@@ -382,7 +382,7 @@ def kernel_wide(ctx: MKBuildContext, refs):
     t_block, t_gdn, lay = ctx.t_block, ctx.t_gdn, ctx.lay
     me, rb_hbm = ctx.me, ctx.rb_hbm
     N_MB, BW, BWP, MB_GDN, MB_ATT = ctx.N_MB, ctx.BW, ctx.BWP, ctx.MB_GDN, ctx.MB_ATT
-    AR_DEFER = ctx.AR_DEFER
+    AR_DEFER, AR_XLAYER = ctx.AR_DEFER, ctx.AR_XLAYER
     M_OUT = ctx.c_wide.M
     res_all, xb_all, part_all = scr["res_all"], scr["xb_all"], scr["part_all"]
     assert FUSED and MB == B and B % 16 == 0, (FUSED, MB, B)
@@ -396,7 +396,15 @@ def kernel_wide(ctx: MKBuildContext, refs):
         then the MoE ones), and whether it is the slot's first use (no sends to wait for)."""
         if ctx.N_AR_SLOTS == 1:
             return 0, seq == 0
-        return lax.rem(seq, 2), seq < 2
+        return lax.rem(seq, ctx.N_AR_SLOTS), seq < ctx.N_AR_SLOTS
+
+    def moe_ar_finish(l_, m):
+        """Rounds 1 and 2 of layer l_'s microbatch-m MoE all-reduce and its residual add."""
+        ars, _ = ar_slot(l_ * (2 * N_MB) + N_MB + m)
+        with sc("moe_ar_end", 3):
+            tot = allreduce_blk.ar0_end(ars)
+            with sc("ar_res"):
+                res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
 
     # ------------------------------ layer loop ------------------------------
     def layer(l, carry):
@@ -469,6 +477,8 @@ def kernel_wide(ctx: MKBuildContext, refs):
                 att_branch()
             else:
                 lax.cond(is_att, att_branch, gdn_branch)
+            if AR_XLAYER:  # the previous layer's last two MoE all-reduces
+                pl.when(jnp.logical_and(l > 0, m < 2))(lambda: moe_ar_finish(l - 1, N_MB - 2 + m))
             if AR_DEFER:  # the previous microbatch's all-reduce, behind this one's mixer
                 pl.when(m > 0)(lambda: mixer_ar_end(m - 1))
             else:
@@ -515,18 +525,15 @@ def kernel_wide(ctx: MKBuildContext, refs):
                 allreduce_blk.ar_begin(ars, part_all[rows(m)], first)
                 allreduce_blk.ar0_mid(ars, first)
 
-        def moe_ar_end(m, carry_m):
-            ars, _ = ar_slot(l * (2 * N_MB) + N_MB + m)
-            with sc("moe_ar_end", 3):
-                tot = allreduce_blk.ar0_end(ars)
-                with sc("ar_res"):
-                    res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
-            return carry_m
-
         def moe_ar_piped(m, carry_m):
-            """Microbatch m + 1's all-reduce is under way before m's completes."""
+            """Microbatch m + 1's all-reduce is under way before m's completes (AR_XLAYER: the
+            last two complete in the next layer's mixer loop)."""
             pl.when(m + 1 < N_MB)(lambda: moe_ar_begin(m + 1))
-            return moe_ar_end(m, carry_m)
+            if AR_XLAYER:
+                pl.when(m < N_MB - 2)(lambda: moe_ar_finish(l, m))
+            else:
+                moe_ar_finish(l, m)
+            return carry_m
 
         if AR_DEFER:
             moe_ar_begin(0)
@@ -599,6 +606,9 @@ def kernel_wide(ctx: MKBuildContext, refs):
             res_all[M_OUT:BW, :] = jnp.zeros((BW - M_OUT, H), BF16)
         zero_seen.wait()
     lax.fori_loop(0, L, layer_scoped, 0)
+    if AR_XLAYER:
+        for m in (N_MB - 2, N_MB - 1):
+            moe_ar_finish(L - 1, m)
     with sc("step_tail"):
         allreduce_blk.ag_credit_drain()
         allreduce_blk.wait_sends()

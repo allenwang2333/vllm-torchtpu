@@ -95,6 +95,10 @@ WIDE_AR_SLOTS = 2
 # slots are credit-protected: a chip signals its three cross-chip peers once it has read a slot's
 # round-1 payload, and a sender waits for those three credits before refilling the slot.
 WIDE_AR_DEFER = True
+# With WIDE_AR_DEFER: leave a layer's last two microbatch MoE all-reduces in flight and finish
+# them behind the next layer's first two microbatch mixers (which read other rows of res_all).
+# Three ARs are then in flight at a microbatch boundary, so the wide step takes three slots.
+WIDE_AR_XLAYER = True
 # GatedDeltaNet input-state prefetch slots of a wide step's microbatch, and whether the routed
 # expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
 WIDE_NGI = 1
@@ -358,7 +362,10 @@ class MKBuildContext:
         NSL = WIDE_AR_SLOTS if WIDE_MB else 2  # all-reduce payload buffer slots
         AR_DEFER = bool(WIDE_MB and WIDE_AR_DEFER and HIER == 2 and AR0S and NSL == 2
                         and R == 8 and "ar" not in skip)
-        assert NSL in (1, 2) and (NSL == 2 or not ARP)
+        AR_XLAYER = bool(AR_DEFER and WIDE_AR_XLAYER and N_MB >= 3)
+        if AR_XLAYER:
+            NSL = 3
+        assert NSL in (1, 2, 3) and (NSL >= 2 or not ARP)
         LCV_NH = 3 * qkv_128
         LCV_NH16 = -(-LCV_NH // 16) * 16
         LCV = bool(
@@ -696,6 +703,7 @@ class MKBuildContext:
         self.WIDE_SCATTER_TN = WIDE_SCATTER_TN
         self.N_AR_SLOTS = NSL
         self.AR_DEFER = AR_DEFER
+        self.AR_XLAYER = AR_XLAYER
         self.WIDE_TILE_REUSE = WIDE_TILE_REUSE
         self.WIDE_SCATTER = WIDE_SCATTER
         self.BLIVE = c_wide.B  # live rows of the wide step (the rest of the tail is padding)
