@@ -209,7 +209,6 @@ def patch_gemma4_layer_config() -> None:
                     )
 
         patch_gemma4_attention_init()
-        patch_rpa_block_sizes()
 
         logger.info(
             "Applied TPU patch: patched gemma4_layer_config and Gemma4Attention "
@@ -217,47 +216,6 @@ def patch_gemma4_layer_config() -> None:
         )
     except (ImportError, AttributeError):
         pass
-
-
-def patch_rpa_block_sizes() -> None:
-    """Ensure RPA v3 block sizes fit in TPU v7 VMEM for wide head_dim models."""
-    try:
-        from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
-            kernel as rpa_kernel_mod,
-        )
-
-        orig_fn = rpa_kernel_mod.get_default_block_sizes
-        if getattr(orig_fn, "_tpu_rpa_block_sizes_patched", False):
-            return
-
-        def patched_get_default_block_sizes(*args, **kwargs):
-            sizes = orig_fn(*args, **kwargs)
-            head_dim = (
-                kwargs.get("head_dim")
-                if "head_dim" in kwargs
-                else (args[4] if len(args) > 4 else 128)
-            )
-            page_size = (
-                kwargs.get("page_size")
-                if "page_size" in kwargs
-                else (args[5] if len(args) > 5 else 256)
-            )
-            if head_dim >= 256 and sizes.get("bkv_sz", 0) > 1024:
-                sizes["bkv_sz"] = 1024
-                if sizes.get("bq_sz", 0) > 512:
-                    sizes["bq_sz"] = 512
-                if sizes.get("bq_csz", 0) > 256:
-                    sizes["bq_csz"] = 256
-                if sizes["bkv_sz"] % page_size != 0:
-                    sizes["bkv_sz"] = page_size
-                if sizes.get("bkv_csz", 0) > sizes["bkv_sz"]:
-                    sizes["bkv_csz"] = sizes["bkv_sz"]
-            return sizes
-
-        setattr(patched_get_default_block_sizes, "_tpu_rpa_block_sizes_patched", True)  # noqa: B010
-        rpa_kernel_mod.get_default_block_sizes = patched_get_default_block_sizes
-    except Exception as e:
-        logger.debug("Failed to patch RPA block sizes: %s", e)
 
 
 def _is_gemma4_mm_model(model_config: "ModelConfig | None") -> bool:

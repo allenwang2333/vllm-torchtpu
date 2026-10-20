@@ -100,6 +100,9 @@ vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
     --mm-processor-kwargs '{"size":{"longest_edge":262144,"shortest_edge":3136}}' \
     --compilation-config '{"cudagraph_mm_encoder":true,"encoder_cudagraph_max_vision_items_per_batch":8,"encoder_cudagraph_max_frames_per_batch":8}' \
     --disable-chunked-mm-input \
+    --max-model-len 1804 \
+    --max-num-batched-tokens 16384 \
+    --kv-cache-dtype fp8 \
     --max-num-seqs 512 \
     --block-size 256 \
     --hf-overrides '{"allow_global_per_layer_attribute_access": true, "text_config": {"allow_global_per_layer_attribute_access": true}}' \
