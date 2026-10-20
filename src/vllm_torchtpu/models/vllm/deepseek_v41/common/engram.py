@@ -7,6 +7,7 @@ its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 
 import mmap
 import tempfile
+import time
 from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -39,8 +40,13 @@ def _record_upload_fence(device: torch.device):
     return fence
 
 
-def _alloc_packed_staging(nbytes: int, huge: bool) -> torch.Tensor:
+def _alloc_packed_staging(nbytes: int, huge: bool, small: bool) -> torch.Tensor:
     """The packed H2D source; see `host_pages` for why its pages matter."""
+    if small:
+        staging = host_pages.alloc_staging(nbytes, huge=False)
+        if staging.huge_kb:
+            raise RuntimeError(f"small-page staging got {staging.huge_kb} KiB huge")
+        return staging.tensor
     if huge:
         staging = host_pages.alloc_staging(nbytes, huge=True)
         if staging.huge_kb == staging.mapped_kb:
@@ -640,6 +646,7 @@ class Engram(upstream.Engram):
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
         self._host_upload_fence = None
+        self._h2d_log: host_pages.H2DStepLog | None = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -658,7 +665,10 @@ class Engram(upstream.Engram):
             words_per_tok = raw_words_per_tok + scale_words_per_tok
             packed_bytes = max_tokens * words_per_tok * 4
             huge = envs.TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING
-            self._host_packed_buf = _alloc_packed_staging(packed_bytes, huge)
+            small = envs.TPU_DEEPSEEK_V41_ENGRAM_SMALLPAGE_STAGING
+            if huge and small:
+                raise ValueError("Engram staging: huge and small pages both requested")
+            self._host_packed_buf = _alloc_packed_staging(packed_bytes, huge, small)
             self._host_scale_buf = torch.full(
                 (max_tokens * scale_words_per_tok * 4,),
                 _INVALID_SCALE,
@@ -674,6 +684,12 @@ class Engram(upstream.Engram):
                     layer_hash_index=getattr(self, "layer_hash_index", None),
                     dp_rank=getattr(parallel, "data_parallel_rank", None),
                     hugepage_staging=huge,
+                    smallpage_staging=small,
+                )
+                self._h2d_log = host_pages.H2DStepLog(
+                    envs.TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG,
+                    layer_hash_index=getattr(self, "layer_hash_index", None),
+                    dp_rank=getattr(parallel, "data_parallel_rank", None),
                 )
             self._host_raw = self._host_packed_buf[
                 : max_tokens * raw_words_per_tok * 4
@@ -785,6 +801,9 @@ class Engram(upstream.Engram):
         )
         staged = self._staged_tensors(num_tokens)
         words = host_words[: raw_words + scale_words]
+        h2d_log = self._h2d_log
+        cpu0 = h2d_log.cpu() if h2d_log is not None else -1
+        start_ns = time.perf_counter_ns()
         if envs.TPU_DEEPSEEK_V41_ENGRAM_ASYNC_H2D:
             # Returns before the DMA has read `words`; the consumer graph waits
             # for it on device. The host buffers stay fenced until then.
@@ -792,6 +811,9 @@ class Engram(upstream.Engram):
             self._host_upload_fence = _record_upload_fence(staged.device)
         else:
             staged.copy_(words)
+        if h2d_log is not None:
+            end_ns = time.perf_counter_ns()
+            h2d_log.add(start_ns, end_ns, cpu0, h2d_log.cpu(), num_tokens=num_tokens)
         self._active_raw = self._staged_views(num_tokens)
 
     def _wait_host_upload(self) -> None:

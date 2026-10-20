@@ -17,6 +17,7 @@ import mmap
 import os
 import re
 import struct
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -200,3 +201,37 @@ def log_staging_buffers(log_dir: str, buffers: dict[str, torch.Tensor], **meta) 
                 **summarize_pages(addr, nbytes),
             }
             f.write(json.dumps(line) + "\n")
+
+
+class H2DStepLog:
+    """Per-upload host time and CPU of the issuing thread, flushed to
+    ``<log_dir>/h2d-<pid>.jsonl`` in batches to stay off the step's path."""
+
+    def __init__(self, log_dir: str, **meta) -> None:
+        self._path = os.path.join(log_dir, f"h2d-{os.getpid()}.jsonl")
+        self._meta = meta
+        self._rows: list[tuple] = []
+        _libc.sched_getcpu.restype = ctypes.c_int
+
+    @staticmethod
+    def cpu() -> int:
+        return _libc.sched_getcpu()
+
+    def add(self, start_ns: int, end_ns: int, cpu0: int, cpu1: int, **fields) -> None:
+        self._rows.append((start_ns, end_ns, cpu0, cpu1, fields))
+        if len(self._rows) >= 256:
+            self.flush()
+
+    def flush(self) -> None:
+        with open(self._path, "a") as f:
+            for start_ns, end_ns, cpu0, cpu1, fields in self._rows:
+                row = {
+                    "start_ns": start_ns,
+                    "ms": (end_ns - start_ns) / 1e6,
+                    "cpu": [cpu0, cpu1],
+                    "tid": threading.get_native_id(),
+                    **self._meta,
+                    **fields,
+                }
+                f.write(json.dumps(row) + "\n")
+        self._rows.clear()

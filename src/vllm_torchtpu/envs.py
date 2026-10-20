@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ATTENTION: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_SMALLPAGE_STAGING: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG: str = ""
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
@@ -416,8 +417,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING", default=True
     ),
+    # Test only: put the packed staging buffer entirely on 4 KiB pages, the
+    # worst case of the default allocation, to measure what huge pages save.
+    "TPU_DEEPSEEK_V41_ENGRAM_SMALLPAGE_STAGING": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_SMALLPAGE_STAGING", default=False
+    ),
     # Debug: directory where each worker logs its Engram staging buffers'
-    # addresses, page NUMA nodes and huge-page backing at init.
+    # addresses, page NUMA nodes and huge-page backing at init, and the host
+    # time and CPU of every packed upload.
     "TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG": env_str(
         "TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG", ""
     ),
