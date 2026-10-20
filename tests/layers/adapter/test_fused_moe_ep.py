@@ -318,9 +318,11 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
     assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
 
-def test_fixed_smem_working_set_is_still_checked():
+@pytest.mark.parametrize("tile_m,expected_bytes", [(128, 2048), (256, 3072)])
+def test_fixed_smem_working_set_is_still_checked(monkeypatch, tile_m, expected_bytes):
+    monkeypatch.setattr(bridge, "_TILE_M", tile_m)
     gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
-    assert gather_bytes == 2048
+    assert gather_bytes == expected_bytes
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
     assert _prebuild(_layer(), smem_bytes=needed) == "op"
     assert _prebuild(_layer(), smem_bytes=needed - 1) is None
