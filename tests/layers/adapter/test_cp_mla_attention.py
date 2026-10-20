@@ -1222,7 +1222,7 @@ def test_send_layout_min_tokens_gates_small_buckets(min_tokens, want, monkeypatc
         TPU_DCP_LSE_MERGE_A2A=True,
         TPU_DCP_LSE_MERGE_A2A_PACK=True,
         TPU_DCP_LSE_MERGE_A2A_REAL_ROWS=True,
-        TPU_DCP_MLA_SPLIT_Q_LSE=True,
+        TPU_MLA_SPARSE_SPLIT_Q=True,
         TPU_DCP_MLA_MASK_IN_KERNEL=True,
         TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=64,
         TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS=min_tokens,

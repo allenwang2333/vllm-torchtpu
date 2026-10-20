@@ -2045,14 +2045,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.decode_prologue and not envs.is_set("TPU_MLA_DECODE_PROLOGUE"):
             # On by default; a q head or q layout the kernel prologue cannot
             # take keeps the torch-side q rope unless the env was set.
-            self.decode_prologue = envs.TPU_DCP_MLA_SPLIT_Q_LSE and (
+            self.decode_prologue = envs.TPU_MLA_SPARSE_SPLIT_Q and (
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
             ) == (192, 64)
         if self.decode_prologue:
-            if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+            if not envs.TPU_MLA_SPARSE_SPLIT_Q:
                 raise NotImplementedError(
-                    "TPU_MLA_DECODE_PROLOGUE needs TPU_DCP_MLA_SPLIT_Q_LSE"
+                    "TPU_MLA_DECODE_PROLOGUE needs TPU_MLA_SPARSE_SPLIT_Q"
                 )
             if (self.qk_nope_head_dim, self.qk_rope_head_dim) != (192, 64):
                 raise NotImplementedError(

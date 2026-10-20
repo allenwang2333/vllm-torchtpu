@@ -444,7 +444,7 @@ def test_decode_prologue_default_steps_aside(monkeypatch, nope, split_q_lse):
     or no split q/lse keeps the torch-side q rope instead of refusing."""
     monkeypatch.delenv("TPU_MLA_DECODE_PROLOGUE", raising=False)
     monkeypatch.setattr(envs, "TPU_MLA_DECODE_PROLOGUE", True)
-    monkeypatch.setattr(envs, "TPU_DCP_MLA_SPLIT_Q_LSE", split_q_lse)
+    monkeypatch.setattr(envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q_lse)
     w = _construct_sparse_qrep(nope)
     assert w.decode_prologue is (nope == NOPE and split_q_lse)
 
@@ -453,7 +453,7 @@ def test_decode_prologue_default_steps_aside(monkeypatch, nope, split_q_lse):
 def test_decode_prologue_explicit_still_refuses(monkeypatch, nope, split_q_lse):
     monkeypatch.setenv("TPU_MLA_DECODE_PROLOGUE", "1")
     monkeypatch.setattr(envs, "TPU_MLA_DECODE_PROLOGUE", True)
-    monkeypatch.setattr(envs, "TPU_DCP_MLA_SPLIT_Q_LSE", split_q_lse)
+    monkeypatch.setattr(envs, "TPU_MLA_SPARSE_SPLIT_Q", split_q_lse)
     with pytest.raises(NotImplementedError, match="TPU_MLA_DECODE_PROLOGUE"):
         _construct_sparse_qrep(nope)
 

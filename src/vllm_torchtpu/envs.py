@@ -52,7 +52,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_RS_LAG: int = 0
     TPU_DCP_MERGE_VSPACE: bool = True
     TPU_DCP_MERGE_VSPACE_MIN_TOKENS: int = 1024
-    TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
+    TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_SMALL_CHUNK_TOKENS: int = 32
     TPU_DCP_MLA_MASK_IN_KERNEL: bool = True
@@ -826,14 +826,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_VSPACE_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_MERGE_VSPACE_MIN_TOKENS", 1024
     ),
-    # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
-    # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
-    # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)
-    # instead of materialising a padded [T, H, 640] concat, and export the
-    # log-sum-exp as a lane-dense f32[T, H] instead of f32[T, H, 1], whose
+    # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
+    # q_nope and q_pe to the kernel as separate operands. The kernel joins
+    # them in VMEM and its output aliases q_nope (512 wide), instead of the
+    # caller materialising a concat the wrapper pads to [T, H, 640]. Where the
+    # caller also needs the log-sum-exp (DCP), it is exported lane-dense as
+    # f32[T, H] (`lse_lane_dense=True`) instead of f32[T, H, 1], whose
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
-    # copies through the LSE merge. Bit-identical outputs.
-    "TPU_DCP_MLA_SPLIT_Q_LSE": env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=True),
+    # copies through the LSE merge. Bit-identical outputs. On by default, as
+    # on glm-agentx (55646d1da, upstream #1731), where it replaced
+    # TPU_DCP_MLA_SPLIT_Q_LSE; that old name is still read as the fallback
+    # when TPU_MLA_SPARSE_SPLIT_Q is unset.
+    "TPU_MLA_SPARSE_SPLIT_Q": lambda: env_bool(
+        "TPU_MLA_SPARSE_SPLIT_Q",
+        default=env_bool("TPU_DCP_MLA_SPLIT_Q_LSE", default=True)(),
+    )(),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
     # this many query tokens per kernel grid step instead of one, so the
@@ -970,7 +977,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA with query replication: rope q_pe inside the attention
     # kernel from the raw q head (no torch-side q rope / q_pe concat), and on
     # decode buckets let the kernel lay down the lse sentinel itself (no
-    # XLA-initialised aliased lse). Needs TPU_DCP_MLA_SPLIT_Q_LSE and
+    # XLA-initialised aliased lse). Needs TPU_MLA_SPARSE_SPLIT_Q and
     # TPU_MLA_ROPE_NEOX_PERMUTE. On by default; the default steps aside without
     # split q/lse or for a q head other than 192 + 64, which an explicit
     # setting refuses.

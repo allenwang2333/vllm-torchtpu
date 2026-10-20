@@ -654,7 +654,7 @@ def send_layout_applies(
         and envs.TPU_DCP_LSE_MERGE_A2A
         and envs.TPU_DCP_LSE_MERGE_A2A_PACK
         and envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS
-        and envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        and envs.TPU_MLA_SPARSE_SPLIT_Q
         and envs.TPU_DCP_MLA_MASK_IN_KERNEL
         and is_backbone
         and dtype == torch.bfloat16
