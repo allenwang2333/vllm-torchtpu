@@ -90,6 +90,21 @@ checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`
 `--target-buckets 128,256,2048` replaces the target compile sizes for bucket-ladder
 experiments (the largest must equal the 2048-token chunk); CI uses the defaults.
 
+In this workload the last chunk of each request has 160 tokens: the 128-token SWA
+replay plus 16384 new tokens, minus eight 2044-token chunks (2048 less DSpark's four
+draft slots). Under `[128,2048]` it runs at the 2048 bucket. Measured on d186106c4,
+two starts per arm, five rounds each:
+
+| target buckets | tail step (ms) | middle step (ms) | request span (ms) | startup (s) |
+| --- | ---: | ---: | ---: | ---: |
+| `[128,2048]` (CI) | 306.0 / 309.3 | 105.1 / 102.5 | 1072 / 1103 | 933 / 895 |
+| `[128,256,2048]` | 222.4 / 224.3 | 104.2 / 102.5 | 995 / 991 | 1083 / 1079 |
+
+Request span runs from the first step's start to the final observation. The greedy
+outputs are identical across arms. The tail step's host interval also contains about
+150 ms of earlier chunks' device work, because intermediate outputs are observed at
+dispatch (`async_no_copy`).
+
 `run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults
