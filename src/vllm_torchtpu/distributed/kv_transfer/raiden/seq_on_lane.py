@@ -60,6 +60,7 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
     PoolManifest,
     RegionSpec,
     build_qwen35_pool_manifest,
+    gdn_state_unit_bytes,
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden.tags import (
     TAG_FA,
@@ -955,7 +956,7 @@ def measured_sol_layout_fingerprint(
         )
     version = package_version or importlib.metadata.version
     qk_pair = tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
-    payload = {
+    payload: dict[str, Any] = {
         "schema": SOL_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),
@@ -968,6 +969,10 @@ def measured_sol_layout_fingerprint(
         "pool_lane_width": LANE_WIDTH,
         "gdn_conv_layout": "qk-pair-v1" if qk_pair else "legacy-split-qk",
     }
+    # See measured_fa_layout_fingerprint: pins the GDN state dtypes.
+    unit_bytes = gdn_state_unit_bytes(manifest)
+    if unit_bytes:
+        payload["gdn_state_unit_bytes"] = unit_bytes
     return canonical_fingerprint(payload), payload
 
 

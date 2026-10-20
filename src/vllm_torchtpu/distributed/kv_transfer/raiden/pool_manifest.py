@@ -462,6 +462,29 @@ def _gdn_ssm_regions(
     )
 
 
+def gdn_state_unit_bytes(manifest: PoolManifest) -> dict[str, int]:
+    """Per-head byte width of each GDN state region, keyed by region name.
+
+    A region's unit is one head's slice (per tap for the conv regions), so
+    the widths follow the state dtypes and head dims but not how the heads
+    are sharded: a producer and its differently sharded consumers agree,
+    while peers on different conv or SSM state dtypes do not. Empty when the
+    manifest holds no GDN state.
+    """
+    widths: dict[str, int] = {}
+    for pool in manifest.pools:
+        if not pool.tag.startswith((TAG_GDN_CONV, TAG_GDN_SSM)):
+            continue
+        for region in pool.regions:
+            width = int(region.unit_bytes)
+            if widths.setdefault(region.name, width) != width:
+                raise ManifestError(
+                    f"GDN pools disagree on the {region.name} unit width: "
+                    f"{widths[region.name]} vs {width}"
+                )
+    return dict(sorted(widths.items()))
+
+
 # ---------------------------------------------------------------------------
 # Manifest builder.
 # ---------------------------------------------------------------------------
