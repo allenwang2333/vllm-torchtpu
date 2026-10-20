@@ -12,6 +12,8 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ATTENTION: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG: str = ""
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "streaming"
@@ -402,6 +404,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # Back the host-offloaded Engram packed staging buffer with 2 MiB pages:
+    # TorchTPU's H2D costs ~20 us per 4 KiB source page. Without transparent
+    # huge pages it warns once and keeps the previous torch.zeros buffer.
+    "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING", default=True
+    ),
+    # Debug: directory where each worker logs its Engram staging buffers'
+    # addresses, page NUMA nodes and huge-page backing at init.
+    "TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG": env_str(
+        "TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG", ""
     ),
     # Under V4.1 SP token-parallel FP8 attention, project q only for this
     # rank's token shard with an all-gathered wq_b and run wo_a for every

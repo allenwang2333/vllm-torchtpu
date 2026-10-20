@@ -21,9 +21,31 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
+from . import host_pages
 from .host_exchange import PendingRowExchange, start_exchange_rows
+
+logger = init_logger(__name__)
+
+
+def _alloc_packed_staging(nbytes: int, huge: bool) -> torch.Tensor:
+    """The packed H2D source; see `host_pages` for why its pages matter."""
+    if huge:
+        staging = host_pages.alloc_staging(nbytes, huge=True)
+        if staging.huge_kb == staging.mapped_kb:
+            return staging.tensor
+        logger.warning_once(
+            "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING: the Engram packed staging "
+            "buffer got %d of %d KiB on 2 MiB pages (transparent_hugepage/enabled: "
+            "%s); using the default torch.zeros buffer, whose H2D costs ~20 us per "
+            "4 KiB page.",
+            staging.huge_kb,
+            staging.mapped_kb,
+            host_pages.thp_mode(),
+        )
+    return torch.zeros(nbytes, dtype=torch.uint8, device="cpu")
 
 
 @dataclass
@@ -624,19 +646,29 @@ class Engram(upstream.Engram):
             raw_words_per_tok = (cols * head_dim) // 4
             scale_words_per_tok = -(-(cols * blocks) // 4)
             words_per_tok = raw_words_per_tok + scale_words_per_tok
-            self._host_packed_buf = torch.zeros(
-                max_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
-            )
-            self._host_raw = self._host_packed_buf[
-                : max_tokens * raw_words_per_tok * 4
-            ].view(max_tokens, cols, head_dim)
-            scale_bytes = max_tokens * cols * blocks
+            packed_bytes = max_tokens * words_per_tok * 4
+            huge = envs.TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING
+            self._host_packed_buf = _alloc_packed_staging(packed_bytes, huge)
             self._host_scale_buf = torch.full(
                 (max_tokens * scale_words_per_tok * 4,),
                 _INVALID_SCALE,
                 dtype=torch.uint8,
                 device="cpu",
             )
+            if envs.TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG:
+                config = get_current_vllm_config_or_none()
+                parallel = getattr(config, "parallel_config", None)
+                host_pages.log_staging_buffers(
+                    envs.TPU_DEEPSEEK_V41_ENGRAM_STAGING_LOG,
+                    {"packed": self._host_packed_buf, "scale": self._host_scale_buf},
+                    layer_hash_index=getattr(self, "layer_hash_index", None),
+                    dp_rank=getattr(parallel, "data_parallel_rank", None),
+                    hugepage_staging=huge,
+                )
+            self._host_raw = self._host_packed_buf[
+                : max_tokens * raw_words_per_tok * 4
+            ].view(max_tokens, cols, head_dim)
+            scale_bytes = max_tokens * cols * blocks
             self._host_scale = self._host_scale_buf[:scale_bytes].view(
                 max_tokens, cols, blocks
             )
