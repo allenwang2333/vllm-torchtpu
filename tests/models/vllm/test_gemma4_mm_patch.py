@@ -227,3 +227,21 @@ def test_patch_gemma4_layer_config():
     )
     assert attn.head_dim == 512
     assert attn.num_kv_heads == 2
+
+
+def test_patch_rpa_block_sizes():
+    from vllm_torchtpu.models.vllm.gemma4_mm_patch import patch_rpa_block_sizes
+
+    patch_rpa_block_sizes()
+    patch_rpa_block_sizes()  # Idempotent
+
+    try:
+        from vllm_torchtpu.kernels.ragged_paged_attention.v3 import (
+            kernel as rpa_kernel_mod,
+        )
+
+        # Mock or call get_default_block_sizes
+        if hasattr(rpa_kernel_mod, "get_default_block_sizes"):
+            pass
+    except (ImportError, ModuleNotFoundError):
+        pass

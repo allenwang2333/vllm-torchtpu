@@ -94,6 +94,7 @@ vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
     --port 8000 \
     --tensor-parallel-size 2 \
     --data-parallel-size 4 \
+    --api-server-count 1 \
     --mm-encoder-tp-mode data \
     --compilation-config '{"cudagraph_mm_encoder":true,"encoder_cudagraph_max_vision_items_per_batch":8}' \
     --disable-chunked-mm-input \

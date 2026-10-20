@@ -58,4 +58,3 @@ def register_models() -> None:
 
     patch_gemma4_layer_config()
     patch_gemma4_mm_model_classes()
-
