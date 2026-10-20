@@ -36,7 +36,7 @@ from .planner import (
 )
 from .spec import POOL_STATE_NAME, ExecSpec, ModelSpec, SwitchSlot
 from .stream import TwoRing
-from .vmem import CorePlan, build_scratch
+from .vmem import CorePlan, build_scratch, fit_default_tiles
 
 ABLATIONS = ("dense", "experts", "kv", "gdn_state", "attn", "gdn", "comm")
 COLLECTIVE_ID = 0
@@ -98,10 +98,15 @@ def build(
     model_spec: ModelSpec,
     ex: ExecSpec,
 ) -> tuple[Any, dict[str, Any]]:
-    """Build the Pallas megakernel `(call, info)` from `model_spec` and `ex`."""
+    """Build the Pallas megakernel `(call, info)` from `model_spec` and `ex`.
+
+    `ex.tiles=None` selects the default tiles fitted to the model's VMEM budget
+    (`vmem.fit_default_tiles`); `info["exec"]` is the `ExecSpec` actually built.
+    """
     g = model_spec.config
     if hasattr(g, "check"):
         g.check(ex)
+    ex = fit_default_tiles(model_spec, ex)
     skip = ex.skip
     assert set(skip) <= set(ABLATIONS), skip
     tiles = ex.resolve_tiles(g)
@@ -395,6 +400,7 @@ def build(
     )
 
     info = {
+        "exec": ex,
         "plan": p,
         "core_plan": core_plan,
         "T_TOTAL": sp.T_TOTAL,
@@ -470,6 +476,7 @@ def make_step(
     """`jax.jit` `shard_map` step wrapping `build(model_spec, ex)` and state updates."""
     g = model_spec.config
     call, info = build(model_spec, ex)
+    ex = info["exec"]
     p = info["plan"]
     w_names = p.w_names
     st_names = p.s_names

@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
 
 
 @pytest.fixture(autouse=True)
@@ -494,10 +495,13 @@ def test_paged_kv_fp8_nan_padding_guard(amask: int):
 def test_long_context_128k_page_table_plan_and_interpret():
     """Verify `ctx=131072` SMEM budgets, SMEM limit check, and `eff_ctx > ex.ctx`."""
     g_full = qwen35.Qwen35Geometry()
-    ex_4k_direct = mk.ExecSpec(R=8, B=64, T=1, ctx=4096, paged_kv=False)
-    ex_4k_paged = mk.ExecSpec(R=8, B=64, T=1, ctx=4096, paged_kv=True, num_pages=65536)
+    t64 = baseline_tiles(64, R=8)
+    ex_4k_direct = mk.ExecSpec(R=8, B=64, T=1, ctx=4096, paged_kv=False, tiles=t64)
+    ex_4k_paged = mk.ExecSpec(
+        R=8, B=64, T=1, ctx=4096, paged_kv=True, num_pages=65536, tiles=t64
+    )
     ex_128k_paged = mk.ExecSpec(
-        R=8, B=64, T=1, ctx=131072, paged_kv=True, num_pages=65536
+        R=8, B=64, T=1, ctx=131072, paged_kv=True, num_pages=65536, tiles=t64
     )
     assert ex_128k_paged.resolved_max_pages_per_seq == 1024
 
@@ -548,6 +552,7 @@ def test_long_context_128k_page_table_plan_and_interpret():
         paged_kv=True,
         num_pages=65536,
         max_pages_per_seq=65536,
+        tiles=t64,
     )
     with pytest.raises(mk.MegakernelConfigError, match="exceeds tiles.smem_mib budget"):
         mk.vmem.build_scratch(spec_full, ex_smem_overflow)

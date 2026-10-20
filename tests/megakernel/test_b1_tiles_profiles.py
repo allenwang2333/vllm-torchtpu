@@ -36,7 +36,7 @@ from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.cache import _should_use_pool_gather
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.profiles.default import frozen_parity_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
 
 
 @pytest.fixture(autouse=True)
@@ -83,8 +83,11 @@ def test_per_bucket_thresholds_come_from_tiles():
 
 
 def test_profile_numerics_are_derived_and_enforced():
-    assert mk.DEFAULT_PROFILE.tiles_for(20, R=8) == frozen_parity_tiles(20, R=8)
+    base = mk.get_profile("qwen35-baseline")
+    assert base.tiles_for(20, R=8) == baseline_tiles(20, R=8)
     assert profile_mod.approx_features(mk.DEFAULT_PROFILE) == ()
+    assert profile_mod.approx_features(base) == ()  # the Qwen3.5 reference
+    # Qwen3.5 profiles are measured against `qwen35-baseline`, not `default`.
     c30 = mk.get_profile("qwen35-candidate30")
     feats = set(profile_mod.approx_features(c30))
     assert {"tiles.kv_sub", "tiles.gdn_head_major", "tiles.moe_unroll"} <= feats
@@ -177,6 +180,9 @@ def _tiny(t: mk.Tiles) -> mk.Tiles:
 
 
 _OUT_CACHE: dict[tuple, list] = {}
+# `ModelSpec.name` of the CPU test geometry and its default profile.
+_QWEN35 = qwen35.qwen35_spec(qwen35.TINY).name
+_QWEN35_DEFAULT = mk.model_default_profile(_QWEN35).name
 
 
 def _flip_exec(
@@ -262,17 +268,18 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
     [c[1:] for c in EXACT_FLIPS],
     ids=[c[0] for c in EXACT_FLIPS],
 )
-def test_exact_tile_fields_reproduce_default(
+def test_exact_tile_fields_reproduce_model_default(
     field: str, value: Any, tb: tuple[int, int], extra: dict
 ):
-    """Each `exact` tile field, moved alone, keeps hidden + pools bit-identical.
+    """Each `exact` tile field, moved alone off the model's default profile
+    (`qwen35-baseline`), keeps hidden + pools bit-identical.
 
     The flip must also reach the plan (asserted below), so a field that is
     silently gated off cannot pass vacuously.
     """
     T, B = tb
-    g0, ex0 = _flip_exec("default", T=T, B=B, **extra)
-    g1, ex1 = _flip_exec("default", T=T, B=B, **extra, **{field: value})
+    g0, ex0 = _flip_exec(_QWEN35_DEFAULT, T=T, B=B, **extra)
+    g1, ex1 = _flip_exec(_QWEN35_DEFAULT, T=T, B=B, **extra, **{field: value})
     assert getattr(ex1.resolved_tiles, field) != getattr(ex0.resolved_tiles, field)
     before, after = _plan_effect(field, g0, ex0), _plan_effect(field, g1, ex1)
     if before is not None:
@@ -280,8 +287,10 @@ def test_exact_tile_fields_reproduce_default(
     if "pipe_ep" in extra:
         _, info = qwen35.build(g1, ex1)
         assert info["plan"].block_params["moe"].PIPE_EP
-    ref = _pooled_outputs("default", T=T, B=B, **extra)
-    _assert_same(_pooled_outputs("default", T=T, B=B, **extra, **{field: value}), ref)
+    ref = _pooled_outputs(_QWEN35_DEFAULT, T=T, B=B, **extra)
+    _assert_same(
+        _pooled_outputs(_QWEN35_DEFAULT, T=T, B=B, **extra, **{field: value}), ref
+    )
 
 
 def test_exact_kv_scatter_vec_ns_non_paged():
@@ -311,9 +320,9 @@ def test_exact_kv_scatter_vec_ns_non_paged():
 
 
 def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-    """Test-only tile rule: the default rule plus exact-class schedule changes."""
+    """Test-only tile rule: the Qwen3.5 baseline plus exact-class schedule changes."""
     return dataclasses.replace(
-        mk.default_tiles(B, moe_tp=moe_tp, R=R),
+        baseline_tiles(B, moe_tp=moe_tp, R=R),
         pair_kv=True,
         kv_ering=True,
         gqa_qv=True,
@@ -325,31 +334,43 @@ def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
 
 _EXACT_SCHED_PROFILE = mk.Profile(
     name="test-exact-sched",
+    model=_QWEN35,
     numerics="exact",
     tiles=_exact_sched_rule,
     description="Test-only: default numerics, exact-class schedule flags on.",
 )
 
 
-def test_every_exact_profile_reproduces_default(monkeypatch: pytest.MonkeyPatch):
-    """Every registered `exact` profile matches `default` bit-exactly (CPU).
+def test_every_exact_profile_reproduces_its_reference(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Every registered `exact` profile matches its reference bit-exactly (CPU).
 
-    A test-only exact profile that turns on exact-class schedule flags is
-    registered so the check is not vacuous.
+    The reference is the default profile of the profile's model
+    (`model_default_profile`); model default profiles are their own reference.
+    A test-only exact Qwen3.5 profile that turns on exact-class schedule flags
+    is registered so the check is not vacuous.
     """
     monkeypatch.setitem(
         profile_mod._REGISTRY, _EXACT_SCHED_PROFILE.name, _EXACT_SCHED_PROFILE
     )
     exact = [n for n in mk.list_profiles() if mk.get_profile(n).numerics == "exact"]
-    assert {"default", _EXACT_SCHED_PROFILE.name} <= set(exact)
-    for T, B in ((1, 8), (2, 4)):
-        ref = _pooled_outputs("default", T=T, B=B)
-        for name in exact:
-            if name != "default":
-                g0, ex0 = _flip_exec("default", T=T, B=B)
-                g1, ex1 = _flip_exec(name, T=T, B=B)
-                assert ex0.resolved_tiles != ex1.resolved_tiles, name
-            _assert_same(_pooled_outputs(name, T=T, B=B), ref)
+    assert {"default", _QWEN35_DEFAULT, _EXACT_SCHED_PROFILE.name} <= set(exact)
+    checked = 0
+    for name in exact:
+        ref_name = mk.model_default_profile(mk.get_profile(name).model).name
+        if ref_name == name:
+            continue
+        assert ref_name == _QWEN35_DEFAULT, name  # only Qwen3.5 profiles here
+        for T, B in ((1, 8), (2, 4)):
+            g0, ex0 = _flip_exec(ref_name, T=T, B=B)
+            g1, ex1 = _flip_exec(name, T=T, B=B)
+            assert ex0.resolved_tiles != ex1.resolved_tiles, name
+            _assert_same(
+                _pooled_outputs(name, T=T, B=B), _pooled_outputs(ref_name, T=T, B=B)
+            )
+            checked += 1
+    assert checked
 
 
 # ---------------------------------------------------------------------------
@@ -357,17 +378,17 @@ def test_every_exact_profile_reproduces_default(monkeypatch: pytest.MonkeyPatch)
 # ---------------------------------------------------------------------------
 
 
-_GPR_ELIGIBLE = mk.DEFAULT_PROFILE.with_overrides(pool_gather=True)
-_GPR_AUTO = mk.DEFAULT_PROFILE.with_overrides(pool_gather=None)
+_GPR_ELIGIBLE = mk.get_profile(_QWEN35_DEFAULT).with_overrides(pool_gather=True)
+_GPR_AUTO = mk.get_profile(_QWEN35_DEFAULT).with_overrides(pool_gather=None)
 
 
 @pytest.mark.parametrize(
     "prof,B", [(_GPR_ELIGIBLE, 8), (_GPR_ELIGIBLE, 16), (_GPR_AUTO, 24)]
 )
 def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
-    """In-kernel GDN gather (GPR) vs split gather at T=4, default tiles (CPU).
+    """In-kernel GDN gather (GPR) vs split gather at T=4, Qwen3.5 baseline (CPU).
 
-    Bitwise with default tiles on non-WIDE (B=8, 16) and WIDE (B=24) buckets.
+    Bitwise with baseline tiles on non-WIDE (B=8, 16) and WIDE (B=24) buckets.
     With qwen35-candidate30 tiles GPR is bitwise only on WIDE buckets (pools
     differ at B=8, hidden and pools at B=16), which is why
     `pool_gather=True` ("every eligible bucket") is classed approx and auto
@@ -376,7 +397,9 @@ def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
     g, ex = _flip_exec(prof, T=4, B=B)
     spec = qwen35.qwen35_spec(g)
     assert _should_use_pool_gather(spec, spec.pool_backend, ex, use_fused=False)
-    _assert_same(_pooled_outputs(prof, T=4, B=B), _pooled_outputs("default", T=4, B=B))
+    _assert_same(
+        _pooled_outputs(prof, T=4, B=B), _pooled_outputs(_QWEN35_DEFAULT, T=4, B=B)
+    )
 
 
 def test_profile_pool_gather_true_means_where_eligible():

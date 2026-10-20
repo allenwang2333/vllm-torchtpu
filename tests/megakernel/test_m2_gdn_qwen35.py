@@ -31,6 +31,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.spec import (
     TINY_TILES,
@@ -53,7 +54,7 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
     g = qwen35.FULL_EP
     assert g.L == 60 and g.att_every == 4 and g.NGDN == 45 and g.NATT == 15
 
-    ex_4k = ExecSpec(B=4, T=1, R=8, ctx=4096)
+    ex_4k = ExecSpec(B=4, T=1, R=8, ctx=4096, tiles=baseline_tiles(4, R=8))
     _, info_4k = qwen35.build(g, ex_4k)
     p = info_4k["plan"]
 
@@ -104,7 +105,7 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
     assert "sbuf" in info_4k["vmem_shapes"]
     assert "convb" in info_4k["vmem_shapes"]
 
-    ex_ver = ExecSpec(B=16, T=4, R=8, ctx=4096)
+    ex_ver = ExecSpec(B=16, T=4, R=8, ctx=4096, tiles=baseline_tiles(16, R=8))
     _, info_ver = qwen35.build(g, ex_ver)
     assert info_ver["plan"].o_names == (
         "hidden",
@@ -114,7 +115,7 @@ def test_m2_recorded_full_ep_hybrid_build_invariants():
         "vnew",
     )
 
-    ex_10k = ExecSpec(B=4, T=1, R=8, ctx=10240)
+    ex_10k = ExecSpec(B=4, T=1, R=8, ctx=10240, tiles=baseline_tiles(4, R=8))
     _, info_10k = qwen35.build(g, ex_10k)
     assert info_10k["vmem_scratch_bytes"] == 49_762_304
 
@@ -566,7 +567,7 @@ def test_m2_tpu7x_aot_compile_full_ep_hybrid(B: int):
     )
     mesh = Mesh(topo.devices, ("tp",))
     g = dataclasses.replace(qwen35.FULL_EP, L=4, att_every=4)
-    ex = ExecSpec(B=B, T=1, R=8, ctx=2048)
+    ex = ExecSpec(B=B, T=1, R=8, ctx=2048, tiles=baseline_tiles(B, R=8))
 
     step, info = qwen35.make_step(mesh, g, ex, donate_states=True)
     wsh = info["wshape"]

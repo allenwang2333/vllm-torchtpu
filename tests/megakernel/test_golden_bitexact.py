@@ -48,18 +48,18 @@ GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
 R = 2
 
 CASES: dict[str, dict[str, Any]] = {
-    # default profile (frozen parity), production-size and tiny tiles
-    "def_t1_b4_prod": dict(profile="default", T=1, B=4, tiles_mode="prod"),
-    "def_t1_b8": dict(profile="default", T=1, B=8),
-    "def_t1_b20_wide": dict(profile="default", T=1, B=20),
-    "def_t2_b4": dict(profile="default", T=2, B=4),
-    "def_t4_b16": dict(profile="default", T=4, B=16),
-    "def_t4_b24_gch": dict(profile="default", T=4, B=24),
-    "def_t4_b48": dict(profile="default", T=4, B=48),
-    "def_t1_b8_moetp": dict(profile="default", T=1, B=8, moe_tp=True),
-    "def_t1_b8_eplb": dict(profile="default", T=1, B=8, e_slots=72),
-    "def_t2_b4_stacke": dict(profile="default", T=2, B=4, stack_e=True),
-    "def_t4_b24_gpr": dict(profile="default", T=4, B=24, pool_gather=True),
+    # Qwen3.5 default profile (qwen35-baseline), production-size and tiny tiles
+    "def_t1_b4_prod": dict(profile="qwen35-baseline", T=1, B=4, tiles_mode="prod"),
+    "def_t1_b8": dict(profile="qwen35-baseline", T=1, B=8),
+    "def_t1_b20_wide": dict(profile="qwen35-baseline", T=1, B=20),
+    "def_t2_b4": dict(profile="qwen35-baseline", T=2, B=4),
+    "def_t4_b16": dict(profile="qwen35-baseline", T=4, B=16),
+    "def_t4_b24_gch": dict(profile="qwen35-baseline", T=4, B=24),
+    "def_t4_b48": dict(profile="qwen35-baseline", T=4, B=48),
+    "def_t1_b8_moetp": dict(profile="qwen35-baseline", T=1, B=8, moe_tp=True),
+    "def_t1_b8_eplb": dict(profile="qwen35-baseline", T=1, B=8, e_slots=72),
+    "def_t2_b4_stacke": dict(profile="qwen35-baseline", T=2, B=4, stack_e=True),
+    "def_t4_b24_gpr": dict(profile="qwen35-baseline", T=4, B=24, pool_gather=True),
     # qwen35-candidate30 (approx), split / both sides of moe_group_rows
     "c30_t1_b4": dict(profile="qwen35-candidate30", T=1, B=4),
     "c30_t1_b4_prod": dict(profile="qwen35-candidate30", T=1, B=4, tiles_mode="prod"),

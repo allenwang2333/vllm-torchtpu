@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -464,3 +465,60 @@ def build_scratch(
         smem_shapes=smem_shapes,
     )
     return core_plan, scratch
+
+
+# Smallest dense / expert ring depth `fit_default_tiles` shrinks to (one slot
+# in use, one being refilled).
+MIN_RING_DEPTH = 2
+# VMEM budget used while probing a candidate (the real budget is checked after).
+_PROBE_VMEM_MIB = 1 << 20
+
+
+def _ring_bytes(core_plan: CorePlan) -> tuple[int, int]:
+    """Allocated `(dense, expert)` weight-ring VMEM bytes of `core_plan`."""
+    dense = expert = 0
+    for k, (sh, dt) in core_plan.vmem_shapes.items():
+        nbytes = math.prod(sh) * jnp.dtype(dt).itemsize
+        if k == "dpool" or k.startswith("dring_"):
+            dense += nbytes
+        elif k == "epool" or k.startswith("ering_"):
+            expert += nbytes
+    return dense, expert
+
+
+def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
+    """Return `ex` with explicit tiles: the default rule fitted to its VMEM budget.
+
+    No-op when `ex.tiles` is set (explicit and profile tiles are never changed;
+    an over-budget plan raises in `build_scratch`). Otherwise starts from
+    `default_tiles(B, R)` and, while the planned VMEM scratch exceeds
+    `vmem_mib`, drops one slot from the larger allocated weight ring (dense
+    `nbd` or expert `nbe`), down to `MIN_RING_DEPTH`. Raises
+    `MegakernelConfigError` if the plan does not fit even then.
+    """
+    if ex.tiles is not None:
+        return ex
+    t = ex.resolve_tiles(model_spec.config)
+    budget = t.vmem_mib * 1024 * 1024
+    while True:
+        probe = dataclasses.replace(
+            ex, tiles=dataclasses.replace(t, vmem_mib=_PROBE_VMEM_MIB)
+        )
+        core_plan, _ = build_scratch(model_spec, probe)
+        if core_plan.vmem_bytes <= budget:
+            return dataclasses.replace(ex, tiles=t)
+        dense, expert = _ring_bytes(core_plan)
+        can_e = expert > 0 and t.nbe > MIN_RING_DEPTH
+        can_d = dense > 0 and t.nbd > MIN_RING_DEPTH
+        if can_e and (expert >= dense or not can_d):
+            t = dataclasses.replace(t, nbe=t.nbe - 1)
+        elif can_d:
+            t = dataclasses.replace(t, nbd=t.nbd - 1)
+        else:
+            need = core_plan.vmem_bytes / (1024 * 1024)
+            raise MegakernelConfigError(
+                f"default tiles do not fit the {t.vmem_mib} MiB VMEM budget for "
+                f"ModelSpec {model_spec.name!r} (B={ex.B}, T={ex.T}, R={ex.R}): "
+                f"{need:.2f} MiB with ring depths nbd={t.nbd}, nbe={t.nbe}; "
+                "pass explicit tiles or a named profile"
+            )

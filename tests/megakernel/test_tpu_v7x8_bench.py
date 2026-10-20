@@ -48,6 +48,9 @@ from vllm_torchtpu.megakernel import (  # noqa: E402
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
 from vllm_torchtpu.megakernel.cache import should_fuse_pool_io  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
+from vllm_torchtpu.megakernel.models.qwen35_profile import (  # noqa: E402
+    baseline_tiles,
+)
 from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     BF16,
     F32,
@@ -56,11 +59,11 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     rup,
 )
 from vllm_torchtpu.megakernel.profile import get_profile  # noqa: E402
-from vllm_torchtpu.megakernel.spec import (  # noqa: E402
-    ExecSpec,
-    default_tiles,
-    frozen_parity_tiles,
-)
+from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
+
+# Qwen3.5 baseline tile rule (bit-exact with the frozen kernel); the bisect
+# bench below swaps this module global for a flagged variant.
+frozen_parity_tiles = baseline_tiles
 
 
 def _has_tpu_v7x8() -> bool:
@@ -2088,7 +2091,7 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
     del w_f
     gc.collect()
 
-    p_def = get_profile("default")
+    p_def = get_profile("qwen35-baseline")
     p_c30 = get_profile("qwen35-candidate30")
     base = ExecSpec(R=8, ctx=4096, paged_kv=True, num_pages=4096, stack_e=True)
     buckets = [(1, 4), (1, 16), (1, 32), (1, 64), (4, 4), (4, 16), (4, 64)]
@@ -2160,7 +2163,7 @@ def test_m5_tpu_v7x8_frozen_parity_bisect(variant: str, monkeypatch):
     monkeypatch.setitem(
         globals(),
         "frozen_parity_tiles",
-        lambda B, **kw: dataclasses.replace(default_tiles(B, **kw), **flags),
+        lambda B, **kw: dataclasses.replace(baseline_tiles(B, **kw), **flags),
     )
     print(f"\n=== M5_BISECT variant={variant} flags={flags}", flush=True)
     try:

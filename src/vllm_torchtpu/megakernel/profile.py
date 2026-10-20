@@ -16,20 +16,24 @@
 A `Profile` groups everything a performance engineer tunes for a deployment
 (tiles per bucket, opt-in perf flags, bucket lists, pool-I/O mode) so model
 files and library defaults stay general. The `default` profile is the
-frozen-parity path (`spec.default_tiles`, split pool I/O, no GPR). Adapters
-(vLLM, SGLang, plain JAX) select a profile by name and apply it per bucket via
-`Profile.exec_for`; nothing in the core changes behaviour based on profiles.
+model-agnostic library default (`profiles/default.py`, split pool I/O, no
+GPR). A model may declare one profile as its default (`model_default=True`,
+`model_default_profile`); adapters (vLLM, SGLang, plain JAX) use it when the
+user names no profile, select others by name, and apply a profile per bucket
+via `Profile.exec_for`. Nothing in the core changes behaviour based on profiles.
 
-Numerics classes (enforced, not just labels):
-- `exact`: must reproduce the `default` profile bit-exactly.
+Numerics classes (enforced, not just labels), relative to the reference
+profile: the default profile of the profile's model (`Profile.model`), or the
+`default` profile when the model declares none (or `model` is None):
+- `exact`: must reproduce the reference profile bit-exactly.
 - `approx`: changes numerics (e.g. `kv_sub`, `route_vec`, `dense_acc_pair`,
   head-major GDN, hierarchical all-reduce variants, fused pool I/O); must pass
   the accuracy ladder.
 
 Every `Tiles` field and pool-I/O mode declares its class in
 `spec.TILE_NUMERICS` / `spec.POOL_IO_NUMERICS`. `approx_features(profile)`
-lists the approx features a profile turns on relative to the `default` tile
-rule; a profile declared `exact` that turns any of them on is rejected at
+lists the approx features a profile turns on relative to its reference; a
+profile declared `exact` that turns any of them on is rejected at
 construction, and `Profile.with_overrides` re-labels (`<name>+overrides`, class
 derived) instead of silently staying `exact`.
 """
@@ -41,8 +45,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .spec import POOL_IO_NUMERICS, TILE_NUMERICS, ExecSpec, Tiles, default_tiles
+from .profiles.default import default_tiles
+from .spec import POOL_IO_NUMERICS, TILE_NUMERICS, ExecSpec, Tiles
 
+# Name of the model-agnostic library default profile.
+DEFAULT_PROFILE_NAME = "default"
 # Tile rule: `(B, *, moe_tp, R) -> Tiles` for a bucket of `B` rows.
 TileRule = Callable[..., Tiles]
 
@@ -65,7 +72,10 @@ class Profile:
     name: str
     model: str | None = None  # `ModelSpec.name` this profile targets (None: any)
     numerics: Literal["exact", "approx"] = "exact"
-    tiles: TileRule = default_tiles
+    # Tile rule. None: the library default (`profiles/default.py`), left
+    # unresolved by `exec_for` so the kernel builder fits it to the model's
+    # VMEM budget (`vmem.fit_default_tiles`).
+    tiles: TileRule | None = None
     buckets: tuple[int, ...] | None = None  # T=1 decode buckets (None: adapter default)
     verify_buckets: tuple[int, ...] | None = None  # T>1 buckets (None: adapter default)
     # Experimental 1-launch fused pool I/O: False | True | "auto" (see
@@ -79,6 +89,9 @@ class Profile:
     pool_gather: bool | None = False
     baseline: Baseline | None = None
     description: str = ""
+    # The default profile of `model` (registered by the model; the reference
+    # of every profile targeting that model, see `model_default_profile`).
+    model_default: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or self.name.strip() != self.name:
@@ -98,6 +111,11 @@ class Profile:
                 f"profile {self.name!r}: pool_gather must be False, None or True, "
                 f"got {self.pool_gather!r}"
             )
+        if self.model_default and (self.model is None or self.numerics != "exact"):
+            raise ValueError(
+                f"profile {self.name!r}: a model default profile needs a model "
+                "and numerics='exact'"
+            )
         if self.numerics == "exact":
             feats = approx_features(self)
             if feats:
@@ -112,7 +130,8 @@ class Profile:
         Overrides equal to the current values are ignored. Any real change
         renames the profile to `<name>+overrides` and derives its numerics
         class: it stays `exact` only if this profile is `exact` and the result
-        turns on no approx feature (it never silently stays `exact`).
+        turns on no approx feature relative to the reference profile (it never
+        silently stays `exact`). The result is never a model default.
         """
         changed = {k: v for k, v in overrides.items() if getattr(self, k) != v}
         if not changed:
@@ -120,20 +139,29 @@ class Profile:
         name = (
             self.name if self.name.endswith("+overrides") else f"{self.name}+overrides"
         )
-        cand = dataclasses.replace(self, name=name, numerics="approx", **changed)
+        cand = dataclasses.replace(
+            self, name=name, numerics="approx", model_default=False, **changed
+        )
         exact = self.numerics == "exact" and not approx_features(cand)
         return dataclasses.replace(cand, numerics="exact" if exact else "approx")
 
     def tiles_for(self, B: int, *, R: int, moe_tp: bool = False) -> Tiles:
-        """Return this profile's tiles for a bucket of `B` rows on `R` ranks."""
-        return self.tiles(B, moe_tp=moe_tp, R=R)
+        """Return this profile's tiles for a bucket of `B` rows on `R` ranks.
+
+        For the library default rule (`tiles=None`) these are the tiles before
+        the kernel builder's VMEM fit.
+        """
+        rule = default_tiles if self.tiles is None else self.tiles
+        return rule(B, moe_tp=moe_tp, R=R)
 
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
 
         Explicit settings on `base` win (expert / test overrides), the profile
         fills the rest:
-        - `tiles`: `base.tiles` if set, else the profile's tile rule;
+        - `tiles`: `base.tiles` if set, else the profile's tile rule (left
+          `None` for the library default rule, which the kernel builder fits
+          to the model's VMEM budget);
         - `pool_gather`: `base.pool_gather` unless it is the library default
           `False` ("no explicit choice"), else the profile's: `None` -> auto,
           `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
@@ -143,11 +171,9 @@ class Profile:
         because it also depends on the pool backend.
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
-        tiles = (
-            base.tiles
-            if base.tiles is not None
-            else self.tiles_for(B, R=base.R, moe_tp=moe_tp)
-        )
+        tiles = base.tiles
+        if tiles is None and self.tiles is not None:
+            tiles = self.tiles_for(B, R=base.R, moe_tp=moe_tp)
         if base.pool_gather is not False:
             pool_gather = base.pool_gather
         else:
@@ -155,36 +181,55 @@ class Profile:
         return dataclasses.replace(base, B=B, T=T, tiles=tiles, pool_gather=pool_gather)
 
 
-# Bucket grid on which a profile's tile rule is compared to the default rule.
+_REGISTRY: dict[str, Profile] = {}
+# `ModelSpec.name` -> name of the model's default profile.
+_MODEL_DEFAULTS: dict[str, str] = {}
+_BUILTINS_LOADED = False
+
+# Bucket grid on which a profile's tile rule is compared to its reference.
 _NUMERICS_GRID_B = range(1, 65)
 _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
 
 
 def approx_features(profile: Profile) -> tuple[str, ...]:
-    """Approx-class features `profile` turns on relative to the `default` rule.
+    """Approx-class features `profile` turns on relative to its reference.
 
-    A tile field counts when the profile's rule gives it a different value
-    than `default_tiles` on any bucket of the grid (`B` in 1..64, `R` in
-    {1, 2, 4, 8, 16}, EP and TP MoE) and the field is `approx` in
-    `TILE_NUMERICS`; pool-I/O modes count per `POOL_IO_NUMERICS`.
+    The reference is `model_default_profile(profile.model)`; a model default
+    profile is its own reference (no features). A tile field counts when the
+    two tile rules give it different values on any bucket of the grid (`B` in
+    1..64, `R` in {1, 2, 4, 8, 16}, EP and TP MoE) and the field is `approx` in
+    `TILE_NUMERICS`; a pool-I/O mode the profile turns on and the reference
+    does not counts per `POOL_IO_NUMERICS`.
     """
+    if profile.model_default:
+        return ()
+    ref_name = _MODEL_DEFAULTS.get(profile.model or "", DEFAULT_PROFILE_NAME)
+    ref = _REGISTRY.get(ref_name)
+    if ref is profile:
+        return ()
+    # While the `default` profile itself is being built, its rule is the
+    # library default with split pool I/O.
+    ref_tiles = default_tiles if ref is None else ref.tiles_for
+    ref_fused = False if ref is None else ref.fused_pool_io
+    ref_gather = False if ref is None else ref.pool_gather
     feats: set[str] = set()
     names = [f.name for f in dataclasses.fields(Tiles)]
     approx_names = [n for n in names if TILE_NUMERICS[n] == "approx"]
     for R in _NUMERICS_GRID_R:
         for moe_tp in (False, True):
             for B in _NUMERICS_GRID_B:
-                t = profile.tiles(B, moe_tp=moe_tp, R=R)
-                d = default_tiles(B, moe_tp=moe_tp, R=R)
+                t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
+                d = ref_tiles(B, moe_tp=moe_tp, R=R)
                 feats.update(
                     f"tiles.{n}" for n in approx_names if getattr(t, n) != getattr(d, n)
                 )
     if (
         profile.fused_pool_io is not False
+        and profile.fused_pool_io != ref_fused
         and POOL_IO_NUMERICS["fused_pool_io"] == "approx"
     ):
         feats.add("fused_pool_io")
-    if profile.pool_gather is not False:
+    if profile.pool_gather is not False and profile.pool_gather != ref_gather:
         mode = "pool_gather_eligible" if profile.pool_gather is True else "pool_gather"
         if POOL_IO_NUMERICS[mode] == "approx":
             feats.add(mode)
@@ -192,26 +237,44 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
 
 
 DEFAULT_PROFILE = Profile(
-    name="default",
+    name=DEFAULT_PROFILE_NAME,
     numerics="exact",
     description=(
-        "General frozen-parity path: spec.default_tiles, split pool I/O, no GPR, "
-        "all opt-in perf flags off."
+        "Model-agnostic library default: one tile set for every bucket "
+        "(profiles/default.py) fitted to the model's VMEM budget, split pool "
+        "I/O, no GPR, all opt-in perf flags off."
     ),
 )
 
-_REGISTRY: dict[str, Profile] = {DEFAULT_PROFILE.name: DEFAULT_PROFILE}
-_BUILTINS_LOADED = False
+_REGISTRY[DEFAULT_PROFILE.name] = DEFAULT_PROFILE
 
 
 def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
-    """Register `profile` by name (`replace=True` to overwrite an existing one)."""
+    """Register `profile` by name (`replace=True` to overwrite an existing one).
+
+    A `model_default` profile also becomes its model's default profile (one
+    per model).
+    """
     if profile.name in _REGISTRY and not replace:
         if _REGISTRY[profile.name] == profile:
             return _REGISTRY[profile.name]  # idempotent (e.g. re-import)
         raise ValueError(f"profile {profile.name!r} is already registered")
+    if profile.model_default:
+        assert profile.model is not None  # checked in `Profile.__post_init__`
+        prev = _MODEL_DEFAULTS.get(profile.model)
+        if prev is not None and prev != profile.name and not replace:
+            raise ValueError(
+                f"model {profile.model!r} already has default profile {prev!r}"
+            )
+        _MODEL_DEFAULTS[profile.model] = profile.name
     _REGISTRY[profile.name] = profile
     return profile
+
+
+def model_default_profile(model: str | None) -> Profile:
+    """The default profile of `model` (`ModelSpec.name`), else `default`."""
+    name = _MODEL_DEFAULTS.get(model) if model is not None else None
+    return _REGISTRY[name] if name is not None else DEFAULT_PROFILE
 
 
 def _load_builtins() -> None:
@@ -250,5 +313,6 @@ __all__ = [
     "approx_features",
     "get_profile",
     "list_profiles",
+    "model_default_profile",
     "register_profile",
 ]

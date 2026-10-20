@@ -60,9 +60,9 @@ from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.profile import (
-    DEFAULT_PROFILE,
     Profile,
     get_profile,
+    model_default_profile,
 )
 from vllm_torchtpu.megakernel.spec import ExecSpec
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
@@ -275,13 +275,15 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
     - `"ep"` / `"tp"`: enabled with explicit sharding mode
     - `"mode=tp,buckets=8:16:32,verify_buckets=4:8:16,fused_pool_io=false,ab=1"`
     - `"profile=qwen35-candidate30"`: named execution profile (tiles, perf flags,
-      buckets, pool I/O); explicit keys in the same config override the profile
+      buckets, pool I/O); explicit keys in the same config override the profile.
+      Without a `profile` key, `cfg["profile"]` is `None` and the driver runs the
+      model's default profile (`profile.model_default_profile`).
     - JSON object string, e.g. `'{"mode": "tp", "buckets": [8, 16], "ab": true}'`
     """
     cfg: dict[str, Any] = {
         "enabled": False,
         "mode": "",
-        "profile": DEFAULT_PROFILE.name,
+        "profile": None,
         "buckets": _DEFAULT_BUCKETS,
         "verify_buckets": _DEFAULT_VERIFY_BUCKETS,
         "buckets_explicit": False,
@@ -300,7 +302,7 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
     def _apply_dict(d: dict[str, Any]) -> None:
         cfg["enabled"] = _parse_bool(d.get("enabled", True))
         if "profile" in d and d["profile"] is not None:
-            cfg["profile"] = str(d["profile"]).strip() or DEFAULT_PROFILE.name
+            cfg["profile"] = str(d["profile"]).strip() or None
         if "mode" in d and d["mode"] is not None:
             m = str(d["mode"]).strip().lower()
             _need(m in ("", "auto", "ep", "tp"), f"invalid mode={d['mode']!r}")
@@ -378,7 +380,13 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
 
 
 def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
-    """Fill profile-owned keys from `cfg["profile"]` unless set explicitly."""
+    """Fill profile-owned keys from `cfg["profile"]` unless set explicitly.
+
+    With no named profile the keys keep their library defaults, which equal
+    the model default profiles' settings (split pool I/O, no GPR).
+    """
+    if cfg["profile"] is None:
+        return
     try:
         prof = get_profile(cfg["profile"])
     except KeyError as exc:
@@ -409,11 +417,14 @@ def resolve_driver_profile(
 ) -> Profile:
     """Resolve the effective profile: named profile plus explicit overrides.
 
-    `None` overrides keep the profile's value. Fails closed (`ValueError`) for
-    unknown profiles or a profile tuned for a different `ModelSpec.name`.
+    `profile=None` (or `""`) selects the model's default profile
+    (`model_default_profile(model_name)`, `default` if the model declares
+    none). `None` overrides keep the profile's value. Fails closed
+    (`ValueError`) for unknown profiles or a profile tuned for a different
+    `ModelSpec.name`.
     """
     try:
-        prof = get_profile(profile)
+        prof = get_profile(profile) if profile else model_default_profile(model_name)
     except KeyError as exc:
         raise ValueError(f"MegakernelDriver: {exc.args[0]}") from None
     _need(

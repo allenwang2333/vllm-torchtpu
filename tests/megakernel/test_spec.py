@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for `spec` and `profiles.default`."""
+"""Unit tests for `spec`, `profiles.default` and the Qwen3.5 baseline tiles."""
 
 from __future__ import annotations
 
@@ -22,7 +22,15 @@ from conftest import EXACT_FLIPS, FakeGeometry
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import spec as spec_mod
-from vllm_torchtpu.megakernel.profiles.default import frozen_parity_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import (
+    DECODE_TILES,
+    baseline_tiles,
+)
+from vllm_torchtpu.megakernel.profiles.default import (
+    DEFAULT_CHIP,
+    ChipBudget,
+    default_tiles,
+)
 
 # Opt-in performance flags and their default (off) values.
 _PERF_FLAGS_OFF = dict(
@@ -67,30 +75,41 @@ def test_exact_flip_list_covers_registry():
     assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | {"kv_scatter_vec_ns"}
 
 
-def test_default_tile_rule_lives_in_default_profile():
-    for R in (1, 2, 8):
-        for B in range(1, 65):
-            assert mk.default_tiles(B, R=R) == frozen_parity_tiles(B, R=R)
-            assert mk.frozen_parity_tiles(B, R=R) == frozen_parity_tiles(B, R=R)
+def test_default_tile_rule_is_model_agnostic():
+    """One tile set for every bucket, rank count and MoE mode; chip budgets."""
+    ref = default_tiles(1)
+    assert ref.hier == 0  # flat-ring all-reduce, no topology-specific mode
+    assert (ref.vmem_mib, ref.smem_mib) == (
+        DEFAULT_CHIP.vmem_mib,
+        DEFAULT_CHIP.smem_mib,
+    )
+    for R in (1, 2, 4, 8, 16):
+        for moe_tp in (False, True):
+            for B in range(1, 65):
+                assert mk.default_tiles(B, moe_tp=moe_tp, R=R) == ref
+    small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
+    assert default_tiles(8, chip=small).vmem_mib == 16
 
 
-def test_tiles_field_defaults_are_frozen_parity():
+def test_tiles_field_defaults_turn_perf_flags_off():
     t = mk.Tiles()
     for k, v in _PERF_FLAGS_OFF.items():
         assert getattr(t, k) == v, k
     assert t.kv_sub == 0
-    assert mk.Tiles(hier=1, pack=1, mb8=2) == spec_mod.DEFAULT_TILES
+    d = mk.default_tiles(8)
+    for k, v in _PERF_FLAGS_OFF.items():
+        assert getattr(d, k) == v, k
 
 
 @pytest.mark.parametrize("R", [1, 8])
 @pytest.mark.parametrize("moe_tp", [False, True])
-def test_default_tiles_equal_frozen_parity_and_ignore_moe_tp(R: int, moe_tp: bool):
+def test_qwen35_baseline_tiles_ignore_moe_tp(R: int, moe_tp: bool):
     for B in range(1, 65):
-        t = mk.default_tiles(B, moe_tp=moe_tp, R=R)
-        assert t == mk.frozen_parity_tiles(B, moe_tp=moe_tp, R=R)
-        assert t == mk.default_tiles(B, R=R)  # no moe_tp dependence
+        t = baseline_tiles(B, moe_tp=moe_tp, R=R)
+        assert t == baseline_tiles(B, R=R)  # no moe_tp dependence
         assert t.kv_sub == 0 and not t.route_vec and not t.dense_acc_pair
-        assert not t.pipe_ep and t.pipe  # frozen PIPE stays on (TP single tile)
+        assert not t.pipe_ep and t.pipe  # PIPE stays on (TP single tile)
+    assert mk.Tiles(hier=1, pack=1, mb8=2) == DECODE_TILES
 
 
 def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
@@ -101,9 +120,9 @@ def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
 
 
 @pytest.mark.parametrize("R", [2, 4])
-def test_default_tiles_non_v7x8_ranks_use_flat_ring(R: int):
+def test_qwen35_baseline_non_v7x8_ranks_use_flat_ring(R: int):
     for B in (2, 4, 8, 16, 32, 64):
-        assert mk.default_tiles(B, R=R).hier == 0
+        assert baseline_tiles(B, R=R).hier == 0
 
 
 def test_exec_spec_pool_gather_default_is_split():

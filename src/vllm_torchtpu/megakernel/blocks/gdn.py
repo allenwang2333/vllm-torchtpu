@@ -833,7 +833,7 @@ class GDNBlock(Block):
                     else h0
                 )
                 if not HEAD_MAJOR:
-                    # Frozen-parity recurrence: whole-state update staged in `sb`.
+                    # Default recurrence: whole-state update staged in `sb`.
                     qc, kc_ = cols(q), cols(k)
                     sb[...] = (
                         st[src : src + vh].astype(F32) * jnp.exp(decay)[:, None, None]

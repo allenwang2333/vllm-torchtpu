@@ -581,7 +581,7 @@ class MoEBlock(Block):
                 h = stream.mm(xb[...], etake("e13", base)[...])
                 egive(base, l_idx)
             elif not mp.unroll:
-                # Frozen-parity path: rolled tile loop with per-tile refill.
+                # Default path: rolled tile loop with per-tile refill.
                 acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
 
                 def b13(t, cc):
@@ -846,8 +846,8 @@ class MoEBlock(Block):
             # both lists are populated in token/pick first-appearance order
             # (`b=0..B-1, k=0..TOPK-1`). Because Po2C is greedy and expert
             # partial sums accumulate into `part` in `elist` order, `route_vec`
-            # is a distinct routing/Po2C policy (`frozen_parity_tiles` sets
-            # `route_vec=False` to preserve first-appearance order).
+            # is a distinct routing/Po2C policy (the default `route_vec=False`
+            # preserves first-appearance order).
             nb_picks = scr["elist"].shape[0]
             VEC = (
                 mp.route_vec

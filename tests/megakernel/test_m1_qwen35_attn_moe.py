@@ -28,6 +28,7 @@ from jax.sharding import Mesh
 
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
 from vllm_torchtpu.megakernel.ops import F32
 from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec
 
@@ -43,7 +44,7 @@ def _can_compile_tpu7x() -> bool:
 def test_m1_recorded_full_ep_build_invariants():
     """Verify recorded `tk`, `nt`, `T_TOTAL`, `TE`, `NSS`, and VMEM budget."""
     g = dataclasses.replace(qwen35.FULL_EP, att_every=1)
-    ex = ExecSpec(B=4, T=1, R=8, ctx=4096)
+    ex = ExecSpec(B=4, T=1, R=8, ctx=4096, tiles=baseline_tiles(4, R=8))
     _, info = qwen35.build(g, ex)
     p = info["plan"]
 
@@ -211,7 +212,7 @@ def test_m1_tpu7x_aot_compile_full_ep():
     )
     mesh = Mesh(topo.devices, ("tp",))
     g = dataclasses.replace(qwen35.FULL_EP, L=2, att_every=1)
-    ex = ExecSpec(B=4, T=1, R=8, ctx=2048)
+    ex = ExecSpec(B=4, T=1, R=8, ctx=2048, tiles=baseline_tiles(4, R=8))
 
     step, info = qwen35.make_step(mesh, g, ex, donate_states=True)
     wsh = info["wshape"]

@@ -48,6 +48,7 @@ from ..spec import (
     SwitchSlot,
 )
 from . import qwen35_pool
+from .qwen35_profile import QWEN35_MODEL_NAME
 
 
 @dataclass(frozen=True)
@@ -200,7 +201,7 @@ def qwen35_spec(g: Qwen35Geometry, gdn_block: Block | None = None) -> ModelSpec:
         )
     lt = LayerType(name="qwen35_layer", slots=(mixer, moe))
     return ModelSpec(
-        name="qwen3_5",
+        name=QWEN35_MODEL_NAME,
         config=g,
         layer_type=lt,
         pool_backend=qwen35_pool.qwen35_pool_backend(g),

@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -126,8 +125,8 @@ class Tiles:
     # Unrolled / PIPE_EP experts: paired ring releases + unrolled refills up to here
     moe_group_rows: int = 40
     kv_scatter_vec_ns: int = 16  # Non-paged host KV update: one scatter above this NS
-    # Opt-in performance flags below default to the frozen-parity path. Named
-    # profiles (`profile.py`, `profiles/`) turn them on; defaults never do.
+    # Opt-in performance flags below default to off. Named profiles
+    # (`profile.py`, `profiles/`) turn them on; defaults never do.
     pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
     r2_direct_store: bool = False  # Direct VMEM store on MoE r2 tile 0
     # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
@@ -141,7 +140,7 @@ class Tiles:
     gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     conv_stage: bool = False  # Stage fused-path GDN conv taps through VMEM `sb`
-    # Head-major GDN recurrence (per-head state update; reassociates vs frozen)
+    # Head-major GDN recurrence (per-head state update; reassociates the sums)
     gdn_head_major: bool = False
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
@@ -162,7 +161,7 @@ class Tiles:
 NumericsClass = Literal["exact", "approx"]
 
 # Numerics class of every `Tiles` field (`profile.approx_features` reads this).
-# `exact`: moving the field off the `default` profile's value keeps hidden
+# `exact`: moving the field off the reference profile's value keeps hidden
 # states and pools bit-identical, because it only changes DMA / ring
 # scheduling, budgets or debug checks. `approx`: changes the
 # arithmetic (matmul K-tiling, reduction / softmax order, rounding, routing) or
@@ -222,29 +221,20 @@ POOL_IO_NUMERICS: dict[str, NumericsClass] = {
     "pool_gather_eligible": "approx",
 }
 
-DEFAULT_TILES = Tiles(hier=1, pack=1, mb8=2)
-VERIFY_TILES = dataclasses.replace(DEFAULT_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
-WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
 TINY_TILES = Tiles(
     bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, nkv=3, vmem_mib=32
 )
 
 
 def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """General, frozen-parity default tiles for batch row count `B`.
+    """Model-agnostic default tiles (`profiles/default.py:default_tiles`).
 
-    The per-bucket schedule is the `default` profile's tile rule
-    (`profiles/default.py:frozen_parity_tiles`); this wrapper keeps the public
-    name. Every opt-in performance flag stays at its `Tiles` default (off).
+    Used for `ExecSpec.tiles=None`; the kernel builder then fits their ring
+    depths to the model's VMEM budget (`vmem.fit_default_tiles`).
     """
-    from .profiles.default import frozen_parity_tiles as _rule
+    from .profiles.default import default_tiles as _rule
 
     return _rule(B, moe_tp=moe_tp, R=R)
-
-
-def frozen_parity_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-    """Default per-bucket tile schedule (`== default_tiles`)."""
-    return default_tiles(B, moe_tp=moe_tp, R=R)
 
 
 # Valid `ExecSpec.pool_gather` values (see the field comment).
@@ -291,7 +281,8 @@ class ExecSpec:
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
     roff_1d: bool = False  # True: 1D read_offsets (NS,); False: 2D (G_PER_ATT, NS)
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
-    tiles: Tiles | None = None  # None -> default_tiles(B, R=R)
+    # None -> default_tiles(B, R=R), ring depths fitted to VMEM at build
+    tiles: Tiles | None = None
     debug: DebugOptions = DebugOptions()
 
     def __post_init__(self) -> None:

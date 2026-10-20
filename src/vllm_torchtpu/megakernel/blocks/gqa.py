@@ -53,8 +53,8 @@ NT = (((1,), (1,)), ((), ()))
 
 # Geometry (layout) requirements, not per-bucket tuning:
 # - KVE views each KV ring stage as `(2, HD // 4, BLK)` u32 rows of the untyped
-#   expert pool; that view is validated for HD == 256 only (the frozen /
-#   candidate30 layout). Other head dims keep the separate `kvbuf` ring.
+#   expert pool; that view is validated for HD == 256 only (the Qwen3.5
+#   layout). Other head dims keep the separate `kvbuf` ring.
 # - GQ sends the partial-softmax `(m | l)` pair as two 128-lane halves of one
 #   HD-wide row of the exchange buffer, so it needs HD == 2 * 128.
 KVE_HD = 256

@@ -381,9 +381,10 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_json["fused_pool_io"] == "auto"
     assert cfg_json["pool_gather"] is True
 
-    # Defaults come from the `default` profile (frozen-parity, split pool I/O)
+    # No named profile: the driver runs the model's default profile; the
+    # profile-owned keys keep their split pool I/O defaults.
     cfg_def = parse_megakernel_config(raw="1")
-    assert cfg_def["profile"] == "default"
+    assert cfg_def["profile"] is None
     assert cfg_def["fused_pool_io"] is False
     assert cfg_def["pool_gather"] is False
     # An empty value means "off", not "auto"
@@ -416,7 +417,7 @@ def test_bucket_parsing_and_selection() -> None:
     assert cfg_runner["mode"] == "tp"
     assert cfg_runner["buckets"] == (16, 32)
     assert cfg_runner["ab"] is True
-    assert cfg_runner["profile"] == "default"
+    assert cfg_runner["profile"] is None
 
     # Named profile selection via `additional_config`
     fake_runner_c30 = SimpleNamespace(
@@ -450,8 +451,13 @@ def test_bucket_parsing_and_selection() -> None:
 
 def test_resolve_driver_profile_and_fused_ir_rule() -> None:
     """Profile resolution (overrides, model check) and the eager fused IR rule."""
+    # No named profile: the model's default profile (Qwen3.5: qwen35-baseline,
+    # other models: the library `default`).
     d = resolve_driver_profile(None, model_name="qwen3_5")
-    assert d.name == "default" and d.pool_gather is False and d.fused_pool_io is False
+    assert d.name == "qwen35-baseline" and d.model_default
+    assert d.pool_gather is False and d.fused_pool_io is False
+    generic = resolve_driver_profile(None, model_name="x")
+    assert generic.name == "default"
     c30 = resolve_driver_profile("qwen35-candidate30", model_name="qwen3_5")
     assert c30.pool_gather is None and c30.numerics == "approx"
     c30_ov = resolve_driver_profile(
@@ -467,8 +473,9 @@ def test_resolve_driver_profile_and_fused_ir_rule() -> None:
     # Real overrides re-label the profile; values equal to the profile's don't.
     assert (c30_ov.name, c30_ov.numerics) == ("qwen35-candidate30+overrides", "approx")
     d_fused = resolve_driver_profile(None, model_name="qwen3_5", fused_pool_io="auto")
-    assert (d_fused.name, d_fused.numerics) == ("default+overrides", "approx")
-    assert resolve_driver_profile(None, model_name="x", fused_pool_io="0") is d
+    assert (d_fused.name, d_fused.numerics) == ("qwen35-baseline+overrides", "approx")
+    assert resolve_driver_profile(None, model_name="qwen3_5", fused_pool_io="0") is d
+    assert resolve_driver_profile(None, model_name="x", fused_pool_io="0") is generic
     fused = resolve_driver_profile("qwen35-candidate30-fused", model_name="qwen3_5")
     assert (fused.name, fused.fused_pool_io) == ("qwen35-candidate30-fused", "auto")
     assert (
@@ -1195,9 +1202,9 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     driver.bind_and_warmup(runner)
     assert driver._hlo_checked_buckets == {(1, 2), (4, 4)}
     assert driver._bucket_fused_io == {(1, 2): False, (4, 4): False}
-    # Default profile: split pool I/O everywhere (GPR is opt-in; it never applies at
-    # T=1 and "auto" only selects it for WIDE verify buckets, B > 16).
-    assert driver.profile.name == "default"
+    # Qwen3.5 default profile: split pool I/O everywhere (GPR is opt-in; it never
+    # applies at T=1 and "auto" only selects it for WIDE verify buckets, B > 16).
+    assert driver.profile.name == "qwen35-baseline"
     assert driver._bucket_gpr == {(1, 2): False, (4, 4): False}
     # Each bucket step has its own code object (separate Dynamo cache entries)
     step_t1, step_t4 = driver._bucket_steps[(1, 2)], driver._bucket_steps[(4, 4)]

@@ -87,6 +87,7 @@ from .profile import (
     Profile,
     get_profile,
     list_profiles,
+    model_default_profile,
     register_profile,
 )
 from .spec import (
@@ -105,9 +106,9 @@ from .spec import (
     Tiles,
     WeightDecl,
     default_tiles,
-    frozen_parity_tiles,
 )
 from .stream import TwoRing
+from .vmem import fit_default_tiles
 
 __all__ = [
     "DEFAULT_PROFILE",
@@ -156,13 +157,14 @@ __all__ = [
     "default_pool_layout",
     "default_tiles",
     "encode_ecopy",
+    "fit_default_tiles",
     "fold",
-    "frozen_parity_tiles",
     "gather_gdn_states",
     "get_profile",
     "kernel",
     "kv_to_raw_page",
     "list_profiles",
+    "model_default_profile",
     "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
     "make_fused_pooled_step",
