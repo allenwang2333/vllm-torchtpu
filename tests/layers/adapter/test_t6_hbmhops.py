@@ -23,6 +23,14 @@ pytestmark = pytest.mark.tpu_test
 ROWS = [1, 4, 16, 32, 64, 128, 256]
 
 
+@pytest.fixture(autouse=True)
+def _trial_norm_config(monkeypatch):
+    """The norm configuration these were measured under: the one-pass Pallas
+    add+RMSNorm on (TPU_FUSED_ADD_RMSNORM, a recipe setting on glm-agentx,
+    where it defaults off) and the materialized decode norm armed per test."""
+    monkeypatch.setenv("TPU_FUSED_ADD_RMSNORM", "1")
+
+
 def _norm(hidden=6144, eps=1e-5, seed=0):
     from vllm.model_executor.layers.layernorm import RMSNorm
 
@@ -61,6 +69,7 @@ def _same(a, b):
 def test_materialized_norm_bitwise(vllm_config_context, rows):
     torch._dynamo.reset()
     n = _norm(seed=rows)
+    _arm(n, True)  # TPU_RMSNORM_DECODE_MATERIALIZE defaults off
     x = (0.7 * torch.randn(rows, 6144)).to(torch.bfloat16).to("tpu")
     r = (4 * torch.randn(rows, 6144)).to(torch.bfloat16).to("tpu")
     assert not n._use_pallas(x, r)

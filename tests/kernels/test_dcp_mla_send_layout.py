@@ -237,11 +237,19 @@ def _dcp_size():
     return min(8, len(jax.devices()))
 
 
+def _require_dcp8(dcp):
+    """The decode buckets these steps send (16 and 32 tokens of 32 heads) fit
+    the send layout only from DCP8: at DCP2, 32 tokens x 16 local heads is
+    512 partial rows, past the V/2 = 256 the lse word row allows."""
+    if dcp < 8:
+        pytest.skip(f"send layout steps need DCP8 (8 devices), have {dcp}")
+
+
+@pytest.mark.multichip
 def test_dcp_send_layout_bit_identical_and_merges():
     prologue._require_tpu()
     dcp = _dcp_size()
-    if dcp < 2:
-        pytest.skip("DCP needs at least 2 devices")
+    _require_dcp8(dcp)
     import test_t4_combined_composition as comb  # noqa: PLC0415
     import torch
 
@@ -312,12 +320,12 @@ def _send_dcp_run_with_rank(dcp, fault=None):
         return prologue._dcp_run(dcp, candidate=True, dcp_rank_ids=comb._rank_ids(dcp))
 
 
+@pytest.mark.multichip
 @pytest.mark.parametrize("fault", ["send_dest_rotate", "send_lse_lo_skip"])
 def test_dcp_send_layout_positive_control_fails(fault):
     prologue._require_tpu()
     dcp = _dcp_size()
-    if dcp < 2:
-        pytest.skip("DCP needs at least 2 devices")
+    _require_dcp8(dcp)
     import test_t4_combined_composition as comb  # noqa: PLC0415
     import torch
 
