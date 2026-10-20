@@ -132,6 +132,57 @@ def test_pallas_plan_matches_xla(t_local, skew, unrouted):
                 )
 
 
+# Experts per shard: 128 over the mesh keeps the routing payload a whole number
+# of lane blocks, which the one-shot routing gather requires.
+_LOCAL_EXPERTS = 16
+
+
+def _layer_inputs(mesh, groups, rows, weight_format):
+    """x, w1, w2, scales and gating for one layer; TP-group members share rows."""
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.kernels.fused_moe.v2 import AXIS, WeightFormat
+
+    ep = mesh.shape[AXIS]
+    owner = [0] * ep
+    for i, group in enumerate(groups):
+        for device in group:
+            owner[device] = i
+    rank = jax.device_put(
+        np.arange(ep, dtype=np.int32).reshape(ep, 1), NamedSharding(mesh, P(AXIS))
+    )
+    fp4 = weight_format == WeightFormat.FP4
+
+    def init(rank_l):
+        me = rank_l[0, 0]
+        group_id = jnp.asarray(owner, dtype=jnp.int32)[me]
+        tk = jax.random.split(jax.random.fold_in(jax.random.key(123), group_id), 2)
+        wk = jax.random.split(jax.random.fold_in(jax.random.key(456), me), 2)
+        x = (jax.random.normal(tk[0], (rows, 512)) * 0.2).astype(jnp.bfloat16)
+        gate = jax.random.normal(tk[1], (rows, _LOCAL_EXPERTS * ep))
+
+        def weights(key, k, n):
+            raw = jax.random.normal(key, (_LOCAL_EXPERTS, k, n)) / jnp.sqrt(float(k))
+            dtype = jnp.float4_e2m1fn if fp4 else jnp.float8_e4m3fn
+            top = 6.0 if fp4 else float(jnp.finfo(dtype).max)
+            scale = jnp.maximum(
+                jnp.max(jnp.abs(raw), axis=1, keepdims=True) / top, 1e-12
+            )
+            return (raw / scale).astype(dtype), scale if fp4 else scale[:, 0, :]
+
+        w1, s1 = weights(wk[0], 512, 1024)
+        w2, s2 = weights(wk[1], 512, 512)
+        return x, w1, w2, s1, s2, gate
+
+    inputs = jax.jit(
+        jax.shard_map(
+            init, mesh=mesh, in_specs=P(AXIS), out_specs=(P(AXIS),) * 6, check_vma=False
+        )
+    )(rank)
+    return rank, inputs
+
+
 @pytest.mark.multichip
 @pytest.mark.parametrize("rows", [16, 32, 256], ids=lambda r: f"t{r}")
 @pytest.mark.parametrize("weight_format", ["fp8", "fp4"])
@@ -144,16 +195,14 @@ def test_single_host_layer_is_bit_exact_with_the_pallas_plan(rows, weight_format
     devices = jax.local_devices()
     if len(devices) < 8 or devices[0].platform != "tpu":
         pytest.skip("requires eight local TPU devices")
-    from test_fused_ep_moe_v2_tp_tokens import _make_inputs
-
     mesh = Mesh(np.asarray([devices[i] for i in (3, 0, 6, 1, 7, 4, 2, 5)]), (AXIS,))
     groups = ((6, 1), (4, 3), (0, 7), (2, 5))
     fmt = WeightFormat.FP4 if weight_format == "fp4" else WeightFormat.FP8
     with jax.default_device(devices[0]):
-        rank, inputs = _make_inputs(mesh, groups, rows, fmt)
-        bias = jnp.linspace(-0.5, 0.5, 2 * mesh.shape[AXIS], dtype=jnp.float32)
+        rank, inputs = _layer_inputs(mesh, groups, rows, fmt)
+        bias = jnp.linspace(-0.5, 0.5, inputs[-1].shape[1], dtype=jnp.float32)
 
-        def run(max_tokens, rank_arg, bias_arg, *args):
+        def run(max_tokens, oneshot, rank_arg, bias_arg, *args):
             return fused_ep_moe_v2(
                 *args,
                 topk=4,
@@ -169,12 +218,18 @@ def test_single_host_layer_is_bit_exact_with_the_pallas_plan(rows, weight_format
                 score_bias=bias_arg,
                 routed_scaling_factor=2.5,
                 pallas_plan_max_tokens=max_tokens,
+                oneshot_routing_gather=oneshot,
             )
 
-        jitted = jax.jit(run, static_argnums=0)
-        for m in (0, rows):
-            hlo = jitted.lower(m, rank, bias, *inputs).as_text()
+        jitted = jax.jit(run, static_argnums=(0, 1))
+        arms = [(m, oneshot) for oneshot in (False, True) for m in (0, rows)]
+        for m, oneshot in arms:
+            hlo = jitted.lower(m, oneshot, rank, bias, *inputs).as_text()
             assert ("_plan_kernel" in hlo) == bool(m), "the flag must select the path"
-        outs = [np.asarray(jitted(m, rank, bias, *inputs)) for m in (0, rows)]
+        outs = [np.asarray(jitted(m, o, rank, bias, *inputs)) for m, o in arms]
     assert np.isfinite(outs[0].astype(np.float32)).all()
-    np.testing.assert_array_equal(outs[0].view(np.uint16), outs[1].view(np.uint16))
+    # The plan and the one-shot routing gather compose: every arm, same bits.
+    for arm, out in zip(arms[1:], outs[1:], strict=True):
+        np.testing.assert_array_equal(
+            outs[0].view(np.uint16), out.view(np.uint16), err_msg=str(arm)
+        )
