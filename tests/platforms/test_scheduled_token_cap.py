@@ -26,20 +26,26 @@ def cap_budget():
     stubs = {
         mod: MagicMock()
         for mod in (
+            "torch",
             "torch_tpu",
             "torch_tpu._internal",
             "torch_tpu._internal.compile",
             "torch_tpu._internal.utils",
             "portpicker",
+            "vllm",
+            "vllm.envs",
+            "vllm.logger",
+            "vllm.platforms",
+            "vllm.platforms.interface",
         )
         if mod not in sys.modules
     }
     with patch.dict(sys.modules, stubs):
         from vllm_torchtpu.platforms.tpu_platform import (
-            _cap_scheduled_tokens_to_compile_sizes,
+            _cap_max_num_scheduled_tokens_to_compile_sizes,
         )
 
-        yield _cap_scheduled_tokens_to_compile_sizes
+        yield _cap_max_num_scheduled_tokens_to_compile_sizes
 
 
 def _budget_config(
@@ -65,8 +71,8 @@ def _budget_config(
     [
         # Decode server from the P/D launcher: cap to the largest bucket.
         ([16, 256], 16384, 1, True, None, 256),
-        # Explicit scheduled-token budget above the largest bucket: cap it.
-        ([16, 256], 16384, 1, True, 1024, 256),
+        # Explicit scheduled-token budget within the largest bucket: untouched.
+        ([16, 256], 16384, 1, True, 128, 128),
         # Largest bucket already covers the budget: untouched.
         ([16, 256, 16384], 16384, 1, True, None, None),
         ([16, 256], 256, 1, True, None, None),
@@ -90,6 +96,24 @@ def test_cap_scheduled_tokens(
     want = scheduled if expected is None else expected
     assert cfg.scheduler_config.max_num_scheduled_tokens == want
     assert cfg.scheduler_config.max_num_batched_tokens == budget
+
+
+@pytest.mark.parametrize(
+    "sizes,pcp,scheduled,need_bucket",
+    [
+        ([16, 256], 1, 1024, 1024),
+        ([512, 1024], 4, 8192, 2048),
+    ],
+)
+def test_explicit_scheduled_tokens_above_compile_sizes_raises(
+    cap_budget, sizes, pcp, scheduled, need_bucket
+):
+    cfg = _budget_config(sizes, 16384, pcp=pcp, scheduled=scheduled)
+    with pytest.raises(
+        ValueError,
+        match=rf"max_num_scheduled_tokens \({scheduled}\).*>= {need_bucket}",
+    ):
+        cap_budget(cfg)
 
 
 def _warnings(mock_logger):
