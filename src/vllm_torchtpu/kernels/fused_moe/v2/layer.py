@@ -464,6 +464,18 @@ def _pallas_routing_operands(
     )
 
 
+def rowquant_fp8_lane_blocks(rows):
+    """`rowquant_fp8` of [rows, hidden], returned as [rows, hidden / 128, 128].
+
+    The scale is [rows, 1] as `rowquant_fp8` returns it.
+    """
+    t, hidden = rows.shape
+    q, scale = rowquant_fp8(
+        rows.reshape(t, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK), axes=(-2, -1)
+    )
+    return q, scale.reshape(t, 1)
+
+
 # Local tokens at or above which the activation all-gather is enqueued ahead
 # of the slab scatters. Measured, not chosen: +2.80% at t_local 2048 and
 # -0.01 / -7.81 / -1.92 / -1.94% at 1024 / 256 / 64 / 32, because the scatters
@@ -788,7 +800,12 @@ def fused_ep_moe_v2(
             # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
-        if form.quantized_activations:
+        if form.quantized_activations and use_pallas_plan:
+            # Quantized straight into the wire's [rows, lane blocks, 128]
+            # view: quantizing [rows, hidden] and reshaping costs a relayout
+            # copy of the fp8 rows. Same values (a row max and elementwise).
+            q_l, row_scale_l = rowquant_fp8_lane_blocks(rows_bf16)
+        elif form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
             # The rows go on the wire as they arrived. There is no scale to
