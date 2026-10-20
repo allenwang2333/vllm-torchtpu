@@ -191,6 +191,8 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
+    VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT: bool = False
 
 
 def env_with_choices(
@@ -1125,6 +1127,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # SrptPrefillScheduler: per-step attention work cap (sum over scheduled
+    # tokens of n * (context + n / 2), 0 disables). Clipped prefill chunks are
+    # snapped to 32-token Pallas query blocks (bq_sz=32).
+    "VLLM_TPU_SRPT_ATTN_WORK_CAP": env_nonnegative_int(
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP", 0
+    ),
+    # SrptPrefillScheduler: order waiting requests by remaining prompt tokens
+    # net of local prefix cache and KVConnector hits, promote completed async KV
+    # loads from skipped_waiting, and overlap async KV load kickoffs with
+    # running prefill chunks.
+    "VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT": env_bool(
+        "VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT", False
     ),
 }
 

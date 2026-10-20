@@ -508,12 +508,187 @@ def test_max_consecutive_holds_env_var_and_compile_cache(
     shared_model_config, monkeypatch
 ):
     monkeypatch.setenv("VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", "16")
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "25000000")
+    monkeypatch.setenv("VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT", "1")
     scheduler, _ = _build_real_scheduler(shared_model_config)
     assert scheduler.max_consecutive_holds == 16
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert scheduler.attn_work_cap == 25_000_000.0
+    assert scheduler.count_external_hit is True
+    for env_name in (
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+        "VLLM_TPU_SRPT_ATTN_WORK_CAP",
+        "VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT",
+    ):
+        assert env_name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert env_name not in tpu_compiler._tpu_compile_env_factors()
+
+
+def test_attn_work_cap_snaps_to_32_token_pallas_tiles(
+    shared_model_config, monkeypatch
+):
+    # At context=320, fit=33 tokens costs 33 * (320 + 16.5) = 11,104.5.
+    # Without 32-token tile snapping, the chunk would get 33 tokens (paying for
+    # two 32-token Pallas query blocks); with snapping (`fit + 8 // 32 * 32`),
+    # it snaps cleanly to 32 tokens.
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "11200")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=128,
     )
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
-        not in tpu_compiler._tpu_compile_env_factors()
+    req = _make_real_request("deep", 512, hasher, seed=1)
+    scheduler.add_request(req)
+    # Advance to 320 computed tokens without cap first.
+    scheduler.attn_work_cap = 0.0
+    for _ in range(2):
+        scheduler.schedule()
+    scheduler.schedule()  # 384 computed if uncapped; set to 320 for exact check.
+    req.num_computed_tokens = 320
+
+    scheduler.attn_work_cap = 11200.0
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"deep": 32}
+
+    # With room for 56 tokens at context=352: 56 * (352 + 28) = 21,280 -> snaps
+    # up to 64 tokens (`(56 + 8) // 32 * 32 = 64`).
+    scheduler.attn_work_cap = 21300.0
+    out2 = scheduler.schedule()
+    assert out2.num_scheduled_tokens == {"deep": 64}
+
+
+def test_attn_work_cap_skips_second_chunk_below_32_without_1_token_stub(
+    shared_model_config, monkeypatch
+):
+    # Room for one 32-token chunk at context=64 (32 * 80 = 2,560) plus 190
+    # leftover work (fit=19 at context=0, not enough for a second 32-token tile).
+    # The waiting request must not be admitted with a 1-token stub and must not
+    # trigger failed-hold backoff.
+    monkeypatch.setenv("VLLM_TPU_SRPT_ATTN_WORK_CAP", "2750")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=64,
     )
+    req_run = _make_real_request("run", 128, hasher, seed=1)
+    scheduler.add_request(req_run)
+    scheduler.attn_work_cap = 0.0
+    assert scheduler.schedule().num_scheduled_tokens == {"run": 64}
+    scheduler.attn_work_cap = 2750.0
+
+    req_wait = _make_real_request("wait", 96, hasher, seed=2)
+    scheduler.add_request(req_wait)
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"run": 32}
+    assert "wait" not in out.num_scheduled_tokens
+    assert req_wait.status == RequestStatus.WAITING
+    assert "wait" not in scheduler._hold_backoff
+
+
+def test_completed_async_kv_in_kv_holding_waiting_orders_ready_first(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=32,
+    )
+    _running_long_prefill(scheduler, hasher, num_tokens=128)  # 96 left
+    req_cold = _make_real_request("cold", 96, hasher, seed=2)
+    scheduler.add_request(req_cold)
+
+    # Simulate an in-flight async KV load ahead of a completed async KV load in
+    # `kv_holding_waiting`: `ready_async` (64 of 96 tokens loaded, status WAITING)
+    # should sort ahead of `inflight_async` (WAITING_FOR_REMOTE_KVS) and preempt
+    # `long` (96 left > 32 left).
+    req_inflight = _make_real_request("inflight_async", 96, hasher, seed=3)
+    scheduler.requests[req_inflight.request_id] = req_inflight
+    scheduler.kv_cache_manager.allocate_slots(req_inflight, 80)
+    req_inflight.num_computed_tokens = 80
+    req_inflight.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.kv_holding_waiting.add_request(req_inflight)
+
+    req_ready = _make_real_request("ready_async", 96, hasher, seed=4)
+    scheduler.requests[req_ready.request_id] = req_ready
+    scheduler.kv_cache_manager.allocate_slots(req_ready, 64)
+    req_ready.num_computed_tokens = 64
+    req_ready.status = RequestStatus.WAITING
+    scheduler.kv_holding_waiting.add_request(req_ready)
+
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"ready_async": 32}
+
+
+class _FakeAsyncConnector:
+    supports_divergent_local_hybrid_hits = False
+
+    def __init__(self, target_req_id: str, matched_tokens: int = 80):
+        self._target_req_id = target_req_id
+        self._matched_tokens = matched_tokens
+
+    def has_pending_block_frees(self) -> bool:
+        return False
+
+    def get_num_new_matched_tokens(self, request, local_computed):
+        if request.request_id == self._target_req_id:
+            return self._matched_tokens, True
+        return 0, False
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        pass
+
+    def build_connector_meta(self, scheduler_output):
+        return None
+
+
+def test_unstarted_async_kv_load_overlaps_running_prefill_without_hold(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=32,
+    )
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=128)  # 96 left
+
+    req_async = _make_real_request("async_hit", 96, hasher, seed=2)
+    scheduler.add_request(req_async)
+    scheduler.connector = _FakeAsyncConnector("async_hit", 80)
+
+    out = scheduler.schedule()
+    # Running chunk is NOT held back: it runs 31 tokens (`max_num_scheduled_tokens - 1`),
+    # leaving 1 token of step budget so `super().schedule()` reaches `async_hit`
+    # and kicks off its async KV load in the same step.
+    assert out.num_scheduled_tokens == {"long": 31}
+    assert req_long.num_computed_tokens == 63
+    assert req_async.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert scheduler._srpt_async_kickoffs == 1
+
+
+def test_async_kv_load_tail_prefetch_caps_final_running_chunk(
+    shared_model_config, monkeypatch
+):
+    monkeypatch.setenv("VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT", "1")
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        num_blocks=64,
+        max_num_batched_tokens=64,
+    )
+    # `tail_run` has 32 tokens left (<= _ASYNC_LOAD_PREFETCH_REMAINING) in a
+    # 64-token step budget.
+    req_tail = _make_real_request("tail_run", 96, hasher, seed=1)
+    scheduler.add_request(req_tail)
+    assert scheduler.schedule().num_scheduled_tokens == {"tail_run": 64}
+    assert req_tail.is_prefill_chunk is True
+
+    req_async = _make_real_request("async_wait", 96, hasher, seed=2)
+    scheduler.add_request(req_async)
+    scheduler.connector = _FakeAsyncConnector("async_wait", 80)
+
+    out = scheduler.schedule()
+    # Capped from 32 to 31 (`rem - 1`) so `tail_run` stays a prefill chunk for 1
+    # more token while `async_wait` starts its async KV load in the same step.
+    assert out.num_scheduled_tokens == {"tail_run": 31}
+    assert req_async.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+

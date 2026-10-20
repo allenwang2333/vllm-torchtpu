@@ -24,6 +24,8 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | :--- | :--- | :--- |
 | `DP_SCHED_ENABLED` | `False` | Enables TPU data-parallel request scheduling optimizations. |
 | `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` | `8` | Consecutive `schedule()` steps a running prefill chunk may go without getting at least one KV block of tokens in `SrptPrefillScheduler` (held back or crowded out by shorter prefills) before it moves ahead of the other prefill chunks and is no longer held until it gets a block (`0` disables hold-back). |
+| `VLLM_TPU_SRPT_ATTN_WORK_CAP` | `0` | Per-step attention work cap (`sum(n * (c + n / 2))` across decodes and prefill chunks; `0` disables) in `SrptPrefillScheduler`. Clipped prefill chunks are snapped to 32-token Pallas query blocks (`bq_sz=32`). |
+| `VLLM_TPU_SRPT_COUNT_EXTERNAL_HIT` | `False` | In `SrptPrefillScheduler`, orders `waiting` requests net of local and `KVConnector` hits, promotes completed async KV loads from `skipped_waiting`, and overlaps async KV load kickoffs (`load_kv_async=True`) with running prefill chunks. |
 | `TPU_PP_DYNAMIC_CHUNKS` | `True` | Dynamically sizes microbatch chunks in Pipeline Parallelism (`--pipeline-parallel-size`). |
 | `TPU_PP_CHUNK_SLACK` | `0.1` | Slack ratio for dynamic pipeline-parallel chunk sizing. |
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
