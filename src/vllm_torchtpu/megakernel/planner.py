@@ -23,17 +23,9 @@ import jax.numpy as jnp
 
 from . import pool_alias
 from .errors import MegakernelConfigError
+from .exec_spec import ExecSpec
 from .ops import BF16, F32, rup
-from .spec import (
-    Block,
-    ExecSpec,
-    ExtraInput,
-    ModelSpec,
-    Spec,
-    StateDecl,
-    SwitchSlot,
-    WeightDecl,
-)
+from .spec import Block, ExtraInput, ModelSpec, Spec, StateDecl, SwitchSlot, WeightDecl
 
 
 def k_tile(K: int, N: int, dtype: Any, bank: int) -> int:

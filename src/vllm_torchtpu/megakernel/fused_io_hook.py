@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 from .errors import MegakernelConfigError
 
 if TYPE_CHECKING:
-    from .spec import ExecSpec, StateDecl
+    from .exec_spec import ExecSpec
+    from .spec import StateDecl
 
 
 class FusedPoolIO(Protocol):

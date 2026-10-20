@@ -35,9 +35,9 @@ from jax.sharding import PartitionSpec as P  # noqa: E402
 
 import vllm_torchtpu.megakernel as mk  # noqa: E402
 from vllm_torchtpu.megakernel import planner  # noqa: E402
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
-from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
     build_pooled_step_op,
     execute_pooled_step_inplace,

@@ -41,6 +41,7 @@ def test_megakernel_portability_ast_guard():
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
     required_modules = {
         "__init__.py",
+        "exec_spec.py",
         "kernel.py",
         "planner.py",
         "pool_alias.py",
@@ -56,6 +57,7 @@ def test_megakernel_portability_ast_guard():
         "pool/layout.py",
         "pool/pack.py",
         "pool/scatter.py",
+        "spec.py",
     }
     assert required_modules <= rel_paths, required_modules - rel_paths
 
@@ -154,7 +156,7 @@ def test_pool_package_is_framework_free():
 
     The generic pool package must not depend on `models/` (no per-model code),
     nor on blocks, the kernel builder or the cache pipes; its only internal
-    dependencies are `ops`, `errors`, `spec` and its own modules.
+    dependencies are `ops`, `errors`, `spec`, `exec_spec` and its own modules.
     """
     pool_root = Path(megakernel.__file__).resolve().parent / "pool"
     py_files = sorted(pool_root.rglob("*.py"))
@@ -169,7 +171,7 @@ def test_pool_package_is_framework_free():
         "config.py",
     } <= rel_paths, rel_paths
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
-    allowed_core = {"ops", "errors", "spec"}
+    allowed_core = {"ops", "errors", "spec", "exec_spec"}
     for path in py_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

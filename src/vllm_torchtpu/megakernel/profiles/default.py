@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..spec import Tiles
+from ..exec_spec import Tiles
 
 
 @dataclass(frozen=True)

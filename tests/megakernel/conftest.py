@@ -40,11 +40,11 @@ os.environ["XLA_FLAGS"] = _xla_flags
 import pytest  # noqa: E402
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
     Block,
-    ExecSpec,
     LayerType,
     ModelSpec,
     ScratchReq,

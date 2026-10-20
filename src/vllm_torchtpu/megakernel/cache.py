@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Model-agnostic cache pool pipeline (`CachePipe`, `DirectHBM`, `PallasWriter`).
 
 Architecture (Default Split Pool I/O vs. Opt-In Experimental `fused_pool_io`):
@@ -46,6 +58,7 @@ from jax.sharding import PartitionSpec as P
 from . import cache_experimental, kernel
 from .cache_experimental import should_fuse_pool_io
 from .errors import MegakernelConfigError
+from .exec_spec import ExecSpec
 from .planner import extra_inputs
 from .pool import POOL_KERNEL_NAMES, PoolLayout, check_ckpt_bounds
 from .pool.config import (
@@ -55,7 +68,7 @@ from .pool.config import (
     resolved_max_pages_per_seq,
     with_cache,
 )
-from .spec import ExecSpec, ModelSpec
+from .spec import ModelSpec
 
 
 @jax.tree_util.register_pytree_node_class

@@ -25,9 +25,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 from . import pool_alias
 from .errors import MegakernelConfigError
+from .exec_spec import ExecSpec
 from .ops import BF16, F32, FP8, rup
 from .planner import Plan, extra_inputs, plan
-from .spec import ExecSpec, ModelSpec, ScratchReq
+from .spec import ModelSpec, ScratchReq
 
 U8 = jnp.uint8
 

@@ -27,10 +27,10 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from ..spec import NumericsClass
+from ..exec_spec import NumericsClass
 
 if TYPE_CHECKING:
-    from ..spec import ExecSpec
+    from ..exec_spec import ExecSpec
     from .layout import PoolLayout
 
 # State name of the unified raw-pool tuple (`ST[...]` / `O[...]`). This is the

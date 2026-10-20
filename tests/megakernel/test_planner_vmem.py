@@ -29,11 +29,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import planner, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import F32, FP8
 from vllm_torchtpu.megakernel.spec import (
     Block,
-    ExecSpec,
     LayerType,
     ModelSpec,
     ScratchReq,

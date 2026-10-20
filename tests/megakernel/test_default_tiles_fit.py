@@ -20,7 +20,7 @@ import dataclasses
 import pytest
 
 from vllm_torchtpu import megakernel as mk
-from vllm_torchtpu.megakernel import spec as spec_mod
+from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
 from vllm_torchtpu.megakernel import vmem
 from vllm_torchtpu.megakernel.models import qwen35
 
@@ -87,7 +87,7 @@ def test_kernel_build_fits_unset_tiles():
 def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):
     spec = qwen35.qwen35_spec(qwen35.FULL_EP)
     tight = dataclasses.replace(mk.default_tiles(4), vmem_mib=4)
-    monkeypatch.setattr(spec_mod, "default_tiles", lambda B, **kw: tight)
+    monkeypatch.setattr(exec_spec_mod, "default_tiles", lambda B, **kw: tight)
     ex = mk.ExecSpec(B=4, T=1, R=8, ctx=4096)
     with pytest.raises(mk.MegakernelConfigError, match="do not fit"):
         vmem.fit_default_tiles(spec, ex)

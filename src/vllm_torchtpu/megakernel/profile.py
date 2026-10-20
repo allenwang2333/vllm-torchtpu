@@ -31,7 +31,7 @@ profile: the default profile of the profile's model (`Profile.model`), or the
   the accuracy ladder.
 
 Every tile knob (core `Tiles` fields and each block's `Tunables`) and pool-I/O
-mode declares its class (`spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
+mode declares its class (`exec_spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
 `approx_features(profile)` lists the approx features a profile turns on
 relative to its reference; a profile declared `exact` that turns any of them on
 is rejected at construction, and `Profile.with_overrides` re-labels
@@ -45,9 +45,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .exec_spec import ExecSpec, Tiles, tile_numerics
 from .pool.config import POOL_IO_NUMERICS, cache_exec, with_cache
 from .profiles.default import default_tiles
-from .spec import ExecSpec, Tiles, tile_numerics
 
 # Name of the model-agnostic library default profile.
 DEFAULT_PROFILE_NAME = "default"
@@ -214,7 +214,7 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
     1..64, `R` in {1, 2, 4, 8, 16}, EP and TP MoE) and the knob is `approx` in
-    `spec.tile_numerics()` (block knobs as `tiles.<block>.<field>`); a pool-I/O
+    `exec_spec.tile_numerics()` (block knobs as `tiles.<block>.<field>`); a pool-I/O
     mode the profile turns on and the reference
     does not counts per `POOL_IO_NUMERICS`.
     """

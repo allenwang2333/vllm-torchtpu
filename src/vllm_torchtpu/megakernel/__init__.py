@@ -56,6 +56,7 @@ from .cache_experimental import (
 )
 from .comm import AllReduceRing
 from .errors import MegakernelConfigError, MegakernelLayoutError
+from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .kernel import (
     KernelContext,
     build,
@@ -101,8 +102,6 @@ from .profile import (
 )
 from .spec import (
     Block,
-    DebugOptions,
-    ExecSpec,
     ExtraInput,
     LayerType,
     ModelSpec,
@@ -111,9 +110,7 @@ from .spec import (
     Spec,
     StateDecl,
     SwitchSlot,
-    Tiles,
     WeightDecl,
-    default_tiles,
 )
 from .stream import TwoRing
 from .vmem import fit_default_tiles

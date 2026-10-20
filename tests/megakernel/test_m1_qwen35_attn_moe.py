@@ -28,10 +28,10 @@ from jax.experimental import topologies
 from jax.sharding import Mesh
 
 from vllm_torchtpu.megakernel import kernel
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.ops import F32
-from vllm_torchtpu.megakernel.spec import ExecSpec
 
 
 def _can_compile_tpu7x() -> bool:

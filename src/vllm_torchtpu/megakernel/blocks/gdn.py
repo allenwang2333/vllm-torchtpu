@@ -25,6 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..errors import MegakernelConfigError
+from ..exec_spec import ExecSpec, NumericsClass
 from ..fused_io_hook import fused_io
 from ..ops import (
     BF16,
@@ -37,14 +38,7 @@ from ..ops import (
     rup,
 )
 from ..pool.config import cache_exec
-from ..spec import (
-    Block,
-    ExecSpec,
-    NumericsClass,
-    SmallField,
-    StateDecl,
-    WeightDecl,
-)
+from ..spec import Block, SmallField, StateDecl, WeightDecl
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:

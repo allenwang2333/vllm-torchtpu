@@ -48,6 +48,7 @@ from vllm_torchtpu.megakernel import (  # noqa: E402
 )
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock  # noqa: E402
 from vllm_torchtpu.megakernel.cache import should_fuse_pool_io  # noqa: E402
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import (  # noqa: E402
     baseline_tiles,
@@ -60,7 +61,6 @@ from vllm_torchtpu.megakernel.ops import (  # noqa: E402
     rup,
 )
 from vllm_torchtpu.megakernel.profile import get_profile  # noqa: E402
-from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
 
 # Qwen3.5 baseline tile rule (bit-exact with the frozen kernel); the bisect
 # bench below swaps this module global for a flagged variant.

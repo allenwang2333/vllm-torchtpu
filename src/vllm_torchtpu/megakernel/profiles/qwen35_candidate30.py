@@ -32,8 +32,8 @@ import dataclasses
 from ..blocks.gdn import GDNBlock
 from ..blocks.gqa import GQABlock
 from ..blocks.moe import MoEBlock
+from ..exec_spec import Tiles
 from ..profile import Baseline, Profile, register_profile
-from ..spec import Tiles
 
 _GQA, _GDN, _MOE = GQABlock.name, GDNBlock.name, MoEBlock.name
 # Opt-in performance flags enabled by this profile (core, then per block).

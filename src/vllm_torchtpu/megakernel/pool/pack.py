@@ -25,8 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8
-from ..spec import ExecSpec
 from .backend import check_ckpt_bounds
 from .config import cache_exec, resolved_max_pages_per_seq
 from .layout import LANES, PoolLayout

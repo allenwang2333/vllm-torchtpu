@@ -54,7 +54,7 @@ from ..ops import BF16, FP8, rup
 from .config import cache_exec
 
 if TYPE_CHECKING:
-    from ..spec import ExecSpec
+    from ..exec_spec import ExecSpec
 
 # TPU lane width: the u32 / bf16 views of a pool page are `(rows, LANES)`.
 LANES = 128

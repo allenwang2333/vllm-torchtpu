@@ -23,8 +23,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8, I32, U32, rup
-from ..spec import ExecSpec
 from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
 from .config import cache_exec
 from .layout import LANES, PoolLayout

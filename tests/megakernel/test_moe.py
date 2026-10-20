@@ -31,13 +31,10 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
-from vllm_torchtpu.megakernel.spec import (
-    ExecSpec,
-    LayerType,
-    ModelSpec,
-)
+from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 
 BLOCKS_DIR = pathlib.Path(blocks.__file__).resolve().parent
 

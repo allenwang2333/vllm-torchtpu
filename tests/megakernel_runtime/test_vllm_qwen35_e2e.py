@@ -40,10 +40,10 @@ from tests.megakernel_runtime.test_weight_collector import (  # noqa: E402
     _jax_to_torch,
     make_synthetic_qwen35_backbone,
 )
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool  # noqa: E402
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache  # noqa: E402
-from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     MegakernelDriver,
     MKABCalibrator,

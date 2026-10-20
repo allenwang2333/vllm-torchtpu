@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .. import pool_alias
 from ..errors import MegakernelConfigError
+from ..exec_spec import ExecSpec, NumericsClass
 from ..fused_io_hook import fused_io
 from ..ops import (
     BF16,
@@ -40,14 +41,7 @@ from ..ops import (
     rup,
 )
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
-from ..spec import (
-    Block,
-    ExecSpec,
-    NumericsClass,
-    SmallField,
-    StateDecl,
-    WeightDecl,
-)
+from ..spec import Block, SmallField, StateDecl, WeightDecl
 
 NN = (((1,), (0,)), ((), ()))
 NT = (((1,), (1,)), ((), ()))

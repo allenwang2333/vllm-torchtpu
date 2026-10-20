@@ -29,6 +29,7 @@ from .. import cache, kernel, planner
 from ..blocks.gdn import GDNBlock
 from ..blocks.gqa import GQABlock
 from ..blocks.moe import MoEBlock
+from ..exec_spec import ExecSpec
 from ..ops import (
     BF16,
     F32,
@@ -40,13 +41,7 @@ from ..ops import (
     rup,
 )
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
-from ..spec import (
-    Block,
-    ExecSpec,
-    LayerType,
-    ModelSpec,
-    SwitchSlot,
-)
+from ..spec import Block, LayerType, ModelSpec, SwitchSlot
 from . import qwen35_pool
 from .qwen35_profile import QWEN35_MODEL_NAME
 

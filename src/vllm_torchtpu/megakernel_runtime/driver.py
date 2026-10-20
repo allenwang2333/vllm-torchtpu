@@ -58,6 +58,7 @@ from vllm_torchtpu.megakernel.cache import (
     should_fuse_pool_io,
 )
 from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
@@ -66,7 +67,6 @@ from vllm_torchtpu.megakernel.profile import (
     get_profile,
     model_default_profile,
 )
-from vllm_torchtpu.megakernel.spec import ExecSpec
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     MegakernelConfigError,
     build_pooled_step_op,

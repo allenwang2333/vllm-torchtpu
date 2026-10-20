@@ -28,6 +28,7 @@ from jax.sharding import PartitionSpec as P
 
 from .comm import AllReduceRing
 from .errors import MegakernelConfigError
+from .exec_spec import ExecSpec
 from .ops import BF16, F32, I32, rmsnorm
 from .planner import (
     extra_inputs,
@@ -36,7 +37,7 @@ from .planner import (
     weight_shapes,
 )
 from .pool.config import POOL_STATE_NAME, cache_exec
-from .spec import ExecSpec, ModelSpec, SwitchSlot
+from .spec import ModelSpec, SwitchSlot
 from .stream import TwoRing
 from .vmem import CorePlan, build_scratch, fit_default_tiles
 

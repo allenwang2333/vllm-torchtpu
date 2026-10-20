@@ -27,8 +27,8 @@ import dataclasses
 
 from ..blocks.gqa import GQABlock, GQATunables
 from ..blocks.moe import MoEBlock
+from ..exec_spec import Tiles
 from ..profile import Profile, register_profile
-from ..spec import Tiles
 
 # `ModelSpec.name` of the Qwen3.5 model (`qwen35.qwen35_spec`).
 QWEN35_MODEL_NAME = "qwen3_5"

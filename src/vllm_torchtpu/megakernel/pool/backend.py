@@ -27,8 +27,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from ..exec_spec import ExecSpec
 from ..ops import I32, rup
-from ..spec import ExecSpec
 from .config import PoolBackend, cache_exec
 from .layout import PoolLayout
 

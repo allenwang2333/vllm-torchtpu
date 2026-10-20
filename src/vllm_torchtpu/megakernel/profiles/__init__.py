@@ -14,7 +14,7 @@
 """Checked-in named execution profiles.
 
 `default` holds the `default` profile's model-agnostic tile rule (imported
-eagerly; it depends only on `spec`). Named profiles register themselves when
+eagerly; it depends only on `exec_spec`). Named profiles register themselves when
 their module is imported; `profile.get_profile` / `list_profiles` call
 `load_builtin_profiles()` first. A model's default profile lives with the model
 (e.g. `models/qwen35_profile.py`) and registers when the model is imported.

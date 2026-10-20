@@ -56,8 +56,9 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import cache
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.pool.config import cache_exec
-from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
+from vllm_torchtpu.megakernel.spec import ModelSpec
 
 
 def _leaf_output_specs(output_partition_specs: Any) -> list[P]:

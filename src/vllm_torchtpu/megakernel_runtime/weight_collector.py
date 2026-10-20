@@ -40,9 +40,9 @@ import torch.nn.functional as F
 
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
-from vllm_torchtpu.megakernel.spec import ExecSpec
 
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 

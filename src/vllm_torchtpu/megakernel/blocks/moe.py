@@ -25,6 +25,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..exec_spec import ExecSpec, NumericsClass
 from ..ops import (
     BF16,
     F32,
@@ -34,14 +35,7 @@ from ..ops import (
     rnd,
     rup,
 )
-from ..spec import (
-    Block,
-    ExecSpec,
-    ExtraInput,
-    NumericsClass,
-    SmallField,
-    WeightDecl,
-)
+from ..spec import Block, ExtraInput, SmallField, WeightDecl
 
 NT = (((1,), (1,)), ((), ()))
 TOPK_NL = 16

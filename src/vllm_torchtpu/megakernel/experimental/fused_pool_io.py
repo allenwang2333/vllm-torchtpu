@@ -79,11 +79,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..exec_spec import ExecSpec
 from ..fused_io_hook import FusedPoolIO, register_fused_io
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
-from ..spec import ExecSpec, StateDecl
+from ..spec import StateDecl
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:

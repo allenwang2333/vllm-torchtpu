@@ -27,10 +27,10 @@ import torch
 
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.pool.config import CacheExec
-from vllm_torchtpu.megakernel.spec import ExecSpec
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     WEIGHT_FLIPPED_ATTR,
     _own,
