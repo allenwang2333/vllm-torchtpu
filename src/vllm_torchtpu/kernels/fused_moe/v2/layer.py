@@ -23,6 +23,7 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental.compute_on import compute_on
 
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
@@ -839,7 +840,18 @@ def fused_ep_moe_v2(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+        if jax.devices()[0].device_kind.startswith("TPU7"):
+            # Keep activation traffic off the SC0 metadata/scatter queue.
+            # compute_on makes core_ids immutable across queue assignment.
+            gather_activations = compute_on(
+                lambda q: lax.all_gather(q, ax, axis=0, tiled=True),
+                compute_type="tpu_sparsecore",
+                out_memory_spaces=jax.memory.Space.Device,
+                compiler_options={"sparse_core_config": {"core_ids": [1]}},
+            )
+            q_g = gather_activations(q_l)
+        else:
+            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
