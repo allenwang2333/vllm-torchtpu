@@ -1019,6 +1019,8 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
 
 @pytest.mark.parametrize("tokens", [512, 2048])
 def test_fp4_tile_256_matches_tile_128_and_the_reference(tokens):
+    from vllm_torchtpu.kernels.fused_moe import v2_prefill
+
     mesh = _mesh()
     weights, scales, decoded = _make_fp4_weights(
         mesh,
@@ -1041,7 +1043,18 @@ def test_fp4_tile_256_matches_tile_128_and_the_reference(tokens):
     )
     outs = {
         c: np.asarray(
-            fused_ep_moe_v2(x, *weights, *scales, gating, capacity=c, **common)
+            (v2_prefill.fused_ep_moe_v2 if c == 256 else fused_ep_moe_v2)(
+                x,
+                *weights,
+                *scales,
+                gating,
+                capacity=c,
+                **(
+                    common | {"weight_format": v2_prefill.WeightFormat.FP4}
+                    if c == 256
+                    else common
+                ),
+            )
         )
         for c in (CAPACITY, 256)
     }

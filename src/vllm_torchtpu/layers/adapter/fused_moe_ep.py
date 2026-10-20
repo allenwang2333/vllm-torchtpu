@@ -188,7 +188,9 @@ def _build_op(
     tile_m: int | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused."""
-    from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
+
+    implementation = v2_prefill if tile_m == _TILE_M else v2
 
     key = (
         topk,
@@ -253,7 +255,7 @@ def _build_op(
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
-        return fused_ep_moe_v2(
+        return implementation.fused_ep_moe_v2(
             x,
             w1,
             w2,
@@ -267,7 +269,7 @@ def _build_op(
             capacity=tile_m,
             block=None,
             ragged_stride=None,
-            weight_format=WeightFormat(weight_format),
+            weight_format=implementation.WeightFormat(weight_format),
             rhs_qb=rhs_qb,
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,

@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel, layer
+from vllm_torchtpu.kernels.fused_moe.v2_prefill import host, kernel, layer
 
 pytestmark = pytest.mark.cpu_test
 

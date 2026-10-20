@@ -289,11 +289,6 @@ def fused_ep_moe_v2(
     inter, hidden] and gating [tokens, experts], all sharded over the mesh
     axis. Returns [tokens, hidden], sharded like x.
 
-    logical_intermediate_size optionally excludes zero-padded intermediate
-    channels from the FP4/G512 matmuls. The caller must supply zero weight
-    tails in both gate/up halves and the down contraction. This requires a
-    supported M128/M256 capacity and no gate/up bias; physical storage is unchanged.
-
     weight_format names one of the kernel's accepted weight forms and
     decides everything that follows from it. w1_scale and w2_scale are per
     output channel for the per-channel forms (fp8 e4m3, int8), [experts,

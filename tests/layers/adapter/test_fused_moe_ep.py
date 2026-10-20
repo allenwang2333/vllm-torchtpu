@@ -151,7 +151,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
 ):
     from unittest.mock import Mock
 
-    from vllm_torchtpu.kernels.fused_moe import v2
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
 
     monkeypatch.setattr(bridge, "_OPS", {})
     closures = []
@@ -164,7 +164,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     # jax_op; the local shim it used to go through is gone.
     monkeypatch.setattr(bridge, "jax_op", build)
     kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    monkeypatch.setattr(v2_prefill if tile_m == 256 else v2, "fused_ep_moe_v2", kernel)
     groups = ((0, 1),)
     args = (None, 2, True, "silu", None, sharded_plan)
     options = dict(
@@ -1141,7 +1141,7 @@ def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
 def test_phase_dispatch_uses_prebuilt_capacity_ops(monkeypatch):
     from unittest.mock import Mock
 
-    from vllm_torchtpu.kernels.fused_moe import v2
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         set_vllm_model_wrapper_context,
     )
@@ -1155,8 +1155,10 @@ def test_phase_dispatch_uses_prebuilt_capacity_ops(monkeypatch):
         return op
 
     monkeypatch.setattr(bridge, "jax_op", build)
-    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    decode = Mock(side_effect=lambda x, *args, **kwargs: x)
+    prefill = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", decode)
+    monkeypatch.setattr(v2_prefill, "fused_ep_moe_v2", prefill)
     op = bridge._build_op(None, 2, True, "silu", None, False)
     assert bridge._build_op(None, 2, True, "silu", None, False) is op
     assert len(built) == len(set(built)) == 2
@@ -1165,7 +1167,10 @@ def test_phase_dispatch_uses_prebuilt_capacity_ops(monkeypatch):
     for is_prefill, capacity in [(False, 128), (True, 256), (False, 128)]:
         with set_vllm_model_wrapper_context(mesh=None, is_prefill=is_prefill):
             assert op(*operands) is x
+        kernel = prefill if is_prefill else decode
         assert kernel.call_args.kwargs["capacity"] == capacity
+    assert decode.call_count == 2
+    assert prefill.call_count == 1
     assert len(built) == 2  # No mesh or op creation in the traced dispatch.
 
 

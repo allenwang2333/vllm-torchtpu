@@ -61,6 +61,8 @@ steps:
         tests/runner/test_tpu_runner.py::test_moe_phase_without_dp_uses_local_prompt_state
         tests/runner/test_tpu_runner.py::test_idle_moe_rank_uses_coordinated_phase
         tests/runner/test_tpu_runner.py::test_dp_draft_decision_includes_ready_peers_and_idle_ranks
+        tests/kernels/fused_moe/test_fused_ep_moe_v2_logical.py
+        tests/kernels/fused_moe/test_fused_ep_moe_prefill_weight_slots.py
         tests/kernels/test_dsv41_decode_tuning.py
         tests/kernels/test_dsv41_decode_index_scores.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
