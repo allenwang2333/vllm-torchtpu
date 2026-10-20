@@ -42,7 +42,7 @@ _ROW_NAMES = {"B", "NS", "MR", "MB", "M", "CB"}
 # Remaining literal row-count comparisons are hardware / layout limits, not
 # per-bucket tuning (each one with its reason).
 _ALLOWED = {
-    ("moe.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
+    ("moe/topk.py", "MR <= 128"): "lane top-k keeps all MR rows in one 128-lane vreg",
     ("gqa.py", "ex.NS <= 64"): "GQ packs 128 // NS lanes per sequence (m | l) field",
 }
 
@@ -65,9 +65,10 @@ def _is_num(node: ast.AST) -> bool:
 
 def test_blocks_have_no_row_count_literal_comparisons():
     """Blocks read per-bucket tuning from `Tiles`, never `B <= 40`-style literals."""
-    assert (BLOCKS_DIR / "moe.py").is_file()
+    assert (BLOCKS_DIR / "moe" / "block.py").is_file()
     found = []
-    for path in sorted(BLOCKS_DIR.glob("*.py")):
+    for path in sorted(BLOCKS_DIR.rglob("*.py")):
+        rel = path.relative_to(BLOCKS_DIR).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Compare):
@@ -76,9 +77,9 @@ def test_blocks_have_no_row_count_literal_comparisons():
             for a, b in zip(ops, ops[1:]):
                 pair = (_row_name(a) and _is_num(b)) or (_row_name(b) and _is_num(a))
                 if pair:
-                    key = (path.name, ast.unparse(node))
+                    key = (rel, ast.unparse(node))
                     if key not in _ALLOWED:
-                        found.append(f"{path.name}:{node.lineno}: {key[1]}")
+                        found.append(f"{rel}:{node.lineno}: {key[1]}")
     assert not found, "row-count literal comparisons in blocks/:\n" + "\n".join(found)
 
 

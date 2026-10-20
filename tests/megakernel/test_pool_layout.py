@@ -559,7 +559,7 @@ _MK_ROOT = Path(mk.__file__).resolve().parent
 
 def _guarded_files() -> list[Path]:
     files = [_MK_ROOT / "kernel.py", *sorted(_MK_ROOT.glob("cache*.py"))]
-    files += sorted((_MK_ROOT / "blocks").glob("*.py"))
+    files += sorted((_MK_ROOT / "blocks").rglob("*.py"))
     files += sorted((_MK_ROOT / "experimental").glob("*.py"))
     files += sorted((_MK_ROOT / "models").glob("*.py"))
     assert len(files) >= 6, files
