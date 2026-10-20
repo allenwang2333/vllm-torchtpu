@@ -549,7 +549,9 @@ def default_tiles(c: MKConfig) -> Tiles:
         # the microbatch's tiles; the dense ring keeps every tile of one input projection (the
         # attention and GatedDeltaNet blocks take them at once)
         t = default_tiles(c.microbatch())
-        return dataclasses.replace(t, nbd=min(t.nbd, WIDE_NBD))
+        # two whole EP experts (2 x 12 tiles) in the expert ring: the wide expert loop has no
+        # software pipeline, so a one-expert ring serializes each expert's DMA behind its compute
+        return dataclasses.replace(t, nbd=min(t.nbd, WIDE_NBD), nbe=2 * t.nbe)
     # EP mode has 12 tiles per expert (T13=8, T2=4); nbe=12 fits 1 whole expert in the ring and
     # unlocks PIPE_EP (overlapping 1 w2 tile of expert i with 2 w13 tiles of expert i+1).
     nbe_ep = 12 if not c.moe_tp else 10
