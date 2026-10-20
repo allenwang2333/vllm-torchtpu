@@ -343,6 +343,10 @@ local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFI
 // 1: the DP routing hook sends a new session to the engine with the fewest prompt tokens in flight
 // (waiting + running) rather than the fewest requests. Pair with TPU_SRPT_ATTN_WORK_CAP. Empty = off.
 local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
+// 1: the API server tokenizes chat prompts piecewise between added tokens and reuses the pieces earlier
+// turns already encoded (vllm-torchtpu segment_tokenize.py; exact ids). The full encode costs ~2.7 us per
+// prompt token on the API server, before the request reaches an engine. Empty = off.
+local segmentTokenize = cdk.var('VLLM_TPU_SEGMENT_TOKENIZE', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
@@ -853,6 +857,7 @@ local serverJob = cdk.job(
         [if moeSharedBeforeKernel != '' then 'MOE_FUSED_EP_SHARED_BEFORE_KERNEL']: moeSharedBeforeKernel,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
+        [if segmentTokenize != '' then 'VLLM_TPU_SEGMENT_TOKENIZE']: segmentTokenize,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
