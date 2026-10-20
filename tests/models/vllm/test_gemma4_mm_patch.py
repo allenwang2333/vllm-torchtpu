@@ -27,6 +27,7 @@ from vllm_torchtpu.models.vllm.gemma4_mm_patch import (
     _is_gemma4_mm_model,
     maybe_patch_gemma4_mm,
     patch_gemma4_mm_model_classes,
+    refresh_gemma4_mm,
 )
 from vllm_torchtpu.patch_registry import PATCHES
 
@@ -56,6 +57,19 @@ def test_is_gemma4_mm_model_detection():
         model="google/gemma-4-26b-it",
     )
     assert not _is_gemma4_mm_model(text_gemma)
+
+    # Singular architecture attribute
+    singular_mm = SimpleNamespace(
+        architecture="Gemma4ForConditionalGeneration",
+        model="google/gemma-4-26b-it",
+    )
+    assert _is_gemma4_mm_model(singular_mm)
+
+    singular_text = SimpleNamespace(
+        architecture="Gemma4ForCausalLM",
+        model="google/gemma-4-26b-it",
+    )
+    assert not _is_gemma4_mm_model(singular_text)
 
     # Gemma4 multimodal model architectures
     mm_gemma = SimpleNamespace(
@@ -147,6 +161,12 @@ def test_patch_registry_contains_gemma4_mm_patch():
     )
     assert patch.stages == ("platform_activation", "model_load")
     assert patch.model_config is True
+    assert (
+        patch.refresh == "vllm_torchtpu.models.vllm.gemma4_mm_patch:refresh_gemma4_mm"
+    )
+
+    # Verify refresh callable works without error
+    refresh_gemma4_mm()
 
 
 def test_patch_gemma4_layer_config():

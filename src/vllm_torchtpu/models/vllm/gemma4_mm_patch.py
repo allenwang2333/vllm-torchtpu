@@ -218,23 +218,35 @@ def patch_gemma4_layer_config() -> None:
         pass
 
 
+def refresh_gemma4_mm() -> None:
+    """Refresh Gemma4 multimodal and layer patches across lifecycle boundaries."""
+    patch_gemma4_mm_model_classes()
+    patch_gemma4_layer_config()
+
+
 def _is_gemma4_mm_model(model_config: "ModelConfig | None") -> bool:
     """Check if the provided ModelConfig corresponds to a Gemma4 multimodal model."""
     if model_config is None:
         return False
 
-    architectures = getattr(model_config, "architectures", []) or []
-    if any(arch in _GEMMA4_MM_ARCHITECTURES for arch in architectures):
+    arch = getattr(model_config, "architecture", None)
+    if arch in _GEMMA4_MM_ARCHITECTURES:
         return True
-    if any(arch in _TEXT_ONLY_ARCHITECTURES for arch in architectures):
+    if arch in _TEXT_ONLY_ARCHITECTURES:
+        return False
+
+    architectures = getattr(model_config, "architectures", []) or []
+    if any(a in _GEMMA4_MM_ARCHITECTURES for a in architectures):
+        return True
+    if any(a in _TEXT_ONLY_ARCHITECTURES for a in architectures):
         return False
 
     hf_config = getattr(model_config, "hf_config", None)
     if hf_config is not None:
         hf_archs = getattr(hf_config, "architectures", []) or []
-        if any(arch in _GEMMA4_MM_ARCHITECTURES for arch in hf_archs):
+        if any(a in _GEMMA4_MM_ARCHITECTURES for a in hf_archs):
             return True
-        if any(arch in _TEXT_ONLY_ARCHITECTURES for arch in hf_archs):
+        if any(a in _TEXT_ONLY_ARCHITECTURES for a in hf_archs):
             return False
         model_type = getattr(hf_config, "model_type", "")
         if model_type == "gemma4":
