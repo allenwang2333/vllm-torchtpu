@@ -86,6 +86,7 @@ def _install() -> None:
         # another module (e.g. a reference kernel with its own pool_alias) may
         # have installed its `_reshape_memref` hook after this module loaded.
         _original = lowering._reshape_memref
+        # pyrefly: ignore[bad-assignment]
         lowering._reshape_memref = _lower
         _installed = True
 
