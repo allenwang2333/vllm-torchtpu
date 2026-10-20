@@ -188,6 +188,8 @@ def test_patch_gemma4_layer_config():
             "sliding_attention",
             "full_attention",
         ],
+        head_dim=256,
+        num_key_value_heads=8,
         global_head_dim=512,
         num_global_key_value_heads=2,
         attention_k_eq_v=True,
