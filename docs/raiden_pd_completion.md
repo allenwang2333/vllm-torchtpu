@@ -49,7 +49,9 @@ D 处理只对 Raiden Stage-3 consumer、`fail` 策略和一个 `TPURaidenConnec
   `SEND_FAILURE > UNCLAIMED_TIMEOUT > SUCCESS` 合并；仅在 `finished_sending`
   屏障后发送一次空 token 终态。成功为 STOP + `kv_transfer_done=True`，
   失败为 ERROR + `kv_transfer_error`。
-- P 取消仅清除等待响应的数据，再调用原 `finish_requests()`；不提前释放发送中的 KV。
+- P 收到 abort 时清除等待响应的数据，并通知 worker 将对应注册的到期时间设为 `-1`，
+  在下一次轮询复用过期回收。仅取消尚未 claim 的注册；已 claim 的 KV 仍等待 native
+  terminal，跨 rank 回收屏障保持不变。
 - D 先读取 `RaidenLoadFailures`，按 request ID 调用 `finish_requests(FINISHED_ERROR)`，
   再处理本步模型输出，避免迟到 token 泄漏。`WAITING_FOR_REMOTE_KVS` 的 buffer
   仍等 `finished_recving` 后才释放；重复失败、已取消请求不再输出终态。
