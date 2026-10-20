@@ -126,6 +126,8 @@ if TYPE_CHECKING:
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -921,6 +923,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": env_with_choices(
         "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has", ["has", "sal"]
     ),
+    # DeepSeek-V4 mHC: compute the post/comb gates (sigmoid, softmax and
+    # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
+    # XLA epilogue of ~130 tiny ops per seam.
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool(
+        "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"
+    ),
+    # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
+    # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),
