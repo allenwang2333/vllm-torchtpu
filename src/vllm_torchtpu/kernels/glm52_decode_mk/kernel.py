@@ -1,0 +1,1161 @@
+# Copyright 2026 Google LLC
+# SPDX-License-Identifier: Apache-2.0
+"""GLM-5.2 whole-backbone decode megakernel, stage A (campaign glm52-decode-mk, WHITEBOARD.v1 md5 6e3abc12).
+
+ONE gridless TensorCore pallas_call per decode step per rank ('glm52_decode_mk'): a fori_loop over all L layers,
+then a separate barrier-free cache writer call (writer.py, 'glm52_decode_mk_writer'). Composition (§4):
+
+  host (csq: explore/clean-sheet-qwen/probe/kw/csq_proto.py, the Qwen-MK scaffold)
+    * the global static dense-tile stream (DenseWeightRing): tile g of the step lands in bank g % NBD, bank g is
+      refilled with tile g + NBD once g is consumed (`dgive`); the router / shared tiles of a MoE layer are given
+      back only after the expert stream (lazy flush), so the next layer's prefetch never competes with experts;
+    * the 6-slot TP16 expert ring, unit = (expert, this rank's I/R slice), moe_tp_decode numerics
+      (main kernels/experimental/moe_tp_decode/kernel.py @ 9ffdb1eb4: _route, _quantize_blocks, the gate_up /
+      finish math, _combine), dot1(e+1) issued before the VPU tail of e;
+    * replicated f32 residual, two in-kernel all-reduces per layer (collectives.all_reduce = moe_tp_decode's).
+  DSA core (G1: dsa.py, from hning/glm52-mk-g1-dsa-spike @ 0a73f68bc), behind the csq DSA interface:
+    qall [R, T, HR*QA/2] u32 (after the q AG) + iqv / wts / rec_v (fresh layers) + caches -> osend (partial + lse).
+  DCP pieces (glm5_mk_dcp @ d41e70f6d kernel.py): attention front (norms, rope, q_b, W_UK absorb, q packing),
+    KV staging rows, indexer front (I_proj), q head all-gather + partial/lse all-to-all (`exchange`), LSE merge.
+
+Per layer: fused add-RMSNorm -> qkv_a -> q_a / kv_a norms, k_pe rope -> KV staging -> q_b + rope + absorb -> q AG
+start -> [fresh: indexer front + batched index path] -> batched attention (alias window on the expert ring) ->
+A2A + LSE merge -> W_UV, o_proj -> AR#1 -> post norm -> dense MLP | router, shared, TP16 experts, combine -> AR#2.
+Trace build (`tiles.trace`): one 'L:layer' scope per layer iteration (layer i = the i-th occurrence in a step; a
+traced layer index cannot name a static jax.named_scope, so 'L{i}:{kind}' is recovered from the occurrence order and
+the inner kind scopes 'L_index' / 'D_mlp' / 'M_route'), phase scopes inside, per-step work in 'S_prologue' /
+'S_epilogue' outside every layer scope.
+
+Numerics follow the instruments' reference (kernel_work/glm52-decode-mk/instruments/glm_ref.py, native mode, bq4
+f32 indexer head reduce = the bar T path). `tiles.dot = "fp8"` is the production fp8 x fp8 MXU path;
+`"mixed"` (bf16 activation x fp8 weight) is exact in products and serves the oracle on hardware.
+"""
+
+import contextlib
+import dataclasses
+import math
+import types
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel as mtk
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
+
+from . import collectives as CO
+from . import dsa as DSA
+from . import layout as LY
+from . import pool_alias
+
+FP8 = jnp.float8_e4m3fn
+BF16 = jnp.bfloat16
+F32 = jnp.float32
+I32 = jnp.int32
+U32 = jnp.uint32
+U8 = jnp.uint8
+FP8_MAX = 448.0
+NT = (((1,), (1,)), ((), ()))
+NN = (((1,), (0,)), ((), ()))
+MB_SH = 27                       # own_u entries: gather source | row bits << MB_SH
+SRC_MASK = (1 << MB_SH) - 1
+COLLECTIVE_ID = 47               # not 0 (moe_tp_decode, fused_moe), 37/39 (glm5 MKs), 43 (probes/01), 45 (csq), 61 (Qwen)
+KERNEL_NAME = "glm52_decode_mk"
+VMEM_LIMIT = 67_043_328          # XLA clamps the request to this on v7x [measured: j-5b5bf421]
+
+# kernel-side fault controls (FAULTS of dsa.py are forwarded to the core)
+FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_partial", "router_tiebreak",
+                       "rope_off_by_one", "dcp_owner", "stale_indexshare",
+                       "f_ichunk", "f_slotreuse", "f_hitcap", "f_xrace", "f_nope",
+                       "f_alias_early", "f_alias_poison", "f_alias_poison_red", "f_stale_is_alias")
+ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
+
+
+@dataclasses.dataclass(frozen=True)
+class Tiles:
+    bank: int = 3 << 20          # dense ring bank (csq: 8 x 3 MiB)
+    nbd: int = 8                 # dense ring banks
+    nbe: int = 6                 # expert ring slots (moe_tp_decode _NUM_BUFFERS)
+    dot: str = "fp8"             # "fp8" (production) | "mixed" (bf16 act x fp8 weight: exact products)
+    trace: bool = False          # named scopes (per kind, per phase)
+    # batched DSA core (G1 tunables, unchanged defaults)
+    pool: int = 1344
+    gring: int = 32
+    scan_sd: int = 4
+    scan_np: int = 16
+    pv: str = "f32"              # WHITEBOARD.v1 A5: f32 PV (served formula)
+    recip: str = "approx"        # attention 1 / l: "approx" (EUP, as the served kernel) | "exact" (CPU oracle build)
+    thr_switch: int = 512        # Sigma np above which the threshold uses 2-bit digits (G1 design §3.3, §11.2)
+    gunroll: int = 16
+    xkc: int = 512
+    fault: str = ""              # oracle fault control (FAULTS)
+    alias: bool = True           # Mosaic: expert ring + DSA scratch in the u8 pool `epool` (WHITEBOARD.v1 §7)
+    alias_dsa: bool = True       # Mosaic: DSA layer-transient scratch as epool views (False: native scratch, the
+                                 # AOT negative control -- WHITEBOARD.v1 §7.2 says it cannot fit)
+    cid: int = COLLECTIVE_ID
+
+
+def bf(x):
+    return x.astype(BF16).astype(F32)
+
+
+def quant_rows(x):
+    """Per-token fp8 quant (quantized_matmul/util.py quantize_block): scale = amax / 448 (0 -> 1)."""
+    s = jnp.max(jnp.abs(x), axis=1, keepdims=True) / FP8_MAX
+    s = jnp.where(s == 0, 1.0, s)
+    return jnp.clip(x / s, -FP8_MAX, FP8_MAX).astype(FP8), s
+
+
+def rmsnorm(x, w, eps):
+    """vLLM rms_norm: bf16(x * rsqrt(mean x^2 + eps)) * w -> bf16 (x f32, w bf16-valued f32)."""
+    return bf(bf(x * lax.rsqrt(jnp.mean(x * x, axis=1, keepdims=True) + eps)) * w)
+
+
+def lane_swap(x):
+    n = x.shape[-1]
+    lane = lax.broadcasted_iota(I32, x.shape, x.ndim - 1)
+    return jnp.where(lane % 2 == 0, pltpu.roll(x, n - 1, x.ndim - 1), pltpu.roll(x, 1, x.ndim - 1))
+
+
+def rope(x, cos, sin_signed):
+    """GPT-J interleaved rope with torch bf16 rounding: bf16(bf16(x*cos) + bf16(swap(x)*sin))."""
+    return bf(bf(x * cos) + bf(lane_swap(x) * sin_signed))
+
+
+def fp8_bytes(x8):
+    return lax.bitcast_convert_type(x8, U8).astype(I32)
+
+
+def fp8_decode_hw(b):
+    b = jnp.where((b & 0x7F) == 0x7F, b ^ 1, b)
+    return lax.bitcast_convert_type(b.astype(U8), FP8).astype(BF16)
+
+
+def shl(x, n):
+    return lax.shift_left(x, jnp.asarray(n, x.dtype))
+
+
+def shr(x, n):
+    return lax.shift_right_logical(x, jnp.asarray(n, x.dtype))
+
+
+def pack2(lo, hi):
+    a = shr(lax.bitcast_convert_type(lo, U32), 16)
+    b = lax.bitcast_convert_type(hi, U32) & jnp.uint32(0xFFFF0000)
+    return a | b
+
+
+def unpack_lo(u):
+    return lax.bitcast_convert_type(shl(u, 16), F32)
+
+
+def unpack_hi(u):
+    return lax.bitcast_convert_type(u & jnp.uint32(0xFFFF0000), F32)
+
+
+def mono_key(score):
+    b = lax.bitcast_convert_type(score, I32)
+    return jnp.where(b >= 0, b, b ^ jnp.int32(0x7FFFFFFF))
+
+
+def mxu(a, b, tiles):
+    if tiles.dot == "fp8" or (a.dtype != FP8 and b.dtype != FP8):
+        return a, b
+    if tiles.dot == "mixed":
+        return a.astype(BF16), b
+    return a.astype(BF16), b.astype(BF16)
+
+
+def bswitch(idx, fns):
+    """Run fns[k]() for k == idx (traced scalar), keys sorted ints: binary cascade of whens."""
+    keys = sorted(fns)
+
+    def rec(ks):
+        if len(ks) == 1:
+            fns[ks[0]]()
+            return
+        mid = len(ks) // 2
+
+        @pl.when(idx < ks[mid])
+        def _():
+            rec(ks[:mid])
+
+        @pl.when(idx >= ks[mid])
+        def _():
+            rec(ks[mid:])
+    rec(keys)
+
+
+class Phases:
+    def __init__(self, on):
+        self.on, self.cur = on, None
+
+    def mark(self, name):
+        self.end()
+        if self.on:
+            self.cur = jax.named_scope(name)
+            self.cur.__enter__()
+
+    def end(self):
+        if self.cur is not None:
+            self.cur.__exit__(None, None, None)
+            self.cur = None
+
+
+def cache_groups(groups, ck):
+    """{kind: n_groups} (default one stacked operand per kind; n = number of layers of the kind = per-layer)."""
+    g = {k: 1 for k in ck}
+    if groups:
+        g.update({k: int(n) for k, n in groups.items()})
+    for k, n in g.items():
+        assert len(ck[k][0]) % n == 0, (k, n)
+    return g
+
+
+def cache_names(ck, G):
+    return [(k, gi) for k in ck for gi in range(G[k])]
+
+
+def epool_layout(cfg, tiles, max_pages):
+    """Byte offsets of the expert-slot views and the aliased DSA views in the u8 pool `epool` (WHITEBOARD.v1 §7.1):
+    every view's pool_alias storage equals its raw bytes, offsets are 4096-B aligned and non-overlapping within each
+    class (expert slots / DSA views); the DSA views overlap the slots by design (the alias window).
+    Returns (pool rows of 128 B, {name: (row offset, shape, dtype)}, slot rows, DSA bytes)."""
+    w13 = ((cfg.H, 2 * cfg.IR), FP8)
+    w2 = ((cfg.IR, cfg.H), FP8)
+    slot_b = sum(pool_alias.storage_size(s, jnp.dtype(d)) for s, d in (w13, w2))
+    views = {}
+    off = 0
+    for i in range(tiles.nbe):
+        for nm, (s, d) in (("w13", w13), ("w2", w2)):
+            sz = pool_alias.storage_size(s, jnp.dtype(d))
+            assert sz == math.prod(s) * jnp.dtype(d).itemsize, (nm, s, sz)
+            views[f"{nm}_{i}"] = (off // 128, s, d)
+            off += sz
+    ring_b = off
+    dsa_specs = DSA.scratch(cfg, tiles, max_pages, cfg.BMAX)
+    off = 0
+    for nm in (DSA.ALIASED if tiles.alias_dsa else ()):
+        spec = dsa_specs[nm]
+        s, d = tuple(spec.shape), spec.dtype
+        sz = pool_alias.storage_size(s, jnp.dtype(d))
+        assert sz == math.prod(s) * jnp.dtype(d).itemsize, ("alias view pads", nm, s, sz)
+        assert off % 4096 == 0
+        views[nm] = (off // 128, s, d)
+        off += sz
+    dsa_b = off
+    total = max(ring_b, dsa_b)
+    assert total % 128 == 0
+    return total // 128, views, ring_b, dsa_b
+
+
+def build(cfg, *, max_pages, nb, nbi, tiles=Tiles(), interpret=False, debug=False, skip=frozenset(),
+          stack_e=True, groups=None):
+    """Returns (call, info). call(*fixed, *dense weights, *expert weights, *caches) -> (out [M, H] bf16,
+    nrow [L, T, 128] u32, rrow [L, T, 128] u32, irec [L, T, 256] i32[, debug outputs]) for ONE rank (wrap in
+    shard_map over the R-rank axis; the rank comes in as scal[2], never axis_index).
+
+    fixed (11): scal SMEM i32[16] (0 live rows T, 1 requests B, 2 rank, 3 F-DELAY rank (-1 off), 4 F-DELAY spin
+      count, 5 F-DELAY layer), rmeta SMEM i32[T, 8] (0 valid, 1 pos, 2 req, 3 seq_len), qmeta SMEM i32[BM, 4]
+      (0 first row, 1 rows, 2 seq_len, 3 valid), bt / bti SMEM i32[BM, MAXP] (local latent / index-K pages),
+      ltab SMEM i32[L, 4], dtab SMEM i32[T_stream], rvec VMEM i32[M, 128] (lane 0 valid, 1 pos),
+      h0 VMEM f32[M, H] (embedding, bf16 values), rope_tab VMEM f32[4, M, 128], smalls HBM f32[L + 1, 1, S].
+    dense weights: one stacked HBM operand per kind in layout.DKINDS order (kinds with layers only).
+    experts (main's served TP-sharded layout, EP off): stack_e -> ew13 [Lm, E, H, 2IR], ew2 [Lm, E, IR, H],
+      es13 [Lm, E, 1, 1, 2IR], es2 [Lm, E, 1, 1, H]; else per MoE layer the four served tensors themselves
+      (w13 [E, H, 2IR], w2 [E, IR, H], s13 [E, 1, 1, 2IR], s2 [E, 1, 1, H]; zero-copy; Lm x 4 operands, bswitch).
+    caches: per kind (nope, rope, idx) `groups[kind]` stacked operands [n_layers / groups, ...]."""
+    cfg.check()
+    assert tiles.fault in FAULTS, tiles.fault
+    assert set(skip) <= set(ABLATIONS), skip
+    fault = tiles.fault
+    R, L, H, M, TMAX, BMAX = cfg.R, cfg.L, cfg.H, cfg.M, cfg.TMAX, cfg.BMAX
+    HR, NH, KL, DQ, DN, DV, QL = cfg.HR, cfg.NH, cfg.KL, cfg.DQ, cfg.DN, cfg.DV, cfg.QL
+    IH, IDIM, E, EPAD, TOPK = cfg.IH, cfg.IDIM, cfg.E, cfg.EPAD, cfg.TOPK
+    IR, ISR, IDR, KR, QB = cfg.IR, cfg.ISR, cfg.IDR, cfg.KR, cfg.QB
+    pg = cfg.page
+    lg_pg = int(math.log2(pg))
+    ILV, G_ = cfg.ILV, cfg.ILV * R
+    QA = KL + 128
+    QH = HR * QA // 2
+    OH = HR * KL // 2
+    OW = OH + 128
+    NQB = HR * DQ
+    NBLK = H // QB
+    QB8 = 8
+    IR4 = cfg.IREC // 4
+    NBD, NBE = tiles.nbd, tiles.nbe
+    typed = bool(interpret) or not tiles.alias
+    assert typed or (H // R) % 128 == 0, "all-reduce column chunks must be lane aligned on the Mosaic path"
+    assert nb < (1 << (MB_SH - 8)), nb
+    lay, S = LY.smalls_layout(cfg)
+    BANK = LY.bank_bytes(cfg, tiles.bank)
+    plan = LY.tile_plan(cfg, BANK)
+    for k_ in ("gate", "sh13", "sh2", "wuk", "wuv"):
+        assert plan[k_][2] == 1, ("consumed as one tile", k_, plan[k_])
+    dkinds = [k for k in LY.DKINDS if LY.layers_of(cfg, k)]
+    ltab_np, dtab_np = LY.stream_tables(cfg, plan)
+    T_STREAM = len(dtab_np)
+    eshapes = LY.expert_shapes(cfg)
+    moe_layers = LY.layers_of(cfg, "gate")
+    Lm = len(moe_layers)
+    ekinds = ("ew13", "ew2", "es13", "es2")
+    e_names = [(k, "stk") for k in ekinds] if stack_e else [(k, i) for i in range(Lm) for k in ekinds]
+    ck = LY.cache_kinds(cfg, nb, nbi)
+    G = cache_groups(groups, ck)
+    c_names = cache_names(ck, G)
+    full_l = LY.layers_of(cfg, "iwq")
+    Lf = len(full_l)
+
+    def cpos_fn(kind):
+        ls = ck[kind][0]
+        if kind != "idx":
+            return lambda l: l
+        fr, sk = cfg.idx_freq, cfg.idx_skip
+        for i, l in enumerate(ls):
+            assert (l if l < sk else sk + (l - sk) // fr) == i, (ls, l)
+        return lambda l: jnp.clip(jnp.where(l < sk, l, sk + (l - sk) // fr), 0, len(ls) - 1)
+    CPOS = {k: cpos_fn(k) for k in ck}
+
+    NACC = LY.rup(max(cfg.QKVP, NQB, H, 2 * IDR, IH * IDIM, cfg.IKW, EPAD))
+    KX = max(H, QL, KR, IDR, ISR)
+
+    # ---------------- scratch ----------------
+    dsa_specs = DSA.scratch(cfg, tiles, max_pages, BMAX)
+    scratch = {
+        "sm": pltpu.VMEM((2, 1, S), F32), "sm_sem": pltpu.SemaphoreType.DMA((2,)),
+        "res": pltpu.VMEM((M, H), F32), "hcur": pltpu.VMEM((M, H), F32),
+        "xbf": pltpu.VMEM((M, H), BF16), "xq": pltpu.VMEM((M, KX), FP8), "sxr": pltpu.VMEM((M, 128), F32),
+        "acc": pltpu.VMEM((M, NACC), F32),
+        "qc": pltpu.VMEM((M, QL), F32), "kvc": pltpu.VMEM((M, KL), F32), "kpe": pltpu.VMEM((M, 128), F32),
+        "wrow": pltpu.VMEM((TMAX, 128), U32), "rwrow": pltpu.VMEM((TMAX, 128), U32),
+        "rec_v": pltpu.VMEM((TMAX, 256), I32), "kvw_sem": pltpu.SemaphoreType.DMA((3,)),
+        "qsend": pltpu.VMEM((TMAX, QH), U32), "qall": pltpu.VMEM((R, TMAX, QH), U32),
+        "iqv": pltpu.VMEM((IH, M + QB8, 128), F32), "wts": pltpu.VMEM((M + QB8, 128), F32),
+        "osend": pltpu.VMEM((R, TMAX, OW), U32), "orecv": pltpu.VMEM((R, TMAX, OW), U32),
+        "orow": pltpu.VMEM((M, KR), F32), "oh": pltpu.VMEM((HR, M, KL), F32), "mvalid": pltpu.VMEM((M, 128), F32),
+        "part": pltpu.VMEM((M, H), F32), "attn": pltpu.VMEM((M, H), F32),
+        # MoE (csq / moe_tp_decode)
+        "owner": pltpu.VMEM((M, H), F32), "shared": pltpu.VMEM((M, H), F32),
+        "xqb": pltpu.VMEM((M, H), FP8), "xsb": pltpu.VMEM((NBLK, M, 128), BF16),
+        "wtab": pltpu.VMEM((M, EPAD), F32), "hits_v": pltpu.VMEM((1, EPAD), I32),
+        "hits_s": pltpu.SMEM((1, EPAD), I32), "active": pltpu.SMEM((E + 8,), I32), "hit_sem": pltpu.SemaphoreType.DMA((1,)),
+        "es13": pltpu.VMEM((NBE, 2 * IR), F32), "es2": pltpu.VMEM((NBE, H), F32),
+        "ring_sem": pltpu.SemaphoreType.DMA((NBE, 4)),
+        # dense ring
+        "dsem": pltpu.SemaphoreType.DMA((NBD,)),
+        "misc_sem": pltpu.SemaphoreType.DMA(()),
+        "q_send": pltpu.SemaphoreType.DMA(()), "q_recv": pltpu.SemaphoreType.DMA(()),
+        "a_send": pltpu.SemaphoreType.DMA(()), "a_recv": pltpu.SemaphoreType.DMA(()),
+        "spin": pltpu.VMEM((8, 128), F32),
+        "arbuf": pltpu.VMEM((M, H), BF16),
+    }
+    for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
+        scratch[f"ar1_{CO.AR_NAMES[i]}"] = sp
+    if fault != "f_xrace":                       # F-XRACE: one slot set shared by both all-reduces of a layer
+        for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
+            scratch[f"ar2_{CO.AR_NAMES[i]}"] = sp
+    if typed:
+        for k in dkinds:
+            shp, dt, _, _ = plan[k]
+            scratch["dring_" + k] = pltpu.VMEM((NBD,) + tuple(shp), dt)
+        scratch["er13"] = pltpu.VMEM((NBE, H, 2 * IR), FP8)
+        scratch["er2"] = pltpu.VMEM((NBE, IR, H), FP8)
+        for nm, sp in dsa_specs.items():
+            scratch[nm] = sp
+        EPOOL = None
+    else:
+        BROWS = BANK // 128
+        scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
+        epool_rows, eviews, ring_b, dsa_b = epool_layout(cfg, tiles, max_pages)
+        scratch["epool"] = pltpu.VMEM((epool_rows, 128), U8)
+        for nm, sp in dsa_specs.items():
+            if nm not in DSA.ALIASED or not tiles.alias_dsa:
+                scratch[nm] = sp
+        EPOOL = dict(rows=epool_rows, views=eviews, ring_bytes=ring_b, dsa_bytes=dsa_b)
+    if fault == "f_nope":
+        scratch["fnope"] = pltpu.VMEM((M, KL), F32)
+    if fault == "stale_indexshare":
+        g_ = DSA.geometry(cfg, tiles, max_pages, BMAX)
+        scratch["sv_uv"] = pltpu.VMEM((g_["UR2"], 128), I32)
+        scratch["sv_u"] = pltpu.SMEM((g_["UR2"], 128), I32)
+        scratch["sv_req"] = pltpu.SMEM((BMAX, 16), I32)
+        scratch["sv_greq"] = pltpu.SMEM((g_["UR2"],), I32)
+        scratch["sv_st"] = pltpu.SMEM((2,), I32)
+    if debug:
+        g_ = DSA.geometry(cfg, tiles, max_pages, BMAX)
+        scratch["dbg_uv"] = pltpu.VMEM((g_["UR2"], 128), I32)
+        scratch["dbg_sem"] = pltpu.SemaphoreType.DMA((1,))
+        scratch["dbg_qc"] = pltpu.VMEM((M, QL), F32)
+        scratch["dbg_x"] = pltpu.VMEM((M, H), F32)
+    s_names = list(scratch)
+
+    n_fixed = 11
+    n_d = len(dkinds)
+    n_e = len(e_names)
+    n_c = len(c_names)
+    GEO = DSA.geometry(cfg, tiles, max_pages, BMAX)
+
+    def kernel(*refs):
+        (scal, rmeta, qmeta, bt, bti, ltab, dtab, rvec, h0, rope_tab, smalls) = refs[:n_fixed]
+        Wd = dict(zip(dkinds, refs[n_fixed:n_fixed + n_d]))
+        e_in = refs[n_fixed + n_d:n_fixed + n_d + n_e]
+        c_in = refs[n_fixed + n_d + n_e:n_fixed + n_d + n_e + n_c]
+        o0 = n_fixed + n_d + n_e + n_c
+        out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
+        rest = refs[o0 + 4:]
+        if debug:
+            (d_state, d_attn, d_xin, d_xffn, d_qc, d_kvcn, d_qall, d_oloc, d_wtab, d_uv, d_ureq) = rest[:11]
+            rest = rest[11:]
+        scr = dict(zip(s_names, rest))
+        sc = (lambda nm: jax.named_scope(nm)) if tiles.trace else (lambda nm: contextlib.nullcontext())
+
+        # ---- views (Mosaic: dense banks and expert slots / DSA scratch as pool_alias views) ----
+        if not typed:
+            BROWS_ = BANK // 128
+
+            def dview(kind, bank):
+                shp, dt, _, _ = plan[kind]
+                return pool_alias.view(
+                    scr["dpool"].at[pl.ds(bank * BROWS_, pool_alias.storage_size(shp, jnp.dtype(dt)) // 128)],
+                    shp, dt)
+
+            def eview(name):
+                r0, shp, dt = EPOOL["views"][name]
+                return pool_alias.view(scr["epool"].at[pl.ds(r0, pool_alias.storage_size(shp, jnp.dtype(dt)) // 128)],
+                                       shp, dt)
+            for nm in (DSA.ALIASED if tiles.alias_dsa else ()):
+                scr[nm] = eview(nm)
+            _, shp13, _ = EPOOL["views"]["w13_0"]
+            r2_0, shp2, _ = EPOOL["views"]["w2_0"]
+            R13 = r2_0                                       # rows of a slot's w13 view (= its byte size / 128)
+            SLOTR = EPOOL["views"]["w13_1"][0] if NBE > 1 else R13 + pool_alias.storage_size(shp2, jnp.dtype(FP8)) // 128
+
+            def er13v(slot):
+                """slot's w13 view (traced slot): a dynamic row window of epool, as csq's dense ring views a bank."""
+                return pool_alias.view(scr["epool"].at[pl.ds(slot * SLOTR, R13)], shp13, FP8)
+
+            def er2v(slot):
+                return pool_alias.view(scr["epool"].at[pl.ds(slot * SLOTR + R13,
+                                                             pool_alias.storage_size(shp2, jnp.dtype(FP8)) // 128)],
+                                       shp2, FP8)
+        else:
+            def dview(kind, bank):
+                return scr["dring_" + kind].at[bank]
+
+        E_REFS = {}
+        if stack_e:
+            for (k, _), r in zip(e_names, e_in):
+                E_REFS[k] = r
+        else:
+            for (k, i), r in zip(e_names, e_in):
+                E_REFS.setdefault(k, {})[i] = r
+
+        CS = {}
+        for (k, gi), r in zip(c_names, c_in):
+            CS.setdefault(k, []).append(r)
+
+        def csel(kinds, l, fn):
+            ng = len(CS[kinds[0]])
+            assert all(len(CS[k]) == ng for k in kinds), kinds
+            pos = CPOS[kinds[0]](l)
+            if ng == 1:
+                fn(*[CS[k][0].at[pos] for k in kinds])
+            else:
+                gs = len(ck[kinds[0]][0]) // ng
+                bswitch(pos // gs, {gi: (lambda gi=gi: fn(*[CS[k][gi].at[pos - gi * gs] for k in kinds]))
+                                    for gi in range(ng)})
+
+        me = scal[2]
+        T = scal[0]
+        T_eff = (T - 1) if fault == "dropped_tail_row" else T
+        row_m = lax.broadcasted_iota(I32, (M, 1), 0)
+        rvalid = jnp.where(jnp.logical_and(rvec[:, 0:1] > 0, row_m < T_eff), 1.0, 0.0)       # [M, 1] f32
+        lane128 = lax.broadcasted_iota(I32, (1, 128), 1)
+
+        def sm(slot, name):
+            o, n = lay[name]
+            return scr["sm"][slot, :, o:o + n]
+
+        # ---------------- dense ring (csq DenseWeightRing, SMEM stream table) ----------------
+        def dsrc(kind, pos, t):
+            r = Wd[kind]
+            if kind in LY.WHOLE:
+                return r.at[pos]
+            tk = plan[kind][3]
+            return r.at[pos, pl.ds(pl.multiple_of(t * tk, tk), tk)]
+
+        def dcopy(kind, src, bank):
+            return pltpu.make_async_copy(src, dview(kind, bank), scr["dsem"].at[bank])
+
+        def fetch(g):
+            if "weights" in skip:
+                return
+
+            @pl.when(g < T_STREAM)
+            def _():
+                d = dtab[jnp.minimum(g, T_STREAM - 1)]
+                kc = lax.shift_right_logical(d, 20)
+                pos = lax.shift_right_logical(d, 8) & 4095
+                t = d & 255
+                bank = lax.rem(g, NBD)
+                for code, kind in enumerate(LY.DKINDS):
+                    if kind not in Wd:
+                        continue
+
+                    @pl.when(kc == code)
+                    def _(kind=kind):
+                        dcopy(kind, dsrc(kind, pos, t), bank).start()
+
+        def dtake(kind, g):
+            bank = lax.rem(g, NBD)
+            if "weights" not in skip:
+                with sc("W_wait"):
+                    dcopy(kind, dsrc(kind, 0, 0), bank).wait()
+            return dview(kind, bank)
+
+        def dgive(g):
+            fetch(g + NBD)
+
+        def dot8(a, w):
+            a_, w_ = mxu(a, w, tiles)
+            return lax.dot_general(a_, w_, NN, preferred_element_type=F32)
+
+        def matmul(kind, g0, xref, nt=None):
+            """acc[:, :N] = xref[:, :K] @ W_l (tiles g0 .. g0 + nt - 1 off the stream); returns acc[:, :N]."""
+            shp, dt, ntl, tk = plan[kind]
+            N = shp[-1]
+            acc = scr["acc"]
+            if ntl == 1:
+                w_ = dtake(kind, g0)
+                acc[:, :N] = dot8(xref[:, 0:shp[0]], w_[...])
+                dgive(g0)
+                return acc[:, :N]
+            acc[:, :N] = jnp.zeros((M, N), F32)
+
+            def body(t, c):
+                w_ = dtake(kind, g0 + t)
+                k0 = pl.multiple_of(t * tk, tk)
+                acc[:, :N] += dot8(xref[:, pl.ds(k0, tk)], w_[...])
+                dgive(g0 + t)
+                return c
+            lax.fori_loop(0, ntl, body, 0)
+            return acc[:, :N]
+
+        # ---------------- collectives ----------------
+        def ar_set(which):
+            pre = "ar1_" if (which == 1 or fault == "f_xrace") else "ar2_"
+            return {n: scr[pre + n] for n in CO.AR_NAMES} if R > 1 else {}
+
+        def all_reduce(partial_f32, which, drop_last=False):
+            """bf16 partial [M, H] (rows >= T zeroed, moe_tp_decode all_reduce._masked) -> rank-order f32 sum ->
+            bf16 values as f32."""
+            buf = scr["arbuf"]
+            buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
+            if "coll" not in skip:
+                with sc("X_ar%d" % which):
+                    CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last)
+            return buf[...].astype(F32)
+
+        def exchange(src_fn, dst_fn, ss, rs, wait=True):
+            if "coll" in skip:
+                return None if wait else (lambda: None)
+            return CO.exchange(R, me, src_fn, dst_fn, scr[ss], scr[rs], wait=wait,
+                               scope=sc if tiles.trace else None)
+
+        def delay_here(l):
+            """F-DELAY: rank scal[3] spins scal[4] iterations at layer scal[5] (runtime; clean = no-op)."""
+            @pl.when(jnp.logical_and(me == scal[3], jnp.logical_or(scal[5] < 0, scal[5] == l)))
+            def _():
+                CO.spin(scal[4], scr["spin"])
+
+        # ---------------- expert ring (csq / moe_tp_decode) ----------------
+        def esel(mpos, fn):
+            if stack_e:
+                fn(E_REFS["ew13"].at[mpos], E_REFS["ew2"].at[mpos], E_REFS["es13"].at[mpos], E_REFS["es2"].at[mpos])
+            else:
+                bswitch(mpos, {i: (lambda i=i: fn(E_REFS["ew13"][i], E_REFS["ew2"][i], E_REFS["es13"][i],
+                                                  E_REFS["es2"][i])) for i in range(Lm)})
+
+        def ecopies(w13r, w2r, s13r, s2r, w, slot):
+            d13, d2 = (scr["er13"].at[slot], scr["er2"].at[slot]) if typed else (er13v(slot), er2v(slot))
+            return [pltpu.make_async_copy(w13r.at[w], d13, scr["ring_sem"].at[slot, 0]),
+                    pltpu.make_async_copy(w2r.at[w], d2, scr["ring_sem"].at[slot, 1]),
+                    pltpu.make_async_copy(s13r.at[w, 0], scr["es13"].at[pl.ds(slot, 1)], scr["ring_sem"].at[slot, 2]),
+                    pltpu.make_async_copy(s2r.at[w, 0], scr["es2"].at[pl.ds(slot, 1)], scr["ring_sem"].at[slot, 3])]
+
+        def estart(step, mpos):
+            w = scr["active"][step]
+            if fault == "f_ichunk":                     # FAULT: the unit loads another expert's slice
+                w = lax.rem(w + 1, E)
+            slot = lax.rem(step, NBE)
+
+            def arm(w13r, w2r, s13r, s2r):
+                for cp in ecopies(w13r, w2r, s13r, s2r, w, slot):
+                    cp.start()
+            esel(mpos, arm)
+
+        def ewait(step):
+            slot = lax.rem(step, NBE)
+            r13, r2, r13s, r2s = (E_REFS["ew13"], E_REFS["ew2"], E_REFS["es13"], E_REFS["es2"])
+            if not stack_e:
+                r13, r2, r13s, r2s = r13[0], r2[0], r13s[0], r2s[0]
+            else:
+                r13, r2, r13s, r2s = r13.at[0], r2.at[0], r13s.at[0], r2s.at[0]
+            for cp in ecopies(r13, r2, r13s, r2s, 0, slot):
+                cp.wait()
+
+        def w13_of(slot, k0, k1):
+            """rows [k0, k1) of the slot's w13 tile (traced slot)."""
+            if typed:
+                return scr["er13"][slot, k0:k1, :]
+            return er13v(slot)[k0:k1, :]
+
+        def w2_of(slot, n0, n1):
+            if typed:
+                return scr["er2"][slot, :, n0:n1]
+            return er2v(slot)[:, n0:n1]
+
+        # ---------------- KV staging (glm5_mk_dcp stage_rows; static k_scale divides as main writes) -------------
+        def stage_rows(l, slot):
+            ks = sm(slot, "k_scale")[:, 0:1]
+            kvsrc = scr["kvc"][0:TMAX]
+            if fault == "f_nope":                        # FAULT F-NOPE: the f32 norm product without its bf16 rounding
+                kvsrc = scr["fnope"][0:TMAX]
+            nb8 = fp8_bytes(jnp.clip(kvsrc / ks, -FP8_MAX, FP8_MAX).astype(FP8))
+            word = (nb8[:, 0:128] | shl(nb8[:, 128:256], 8) | shl(nb8[:, 256:384], 16) | shl(nb8[:, 384:512], 24))
+            scr["wrow"][...] = lax.bitcast_convert_type(word, U32)
+            rb = fp8_bytes(jnp.clip(scr["kpe"][0:TMAX] / ks, -FP8_MAX, FP8_MAX).astype(FP8))
+            lane_t = lax.broadcasted_iota(I32, (TMAX, 128), 1)
+            rw = jnp.where(lane_t < 32, rb | shl(pltpu.roll(rb, 96, 1), 8), 0)
+            seg = rvec[0:TMAX, 1:2] & 3
+            rq = jnp.zeros((TMAX, 128), I32)
+            for sg in range(4):
+                rq = jnp.where((seg == sg) & (lane_t // 32 == sg), pltpu.roll(rw, 32 * sg, 1) if sg else rw, rq)
+            scr["rwrow"][...] = lax.bitcast_convert_type(rq, U32)
+            pltpu.make_async_copy(scr["wrow"], nrow_out.at[l], scr["kvw_sem"].at[0]).start()
+            pltpu.make_async_copy(scr["rwrow"], rrow_out.at[l], scr["kvw_sem"].at[1]).start()
+
+        def stage_wait(l):
+            pltpu.make_async_copy(scr["wrow"], nrow_out.at[l], scr["kvw_sem"].at[0]).wait()
+            pltpu.make_async_copy(scr["rwrow"], rrow_out.at[l], scr["kvw_sem"].at[1]).wait()
+
+        # ---------------- indexer front (glm5_mk_dcp indexer_proj) ----------------
+        def indexer_proj(l, slot, g0):
+            xq, sx = quant_rows(scr["qc"][...])
+            scr["xq"][:, :QL] = xq
+            a = matmul("iwq", g0, scr["xq"])
+            iq = bf(a * sx * sm(slot, "idx_wq_s"))
+            a2 = matmul("iwk", g0 + plan["iwq"][2], scr["xbf"])
+            kw = bf(a2)
+            wts = jnp.zeros((M, 128), F32)
+            for h_ in range(IH):
+                v = rope(iq[:, h_ * IDIM:(h_ + 1) * IDIM], rope_tab[0], rope_tab[1])
+                s = bf(jnp.max(jnp.abs(v), axis=1, keepdims=True) * (1.0 / FP8_MAX))
+                inv = jnp.where(s == 0, 0.0, bf(1.0 / jnp.where(s == 0, 1.0, s)))
+                qv = jnp.clip(bf(v * inv), -FP8_MAX, FP8_MAX).astype(FP8).astype(F32)
+                scr["iqv"][h_, 0:M, :] = qv
+                wcol = bf(((kw[:, IDIM + h_:IDIM + h_ + 1] * s) * (IDIM ** -0.5)) * (IH ** -0.5))
+                wts = jnp.where(lane128 == h_, wcol, wts)
+            scr["iqv"][:, M:M + QB8, :] = jnp.zeros((IH, QB8, 128), F32)
+            scr["wts"][0:M, :] = wts
+            scr["wts"][M:M + QB8, :] = jnp.zeros((QB8, 128), F32)
+            kx = kw[:, 0:IDIM]
+            mu = jnp.mean(kx, axis=1, keepdims=True)
+            var = jnp.mean((kx - mu) ** 2, axis=1, keepdims=True)
+            kn = bf((kx - mu) * lax.rsqrt(var + cfg.idx_eps) * sm(slot, "idx_kn_w") + sm(slot, "idx_kn_b"))
+            kr = rope(kn, rope_tab[0], rope_tab[1])
+            s = jnp.max(jnp.abs(kr), axis=1, keepdims=True) * (1.0 / FP8_MAX)
+            sb = lax.bitcast_convert_type(s, I32)
+            e = (shr(sb, 23) & 0xFF) - 127
+            e = jnp.where((sb & 0x7FFFFF) != 0, e + 1, e)
+            e = jnp.where(s == 0, -127, e)
+            e = jnp.clip(e, -127, 127)
+            scl = lax.bitcast_convert_type(shl(jnp.clip(e, -126, 127) + 127, 23), F32)
+            scl = jnp.where(e == -127, 2.0 ** -127, scl)
+            k8 = fp8_bytes(jnp.clip(kr / scl, -FP8_MAX, FP8_MAX).astype(FP8))
+            rec = jnp.concatenate([k8, jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) == 0, e + 127, 0)], axis=1)
+            scr["rec_v"][...] = rec[0:TMAX]
+            pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).start()
+
+        # ---------------- LSE merge (glm5_mk_dcp merge: main cp_mla_attention.py:148-186) ----------------
+        def merge():
+            MCH = min(TMAX, 16)
+            scr["mvalid"][...] = jnp.broadcast_to(rvalid, (M, 128))
+
+            def body(c, cc):
+                r0 = pl.multiple_of(c * MCH, MCH)
+
+                def lse_of(s_):
+                    return lax.bitcast_convert_type(scr["orecv"][s_, pl.ds(r0, MCH), OH:OH + 128], F32)
+                shift = jnp.full((MCH, 128), -jnp.inf, F32)
+                for s_ in range(R):
+                    x_ = lse_of(s_)
+                    shift = jnp.maximum(shift, jnp.where(jnp.isfinite(x_), x_, -jnp.inf))
+                shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
+
+                def w_of(s_):
+                    x_ = lse_of(s_)
+                    return jnp.where(jnp.isfinite(x_), jnp.exp(x_ - shift), 0.0)
+                tot = w_of(0)
+                for s_ in range(1, R):
+                    tot = tot + w_of(s_)
+                tot = jnp.where(tot > 0, tot, 1.0)
+                hi = [jnp.zeros((MCH, KL), F32) for _ in range(HR)]
+                lo = [jnp.zeros((MCH, KL), F32) for _ in range(HR)]
+                for s_ in range(R):
+                    blk = scr["orecv"][s_, pl.ds(r0, MCH), 0:OH]
+                    o_all = jnp.concatenate([unpack_lo(blk), unpack_hi(blk)], axis=1)
+                    w_s = w_of(s_) / tot
+                    for hh in range(HR):
+                        o_ = o_all[:, hh * KL:(hh + 1) * KL]
+                        w_ = w_s[:, hh:hh + 1]
+                        wh = bf(w_)
+                        hi[hh] = hi[hh] + o_ * wh
+                        lo[hh] = lo[hh] + o_ * (w_ - wh)
+                valid_t = scr["mvalid"][pl.ds(r0, MCH), 0:1]
+                for hh in range(HR):
+                    scr["oh"][hh, pl.ds(r0, MCH), :] = bf(hi[hh] + lo[hh]) * valid_t
+                return cc
+            lax.fori_loop(0, TMAX // MCH, body, 0)
+
+        # ---------------- debug export ----------------
+        def dput(dst, src):
+            if not debug:
+                return
+            cp = pltpu.make_async_copy(src, dst, scr["dbg_sem"].at[0])
+            cp.start()
+            cp.wait()
+
+        def dput_val(dst, val, stage):
+            if not debug:
+                return
+            stage[...] = val
+            dput(dst, stage)
+
+        # ---------------- the batched DSA core ----------------
+        core = {}
+        cur_slot = [None]
+        Ens = types.SimpleNamespace(
+            cfg=cfg, tiles=tiles, scr=scr, max_pages=max_pages, BMAX=BMAX, me=me, scal=scal, rmeta=rmeta,
+            qmeta=qmeta, bt=bt, bti=bti, rvec=rvec, skip=frozenset(x for x in skip if x in ("index", "gather",
+                                                                                              "attn", "coll")),
+            MB_SH=MB_SH, SRC_MASK=SRC_MASK, QA=QA, QH=QH, OH=OH, sm_scale=cfg.sm_scale, Phases=Phases, csel=csel,
+            mxu=mxu, fp8_decode_hw=fp8_decode_hw, mono_key=mono_key, pack2=pack2, unpack_lo=unpack_lo,
+            unpack_hi=unpack_hi, bf=bf, misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M,
+            debug=False, nb=nb, ks=lambda: sm(cur_slot[0], "k_scale")[:, 0:1],
+            dbg_uv=scr["dbg_uv"] if debug else None,
+            delay=None)
+        core.update(DSA.make(Ens))
+
+        def save_table():
+            """FAULT stale_indexshare: snapshot the IndexShare table before a fresh layer replaces it."""
+            g_ = GEO
+            scr["sv_uv"][...] = scr["own_uv"][...]
+
+            def cu(i, c):
+                for j in range(128):
+                    scr["sv_u"][i, j] = scr["own_u"][i, j]
+                scr["sv_greq"][i] = scr["b_greq"][i]
+                return c
+            lax.fori_loop(0, g_["UR2"], cu, 0)
+            for b_ in range(BMAX):
+                for k_ in range(16):
+                    scr["sv_req"][b_, k_] = scr["b_req"][b_, k_]
+            scr["sv_st"][0] = scr["b_st"][0]
+
+        def restore_table():
+            g_ = GEO
+            scr["own_uv"][...] = scr["sv_uv"][...]
+
+            def cu(i, c):
+                for j in range(128):
+                    scr["own_u"][i, j] = scr["sv_u"][i, j]
+                scr["b_greq"][i] = scr["sv_greq"][i]
+                return c
+            lax.fori_loop(0, g_["UR2"], cu, 0)
+            for b_ in range(BMAX):
+                for k_ in range(16):
+                    scr["b_req"][b_, k_] = scr["sv_req"][b_, k_]
+            scr["b_st"][0] = scr["sv_st"][0]
+
+        # ---------------- one layer ----------------
+        def layer(l, carry):
+            """One layer under the per-layer scope 'L:layer' (trace build). A traced layer index cannot name a
+            static scope, so layer i is the i-th 'L:layer' occurrence of a step; the kind shows as the inner
+            'L_index' (fresh), 'D_mlp' (dense) or 'M_route' (MoE) scope."""
+            with sc("L:layer"):
+                return layer_body(l, carry)
+
+        def layer_body(l, carry):
+            g0 = ltab[l, 0]
+            fresh = ltab[l, 1] > 0
+            is_moe = ltab[l, 2] > 0
+            mpos = ltab[l, 3]
+            slot = l % 2
+            cur_slot[0] = slot
+            pltpu.make_async_copy(smalls.at[0], scr["sm"].at[slot], scr["sm_sem"].at[slot]).wait()
+
+            @pl.when(l + 1 < L)
+            def _():
+                pltpu.make_async_copy(smalls.at[l + 1], scr["sm"].at[1 - slot], scr["sm_sem"].at[1 - slot]).start()
+
+            if debug:
+                dput(d_state.at[l, 0], scr["hcur"])
+                dput(d_state.at[l, 1], scr["res"])
+            # ===== fused add-RMSNorm (vLLM fused_add_rms_norm; layer 0: res = 0, so x = h) =====
+            with sc("L_norm"):
+                x = scr["hcur"][...] + scr["res"][...]
+                scr["res"][...] = bf(x)
+                xn = rmsnorm(x, sm(slot, "in_ln"), cfg.eps) * rvalid
+                scr["xbf"][...] = xn.astype(BF16)
+                if debug:
+                    dput_val(d_xin.at[l], xn, scr["dbg_x"])
+
+            # ===== qkv_a, q_a / kv_a norms, k_pe rope =====
+            with sc("L_qkva"):
+                xq, sx = quant_rows(xn)
+                scr["xq"][:, :H] = xq
+                a = matmul("qkva", g0, scr["xq"])
+                o_s, _ = lay["qkv_a_s"]
+                y = bf(a * sx * scr["sm"][slot, :, o_s:o_s + cfg.QKVP])
+                qc = rmsnorm(y[:, :QL], sm(slot, "q_a_ln"), cfg.eps) * rvalid
+                kvn = y[:, QL:QL + KL]
+                kvc = rmsnorm(kvn, sm(slot, "kv_a_ln"), cfg.eps) * rvalid
+                if fault == "f_nope":                    # the norm product before its last bf16 rounding
+                    yk = bf(kvn * lax.rsqrt(jnp.mean(kvn * kvn, axis=1, keepdims=True) + cfg.eps))
+                    scr["fnope"][...] = yk * sm(slot, "kv_a_ln") * rvalid
+                o_pe = QL + KL
+                kpe_raw = y[:, o_pe:o_pe + 128]
+                kpe_raw = jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) < cfg.DR, kpe_raw, 0.0)
+                kpe = rope(kpe_raw, rope_tab[0], rope_tab[1]) * rvalid
+                scr["qc"][...] = qc
+                scr["kvc"][...] = kvc
+                scr["kpe"][...] = kpe
+                if debug:
+                    dput(d_qc.at[l], scr["qc"])
+                    dput(d_kvcn.at[l], scr["kvc"])
+
+            # ===== q_b on this rank's heads (qrep 0), rope, W_UK absorb -> qsend; q AG start =====
+            with sc("L_qb"):
+                xq2, sx2 = quant_rows(qc)
+                scr["xq"][:, :QL] = xq2
+                a = matmul("qb", g0 + plan["qkva"][2], scr["xq"])
+                o_qb, _ = lay["q_b_s"]
+                q = bf(a * sx2 * scr["sm"][slot, :, o_qb:o_qb + NQB])
+                g_uk = g0 + plan["qkva"][2] + plan["qb"][2]
+                wb = dtake("wuk", g_uk)
+                parts = []
+                for hh in range(HR):
+                    qn = q[:, hh * DQ:hh * DQ + DN].astype(BF16)
+                    ql = bf(lax.dot_general(qn, wb[hh], NN, preferred_element_type=F32))
+                    win = q[:, hh * DQ + DQ - 128:hh * DQ + DQ]
+                    wr = rope(win, rope_tab[2], rope_tab[3])
+                    qpe = jnp.where(lax.broadcasted_iota(I32, (M, 128), 1) < cfg.DR, pltpu.roll(wr, cfg.DR, 1), 0.0)
+                    parts += [ql[0:TMAX], qpe[0:TMAX]]
+                dgive(g_uk)
+                qrow = jnp.concatenate(parts, axis=1)
+                scr["qsend"][...] = pack2(qrow[:, :QH], qrow[:, QH:])
+                scr["qall"][me] = scr["qsend"][...]
+                q_wait = exchange(lambda d: scr["qsend"], lambda i: scr["qall"].at[i], "q_send", "q_recv",
+                                  wait=False)
+
+            # ===== this layer's new KV rows -> staging (the q AG flies meanwhile) =====
+            with sc("L_kvw"):
+                stage_rows(l, slot)
+
+            g_idx = g_uk + 1
+            n_idx = plan["iwq"][2] + plan["iwk"][2]
+
+            # ===== indexer front + batched index path (fresh layers) =====
+            if fault == "stale_indexshare":
+                @pl.when(jnp.logical_and(fresh, l > full_l[0]))
+                def _():
+                    save_table()
+
+            @pl.when(fresh)
+            def _():
+                with sc("L_index"):
+                    indexer_proj(l, slot, g_idx)
+                    core["indexer_tail"](l)
+                    pltpu.make_async_copy(scr["rec_v"], irec_out.at[l], scr["kvw_sem"].at[2]).wait()
+                if debug:
+                    fp = jnp.clip(jnp.where(l < cfg.idx_skip, l, cfg.idx_skip + (l - cfg.idx_skip) // cfg.idx_freq),
+                                  0, Lf - 1)
+                    dput(d_uv.at[fp], scr["dbg_uv"])
+                    dput(d_ureq.at[fp], scr["b_req"])
+
+            # ===== batched attention (IndexShare layers issue the gather ring before the q AG wait) =====
+            with sc("L_attn"):
+                core["attention"](l, fresh, q_wait)
+            if fault == "stale_indexshare":
+                @pl.when(jnp.logical_and(fresh, l > full_l[0]))
+                def _():
+                    restore_table()
+            if debug:
+                dput(d_qall.at[l], scr["qall"])
+
+            # ===== A2A partials + lse to head owners, LSE merge =====
+            with sc("L_merge"):
+                scr["orecv"][me] = scr["osend"][me]
+                exchange(lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i], "a_send", "a_recv")
+                merge()
+                if debug:
+                    dput(d_oloc.at[l], scr["oh"])
+
+            # ===== W_UV + o_proj (local K, per-rank scale) -> AR#1 =====
+            g_uv = g_idx + jnp.where(fresh, n_idx, 0)
+            with sc("L_oproj"):
+                wv = dtake("wuv", g_uv)
+                for hh in range(HR):
+                    y_ = lax.dot_general(scr["oh"][hh].astype(BF16), wv[hh], NN, preferred_element_type=F32)
+                    scr["orow"][:, hh * DV:(hh + 1) * DV] = bf(y_)
+                dgive(g_uv)
+                xq3, sx3 = quant_rows(scr["orow"][...])
+                scr["xq"][:, :KR] = xq3
+                a = matmul("wo", g_uv + 1, scr["xq"])
+                part1 = bf(a * sx3 * sm(slot, "o_proj_s"))
+            attn = all_reduce(part1, 1, drop_last=(fault == "missing_rank_partial"))
+            scr["attn"][...] = attn
+            if debug:
+                dput(d_attn.at[l], scr["attn"])
+
+            # ===== post-attention fused add-RMSNorm =====
+            with sc("L_postnorm"):
+                x2 = scr["attn"][...] + scr["res"][...]
+                scr["res"][...] = bf(x2)
+                xn2 = rmsnorm(x2, sm(slot, "post_ln"), cfg.eps) * rvalid
+                scr["xbf"][...] = xn2.astype(BF16)
+                if debug:
+                    dput_val(d_xffn.at[l], xn2, scr["dbg_x"])
+
+            g_ffn = g_uv + 1 + plan["wo"][2]
+
+            # ===== dense MLP (layers < first_dense; TP slice) =====
+            if cfg.first_dense > 0:
+                @pl.when(jnp.logical_not(is_moe))
+                def _dense():
+                    with sc("D_mlp"):
+                        xn_ = scr["xbf"][...].astype(F32)
+                        xqd, sxd = quant_rows(xn_)
+                        scr["xq"][:, :H] = xqd
+                        a_ = matmul("dw13", g_ffn, scr["xq"])
+                        gu = bf(a_ * sxd * sm(slot, "w13_s"))
+                        mid = bf(gu[:, :IDR] * jax.nn.sigmoid(gu[:, :IDR]))
+                        mid = bf(mid * gu[:, IDR:])
+                        xq4, sx4 = quant_rows(mid)
+                        scr["xq"][:, :IDR] = xq4
+                        a_ = matmul("dw2", g_ffn + plan["dw13"][2], scr["xq"])
+                        scr["part"][...] = bf(a_ * sx4 * sm(slot, "w2_s"))
+                    scr["hcur"][...] = all_reduce(scr["part"][...], 2)
+
+            # ===== MoE: router, hit list, shared expert, TP16 routed experts (moe_tp_decode), combine, AR#2 =====
+            if cfg.first_dense < L:
+                @pl.when(is_moe)
+                def _moe():
+                    moe(l, slot, g_ffn, mpos)
+            stage_wait(l)
+            if fault == "f_alias_poison" or fault == "f_alias_poison_red":
+                poison_alias()
+            return carry
+
+        def poison_alias():
+            """F-ALIAS-POISON (Mosaic only): after each layer's MoE, the whole alias window holds 0x7E bytes
+            (finite fp8 448 / f32 8.4e37), so a buffer wrongly assumed persistent reads garbage."""
+            if typed:
+                return
+            n_ = EPOOL["dsa_bytes"] // 128
+            scr["epool"][0:n_, :] = jnp.full((n_, 128), 0x7E, U8)
+
+        def moe(l, slot, g_ffn, mpos):
+            with sc("M_route"):
+                xb2 = scr["xbf"][...]
+                g_gate = g_ffn
+                wg = dtake("gate", g_gate)
+                logits = bf(lax.dot_general(xb2, wg[...], NN, preferred_element_type=F32))
+                scores = jax.nn.sigmoid(logits)
+                bias = sm(slot, "gate_bias")
+                scr["wtab"][...] = route(scores, bias, T_eff)
+                if debug:
+                    dput(d_wtab.at[l], scr["wtab"])
+                hit = jnp.any(scr["wtab"][...] != 0, axis=0, keepdims=True)
+                scr["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
+                hc = pltpu.make_async_copy(scr["hits_v"], scr["hits_s"], scr["hit_sem"].at[0])
+                hc.start()
+                hc.wait()
+
+                def compact(e, cnt):
+                    h_ = scr["hits_s"][0, e] != 0
+                    scr["active"][cnt] = e
+                    return cnt + h_.astype(I32)
+                count = lax.fori_loop(0, E, compact, jnp.int32(0))
+                if fault == "f_hitcap":                     # FAULT: hit list truncated one short of all experts
+                    count = jnp.minimum(count, E - 1)
+                if "experts" in skip:
+                    count = jnp.int32(0)
+
+                def prime(st0, c):
+                    estart(st0, mpos)
+                    return c
+                lax.fori_loop(0, jnp.minimum(count, NBE), prime, 0)
+            with sc("M_shared"):
+                w13s = dtake("sh13", g_ffn + plan["gate"][2])
+                w2s = dtake("sh2", g_ffn + plan["gate"][2] + plan["sh13"][2])
+                if fault != "stale_accumulator":
+                    scr["owner"][...] = jnp.zeros((M, H), F32)
+                else:                                       # FAULT: the routed accumulator is never cleared
+                    @pl.when(mpos == 0)
+                    def _():
+                        scr["owner"][...] = jnp.zeros((M, H), F32)
+                xb2f = xb2.astype(F32)
+                sxq, sxs = quantize_block(xb2f, axis=1, target_dtype=FP8)
+                gu = dot8(sxq, w13s[...])
+                gu = (gu * sxs * sm(slot, "sw13_s")).astype(BF16).astype(F32)
+                act = jax.nn.silu(gu[:, :ISR]).astype(BF16).astype(F32) * gu[:, ISR:]
+                aq, asc = quantize_block(act.astype(BF16), axis=1, target_dtype=FP8)
+                for n0 in range(0, H, 512):
+                    n1 = min(H, n0 + 512)
+                    yv = dot8(aq, w2s[:, n0:n1])
+                    scr["shared"][:, n0:n1] = yv * asc * sm(slot, "sw2_s")[:, n0:n1]
+                mtk._quantize_blocks(xb2, scr["xqb"], scr["xsb"])
+
+            lane_e = lax.broadcasted_iota(I32, (M, EPAD), 1)
+            with sc("M_exp"):
+                def gate_up(eslot):
+                    w_scale = scr["es13"][pl.ds(eslot, 1), :].astype(BF16)
+                    a1 = jnp.zeros((M, 2 * IR), BF16)
+                    for k0 in range(0, H, QB):
+                        part = dot8(scr["xqb"][:, k0:k0 + QB], w13_of(eslot, k0, k0 + QB)).astype(BF16)
+                        part *= jnp.concatenate([scr["xsb"][k0 // QB]] * (2 * IR // 128), axis=1)
+                        part *= w_scale
+                        a1 += part
+                    return a1
+
+                def finish(step, eslot, a1):
+                    e = scr["active"][step]
+                    coeff = jnp.sum(jnp.where(lane_e == e, scr["wtab"][...], 0.0), axis=1, keepdims=True)
+                    act_ = jax.nn.silu(a1[:, :IR]) * a1[:, IR:]
+                    mid = jnp.where(coeff != 0, act_.astype(F32) * coeff, 0.0)
+                    ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
+                    mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(FP8)
+                    for n0 in range(0, H, 512):
+                        n1 = min(H, n0 + 512)
+                        a2 = dot8(mq, w2_of(eslot, n0, n1))
+                        scr["owner"][:, n0:n1] += a2 * scr["es2"][pl.ds(eslot, 1), n0:n1] * ms
+
+                @pl.when(count > 0)
+                def _():
+                    ewait(jnp.int32(0))
+
+                    def body(step, a1):
+                        nxt = step + 1
+
+                        @pl.when(nxt < count)
+                        def _():
+                            ewait(nxt)
+                        a1n = gate_up(lax.rem(nxt, NBE))
+                        if fault == "f_slotreuse":          # FAULT: refill before this unit's down-proj read
+                            @pl.when(step + NBE < count)
+                            def _():
+                                estart(step + NBE, mpos)
+                        finish(step, lax.rem(step, NBE), a1)
+                        if fault != "f_slotreuse":
+                            @pl.when(step + NBE < count)
+                            def _():
+                                estart(step + NBE, mpos)
+                        return a1n
+                    lax.fori_loop(0, count, body, gate_up(0))
+                # lazy flush: the router / shared tiles refill only now (Qwen flush_rel)
+                dgive(g_ffn)
+                dgive(g_ffn + plan["gate"][2])
+                dgive(g_ffn + plan["gate"][2] + plan["sh13"][2])
+            with sc("M_combine"):
+                comb = mtk._combine(scr["owner"][...], scr["shared"][...], cfg.routed_scale)
+            scr["hcur"][...] = all_reduce(comb.astype(F32), 2)
+
+        def route(scores, bias, n_valid):
+            """moe_tp_decode._route (kernel.py:171-193 @ 9ffdb1eb4); FAULT router_tiebreak picks the highest
+            attaining column instead of the lowest."""
+            if fault != "router_tiebreak":
+                return mtk._route(scores, bias, n_valid, topk=TOPK)
+            rows, n = scores.shape
+            lane = lax.broadcasted_iota(I32, (rows, n), 1)
+            masked = float(jnp.finfo(F32).min)
+            x = scores + bias
+            x = jnp.where(x > mtk.ROUTER_NEG, x, mtk.ROUTER_NEG)
+            wsum = jnp.zeros((rows, 1), F32)
+            for _ in range(TOPK):
+                m = jnp.max(x, axis=1, keepdims=True)
+                idx = jnp.max(jnp.where(x == m, lane, 0), axis=1, keepdims=True)
+                pick = lane == idx
+                wsum = wsum + jnp.sum(jnp.where(pick, scores, 0.0), axis=1, keepdims=True)
+                x = jnp.where(pick, masked, x)
+            chosen = x == masked
+            denom = jnp.where(wsum < mtk.SUM_FLOOR, mtk.SUM_FLOOR, wsum)
+            w = (jnp.where(chosen, scores, 0.0) / denom).astype(BF16)
+            valid = lax.broadcasted_iota(I32, (rows, n), 0) < n_valid
+            return jnp.where(jnp.logical_and(chosen, valid), w.astype(F32), 0.0)
+
+        # ---------------- step ----------------
+        def prefetch(b0, c):                                  # the stream starts before anything else
+            fetch(b0)
+            return c
+        with sc("S_prologue"):                                # per-step work, outside every layer scope
+            lax.fori_loop(0, NBD, prefetch, 0)
+            pltpu.make_async_copy(smalls.at[0], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
+            if "coll" not in skip:
+                CO.entry_barrier(R)
+            scr["hcur"][...] = h0[...]
+            scr["res"][...] = jnp.zeros((M, H), F32)
+            scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
+            scr["spin"][...] = jnp.zeros((8, 128), F32)
+            if fault == "stale_accumulator":
+                scr["owner"][...] = jnp.zeros((M, H), F32)
+            core["step_init"]()
+        lax.fori_loop(0, L, layer, 0)
+        if debug:
+            dput(d_state.at[L, 0], scr["hcur"])
+            dput(d_state.at[L, 1], scr["res"])
+        with sc("S_epilogue"):
+            x = scr["hcur"][...] + scr["res"][...]
+            pltpu.make_async_copy(smalls.at[L], scr["sm"].at[0], scr["sm_sem"].at[0]).start()
+            pltpu.make_async_copy(smalls.at[L], scr["sm"].at[0], scr["sm_sem"].at[0]).wait()
+            o, n = lay["in_ln"]
+            out_ref[...] = rmsnorm(x, scr["sm"][0, :, o:o + n], cfg.eps).astype(BF16)
+
+    # ---------------- pallas_call ----------------
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c)
+    out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, TMAX, 128), U32),
+                 jax.ShapeDtypeStruct((L, TMAX, 128), U32), jax.ShapeDtypeStruct((L, TMAX, 256), I32)]
+    out_specs = [vmem, hbm, hbm, hbm]
+    if debug:
+        dshapes = [((L + 1, 2, M, H), F32), ((L, M, H), F32), ((L, M, H), F32), ((L, M, H), F32),
+                   ((L, M, QL), F32), ((L, M, KL), F32), ((L, R, TMAX, QH), U32), ((L, HR, M, KL), F32),
+                   ((L, M, EPAD), F32), ((max(Lf, 1), GEO["UR2"], 128), I32), ((max(Lf, 1), BMAX, 16), I32)]
+        out_shape += [jax.ShapeDtypeStruct(s, d) for s, d in dshapes]
+        out_specs += [hbm] * len(dshapes)
+    call = pl.pallas_call(
+        kernel,
+        name=KERNEL_NAME + ("_dbg" if debug else ""),
+        out_shape=out_shape,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        scratch_shapes=[scratch[k] for k in s_names],
+        compiler_params=pltpu.CompilerParams(collective_id=tiles.cid if R > 1 else None,
+                                             vmem_limit_bytes=VMEM_LIMIT, disable_bounds_checks=True),
+        interpret=(interpret if isinstance(interpret, pltpu.InterpretParams) else pltpu.InterpretParams())
+        if interpret else False,
+    )
+    vmem_by = {k: int(np.prod(v.shape)) * jnp.dtype(v.dtype).itemsize for k, v in scratch.items()
+               if str(getattr(v, "memory_space", "")).lower().endswith("vmem")}
+    info = dict(s_names=s_names, dkinds=dkinds, e_names=e_names, c_names=c_names, plan=plan, BANK=BANK, S=S,
+                lay=lay, ltab=ltab_np, dtab=dtab_np, M=M, ck=ck, groups=G, OW=OW, OH=OH, QH=QH, QA=QA, MB_SH=MB_SH,
+                geometry=GEO, epool=EPOOL, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by,
+                moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed)
+    return call, info
