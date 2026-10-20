@@ -31,6 +31,8 @@ _TEXT_ONLY_ARCHITECTURES = {
     "Gemma4ForCausalLM",
 }
 
+_orig_gemma4_layer_config = None
+
 
 def patch_gemma4_mm_model_classes() -> None:
     """Set supports_encoder_tp_data = True on Gemma4 multimodal model classes."""
@@ -119,16 +121,16 @@ def patch_gemma4_attention_init() -> None:
 
 def patch_gemma4_layer_config() -> None:
     """Ensure full attention layers receive global_head_dim and global KV heads."""
+    global _orig_gemma4_layer_config
     try:
         import sys
         from copy import copy
 
         import vllm.transformers_utils.configs.gemma4 as gemma4_cfg_mod
 
-        orig_fn = getattr(gemma4_cfg_mod, "_orig_gemma4_layer_config", None)
-        if orig_fn is None:
-            orig_fn = gemma4_cfg_mod.gemma4_layer_config
-            gemma4_cfg_mod._orig_gemma4_layer_config = orig_fn
+        if _orig_gemma4_layer_config is None:
+            _orig_gemma4_layer_config = gemma4_cfg_mod.gemma4_layer_config
+        orig_fn = _orig_gemma4_layer_config
 
         def patched_gemma4_layer_config(text_config, layer_idx: int):
             layer_types = getattr(text_config, "layer_types", None)
@@ -191,7 +193,7 @@ def patch_gemma4_layer_config() -> None:
             return layer
 
         gemma4_cfg_mod.gemma4_layer_config = patched_gemma4_layer_config
-        gemma4_cfg_mod._tpu_layer_config_patched = True
+        setattr(gemma4_cfg_mod, "_tpu_layer_config_patched", True)  # noqa: B010
 
         for mod_name in [
             "vllm.model_executor.models.gemma4",
