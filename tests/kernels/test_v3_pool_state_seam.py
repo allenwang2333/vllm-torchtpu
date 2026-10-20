@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GDN V3 pooled state seam: plan math, byte compatibility, equivalence.
+"""GDN V3 pooled state seam: byte compatibility and equivalence.
 
-`TestV3StateSourcePlan` and the source-hygiene test are pure Python/CPU.
-The remaining classes execute Pallas kernels and run on TPU (same gating
-as test_pool_adapters.py).
+The source-hygiene test is pure Python/CPU. The remaining classes execute
+Pallas kernels and run on TPU (same gating as test_pool_adapters.py).
 """
 
 import functools
@@ -38,104 +37,32 @@ from kernels.gdn.v3.gdn_pool_state_utils import (
     write_states,
 )
 
-from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 
 # 35B-like slice: manager block = 3 kernel blocks; ssm = 2 whole kernel
-# blocks (one contiguous 512 KB DMA per slot); conv = 16 token rows at
-# the start of the third kernel block.
+# blocks (one contiguous 512 KB DMA per slot); the fp32 conv state starts
+# the third kernel block.
 N_KQ, N_V, D_K, D_V = 2, 8, 128, 128
 KERNEL_SIZE = 4
 DIM = N_KQ * D_K * 2 + N_V * D_V  # 1536
 SPLIT, KBS, LANES = 3, 256, 256
 PAYLOAD = (1, 2)
 TOK_BYTES = 2 * LANES * 2  # bf16 pool
-SSM_NTOK = N_V * D_K * D_V * 4 // TOK_BYTES  # 512
-CONV_TOK0 = SSM_NTOK
-CONV_NTOK = 16
-CONV_ROWS = (KERNEL_SIZE - 1) * DIM // LANES  # 18
-CONV_SLOT_ROWS = CONV_NTOK * TOK_BYTES // (2 * LANES)  # 32
 NUM_MGR = 5  # null block + 4 slots
-POOL_SHAPE = (NUM_MGR * SPLIT, KBS) + PAYLOAD + (LANES,)
 
-# Granule coordinates of the same two regions. The kernel is told neither of
-# them -- it rederives the conv region's start from the pool's own geometry --
-# so these exist for the tests to place and read bytes with. Both regions are
-# plain byte ranges, so their extents follow from the state dtypes alone.
+# Granule extent of the conv region. The kernel is not told it -- it rederives
+# the conv region's start from the pool's own geometry -- so this exists for
+# the tests to place and read bytes with. The region is a plain byte range, so
+# its extent follows from the state dtype alone.
 CONV_GRANULES = (KERNEL_SIZE - 1) * DIM * 4 // GRANULE  # 36
 # Pool tokens the conv region covers, from the start of its kernel block.
 CONV_END_TOK = CONV_GRANULES * GRANULE // TOK_BYTES  # 18
 
 
-def _plan(pool=None, **overrides):
-    if pool is None:
-        pool = jax.ShapeDtypeStruct(POOL_SHAPE, jnp.bfloat16)
-    kwargs = dict(
-        split=SPLIT,
-        ssm_ntok=SSM_NTOK,
-        conv_tok0=CONV_TOK0,
-        conv_ntok=CONV_NTOK,
-        conv_dim=DIM,
-        n_v=N_V,
-        d_k=D_K,
-        d_v=D_V,
-        kernel_size=KERNEL_SIZE,
-    )
-    kwargs.update(overrides)
-    return pool_adapters.v3_state_source(pool, **kwargs)
-
-
-class TestV3StateSourcePlan:
-    """Plan-construction math only; runs on CPU."""
-
-    def test_ssm_region_one_contiguous_whole_block_window(self):
-        r = _plan().recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 2, 0, KBS)
-        assert r.view_dtype == jnp.dtype(jnp.float32)
-        assert r.lane_split == LANES // D_V
-        assert r.rows_used == N_V * D_K
-
-    def test_conv_region_rows_of_last_kernel_block(self):
-        plan = _plan()
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (2, 1, 0, CONV_NTOK)
-        assert c.view_dtype == jnp.dtype(jnp.bfloat16)
-        assert c.lane_split == 1
-        assert c.rows_used == CONV_ROWS
-        assert plan.stride == SPLIT
-        assert plan.whole_block_dma is False
-
-    def test_plan_is_static_hashable_and_stable(self):
-        assert _plan() == _plan()
-        assert hash(_plan()) == hash(_plan())
-
-    def test_subblock_regions_when_pool_is_manager_grained(self):
-        pool = jax.ShapeDtypeStruct(
-            (NUM_MGR, SPLIT * KBS) + PAYLOAD + (LANES,), jnp.bfloat16
-        )
-        plan = _plan(pool, split=1)
-        r = plan.recurrent
-        assert (r.kb0, r.nblocks, r.row0, r.nrows) == (0, 1, 0, SSM_NTOK)
-        c = plan.conv
-        assert (c.kb0, c.nblocks, c.row0, c.nrows) == (0, 1, CONV_TOK0, CONV_NTOK)
-        assert plan.stride == 1
-
-    def test_one_byte_pool_keeps_regions_and_view_dtypes(self):
-        pool = jax.ShapeDtypeStruct((NUM_MGR * SPLIT, KBS, 1, 4, LANES), jnp.int8)
-        plan = _plan(pool)
-        assert plan.recurrent.nblocks == 2
-        assert plan.recurrent.view_dtype == jnp.dtype(jnp.float32)
-        assert plan.conv.view_dtype == jnp.dtype(jnp.bfloat16)
-
-    def test_conv_region_straddling_kernel_blocks_rejected(self):
-        with pytest.raises(NotImplementedError):
-            _plan(conv_tok0=KBS - 8)
-
-
 def test_v3_kernel_package_stays_pool_agnostic():
-    """The dense path must be byte-for-byte untouched by the seam: the V3
-    kernel package sees only the generic state-source plan, never the
-    pool (pool knowledge lives in pool_adapters / the pooled caller)."""
+    """The V3 kernel package addresses state by granule offset only and
+    never imports the pool adapters (pool knowledge lives in the pooled
+    caller)."""
     import vllm_torchtpu.kernels.gdn.v3 as v3_pkg
 
     for path in pathlib.Path(list(v3_pkg.__path__)[0]).glob("*.py"):

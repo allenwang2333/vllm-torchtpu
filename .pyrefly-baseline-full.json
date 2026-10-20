@@ -596,41 +596,6 @@
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[ExternalStateBufferedRef, ExternalStateBufferedRef]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/legacy_unified.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-override",
       "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
@@ -643,7 +608,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-return",
-      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef | ExternalStateBufferedRef, BufferedRef | ExternalStateBufferedRef, BufferedRef, BufferedRef | None, BufferedRef | None]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, BufferedRef, BufferedRef, OutBufferedRef, StateOutBufferedRef | None, StateOutBufferedRef | None]`"
+      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateInBufferedRef, StateInBufferedRef, OutBufferedRef, StateOutBufferedRef, StateOutBufferedRef]`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",

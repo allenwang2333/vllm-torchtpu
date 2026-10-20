@@ -25,7 +25,6 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     compute_gdn,
     compute_kda,
     config,
-    legacy_unified,
     memory_ref,
     metadata,
     tiling,
@@ -121,13 +120,7 @@ def inner_kernel(
         cfg=cfg,
     )
 
-    if cfg.state_plan is None:
-        conv_state_out_slot_ref[...] = new_conv_state
-    else:
-        # TODO: Delete this after completing unified pool redesign.
-        legacy_unified.store_external_state(
-            conv_state_out_slot_ref, cfg.state_plan.conv, new_conv_state, cfg
-        )
+    conv_state_out_slot_ref[...] = new_conv_state
     if carry_conv_scratch_ref is not None:
         # The next tile resumes from the state after this tile's last token,
         # which is the final checkpoint.
@@ -206,16 +199,10 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    if cfg.state_plan is None:
-        # Round to the state dtype, then pack into the uint32 window.
-        recurrent_out_slot_ref[...] = pltpu.bitcast(
-            new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
-        )
-    else:
-        # TODO: Delete this after unified pool migration completes.
-        legacy_unified.store_external_state(
-            recurrent_out_slot_ref, cfg.state_plan.recurrent, new_recurrent_state, cfg
-        )
+    # Round to the state dtype, then pack into the uint32 window.
+    recurrent_out_slot_ref[...] = pltpu.bitcast(
+        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    )
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -274,26 +261,9 @@ def outer_kernel(
     )
     num_tiles = metadata_ref.num_tiles[...]
     body = functools.partial(inner_kernel, cfg=cfg)
-
-    if conv_out_alloc is None:
-        # TODO: Delete this after unified pool migration completes. The
-        # legacy external-state path keeps one input/output window per state,
-        # so the kernel stores into the tiles it loaded.
-        assert recurrent_out_alloc is None
-        state_allocs = (conv_in_alloc, recurrent_in_alloc)
-        out_allocs = (out_alloc,)
-        state_out_args = ()
-
-        def body(qkv, b, a, conv, recurrent, out, *scratches):
-            inner_kernel(
-                qkv, b, a, conv, recurrent, out, conv, recurrent, *scratches, cfg=cfg
-            )
-
-    else:
-        assert recurrent_out_alloc is not None
-        state_allocs = (conv_in_alloc, recurrent_in_alloc)
-        out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
-        state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
+    state_allocs = (conv_in_alloc, recurrent_in_alloc)
+    out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
+    state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
 
     pipeline_func = pltpu.emit_pipeline(
         body=body,

@@ -658,8 +658,8 @@ def test_unified_pool_views_are_kernel_tied_not_spec_tied():
     )
 
 
-def test_unified_pool_conv_region_matches_kernel_state_plan():
-    """Pin the manifest's state model to the pooled kernel's state plan.
+def test_unified_pool_conv_region_matches_kernel_slot_sizing():
+    """Pin the manifest's state model to the pooled kernel's slot sizing.
 
     Uses the live Qwen3.5 full-width geometry and the same
     ``gdn_pool_layout`` helpers the pooled kernel's slot sizing consumes, so a
