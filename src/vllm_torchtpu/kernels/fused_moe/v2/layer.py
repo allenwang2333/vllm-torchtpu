@@ -219,13 +219,18 @@ def _unpack_routing_exchange(exchange, layout, t_local, topk, e_total):
     return pairs, scale_bits, counts
 
 
+# The meta words cross the e4m3 collective a nibble per byte, each byte
+# 0x10 | nibble: a normal, finite e4m3 value, so no float data path -- NaN
+# canonicalization or subnormal flushing -- can change it, and the meta rows
+# are sliced out of the gathered rows as floats without a copy of the buffer.
+_META_NIBBLES = 8
+_META_BYTE_BASE = 0x10
+
+
 def _gather_rows_with_meta(rows, meta, ax):
     """All-gather e4m3 token rows [t, lane blocks, 128] and an i32 vector.
 
-    The vector rides as trailing rows, so one collective carries both. It is
-    packed as bytes, since a float concatenate or pad may rewrite a NaN bit
-    pattern and an integer one does not, while the collective moves the rows'
-    own dtype: the SparseCore all-gather offload is only exercised with that.
+    The vector rides as trailing rows, so one collective carries both.
     Returns the gathered rows -- each source's `t + meta rows` rows in turn,
     its tokens first -- and the gathered vectors [ep, len(meta)].
     """
@@ -233,40 +238,35 @@ def _gather_rows_with_meta(rows, meta, ax):
         raise ValueError(f"the vector rides e4m3 rows; got {rows.dtype}")
     t, lane_blocks, lanes = rows.shape
     row_bytes = lane_blocks * lanes
-    meta_rows = -(-meta.size * 4 // row_bytes)
-    meta_bytes = lax.bitcast_convert_type(meta, jnp.uint8).reshape(-1)
+    nbytes = meta.size * _META_NIBBLES
+    meta_rows = -(-nbytes // row_bytes)
+    words = lax.bitcast_convert_type(meta, jnp.uint32)
+    shifts = 4 * jnp.arange(_META_NIBBLES, dtype=jnp.uint32)
+    nibbles = (words[:, None] >> shifts[None, :]) & jnp.uint32(15)
+    meta_bytes = (nibbles | jnp.uint32(_META_BYTE_BASE)).astype(jnp.uint8).reshape(-1)
     meta_bytes = jnp.pad(
-        meta_bytes, (0, meta_rows * row_bytes - meta_bytes.size)
+        meta_bytes, (0, meta_rows * row_bytes - nbytes), constant_values=_META_BYTE_BASE
     ).reshape(meta_rows, lane_blocks, lanes)
     payload = jnp.concatenate(
-        [lax.bitcast_convert_type(rows, jnp.uint8), meta_bytes], axis=0
+        [rows, lax.bitcast_convert_type(meta_bytes, rows.dtype)], axis=0
     )
-    gathered = lax.all_gather(
-        lax.bitcast_convert_type(payload, rows.dtype), ax, axis=0, tiled=True
-    )
+    gathered = lax.all_gather(payload, ax, axis=0, tiled=True)
     ep = gathered.shape[0] // (t + meta_rows)
-    nbytes = meta.size * 4
-    # Bytes first, then only the meta rows' leading lane blocks: a float slice
-    # may rewrite a NaN byte, and slicing the whole buffer would copy it.
-    gathered_bytes = lax.bitcast_convert_type(gathered, jnp.uint8)
     if meta_rows == 1:
-        blocks = -(-nbytes // lanes)
         meta_g = lax.slice(
-            gathered_bytes,
+            gathered,
             (t, 0, 0),
-            (gathered.shape[0], blocks, lanes),
+            (gathered.shape[0], -(-nbytes // lanes), lanes),
             (t + 1, 1, 1),
         )
     else:
         meta_g = lax.slice_in_dim(
-            gathered_bytes.reshape(ep, t + meta_rows, row_bytes),
-            t,
-            t + meta_rows,
-            axis=1,
+            gathered.reshape(ep, t + meta_rows, row_bytes), t, t + meta_rows, axis=1
         )
-    meta_g = meta_g.reshape(ep, -1)[:, :nbytes]
-    meta_g = lax.bitcast_convert_type(meta_g.reshape(ep, meta.size, 4), jnp.int32)
-    return gathered, meta_g
+    meta_g = lax.bitcast_convert_type(meta_g, jnp.uint8).reshape(ep, -1)[:, :nbytes]
+    nibbles_g = meta_g.reshape(ep, meta.size, _META_NIBBLES).astype(jnp.uint32) & 15
+    words_g = jnp.sum(nibbles_g << shifts[None, None, :], axis=-1, dtype=jnp.uint32)
+    return gathered, lax.bitcast_convert_type(words_g, jnp.int32)
 
 
 def _to_slots(topk_idx, expert_slot, row_base):
