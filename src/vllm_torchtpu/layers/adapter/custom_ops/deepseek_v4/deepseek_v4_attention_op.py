@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_masked_dense
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -40,6 +41,11 @@ from vllm_torchtpu.utils import align_to
 logger = init_logger(__name__)
 
 BATCH_AXIS = None
+
+# Masked-dense CSA tiling, measured on tpu7x at T2048 with 16 heads per core.
+MASKED_DENSE_KV_PAGES_PER_BLOCK = 4
+MASKED_DENSE_QUERIES_PER_BLOCK = 64
+MASKED_DENSE_PV_BF16 = False
 
 
 def _run_swa(
@@ -204,11 +210,17 @@ def _attention_csa(
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
     csa_gather_no_pad: bool = False,
+    masked_dense_max_kv: int = 0,
+    masked_dense_min_tokens: int = 512,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
     `verify_q_len` as in `_attention_hca`; the sparse gather is per token and
     reads only distribution[2].
+
+    `masked_dense_max_kv` > 0 (buckets of at least `masked_dense_min_tokens`):
+    the trailing sequences whose compressed KV length is at most that take
+    `csa_masked_dense`, the rest the sparse gather.
     """
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
@@ -241,6 +253,18 @@ def _attention_csa(
     # it, instead of stalling the TensorCore before them.
     extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
 
+    masked_dense = masked_dense_max_kv > 0 and q.shape[0] >= masked_dense_min_tokens
+    num_sparse_tokens = None
+    if masked_dense:
+        # Sequences [split_seq, num_seqs) go dense: everything after the last
+        # one whose compressed KV is too long for the dense kernel.
+        seq_ids = jnp.arange(main_kv_lens.shape[0], dtype=jnp.int32)
+        too_long = (seq_ids < main_distribution[2]) & (
+            main_kv_lens > masked_dense_max_kv
+        )
+        split_seq = jnp.max(jnp.where(too_long, seq_ids + 1, 0)).astype(jnp.int32)
+        num_sparse_tokens = main_cu_q_lens[split_seq]
+
     output = sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,
@@ -260,7 +284,35 @@ def _attention_csa(
         gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 64,
         attention_kernel_batch_size=8,
         gather_no_pad=csa_gather_no_pad,
+        num_valid_tokens=num_sparse_tokens,
     )
+    if masked_dense:
+        page_size = main_cache_kv.shape[1]
+        bkv_sz = MASKED_DENSE_KV_PAGES_PER_BLOCK * page_size
+        mask = csa_masked_dense.build_mask(
+            extra, max_kv_len=masked_dense_max_kv, page_size=page_size, bkv_sz=bkv_sz
+        )
+        # Rows of the sparse sequences pass through: the output aliases `q`.
+        output = csa_masked_dense.masked_dense_attention(
+            output,
+            main_cache_kv,
+            main_cache_rope,
+            mask,
+            main_kv_lens,
+            main_page_indices,
+            main_cu_q_lens,
+            split_seq,
+            main_distribution[2],
+            attention_sinks,
+            swa_output,
+            swa_l,
+            swa_m,
+            sm_scale=sm_scale,
+            max_kv_len=masked_dense_max_kv,
+            num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
+            pv_bf16=MASKED_DENSE_PV_BF16,
+        )
     return output, updated_sw_cache
 
 

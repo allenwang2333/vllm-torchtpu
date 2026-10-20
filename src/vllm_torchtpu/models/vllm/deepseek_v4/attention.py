@@ -385,7 +385,15 @@ class VllmDeepseekV4MLAAttention(
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
             **(
-                {"csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD} if is_csa else {}
+                {
+                    "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
+                    "masked_dense_max_kv": envs.TPU_DSV4_CSA_MASKED_DENSE_MAX_KV,
+                    "masked_dense_min_tokens": (
+                        envs.TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS
+                    ),
+                }
+                if is_csa
+                else {}
             ),
         )
 

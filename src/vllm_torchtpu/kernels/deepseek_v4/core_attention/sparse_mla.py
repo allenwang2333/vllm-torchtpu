@@ -675,6 +675,7 @@ def sparse_ragged_paged_attention(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     # See `csa_gather.csa_gather`'s `no_pad`.
     gather_no_pad: bool = False,
+    num_valid_tokens: jax.Array | None = None,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -693,6 +694,8 @@ def sparse_ragged_paged_attention(
         k is also the total number of sequences.
       sm_scale: the softmax scale which will be applied to the Q@K^T.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      num_valid_tokens: attend only query rows `[0, num_valid_tokens)`; later
+        rows return `q` unchanged. Defaults to every scheduled token.
 
     Returns:
       The output of attention.
@@ -846,6 +849,8 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
+    if num_valid_tokens is None:
+        num_valid_tokens = cu_q_lens[distribution[2]]
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
     seq_ids_segment = jnp.repeat(
         jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=q.shape[0]
@@ -898,7 +903,7 @@ def sparse_ragged_paged_attention(
                 jnp.maximum(
                     0,
                     jnp.minimum(
-                        cu_q_lens[distribution[2]],
+                        num_valid_tokens,
                         end_pos,
                     )
                     - start_pos,
@@ -940,7 +945,7 @@ def sparse_ragged_paged_attention(
             swa_m,
             start_seq_idx=start_pos,
             end_seq_idx=batch_end,
-            num_valid_tokens=cu_q_lens[distribution[2]],
+            num_valid_tokens=num_valid_tokens,
             kernel_batch_size=kernel_batch_size,
         )
     return prepare_outputs(

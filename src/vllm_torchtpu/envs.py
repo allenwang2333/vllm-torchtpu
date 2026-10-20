@@ -135,6 +135,8 @@ if TYPE_CHECKING:
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
     TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
+    TPU_DSV4_CSA_MASKED_DENSE_MAX_KV: int = 0
+    TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS: int = 512
     TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -970,6 +972,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
     "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
+    # CSA prefill: attend sequences whose compressed KV length is at most this
+    # many positions with the masked-dense kernel (`csa_masked_dense`) instead
+    # of the per-token sparse gather. 0 disables; else a multiple of 4096.
+    "TPU_DSV4_CSA_MASKED_DENSE_MAX_KV": env_int("TPU_DSV4_CSA_MASKED_DENSE_MAX_KV", 0),
+    # Smallest token bucket compiled with the masked-dense route.
+    "TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS": env_int(
+        "TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS", 512
+    ),
     # DSpark greedy drafting: shard the Markov head over the vocabulary and
     # exchange per-rank (max, argmax) pairs instead of reading the replicated
     # full-vocabulary weight at every draft position.
