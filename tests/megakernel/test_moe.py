@@ -22,7 +22,7 @@ import pathlib
 import jax
 import jax.numpy as jnp
 import pytest
-from conftest import FakeGeometry, FakeMixerBlock, MiniCtx
+from conftest import TINY_TILES, FakeGeometry, FakeMixerBlock, MiniCtx
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -32,7 +32,6 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
 

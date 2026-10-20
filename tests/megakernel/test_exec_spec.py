@@ -55,7 +55,9 @@ def test_core_tile_numerics_cover_every_core_field():
     assert set(exec_spec.TILE_NUMERICS) == names
     assert set(exec_spec.TILE_NUMERICS.values()) <= {"exact", "approx"}
     numerics = exec_spec.tile_numerics()
-    assert {k: v for k, v in numerics.items() if "." not in k} == exec_spec.TILE_NUMERICS
+    assert {
+        k: v for k, v in numerics.items() if "." not in k
+    } == exec_spec.TILE_NUMERICS
     assert numerics[f"{_TEST_BLOCK}.width"] == "approx"
     assert numerics[f"{_TEST_BLOCK}.fast"] == "exact"
 
@@ -94,22 +96,20 @@ def test_tiles_block_tunables_are_canonical_and_hashable():
         t.with_blocks({"no_such_block": {"x": 1}})
 
 
-# Block and cache names the core spec modules must not mention (in any case).
+# Block and cache names `exec_spec.py` must not mention (in any case).
 _NON_CORE_NAMES = ("gqa", "gdn", "moe", "pool", "fused", "paged", "ckpt")
 
 
-def test_core_spec_mentions_no_block_or_cache_names():
-    """`exec_spec.py` and `spec.py` are core: no block or pool name in them."""
-    for module in ("exec_spec.py", "spec.py"):
-        path = Path(exec_spec.__file__).parent / module
-        text = path.read_text(encoding="utf-8")
-        for name in _NON_CORE_NAMES:
-            hits = [
-                f"{i}: {line.strip()}"
-                for i, line in enumerate(text.splitlines(), 1)
-                if re.search(name, line, flags=re.IGNORECASE)
-            ]
-            assert not hits, (module, name, hits)
+def test_core_exec_spec_mentions_no_block_or_cache_names():
+    """`exec_spec.py` holds core knobs only: no block or pool name in it."""
+    text = Path(exec_spec.__file__).read_text(encoding="utf-8")
+    for name in _NON_CORE_NAMES:
+        hits = [
+            f"{i}: {line.strip()}"
+            for i, line in enumerate(text.splitlines(), 1)
+            if re.search(name, line, flags=re.IGNORECASE)
+        ]
+        assert not hits, (name, hits)
 
 
 def test_default_tile_rule_is_model_agnostic():

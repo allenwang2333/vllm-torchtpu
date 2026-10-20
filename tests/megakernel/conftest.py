@@ -40,8 +40,7 @@ os.environ["XLA_FLAGS"] = _xla_flags
 import pytest  # noqa: E402
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec  # noqa: E402
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles  # noqa: E402
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
     Block,
@@ -53,6 +52,9 @@ from vllm_torchtpu.megakernel.spec import (  # noqa: E402
     SwitchSlot,
     WeightDecl,
 )
+
+# Small banks and rings for CPU interpret unit tests of tiny geometries.
+TINY_TILES = Tiles(bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32)
 
 
 def pytest_configure(config: Any) -> None:

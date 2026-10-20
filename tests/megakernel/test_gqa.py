@@ -15,22 +15,26 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
-from conftest import FakeGeometry, MiniCtx
+from conftest import TINY_TILES, FakeGeometry, MiniCtx
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import GQABlock, MoEBlock
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32
 from vllm_torchtpu.megakernel.spec import LayerType, ModelSpec
+
+_TINY_GQA_TILES = TINY_TILES.with_blocks({"gqa": {"kv_blk": 256, "nkv": 3}})
 
 
 def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
     """Verify `GQABlock` declarations drive `planner`/`vmem` and `emit` in Pallas."""
+    fake_ex = dataclasses.replace(fake_ex, tiles=_TINY_GQA_TILES)
     g_decl = FakeGeometry(L=2, att_every=1, H=256)
     gqa_decl = GQABlock()
     moe_decl = MoEBlock()
@@ -53,7 +57,7 @@ def test_gqa_block_declarations_and_emit_in_pallas_interpret(fake_ex: ExecSpec):
     assert cp_decl.block("gqa").NAI == (2 * (g_decl.NH // fake_ex.R) + 2) * g_decl.HD
 
     ex = ExecSpec(
-        B=4, T=1, R=1, ctx=256, stack_e=True, tiles=TINY_TILES, interpret=True
+        B=4, T=1, R=1, ctx=256, stack_e=True, tiles=_TINY_GQA_TILES, interpret=True
     )
     g = FakeGeometry(
         L=1,
