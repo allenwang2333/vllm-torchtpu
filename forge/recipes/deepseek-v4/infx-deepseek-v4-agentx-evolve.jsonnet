@@ -107,6 +107,10 @@ local useVllmRouter =
   else error 'ROUTER must be vllm-router or none, got "%s"' % router;
 local vllmRouterVersion = cdk.var('VLLM_ROUTER_VERSION', '0.1.14');
 local vllmRouterPort = cdk.numVar('VLLM_ROUTER_PORT', 8090);
+// vllm-router's DP policy (consistent_hash, as B200 runs it; or cache_aware, power_of_two, round_robin, random).
+// ROUTER_EXTRA_ARGS is appended verbatim, e.g. "--cache-threshold 0.5".
+local vllmRouterPolicy = cdk.var('ROUTER_POLICY', 'consistent_hash');
+local vllmRouterExtraArgs = cdk.var('ROUTER_EXTRA_ARGS', '');
 local enablePrefixRouting = cdk.boolVar('ENABLE_PREFIX_ROUTING', !useVllmRouter);
 
 // --- Serving -----------------------------------------------------------------
@@ -1046,18 +1050,18 @@ local vllmRouterStart = agentx.fill(
   |||
     ROUTER_URL="http://127.0.0.1:@PORT@"
     ROUTER_LOG="${CDK_OUTPUT_DIR:-/tmp}/vllm-router.log"
-    echo "Starting vllm-router (consistent_hash over @DP@ DP ranks of ${VLLM_URL}) at ${ROUTER_URL}, log ${ROUTER_LOG}"
+    echo "Starting vllm-router (@POLICY@ over @DP@ DP ranks of ${VLLM_URL}) at ${ROUTER_URL}, log ${ROUTER_LOG}"
     /opt/vllm-router-venv/bin/vllm-router \
       --worker-urls "${VLLM_URL}" \
       --intra-node-data-parallel-size @DP@ \
-      --policy consistent_hash \
+      --policy @POLICY@ @EXTRA@ \
       --host 127.0.0.1 --port @PORT@ \
       --prometheus-host 127.0.0.1 --prometheus-port 18000 \
       --request-timeout-secs 14400 \
       --disable-retries \
       > "${ROUTER_LOG}" 2>&1 &
   |||,
-  { PORT: vllmRouterPort, DP: dataParallelSize }
+  { PORT: vllmRouterPort, DP: dataParallelSize, POLICY: vllmRouterPolicy, EXTRA: vllmRouterExtraArgs }
 ) + cdk.waitForHttp('${ROUTER_URL}/health', 600);
 // aiperf scrapes <server url>/metrics by default, which is the router's now; name vLLM's too.
 local vllmRouterRewrite = |||
