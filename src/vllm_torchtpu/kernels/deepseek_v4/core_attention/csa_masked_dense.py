@@ -46,6 +46,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
     _dequant_dsv4_fp8,
     prepare_outputs,
@@ -97,38 +98,57 @@ def mask_codes(
     return jnp.where(valid, word * WORD_BITS + bit, -1)
 
 
-def _mask_sc_kernel(codes_hbm_ref, mask_hbm_ref, *, topk: int, num_words: int):
-    """One token row per step: zero its words, then OR in one bit per code."""
+def _mask_sc_kernel(
+    codes_hbm_ref, mask_hbm_ref, *, topk: int, max_kv_len: int, num_lanes: int
+):
+    """One token row per step: scatter ones into an unpacked row, then pack.
+
+    `codes_hbm_ref` holds each selected position's index in the unpacked row,
+    `4096 s + 128 b + l` for bit `b` of word `128 s + l`; selected positions
+    are distinct, so the scatter has no conflicts.
+    """
     core = lax.axis_index(("core", "subcore"))
     num_cores = lax.psum(1, ("core", "subcore"))
     rows_per_core = codes_hbm_ref.shape[0] // num_cores
+    L = num_lanes
 
-    def body(codes_ref, out_ref):
-        out_ref[pl.ds(0, 1), pl.ds(0, num_words)] = jnp.zeros((1, num_words), jnp.int32)
+    def scoped(row_ref):
+        def body(codes_ref, out_ref):
+            @plsc.parallel_loop(0, max_kv_len, step=L)
+            def _zero(i):
+                row_ref[pl.ds(i, L)] = jnp.zeros((L,), jnp.int32)
 
-        def k_loop(k, _):
-            vec = codes_ref[0, pl.ds(k * 8, 8)]
-            for lane in range(8):
-                code = vec[lane]
+            @plsc.parallel_loop(0, topk, step=L)
+            def _scatter(k):
+                c = codes_ref[0, pl.ds(k, L)]
+                valid = c >= 0
+                plsc.addupdate_scatter(
+                    row_ref,
+                    (jnp.where(valid, c, 0),),
+                    jnp.ones((L,), jnp.int32),
+                    mask=valid,
+                )
 
-                def set_bit(code=code):
-                    word = lax.shift_right_logical(code, 5)
-                    bit = jnp.bitwise_and(code, WORD_BITS - 1)
-                    cur = out_ref[0, pl.ds(word, 1)]
-                    out_ref[0, pl.ds(word, 1)] = jnp.bitwise_or(
-                        cur, jnp.left_shift(jnp.ones((1,), jnp.int32), bit)
-                    )
+            for sb in range(max_kv_len // SUPER_BLOCK):
 
-                lax.cond(code >= 0, set_bit, lambda: None)
+                @plsc.parallel_loop(0, LANES, step=L)
+                def _pack(l, sb=sb):
+                    acc = jnp.zeros((L,), jnp.int32)
+                    for b in range(WORD_BITS):
+                        bit = row_ref[pl.ds(sb * SUPER_BLOCK + b * LANES + l, L)]
+                        acc = jnp.bitwise_or(acc, jnp.left_shift(bit, b))
+                    out_ref[0, pl.ds(sb * LANES + l, L)] = acc
 
-        lax.fori_loop(0, topk // 8, k_loop, None, unroll=8)
+        pltpu.emit_pipeline(
+            body,
+            grid=(rows_per_core,),
+            in_specs=pl.BlockSpec((1, topk), lambda r: (r * num_cores + core, 0)),
+            out_specs=pl.BlockSpec(
+                (1, max_kv_len // WORD_BITS), lambda r: (r * num_cores + core, 0)
+            ),
+        )(codes_hbm_ref, mask_hbm_ref)
 
-    pltpu.emit_pipeline(
-        body,
-        grid=(rows_per_core,),
-        in_specs=pl.BlockSpec((1, topk), lambda r: (r * num_cores + core, 0)),
-        out_specs=pl.BlockSpec((1, num_words), lambda r: (r * num_cores + core, 0)),
-    )(codes_hbm_ref, mask_hbm_ref)
+    pl.run_scoped(scoped, pltpu.VMEM((max_kv_len,), jnp.int32))
 
 
 def build_mask(
@@ -146,13 +166,18 @@ def build_mask(
     codes = mask_codes(
         topk_indices, max_kv_len=max_kv_len, page_size=page_size, bkv_sz=bkv_sz
     )
-    num_tokens, topk = codes.shape
-    assert topk % 8 == 0
+    word, bit = codes // WORD_BITS, codes % WORD_BITS
+    unpacked = jnp.where(
+        codes >= 0,
+        (word // LANES) * SUPER_BLOCK + bit * LANES + word % LANES,
+        -1,
+    )
+    num_tokens, topk = unpacked.shape
     sc = pltpu.get_tpu_info().sparse_core
+    assert topk % sc.num_lanes == 0
     num_cores = sc.num_cores * sc.num_subcores
     pad = -num_tokens % num_cores
-    codes = jnp.pad(codes, ((0, pad), (0, 0)), constant_values=-1)
-    num_words = max_kv_len // WORD_BITS
+    unpacked = jnp.pad(unpacked, ((0, pad), (0, 0)), constant_values=-1)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=sc.num_cores,
         num_subcores=sc.num_subcores,
@@ -160,14 +185,21 @@ def build_mask(
         subcore_axis_name="subcore",
     )
     out = pl.kernel(
-        functools.partial(_mask_sc_kernel, topk=topk, num_words=num_words),
-        out_type=jax.ShapeDtypeStruct((num_tokens + pad, num_words), jnp.int32),
+        functools.partial(
+            _mask_sc_kernel,
+            topk=topk,
+            max_kv_len=max_kv_len,
+            num_lanes=sc.num_lanes,
+        ),
+        out_type=jax.ShapeDtypeStruct(
+            (num_tokens + pad, max_kv_len // WORD_BITS), jnp.int32
+        ),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True, disable_bounds_checks=True
         ),
         mesh=mesh,
         name="csa_masked_dense_mask",
-    )(codes)
+    )(unpacked)
     return out[:num_tokens]
 
 
@@ -634,3 +666,98 @@ def masked_dense_attention(
         per_row(swa_m),
     )
     return prepare_outputs(out, actual_num_q_heads, actual_head_dim)
+
+
+# A sparse prefix of at most this many rows (verify windows) runs on a static
+# slice of the step, so the sparse path's per-chunk launches over the dense
+# rows are skipped.
+SPARSE_PREFIX_ROWS = 64
+
+
+def split_attention(
+    q: jax.Array,  # [max_num_tokens, actual_num_q_heads, head_dim]
+    cache_kv_nope: jax.Array,
+    cache_kv_rope: jax.Array,
+    topk_indices: jax.Array,  # i32[max_num_tokens, topk]
+    kv_lens: jax.Array,  # i32[max_num_seqs] compressed KV length per sequence
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    attention_sinks: jax.Array,
+    swa_accumution: jax.Array,
+    swa_l: jax.Array,
+    swa_m: jax.Array,
+    *,
+    sm_scale: float,
+    max_kv_len: int,
+    num_kv_pages_per_block: int,
+    num_queries_per_block: int,
+    gather_no_pad: bool = False,
+) -> jax.Array:
+    """CSA attention: sparse gather for the leading sequences, masked dense
+    for the trailing ones whose compressed KV fits `max_kv_len`."""
+    seq_ids = jnp.arange(kv_lens.shape[0], dtype=jnp.int32)
+    too_long = (seq_ids < distribution[2]) & (kv_lens > max_kv_len)
+    split_seq = jnp.max(jnp.where(too_long, seq_ids + 1, 0)).astype(jnp.int32)
+    num_sparse_tokens = cu_q_lens[split_seq]
+
+    def sparse(rows):
+        def run(q):
+            out = sparse_mla.sparse_ragged_paged_attention(
+                q=q[:rows],
+                cache_kv_nope=cache_kv_nope,
+                cache_kv_rope=cache_kv_rope,
+                topk_indices=topk_indices[:rows],
+                page_indices=page_indices,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                attention_sinks=attention_sinks,
+                swa_accumution=swa_accumution[:rows],
+                swa_l=swa_l[:rows],
+                swa_m=swa_m[:rows],
+                sm_scale=sm_scale,
+                gather_and_attention_chunk_size=32 if rows <= 128 else 64,
+                attention_kernel_batch_size=8,
+                gather_no_pad=gather_no_pad,
+                num_valid_tokens=num_sparse_tokens,
+            )
+            return out if rows == q.shape[0] else q.at[:rows].set(out)
+
+        return run
+
+    num_tokens = q.shape[0]
+    if num_tokens <= SPARSE_PREFIX_ROWS:
+        q = sparse(num_tokens)(q)
+    else:
+        q = lax.cond(
+            num_sparse_tokens <= SPARSE_PREFIX_ROWS,
+            sparse(SPARSE_PREFIX_ROWS),
+            sparse(num_tokens),
+            q,
+        )
+    page_size = cache_kv_nope.shape[1]
+    mask = build_mask(
+        topk_indices,
+        max_kv_len=max_kv_len,
+        page_size=page_size,
+        bkv_sz=num_kv_pages_per_block * page_size,
+    )
+    return masked_dense_attention(
+        q,
+        cache_kv_nope,
+        cache_kv_rope,
+        mask,
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        split_seq,
+        distribution[2],
+        attention_sinks,
+        swa_accumution,
+        swa_l,
+        swa_m,
+        sm_scale=sm_scale,
+        max_kv_len=max_kv_len,
+        num_kv_pages_per_block=num_kv_pages_per_block,
+        num_queries_per_block=num_queries_per_block,
+    )

@@ -92,8 +92,12 @@ def gather_page_ids(
     max_num_seqs: int,
     *,
     block_tokens: int = 8,
+    num_valid_tokens: jax.Array | None = None,
 ) -> jax.Array:
-    """Gathers physical page ids for the CSA top-k tokens."""
+    """Gathers physical page ids for the CSA top-k tokens.
+
+    With `num_valid_tokens`, rows at or past it are left unwritten.
+    """
     num_tokens, topk = seq_page_ids.shape
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     num_chunks = cdiv(pages_per_seq, _GATHER_PAGE_CHUNK)
@@ -121,7 +125,11 @@ def gather_page_ids(
                 pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
             ],
             out_specs=pl.BlockSpec((block_tokens, topk), lambda t: (t, 0)),
-            grid=(padded_tokens // block_tokens,),
+            grid=(
+                padded_tokens // block_tokens
+                if num_valid_tokens is None
+                else cdiv(num_valid_tokens, block_tokens),
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct((padded_tokens, topk), jnp.int32),
         compiler_params=pltpu.CompilerParams(
@@ -849,6 +857,8 @@ def sparse_ragged_paged_attention(
             swa_m,
         )
 
+    # Rows past an explicit bound are never gathered, so skip their page ids.
+    page_ids_bound = num_valid_tokens
     if num_valid_tokens is None:
         num_valid_tokens = cu_q_lens[distribution[2]]
     tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -862,7 +872,11 @@ def sparse_ragged_paged_attention(
     token_offset = topk_indices % page_size
     topk = topk_indices.shape[-1]
     page_ids = gather_page_ids(
-        page_indices, seq_page_ids, seq_ids_segment, max_num_seqs
+        page_indices,
+        seq_page_ids,
+        seq_ids_segment,
+        max_num_seqs,
+        num_valid_tokens=page_ids_bound,
     )
 
     # For the "-1" padding elements in topk_indices, we scatter the corresponding

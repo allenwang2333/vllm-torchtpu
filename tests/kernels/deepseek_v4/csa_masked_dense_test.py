@@ -79,18 +79,12 @@ def _sparse(c, num_valid_tokens=None):
     )  # fmt: skip
 
 
-def _dense(c, q, start_seq, max_kv_len, pages_per_block):
-    mask = csa_masked_dense.build_mask(
-        c["topk"],
-        max_kv_len=max_kv_len,
-        page_size=PAGE_SIZE,
-        bkv_sz=pages_per_block * PAGE_SIZE,
-    )
-    return csa_masked_dense.masked_dense_attention(
-        q, c["nope"], c["rope"], mask, c["kv_lens"], c["pages"], c["cu"],
-        jnp.int32(start_seq), c["dist"][2], c["sinks"], c["swa_acc"], c["swa_l"],
-        c["swa_m"], sm_scale=0.04, max_kv_len=max_kv_len,
-        num_kv_pages_per_block=pages_per_block, num_queries_per_block=64,
+def _split(c, max_kv_len, pages_per_block):
+    return csa_masked_dense.split_attention(
+        c["q"], c["nope"], c["rope"], c["topk"], c["kv_lens"], c["pages"], c["cu"],
+        c["dist"], c["sinks"], c["swa_acc"], c["swa_l"], c["swa_m"], sm_scale=0.04,
+        max_kv_len=max_kv_len, num_kv_pages_per_block=pages_per_block,
+        num_queries_per_block=64,
     )  # fmt: skip
 
 
@@ -111,20 +105,19 @@ def test_sc_mask_matches_xla(max_kv_len):
         [(130, 0)],  # every visible position selected
         [(4, 2000), (4, 40000), (300, 6000)],  # deep verify seq stays sparse
         [(4, 40000), (200, 17000)],  # partial last KV block, top-k < visible
+        [(100, 40000), (300, 6000)],  # sparse prefix too long for the slice
     ],
 )
 def test_split_matches_sparse(seqs, pages_per_block):
     c = _case(np.random.default_rng(0), seqs)
     max_kv_len = 8192
     ref = _sparse(c)
-    split_seq = int(np.max(np.where(np.asarray(c["kv_lens"]) > max_kv_len,
-                                    np.arange(len(seqs)) + 1, 0)))  # fmt: skip
+    out = _split(c, max_kv_len, pages_per_block)
+    long = np.asarray(c["kv_lens"]) > max_kv_len
+    split_seq = int(np.max(np.where(long, np.arange(len(seqs)) + 1, 0)))
     n_sparse = int(c["cu"][split_seq])
-    out = _dense(
-        c, _sparse(c, jnp.int32(n_sparse)), split_seq, max_kv_len, pages_per_block
-    )
-    # Sparse rows are untouched by the dense pass; dense rows differ from the
-    # sparse kernel only in summation order.
+    # Sparse rows come from the same sparse kernel; dense rows differ from it
+    # only in summation order.
     np.testing.assert_array_equal(out[:n_sparse], ref[:n_sparse])
     np.testing.assert_allclose(
         np.asarray(out, np.float32), np.asarray(ref, np.float32), atol=8e-3, rtol=0

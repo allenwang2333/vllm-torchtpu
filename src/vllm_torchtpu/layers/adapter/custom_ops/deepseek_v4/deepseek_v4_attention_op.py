@@ -45,7 +45,6 @@ BATCH_AXIS = None
 # Masked-dense CSA tiling, measured on tpu7x at T2048 with 16 heads per core.
 MASKED_DENSE_KV_PAGES_PER_BLOCK = 4
 MASKED_DENSE_QUERIES_PER_BLOCK = 64
-MASKED_DENSE_PV_BF16 = False
 
 
 def _run_swa(
@@ -253,17 +252,27 @@ def _attention_csa(
     # it, instead of stalling the TensorCore before them.
     extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
 
-    masked_dense = masked_dense_max_kv > 0 and q.shape[0] >= masked_dense_min_tokens
-    num_sparse_tokens = None
-    if masked_dense:
-        # Sequences [split_seq, num_seqs) go dense: everything after the last
-        # one whose compressed KV is too long for the dense kernel.
-        seq_ids = jnp.arange(main_kv_lens.shape[0], dtype=jnp.int32)
-        too_long = (seq_ids < main_distribution[2]) & (
-            main_kv_lens > masked_dense_max_kv
+    if masked_dense_max_kv > 0 and q.shape[0] >= masked_dense_min_tokens:
+        output = csa_masked_dense.split_attention(
+            q,
+            main_cache_kv,
+            main_cache_rope,
+            extra,
+            main_kv_lens,
+            main_page_indices,
+            main_cu_q_lens,
+            main_distribution,
+            attention_sinks,
+            swa_output,
+            swa_l,
+            swa_m,
+            sm_scale=sm_scale,
+            max_kv_len=masked_dense_max_kv,
+            num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
+            gather_no_pad=csa_gather_no_pad,
         )
-        split_seq = jnp.max(jnp.where(too_long, seq_ids + 1, 0)).astype(jnp.int32)
-        num_sparse_tokens = main_cu_q_lens[split_seq]
+        return output, updated_sw_cache
 
     output = sparse_ragged_paged_attention(
         q=q,
@@ -284,35 +293,7 @@ def _attention_csa(
         gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 64,
         attention_kernel_batch_size=8,
         gather_no_pad=csa_gather_no_pad,
-        num_valid_tokens=num_sparse_tokens,
     )
-    if masked_dense:
-        page_size = main_cache_kv.shape[1]
-        bkv_sz = MASKED_DENSE_KV_PAGES_PER_BLOCK * page_size
-        mask = csa_masked_dense.build_mask(
-            extra, max_kv_len=masked_dense_max_kv, page_size=page_size, bkv_sz=bkv_sz
-        )
-        # Rows of the sparse sequences pass through: the output aliases `q`.
-        output = csa_masked_dense.masked_dense_attention(
-            output,
-            main_cache_kv,
-            main_cache_rope,
-            mask,
-            main_kv_lens,
-            main_page_indices,
-            main_cu_q_lens,
-            split_seq,
-            main_distribution[2],
-            attention_sinks,
-            swa_output,
-            swa_l,
-            swa_m,
-            sm_scale=sm_scale,
-            max_kv_len=masked_dense_max_kv,
-            num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
-            num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
-            pv_bf16=MASKED_DENSE_PV_BF16,
-        )
     return output, updated_sw_cache
 
 
