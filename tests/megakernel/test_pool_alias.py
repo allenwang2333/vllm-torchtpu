@@ -29,7 +29,7 @@ def test_pool_alias_storage_size():
     assert pool_alias.storage_size((1, 256), jnp.dtype(F32)) == 8 * 256 * 4
 
 
-def test_pool_alias_reinterpret_mosaic_lowering():
+def test_pool_alias_reinterpret_mosaic_lowering(monkeypatch):
     """Verify `pool_alias.Reinterpret` lowers to TPU MLIR ops (`jax==0.11.2`).
 
     Exercises the `jax._src.pallas.mosaic.lowering._reshape_memref` hook (pinned
@@ -41,8 +41,12 @@ def test_pool_alias_reinterpret_mosaic_lowering():
     from jax._src.lib.mlir import ir
     from jax._src.pallas.mosaic import lowering
 
-    if not pool_alias._installed:
-        assert lowering._reshape_memref is pool_alias._original
+    # Start from a fresh install: earlier tests may already have installed the
+    # hook, and the frozen reference kernel (loaded by other test modules)
+    # installs its own pool_alias hook on top. monkeypatch restores all three.
+    monkeypatch.setattr(pool_alias, "_installed", False)
+    monkeypatch.setattr(pool_alias, "_original", pool_alias._original)
+    monkeypatch.setattr(lowering, "_reshape_memref", lowering._reshape_memref)
     pool_alias._install()
     pool_alias._install()
     assert pool_alias._installed
