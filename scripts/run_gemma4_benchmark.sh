@@ -95,8 +95,10 @@ vllm serve RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic \
     --tensor-parallel-size 2 \
     --data-parallel-size 4 \
     --api-server-count 1 \
+    --gpu-memory-utilization 0.90 \
     --mm-encoder-tp-mode data \
-    --compilation-config '{"cudagraph_mm_encoder":true,"encoder_cudagraph_max_vision_items_per_batch":8}' \
+    --mm-processor-kwargs '{"size":{"longest_edge":262144,"shortest_edge":3136}}' \
+    --compilation-config '{"cudagraph_mm_encoder":true,"encoder_cudagraph_max_vision_items_per_batch":8,"encoder_cudagraph_max_frames_per_batch":8}' \
     --disable-chunked-mm-input \
     --max-num-seqs 512 \
     --block-size 256 \
