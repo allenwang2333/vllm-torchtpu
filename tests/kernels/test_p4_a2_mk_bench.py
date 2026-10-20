@@ -210,6 +210,7 @@ VARIANTS = {
     "fixed_no_ar": (frozenset({"experts", "kv", "ar"}), 0, {}, {}),
     "scopes1": (frozenset(), 1, {}, {}),
     "scopes2": (frozenset(), 2, {}, {}),
+    "scopes3": (frozenset(), 3, {}, {}),  # + per-layer / per-expert / dense-matmul scopes
     "no_ar_scopes1": (frozenset({"ar"}), 1, {}, {}),
     "arpipe_all": (frozenset(), 0, {}, {("context", "ARPIPE_OFF_B"): ()}),
     "arpipe_all_scopes1": (frozenset(), 1, {}, {("context", "ARPIPE_OFF_B"): ()}),

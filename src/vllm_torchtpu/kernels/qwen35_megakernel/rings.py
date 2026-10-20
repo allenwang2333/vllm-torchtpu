@@ -435,7 +435,12 @@ class DenseWeightRing:
             lax.fori_loop(1, n_s, body_pair, 0)
         return acc[:, :N]
 
-    def dmatmul(
+    def dmatmul(self, kind: str, g0, xsrc, N: int, **kw):
+        """acc[:, :N] = xsrc[:, :K] @ W(kind), under a level-3 trace scope named for the weight."""
+        with self.ctx.sc(f"dmm_{kind}", 3):
+            return self._dmatmul(kind, g0, xsrc, N, **kw)
+
+    def _dmatmul(
         self,
         kind: str,
         g0,

@@ -122,6 +122,7 @@ class MoEBlock:
                     scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
         with sc("moe_route"):
             n_hit = self.route(l, pexp)
+            ctx.tv("n_hit", n_hit)
         if SH_PRE and not ctx.SH2_PRE_ROUTE:
             with sc("moe_shared"):
                 t2 = tk["sh2"]
@@ -880,6 +881,10 @@ class MoEBlock:
             return v
 
         def expert_w(i, carry):
+            with sc("ew_iter", 3):
+                return expert_w_body(i, carry)
+
+        def expert_w_body(i, carry):
             e = scr["elist"][i]
             s_ = i % NSS
             base_u = i * TE
@@ -900,10 +905,12 @@ class MoEBlock:
             pos = jnp.concatenate(segs, axis=1) - nzi if NQ > 1 else segs[0] - nzi
             n_e = scr["hits"][MROW + 1 + lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
             n_grp = lax.div(n_e + (CAP - 1), CAP)
-            w13 = [etake("e13", base_u + t) for t in range(T13)]
-            self.es_wait(i)
-            es = scr["es"][s_]  # [1, 2 * IR + H]
-            w2 = [etake("e2", base_u + T13 + t) for t in range(T2)]
+            ctx.tv("n_rows", n_e)
+            with sc("ew_wait", 3):
+                w13 = [etake("e13", base_u + t) for t in range(T13)]
+                self.es_wait(i)
+                es = scr["es"][s_]  # [1, 2 * IR + H]
+                w2 = [etake("e2", base_u + T13 + t) for t in range(T2)]
 
             def group(g, carry_g):
                 last = g == n_grp - 1
@@ -963,9 +970,14 @@ class MoEBlock:
             return carry
 
         with sc("moe_experts"):
+            ctx.tv("n_hit", n_hit)
             lax.fori_loop(0, n_hit, expert_w, 0)
 
     def expert(self, l, i, carry):
+        with self.ctx.sc("e_iter", 3):
+            return self._expert(l, i, carry)
+
+    def _expert(self, l, i, carry):
         """Listed expert i on all rows: part += wn[:, e] * expert_e(xb). EP: the whole expert;
         TP: this rank's slice of the intermediate dim (the all-reduce sums the slices)."""
         ctx = self.ctx
@@ -1093,6 +1105,10 @@ class MoEBlock:
             egive(0, l, 0)
 
             def body(i, carry):
+                with ctx.sc("ep1_iter", 3):
+                    return body_(i, carry)
+
+            def body_(i, carry):
                 u13, u2 = (i + 1) * TE, i * TE + T13
                 w13 = etake("e13", u13)
                 self.es_wait(i + 1)
@@ -1139,79 +1155,87 @@ class MoEBlock:
             DIRECT0 = tiles.r2_direct_store
 
             # Prologue: expert 0 gate|up (T13 tiles)
-            if not DIRECT0:
-                acc13[...] = jnp.zeros((MB, BN), F32)
-            for t in range(T13):
-                w13 = etake("e13", t)
-                k0 = t * TK13
-                mm13 = mm(xb[:, k0 : k0 + TK13], w13[...])
-                if DIRECT0 and t == 0:
-                    acc13[:, :BN] = mm13
-                else:
-                    acc13[:, :BN] += mm13
-                if c.B <= 40:
-                    if t % 2 == 1:
-                        egive_group([(t - 1, t - 1), (t, t)], l)
-                    elif t == T13 - 1:
+            with ctx.sc("ep_pro", 3):
+                if not DIRECT0:
+                    acc13[...] = jnp.zeros((MB, BN), F32)
+                for t in range(T13):
+                    w13 = etake("e13", t)
+                    k0 = t * TK13
+                    mm13 = mm(xb[:, k0 : k0 + TK13], w13[...])
+                    if DIRECT0 and t == 0:
+                        acc13[:, :BN] = mm13
+                    else:
+                        acc13[:, :BN] += mm13
+                    if c.B <= 40:
+                        if t % 2 == 1:
+                            egive_group([(t - 1, t - 1), (t, t)], l)
+                        elif t == T13 - 1:
+                            egive(t, l, t)
+                    else:
                         egive(t, l, t)
-                else:
-                    egive(t, l, t)
-            self.es_wait(0)
-            h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
-            mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
-            xb2[:, :IR] = mid0.astype(BF16)
+                self.es_wait(0)
+                h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+                mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+                xb2[:, :IR] = mid0.astype(BF16)
 
-            def body_ep(i, _):
+            def body_ep(i, carry):
+                with ctx.sc("ep_iter", 3):
+                    return body_ep_(i, carry)
+
+            def body_ep_(i, _):
                 e = scr["elist"][i]
                 s_cur = i % NSS
                 s_nxt = (i + 1) % NSS
                 base_w2 = i * TE + T13
                 base_nxt13 = (i + 1) * TE
 
-                if not DIRECT0:
-                    acc[:, :H] = jnp.zeros((MB, H), F32)
-                    acc13[...] = jnp.zeros((MB, BN), F32)
+                with ctx.sc("ep_mm", 3):
+                    if not DIRECT0:
+                        acc[:, :H] = jnp.zeros((MB, H), F32)
+                        acc13[...] = jnp.zeros((MB, BN), F32)
 
-                for s_step in range(T2):
-                    u2 = base_w2 + s_step
-                    t0 = 2 * s_step
-                    t1 = 2 * s_step + 1
-                    u13_0 = base_nxt13 + t0
-                    u13_1 = base_nxt13 + t1
+                    for s_step in range(T2):
+                        u2 = base_w2 + s_step
+                        t0 = 2 * s_step
+                        t1 = 2 * s_step + 1
+                        u13_0 = base_nxt13 + t0
+                        u13_1 = base_nxt13 + t1
 
-                    w2 = etake("e2", u2)
-                    w13_0 = etake("e13", u13_0)
-                    k2 = s_step * TK2
-                    k13_0 = t0 * TK13
-                    mm2 = mm(xb2[:, k2 : k2 + TK2], w2[...])
-                    mm13_0 = mm(xb[:, k13_0 : k13_0 + TK13], w13_0[...])
-                    if DIRECT0 and s_step == 0:
-                        acc[:, :H] = mm2
-                        acc13[:, :BN] = mm13_0
-                    else:
-                        acc[:, :H] += mm2
-                        acc13[:, :BN] += mm13_0
-                    if c.B <= 40:
-                        egive_group([(u2, T13 + s_step), (u13_0, t0)], l)
-                    else:
-                        egive(u2, l, T13 + s_step)
-                        egive(u13_0, l, t0)
+                        w2 = etake("e2", u2)
+                        w13_0 = etake("e13", u13_0)
+                        k2 = s_step * TK2
+                        k13_0 = t0 * TK13
+                        mm2 = mm(xb2[:, k2 : k2 + TK2], w2[...])
+                        mm13_0 = mm(xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                        if DIRECT0 and s_step == 0:
+                            acc[:, :H] = mm2
+                            acc13[:, :BN] = mm13_0
+                        else:
+                            acc[:, :H] += mm2
+                            acc13[:, :BN] += mm13_0
+                        if c.B <= 40:
+                            egive_group([(u2, T13 + s_step), (u13_0, t0)], l)
+                        else:
+                            egive(u2, l, T13 + s_step)
+                            egive(u13_0, l, t0)
 
-                    w13_1 = etake("e13", u13_1)
-                    k13_1 = t1 * TK13
-                    acc13[:, :BN] += mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
-                    egive(u13_1, l, t1)
+                        w13_1 = etake("e13", u13_1)
+                        k13_1 = t1 * TK13
+                        acc13[:, :BN] += mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
+                        egive(u13_1, l, t1)
 
-                wcol = jnp.sum(
-                    jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
-                )
-                y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
-                part[0:MR, :] += wcol * y
+                with ctx.sc("ep_out", 3):
+                    wcol = jnp.sum(
+                        jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
+                    )
+                    y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                    part[0:MR, :] += wcol * y
 
-                self.es_wait(i + 1)
-                h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
-                mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
-                xb2[:, :IR] = mid_nxt.astype(BF16)
+                with ctx.sc("ep_act", 3):
+                    self.es_wait(i + 1)
+                    h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+                    mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
+                    xb2[:, :IR] = mid_nxt.astype(BF16)
                 return 0
 
             lax.fori_loop(0, n_hit - 1, body_ep, 0)
@@ -1219,30 +1243,31 @@ class MoEBlock:
             # Epilogue: last expert (n_hit - 1) down projection (T2 tiles)
             if pre_drain is not None:
                 pre_drain()
-            i_last = n_hit - 1
-            e_last = scr["elist"][i_last]
-            s_last = i_last % NSS
-            base_last_w2 = i_last * TE + T13
-            if not DIRECT0:
-                acc[:, :H] = jnp.zeros((MB, H), F32)
-            for s_step in range(T2):
-                u2 = base_last_w2 + s_step
-                w2 = etake("e2", u2)
-                k2 = s_step * TK2
-                mm2 = mm(xb2[:, k2 : k2 + TK2], w2[...])
-                if DIRECT0 and s_step == 0:
-                    acc[:, :H] = mm2
-                else:
-                    acc[:, :H] += mm2
-                if c.B <= 40:
-                    if s_step % 2 == 1:
-                        egive_group([(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)], l)
-                    elif s_step == T2 - 1:
+            with ctx.sc("ep_epi", 3):
+                i_last = n_hit - 1
+                e_last = scr["elist"][i_last]
+                s_last = i_last % NSS
+                base_last_w2 = i_last * TE + T13
+                if not DIRECT0:
+                    acc[:, :H] = jnp.zeros((MB, H), F32)
+                for s_step in range(T2):
+                    u2 = base_last_w2 + s_step
+                    w2 = etake("e2", u2)
+                    k2 = s_step * TK2
+                    mm2 = mm(xb2[:, k2 : k2 + TK2], w2[...])
+                    if DIRECT0 and s_step == 0:
+                        acc[:, :H] = mm2
+                    else:
+                        acc[:, :H] += mm2
+                    if c.B <= 40:
+                        if s_step % 2 == 1:
+                            egive_group([(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)], l)
+                        elif s_step == T2 - 1:
+                            egive(u2, l, T13 + s_step)
+                    else:
                         egive(u2, l, T13 + s_step)
-                else:
-                    egive(u2, l, T13 + s_step)
-            wcol_last = jnp.sum(
-                jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0), axis=1, keepdims=True
-            )
-            y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
-            part[0:MR, :] += wcol_last * y_last
+                wcol_last = jnp.sum(
+                    jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0), axis=1, keepdims=True
+                )
+                y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+                part[0:MR, :] += wcol_last * y_last

@@ -800,6 +800,11 @@ class MKBuildContext:
         """Return a named device trace scope context manager when scopes >= level."""
         return jax.named_scope(name) if int(self.scopes) >= level else contextlib.nullcontext()
 
+    def tv(self, label: str, value, level: int = 3):
+        """Attach an i32 scalar to the enclosing device trace scope when scopes >= level."""
+        if int(self.scopes) >= level:
+            pltpu.trace_value(label, jnp.asarray(value, jnp.int32))
+
     def mm(self, x, w, dims=NN):
         """Matrix multiply in f32 accumulation, casting w in interpret mode when dtypes differ."""
         if self.interpret and x.dtype != w.dtype:

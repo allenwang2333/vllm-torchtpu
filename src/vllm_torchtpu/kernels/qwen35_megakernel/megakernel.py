@@ -213,109 +213,126 @@ def build(
                     )
                 )
 
+            def att_scoped():
+                with sc("mixer_att", 3):
+                    att_branch()
+
+            def gdn_scoped():
+                with sc("mixer_gdn", 3):
+                    gdn_branch()
+
             if AE == 1:
-                att_branch()
+                att_scoped()
             else:
-                lax.cond(is_att, att_branch, gdn_branch)
-            y_moe, fill = moe_blk.moe(l, slot, g0, is_att, defer_flush=True)
-            if ctx.ARP:  # own half's residual added; round 2 waited inside the next layer's mixer
-                allreduce_blk.allreduce(1, y_moe, first, fill=fill, defer=True)
-            else:
-                allreduce_blk.add_residual(
-                    allreduce_blk.allreduce(1, y_moe, first, fill=fill)
-                )
+                lax.cond(is_att, att_scoped, gdn_scoped)
+            with sc("moe", 3):
+                y_moe, fill = moe_blk.moe(l, slot, g0, is_att, defer_flush=True)
+            with sc("moe_ar", 3):
+                if ctx.ARP:  # own half's residual added; round 2 waited inside the next layer's mixer
+                    allreduce_blk.allreduce(1, y_moe, first, fill=fill, defer=True)
+                else:
+                    allreduce_blk.add_residual(
+                        allreduce_blk.allreduce(1, y_moe, first, fill=fill)
+                    )
             return carry
 
+        def layer_scoped(l, carry):
+            with sc("layer", 3):
+                ctx.tv("layer", l)
+                return layer(l, carry)
+
         # ------------------------------ step ------------------------------
-        scr["hitv"][...] = jnp.zeros((MR, 128), I32)
-        zero_seen = pltpu.make_async_copy(
-            scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
-        )
-        zero_seen.start()
-        for i in range(NBD):
-            rings.fetch(jnp.int32(i))
-        pltpu.make_async_copy(
-            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
-        ).start()
-        if ECOPY:
-            o_ec = lay["ecopy"][0]
+        with sc("step_init"):
+            scr["hitv"][...] = jnp.zeros((MR, 128), I32)
+            zero_seen = pltpu.make_async_copy(
+                scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+            )
+            zero_seen.start()
+            for i in range(NBD):
+                rings.fetch(jnp.int32(i))
             pltpu.make_async_copy(
-                W["smalls"].at[0, :, pl.ds(o_ec, E)],
-                scr["ecopy"].at[0],
-                scr["ec_sem"].at[0],
+                W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
             ).start()
-        if ctx.forced_routing:
-            pltpu.make_async_copy(
-                rb_hbm.at[0], scr["rb"].at[0], scr["rb_sem"].at[0]
-            ).start()
-        att_blk.init_worklist()
-        if R > 1:
-            barrier = pltpu.get_barrier_semaphore()
-            for off in range(1, R):
-                pl.semaphore_signal(
-                    barrier,
-                    1,
-                    device_id=(me ^ off,),
-                    device_id_type=pl.DeviceIdType.MESH,
-                )
-            pl.semaphore_wait(barrier, R - 1)
-        scr["res"][...] = jnp.where(live, hid_ref[:MB].astype(F32), 0.0)
-        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
-        if c.paged_kv:
-            scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
-            scr["vnew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
-        if FUSED:
-            for s in range(NS):
-                scr["kv_rd_pend"][s] = jnp.int32(0)
-                scr["kv_wr_pend"][s] = jnp.int32(0)
-            if c.NGDN > 0:
-                for slot_i in range(NGI):
-                    scr["gdn_in_pend"][slot_i] = jnp.int32(0)
-                for slot_o in range(NGO):
-                    scr["gdn_out_mode"][slot_o] = jnp.int32(0)
-                scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
-        if SPLIT and not GQ:
-            scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
-        if PACK or QV:
-            scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
-        att_blk.init_rope()
-        if ctx.ARP:
-            # ARPIPE prime: a zero round 2 of the MoE all-reduce, so layer 0's input projection
-            if ctx.HIER == 1:  # zero push half 1 from every chip, own entry included
-                scr["ag_send"][1] = jnp.zeros(scr["ag_send"].shape[1:], BF16)
-                scr["ag_recv"][1, me // 2] = jnp.zeros(scr["ag_recv"].shape[2:], BF16)
-            else:
-                scr["s2_send"][1] = jnp.zeros(scr["s2_send"].shape[1:], BF16)
-            for d in allreduce_blk.ar_copies(1, 2):
-                d.start()
-        zero_seen.wait()
-        lax.fori_loop(0, L, layer, 0)
-        if ctx.ARP:  # the last layer's MoE all-reduce round 2
-            allreduce_blk.arp_round2_add()
-        allreduce_blk.wait_sends()
-        if FUSED:
-            if c.NGDN > 0:
-                for slot_o in range(NGO):
-                    gdn_dma.wait_gdn_out(slot_o)
-            for s in range(NS):
-                kv_dma.wait_kv_wr(s)
-        elif c.NGDN > 0:
-            o_last = c.NGDN - 1
-            pltpu.make_async_copy(
-                gdn_dma.conv_out_src(), O["conv"].at[o_last], scr["st_sem"].at[2]
-            ).wait()
-            if GCH:
-                gdn_dma.rec_drain(o_last)
-            else:
+            if ECOPY:
+                o_ec = lay["ecopy"][0]
                 pltpu.make_async_copy(
-                    scr["recb"], O["rec"].at[o_last], scr["st_sem"].at[3]
+                    W["smalls"].at[0, :, pl.ds(o_ec, E)],
+                    scr["ecopy"].at[0],
+                    scr["ec_sem"].at[0],
+                ).start()
+            if ctx.forced_routing:
+                pltpu.make_async_copy(
+                    rb_hbm.at[0], scr["rb"].at[0], scr["rb_sem"].at[0]
+                ).start()
+            att_blk.init_worklist()
+            if R > 1:
+                barrier = pltpu.get_barrier_semaphore()
+                for off in range(1, R):
+                    pl.semaphore_signal(
+                        barrier,
+                        1,
+                        device_id=(me ^ off,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                pl.semaphore_wait(barrier, R - 1)
+            scr["res"][...] = jnp.where(live, hid_ref[:MB].astype(F32), 0.0)
+            scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+            if c.paged_kv:
+                scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+                scr["vnew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+            if FUSED:
+                for s in range(NS):
+                    scr["kv_rd_pend"][s] = jnp.int32(0)
+                    scr["kv_wr_pend"][s] = jnp.int32(0)
+                if c.NGDN > 0:
+                    for slot_i in range(NGI):
+                        scr["gdn_in_pend"][slot_i] = jnp.int32(0)
+                    for slot_o in range(NGO):
+                        scr["gdn_out_mode"][slot_o] = jnp.int32(0)
+                    scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
+            if SPLIT and not GQ:
+                scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
+            if PACK or QV:
+                scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
+            att_blk.init_rope()
+            if ctx.ARP:
+                # ARPIPE prime: a zero round 2 of the MoE all-reduce, so layer 0's input projection
+                if ctx.HIER == 1:  # zero push half 1 from every chip, own entry included
+                    scr["ag_send"][1] = jnp.zeros(scr["ag_send"].shape[1:], BF16)
+                    scr["ag_recv"][1, me // 2] = jnp.zeros(scr["ag_recv"].shape[2:], BF16)
+                else:
+                    scr["s2_send"][1] = jnp.zeros(scr["s2_send"].shape[1:], BF16)
+                for d in allreduce_blk.ar_copies(1, 2):
+                    d.start()
+            zero_seen.wait()
+        lax.fori_loop(0, L, layer_scoped, 0)
+        with sc("step_tail"):
+            if ctx.ARP:  # the last layer's MoE all-reduce round 2
+                allreduce_blk.arp_round2_add()
+            allreduce_blk.wait_sends()
+            if FUSED:
+                if c.NGDN > 0:
+                    for slot_o in range(NGO):
+                        gdn_dma.wait_gdn_out(slot_o)
+                for s in range(NS):
+                    kv_dma.wait_kv_wr(s)
+            elif c.NGDN > 0:
+                o_last = c.NGDN - 1
+                pltpu.make_async_copy(
+                    gdn_dma.conv_out_src(), O["conv"].at[o_last], scr["st_sem"].at[2]
                 ).wait()
-        cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["misc_sem"])
-        cp.start()
-        cp.wait()
-        out_ref[:MB] = rms_zc(scr["res"][...], scr["fn"][...]).astype(BF16)
-        if MB < M:
-            out_ref[MB:] = jnp.zeros((M - MB, H), BF16)
+                if GCH:
+                    gdn_dma.rec_drain(o_last)
+                else:
+                    pltpu.make_async_copy(
+                        scr["recb"], O["rec"].at[o_last], scr["st_sem"].at[3]
+                    ).wait()
+            cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["misc_sem"])
+            cp.start()
+            cp.wait()
+            out_ref[:MB] = rms_zc(scr["res"][...], scr["fn"][...]).astype(BF16)
+            if MB < M:
+                out_ref[MB:] = jnp.zeros((M - MB, H), BF16)
 
     call = pl.pallas_call(
         kernel,
@@ -415,6 +432,11 @@ def kernel_wide(ctx: MKBuildContext, refs):
         per_mb = jnp.where(is_att, MB_ATT, MB_GDN)
 
         def mixer(m, carry_m):
+            with sc("mixer_mb", 3):
+                ctx.tv("mb", m)
+                return mixer_body(m, carry_m)
+
+        def mixer_body(m, carry_m):
             ctx.bind_microbatch(m)
             with sc("norm_in"):
                 scr["res"][...] = res_all[rows(m)].astype(F32)
@@ -452,95 +474,104 @@ def kernel_wide(ctx: MKBuildContext, refs):
             return carry_m
 
         lax.fori_loop(0, N_MB, mixer, 0)
-        moe_blk.moe_wide(l, slot, base_l + N_MB * per_mb)
+        with sc("moe", 3):
+            moe_blk.moe_wide(l, slot, base_l + N_MB * per_mb)
 
         def moe_ar(m, carry_m):
-            ars, first = ar_slot(l * (2 * N_MB) + N_MB + m)
-            tot = allreduce_blk.allreduce(ars, part_all[rows(m)], first)
-            with sc("ar_res"):
-                res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
+            with sc("moe_ar_mb", 3):
+                ars, first = ar_slot(l * (2 * N_MB) + N_MB + m)
+                tot = allreduce_blk.allreduce(ars, part_all[rows(m)], first)
+                with sc("ar_res"):
+                    res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
             return carry_m
 
         lax.fori_loop(0, N_MB, moe_ar, 0)
         return carry
 
+    def layer_scoped(l, carry):
+        with sc("layer", 3):
+            ctx.tv("layer", l)
+            return layer(l, carry)
+
     # ------------------------------ step ------------------------------
-    scr["hitv"][...] = jnp.zeros((MR, 128), I32)
-    zero_seen = pltpu.make_async_copy(
-        scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
-    )
-    zero_seen.start()
-    for i in range(NBD):
-        rings.fetch(jnp.int32(i))
-    pltpu.make_async_copy(
-        W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
-    ).start()
-    if ECOPY:
-        o_ec = lay["ecopy"][0]
-        pltpu.make_async_copy(
-            W["smalls"].at[0, :, pl.ds(o_ec, E)],
-            scr["ecopy"].at[0],
-            scr["ec_sem"].at[0],
-        ).start()
-    if ctx.forced_routing:  # the first 128-row routing chunk; moe_wide chains the rest
-        pltpu.make_async_copy(
-            rb_hbm.at[0, pl.ds(0, 128)], scr["rb"].at[0], scr["rb_sem"].at[0]
-        ).start()
-    hid_in = pltpu.make_async_copy(
-        hid_hbm, res_all.at[pl.ds(0, M_OUT)], scr["io_sem"].at[0]
-    )
-    hid_in.start()
-    if R > 1:
-        barrier = pltpu.get_barrier_semaphore()
-        for off in range(1, R):
-            pl.semaphore_signal(
-                barrier,
-                1,
-                device_id=(me ^ off,),
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-        pl.semaphore_wait(barrier, R - 1)
-    scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
-    scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
-    scr["vnew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
-    for s in range(NS):
-        scr["kv_rd_pend"][s] = jnp.int32(0)
-        scr["kv_wr_pend"][s] = jnp.int32(0)
-    if c.NGDN > 0:
-        for slot_i in range(NGI):
-            scr["gdn_in_pend"][slot_i] = jnp.int32(0)
-        for slot_o in range(NGO):
-            scr["gdn_out_mode"][slot_o] = jnp.int32(0)
-        scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
-    if SPLIT and not GQ:
-        scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
-    if PACK or QV:
-        scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
-    xb_all[...] = jnp.zeros(xb_all.shape, BF16)
-    hid_in.wait()
-    if BW > M_OUT:
-        res_all[M_OUT:BW, :] = jnp.zeros((BW - M_OUT, H), BF16)
-    zero_seen.wait()
-    lax.fori_loop(0, L, layer, 0)
-    allreduce_blk.wait_sends()
-    if c.NGDN > 0:
-        for slot_o in range(NGO):
-            gdn_dma.wait_gdn_out(slot_o)
-    for s in range(NS):
-        kv_dma.wait_kv_wr(s)
-    cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["misc_sem"])
-    cp.start()
-    cp.wait()
-    for m in range(N_MB):
-        n = min(B, M_OUT - m * B)
-        if n <= 0:
-            break
-        scr["xb"][...] = rms_zc(res_all[m * B:(m + 1) * B, :].astype(F32), scr["fn"][...]).astype(BF16)
-        out_cp = pltpu.make_async_copy(
-            scr["xb"].at[pl.ds(0, n)], out_hbm.at[pl.ds(m * B, n)], scr["io_sem"].at[1]
+    with sc("step_init"):
+        scr["hitv"][...] = jnp.zeros((MR, 128), I32)
+        zero_seen = pltpu.make_async_copy(
+            scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
         )
-        out_cp.start()
-        out_cp.wait()
+        zero_seen.start()
+        for i in range(NBD):
+            rings.fetch(jnp.int32(i))
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).start()
+        if ECOPY:
+            o_ec = lay["ecopy"][0]
+            pltpu.make_async_copy(
+                W["smalls"].at[0, :, pl.ds(o_ec, E)],
+                scr["ecopy"].at[0],
+                scr["ec_sem"].at[0],
+            ).start()
+        if ctx.forced_routing:  # the first 128-row routing chunk; moe_wide chains the rest
+            pltpu.make_async_copy(
+                rb_hbm.at[0, pl.ds(0, 128)], scr["rb"].at[0], scr["rb_sem"].at[0]
+            ).start()
+        hid_in = pltpu.make_async_copy(
+            hid_hbm, res_all.at[pl.ds(0, M_OUT)], scr["io_sem"].at[0]
+        )
+        hid_in.start()
+        if R > 1:
+            barrier = pltpu.get_barrier_semaphore()
+            for off in range(1, R):
+                pl.semaphore_signal(
+                    barrier,
+                    1,
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(barrier, R - 1)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+        scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+        scr["vnew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+        for s in range(NS):
+            scr["kv_rd_pend"][s] = jnp.int32(0)
+            scr["kv_wr_pend"][s] = jnp.int32(0)
+        if c.NGDN > 0:
+            for slot_i in range(NGI):
+                scr["gdn_in_pend"][slot_i] = jnp.int32(0)
+            for slot_o in range(NGO):
+                scr["gdn_out_mode"][slot_o] = jnp.int32(0)
+            scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
+        if SPLIT and not GQ:
+            scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
+        if PACK or QV:
+            scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
+        xb_all[...] = jnp.zeros(xb_all.shape, BF16)
+        hid_in.wait()
+        if BW > M_OUT:
+            res_all[M_OUT:BW, :] = jnp.zeros((BW - M_OUT, H), BF16)
+        zero_seen.wait()
+    lax.fori_loop(0, L, layer_scoped, 0)
+    with sc("step_tail"):
+        allreduce_blk.wait_sends()
+        if c.NGDN > 0:
+            for slot_o in range(NGO):
+                gdn_dma.wait_gdn_out(slot_o)
+        for s in range(NS):
+            kv_dma.wait_kv_wr(s)
+        cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["misc_sem"])
+        cp.start()
+        cp.wait()
+        for m in range(N_MB):
+            n = min(B, M_OUT - m * B)
+            if n <= 0:
+                break
+            scr["xb"][...] = rms_zc(res_all[m * B:(m + 1) * B, :].astype(F32), scr["fn"][...]).astype(BF16)
+            out_cp = pltpu.make_async_copy(
+                scr["xb"].at[pl.ds(0, n)], out_hbm.at[pl.ds(m * B, n)], scr["io_sem"].at[1]
+            )
+            out_cp.start()
+            out_cp.wait()
 
 
 def make_step(
