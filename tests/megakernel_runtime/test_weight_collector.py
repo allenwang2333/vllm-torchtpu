@@ -28,7 +28,9 @@ import torch
 from vllm_torchtpu.megakernel import planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
+from vllm_torchtpu.megakernel.pool.config import CacheExec
+from vllm_torchtpu.megakernel.spec import ExecSpec
 from vllm_torchtpu.megakernel_runtime.weight_collector import (
     WEIGHT_FLIPPED_ATTR,
     _own,
@@ -353,12 +355,10 @@ def test_pack_weights_shapes_base_buffers_and_expert_aliasing(
         B=4,
         T=1,
         ctx=256,
-        paged_kv=True,
-        num_pages=64,
-        max_pages_per_seq=2,
         stack_e=stack_e,
         tiles=tiles,
         interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=64, max_pages_per_seq=2),
     )
     # 1. Without `_ecopy` / `_ecopy_cores` / `expert_placement`, `extract_ecopy_layer`
     # must return `None` (no fabricated fallback placement).
@@ -435,12 +435,10 @@ def test_pack_weights_value_parity_against_split_hf_weights() -> None:
         B=4,
         T=1,
         ctx=256,
-        paged_kv=True,
-        num_pages=96,
-        max_pages_per_seq=2,
         stack_e=False,
         tiles=tiles,
         interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=96, max_pages_per_seq=2),
     )
     hf = qwen35.random_hf_weights(jax.random.key(314), g)
     e_cores = qwen35.default_eplb_cores(g, ex.R)

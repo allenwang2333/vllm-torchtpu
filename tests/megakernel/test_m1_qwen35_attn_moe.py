@@ -23,14 +23,15 @@ import pathlib
 import jax
 import jax.numpy as jnp
 import pytest
+from conftest import with_tile_fields
 from jax.experimental import topologies
 from jax.sharding import Mesh
 
 from vllm_torchtpu.megakernel import kernel
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.ops import F32
-from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec
+from vllm_torchtpu.megakernel.spec import ExecSpec
 
 
 def _can_compile_tpu7x() -> bool:
@@ -117,7 +118,9 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
         IS=256,
         moe_tp=moe_tp,
     )
-    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10, split=True)
+    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10).with_blocks(
+        {"gqa": {"split": True}}
+    )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(100 + R * 10 + T)
@@ -174,7 +177,9 @@ def test_m1_qwen35_r8_multi_rank_interpret():
         IS=1024,
         moe_tp=False,
     )
-    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10, split=True, hier=1, mb8=2)
+    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=1, mb8=2).with_blocks(
+        {"gqa": {"split": True}}
+    )
     ex = ExecSpec(B=2, T=1, R=8, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(808)
@@ -298,7 +303,7 @@ def test_m1_bit_exact_vs_frozen_qwen35():
     out_hid_lib, out_st_lib = step_lib(pos, hid_lib, w_lib, st_lib)
 
     tiles_f = frozen_mk.Tiles(
-        bank=256 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, nkv=3, vmem_mib=32
+        bank=256 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32, kv_blk=256, nkv=3
     )
     c_f = frozen_mk.MKConfig(
         R=1,
@@ -399,14 +404,8 @@ _FLAG_GEOM = dict(
 # n_t > dmm_unroll). ebank=64 KiB -> e13 [512, 512] T13=4 and e2 [256, 512] T2=2,
 # so T13 == 2 * T2 and nbe=6 == TE (PIPE_EP preconditions).
 _FLAG_TILES_BASE = dataclasses.replace(
-    TINY_TILES,
-    bank=96 << 10,
-    nbd=6,
-    ebank=64 << 10,
-    nbe=6,
-    kv_blk=128,
-    nkv=3,
-)
+    TINY_TILES, bank=96 << 10, nbd=6, ebank=64 << 10, nbe=6
+).with_blocks({"gqa": {"kv_blk": 128, "nkv": 3}})
 
 
 @pytest.fixture(scope="module")
@@ -428,15 +427,15 @@ def m5_flag_base():
 @pytest.mark.parametrize(
     "flags",
     [
-        {"topk_lanes": True},
-        {"pair_kv": True},
-        {"pipe_ep": True},
-        {"moe_unroll": True},
+        {"moe.topk_lanes": True},
+        {"gqa.pair_kv": True},
+        {"moe.pipe_ep": True},
+        {"moe.moe_unroll": True},
         {"rel_fetch": True},
-        {"r2_direct_store": True},
-        {"pipe_ep": True, "r2_direct_store": True},
+        {"moe.r2_direct_store": True},
+        {"moe.pipe_ep": True, "moe.r2_direct_store": True},
     ],
-    ids=lambda d: "+".join(sorted(d)),
+    ids=lambda d: "+".join(sorted(k.split(".")[-1] for k in d)),
 )
 def test_m5_flags_cpu_bit_exact_vs_default(m5_flag_base, flags):
     """These opt-in M5 flags reproduce the default bitwise in CPU interpret mode.
@@ -446,15 +445,13 @@ def test_m5_flags_cpu_bit_exact_vs_default(m5_flag_base, flags):
     `test_m5_tpu_v7x8_frozen_parity_bisect`), so their numerics class is `approx`.
     """
     mesh1, g, ex, args, out_hid, out_st = m5_flag_base
-    ex_opt = dataclasses.replace(
-        ex, tiles=dataclasses.replace(_FLAG_TILES_BASE, **flags)
-    )
+    ex_opt = dataclasses.replace(ex, tiles=with_tile_fields(_FLAG_TILES_BASE, flags))
     step_opt, info_opt = qwen35.make_step(mesh1, g, ex_opt)
     mp = info_opt["plan"].block_params["moe"]
-    assert mp.PIPE_EP is bool(flags.get("pipe_ep", False))
-    assert mp.topk_lanes is bool(flags.get("topk_lanes", False))
+    assert mp.PIPE_EP is bool(flags.get("moe.pipe_ep", False))
+    assert mp.topk_lanes is bool(flags.get("moe.topk_lanes", False))
     assert info_opt["plan"].block_params["gqa"].PAIR_KV is bool(
-        flags.get("pair_kv", False)
+        flags.get("gqa.pair_kv", False)
     )
     out_hid_opt, out_st_opt = step_opt(*args)
     assert jnp.array_equal(out_hid_opt, out_hid), flags
@@ -511,7 +508,9 @@ def test_m5_hier3_butterfly_all_reduce(R_test: int):
             TOPK=2,
         )
     )
-    tiles_h0 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=0, split=False)
+    tiles_h0 = dataclasses.replace(TINY_TILES, bank=256 << 10, hier=0).with_blocks(
+        {"gqa": {"split": False}}
+    )
     tiles_h3 = dataclasses.replace(tiles_h0, hier=3)
     ex_h0 = ExecSpec(B=2, T=1, R=R_test, ctx=256, tiles=tiles_h0, interpret=True)
     ex_h3 = dataclasses.replace(ex_h0, tiles=tiles_h3)

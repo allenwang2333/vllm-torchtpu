@@ -26,12 +26,24 @@ from jax.sharding import Mesh
 
 import vllm_torchtpu.megakernel as mk
 from tests.megakernel.frozen_utils import load_frozen_qwen35
-from vllm_torchtpu.megakernel import spec as mk_spec
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.profiles.qwen35_candidate30 import (
     candidate30_tiles,
 )
+
+
+def _tile_value(t: mk.Tiles, name: str) -> object:
+    """Field `name` of `t`, looked up in core fields, then each block's tunables."""
+    if name in {f.name for f in dataclasses.fields(t)}:
+        return getattr(t, name)
+    owners = [
+        b.name
+        for b in (mk.GQABlock, mk.GDNBlock, mk.MoEBlock)
+        if name in getattr(b.Tunables, "NUMERICS", {})
+    ]
+    assert len(owners) == 1, (name, owners)
+    return getattr(t.block(owners[0]), name)
 
 
 def test_qwen35_baseline_tiles_match_frozen_kernel_schedule():
@@ -49,7 +61,7 @@ def test_qwen35_baseline_tiles_match_frozen_kernel_schedule():
             tf = dataclasses.replace(tf, nbe=6)
         tl = mk.get_profile("qwen35-baseline").tiles_for(B, R=8)
         for name in frozen_fields:
-            assert getattr(tl, name) == getattr(tf, name), (B, name)
+            assert _tile_value(tl, name) == getattr(tf, name), (B, name)
 
 
 def test_profile_registry_and_default_profile():
@@ -97,7 +109,12 @@ def test_candidate30_profile_carries_m5_tuning():
     assert p.pool_gather is None  # GPR auto
     assert p.fused_pool_io is False  # experimental: explicit opt-in only
     t4 = p.tiles_for(4, R=8)
-    assert (t4.kv_sub, t4.nbe, t4.hier, t4.ecopy_opt) == (1024, 20, 1, 1)
+    assert (t4.block("gqa").kv_sub, t4.nbe, t4.hier, t4.block("moe").ecopy_opt) == (
+        1024,
+        20,
+        1,
+        1,
+    )
     for flag in (
         "pipe_ep",
         "r2_direct_store",
@@ -112,7 +129,7 @@ def test_candidate30_profile_carries_m5_tuning():
         "moe_unroll",
         "rel_fetch",
     ):
-        assert getattr(t4, flag) is True, flag
+        assert _tile_value(t4, flag) is True, flag
     assert t4.dmm_unroll == 8
     assert p.tiles_for(4, R=8, moe_tp=True).nbe == 10
     t64 = p.tiles_for(64, R=8)
@@ -120,7 +137,7 @@ def test_candidate30_profile_carries_m5_tuning():
     t56 = p.tiles_for(56, R=8)
     assert (t56.nbd, t56.nbe, t56.hier) == (8, 12, 2)
     t16 = p.tiles_for(16, R=8)
-    assert (t16.nkv, t16.rsag, t16.hier, t16.nbe) == (4, True, 2, 12)
+    assert (t16.block("gqa").nkv, t16.rsag, t16.hier, t16.nbe) == (4, True, 2, 12)
     # HIER3 remap for power-of-2 R != 8 (B <= 32), flat ring otherwise
     assert candidate30_tiles(16, R=4).hier == 3
     assert candidate30_tiles(64, R=4).hier == 0
@@ -133,22 +150,22 @@ def test_candidate30_conv_stage_only_from_b8(R: int, moe_tp: bool):
     """Fused-path conv staging is on from B >= 8 only, as in candidate30's kernel."""
     for B in (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64):
         t = candidate30_tiles(B, moe_tp=moe_tp, R=R)
-        assert t.conv_stage is (B >= 8), (B, R, moe_tp)
+        assert t.block("gdn").conv_stage is (B >= 8), (B, R, moe_tp)
 
 
 def test_profile_exec_for_respects_explicit_tiles():
     p = mk.get_profile("qwen35-candidate30")
-    base = mk.ExecSpec(R=8, paged_kv=True)
+    base = mk.ExecSpec(R=8, cache=mk.CacheExec(paged_kv=True))
     ex = p.exec_for(base, B=16, T=4, g=qwen35.FULL_EP)
     assert (ex.B, ex.T) == (16, 4)
     assert ex.tiles == candidate30_tiles(16, R=8, moe_tp=False)
-    assert ex.pool_gather is None
-    base_t = replace(base, tiles=mk_spec.TINY_TILES)
-    assert p.exec_for(base_t, B=8, T=1).tiles is mk_spec.TINY_TILES
+    assert mk.cache_exec(ex).pool_gather is None
+    base_t = replace(base, tiles=TINY_TILES)
+    assert p.exec_for(base_t, B=8, T=1).tiles is TINY_TILES
     # The library default leaves tiles unset: the kernel builder fits them.
     d = mk.get_profile("default").exec_for(base, B=8, T=1)
     assert d.tiles is None and d.resolved_tiles == mk.default_tiles(8)
-    assert d.pool_gather is False
+    assert mk.cache_exec(d).pool_gather is False
     q = mk.get_profile("qwen35-baseline").exec_for(base, B=8, T=1)
     assert q.tiles == baseline_tiles(8, R=8)
 
@@ -172,17 +189,16 @@ def _tiny_pool_setup(R: int = 1, B: int = 2, T: int = 1):
         att_every=4,
         moe_tp=False,
     )
-    tiles = replace(mk_spec.TINY_TILES, bank=512 << 10)
+    tiles = replace(TINY_TILES, bank=512 << 10)
     ex = mk.ExecSpec(
         R=R,
         B=B,
         T=T,
         ctx=256,
-        paged_kv=True,
-        num_pages=64,
         stack_e=False,
         interpret=True,
         tiles=tiles,
+        cache=mk.CacheExec(paged_kv=True, num_pages=64),
     )
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
     return g, ex, mesh
@@ -208,12 +224,15 @@ def test_ckpt_bounds_host_check_is_debug_opt_in():
     g, ex, mesh = _tiny_pool_setup()
     spec = qwen35.qwen35_spec(g)
     pt, ckpt, roff, _ = mk.default_pool_layout(g, ex)
-    bad_ckpt = ckpt + ex.num_pages  # every slot maps past the pool
+    bad_ckpt = ckpt + mk.cache_exec(ex).num_pages  # every slot maps past the pool
     dummy = (jnp.zeros((1,), jnp.int32),) * 3
-    ex_dbg = replace(ex, debug=mk.DebugOptions(check_ckpt_bounds=True))
+    ex_dbg = mk.with_cache(ex, check_ckpt_bounds=True)
     step_dbg = mk.make_pooled_step(mesh, spec, ex_dbg)
     raw = tuple(
-        jnp.zeros((ex.num_pages, 2, g.HD // 4, 4, ex.page_size), jnp.float8_e4m3fn)
+        jnp.zeros(
+            (mk.cache_exec(ex).num_pages, 2, g.HD // 4, 4, mk.cache_exec(ex).page_size),
+            jnp.float8_e4m3fn,
+        )
         for _ in range(g.NATT)
     )
     with pytest.raises(ValueError, match="maps to pages"):

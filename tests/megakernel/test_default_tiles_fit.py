@@ -47,7 +47,11 @@ def test_default_tiles_fit_vmem_for_every_model_config(name: str, paged: bool):
     shrunk = False
     for T, B in _buckets():
         ex = mk.ExecSpec(
-            B=B, T=T, R=8, ctx=4096, paged_kv=paged, num_pages=65536 if paged else 4096
+            B=B,
+            T=T,
+            R=8,
+            ctx=4096,
+            cache=mk.CacheExec(paged_kv=paged, num_pages=65536 if paged else 4096),
         )
         fitted = vmem.fit_default_tiles(spec, ex)
         t = fitted.tiles

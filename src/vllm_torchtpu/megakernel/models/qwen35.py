@@ -39,8 +39,8 @@ from ..ops import (
     rope_partial,
     rup,
 )
+from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ..spec import (
-    POOL_STATE_NAME,
     Block,
     ExecSpec,
     LayerType,
@@ -144,17 +144,17 @@ class Qwen35Geometry:
         assert self.e_slots == 0 or self.e_slots >= (
             self.E if self.moe_tp else self.ER(R)
         )
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             assert (
-                ex.page_size == 128
-                and ex.ctx % ex.page_size == 0
-                and ex.num_pages >= 1
-                and ex.resolved_max_pages_per_seq >= ex.ctx // ex.page_size
+                cache_exec(ex).page_size == 128
+                and ex.ctx % cache_exec(ex).page_size == 0
+                and cache_exec(ex).num_pages >= 1
+                and resolved_max_pages_per_seq(ex) >= ex.ctx // cache_exec(ex).page_size
             ), (
-                ex.page_size,
+                cache_exec(ex).page_size,
                 ex.ctx,
-                ex.num_pages,
-                ex.resolved_max_pages_per_seq,
+                cache_exec(ex).num_pages,
+                resolved_max_pages_per_seq(ex),
             )
         for n in (
             self.H,
@@ -204,7 +204,7 @@ def qwen35_spec(g: Qwen35Geometry, gdn_block: Block | None = None) -> ModelSpec:
         name=QWEN35_MODEL_NAME,
         config=g,
         layer_type=lt,
-        pool_backend=qwen35_pool.qwen35_pool_backend(g),
+        cache_backend=qwen35_pool.qwen35_pool_backend(g),
     )
 
 
@@ -921,14 +921,14 @@ def pack_inputs(
         states_mk["conv"] = kernel.fold(conv_p.astype(F32))
         states_mk["rec"] = kernel.fold(rec_p.astype(BF16))
 
-    if ex.paged_kv:
+    if cache_exec(ex).paged_kv:
         if POOL_STATE_NAME in logical_states and "page_table" in logical_states:
             states_mk[POOL_STATE_NAME] = tuple(
                 kernel.fold(r) if r.ndim == 6 else r
                 for r in logical_states[POOL_STATE_NAME]
             )
             pt_in = logical_states["page_table"]
-            max_pt = ex.resolved_max_pages_per_seq
+            max_pt = resolved_max_pages_per_seq(ex)
             if pt_in.ndim == 2:
                 if pt_in.shape[0] not in (NS, R * NS) or pt_in.shape[1] < max_pt:
                     raise ValueError(
@@ -957,11 +957,11 @@ def pack_inputs(
             )
             states_mk[POOL_STATE_NAME] = raw_pools
             states_mk["page_table"] = jnp.tile(
-                pt[:, : ex.resolved_max_pages_per_seq], (R, 1)
+                pt[:, : resolved_max_pages_per_seq(ex)], (R, 1)
             )
         else:
             raise ValueError(
-                f"pack_inputs with ex.paged_kv=True requires {POOL_STATE_NAME!r} "
+                f"pack_inputs with paged_kv=True requires {POOL_STATE_NAME!r} "
                 "and 'page_table' in logical_states (or pass build_default_pool=True)."
             )
     elif "kc" in logical_states and "vc" in logical_states:
@@ -999,7 +999,14 @@ def random_inputs(
     """Generate packed megakernel inputs `(pos, hidden, weights, states)`."""
     pos, hid_l, w_l, st_l = random_logical_inputs(key, g, ex)
     return pack_inputs(
-        pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=ex.paged_kv
+        pos,
+        hid_l,
+        w_l,
+        st_l,
+        g,
+        ex,
+        mesh=mesh,
+        build_default_pool=cache_exec(ex).paged_kv,
     )
 
 
@@ -1022,7 +1029,7 @@ def reference_step(
     kh, vh, KD, VD = lay_gdn.kh, lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     QKV, Z, BA, A_OFF = lay_gdn.QKV, lay_gdn.Z, lay_gdn.BA, lay_gdn.A_OFF
     CR, HR = rup(3 * B, 8), rup(3 + T, 8)
-    use_paged_kv = ex.paged_kv if paged_kv is None else bool(paged_kv)
+    use_paged_kv = cache_exec(ex).paged_kv if paged_kv is None else bool(paged_kv)
 
     kc_all = logical_states["kc"]  # [R, NATT, NS, ctx, HD]
     vc_all = logical_states["vc"]  # [R, NATT, NS, ctx, HD]

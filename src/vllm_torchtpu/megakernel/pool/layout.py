@@ -51,6 +51,7 @@ import jax.numpy as jnp
 
 from ..errors import MegakernelConfigError
 from ..ops import BF16, FP8, rup
+from .config import cache_exec
 
 if TYPE_CHECKING:
     from ..spec import ExecSpec
@@ -148,7 +149,9 @@ class PoolLayout:
     def min_num_pages(self, ex: ExecSpec) -> int:
         """Pages needed by `allocate_test_layout(self, ex)` (reserved + KV + slots)."""
         pps = self.pages_per_slot
-        kv_pages_total = self.reserved_pages + ex.NS * (ex.ctx // ex.page_size)
+        kv_pages_total = self.reserved_pages + ex.NS * (
+            ex.ctx // cache_exec(ex).page_size
+        )
         if not self.has_recurrent:
             return kv_pages_total
         base_slot = max(1, (kv_pages_total + pps - 1) // pps)
@@ -203,10 +206,10 @@ class PoolLayout:
     def validate(self, ex: ExecSpec | None = None) -> None:
         """Raise `MegakernelConfigError` for layouts the pool kernels can't run.
 
-        With `ex`, also checks that `ex.page_size` matches the layout and that
-        the per-rank recurrent state and the conv window of every pool I/O path
-        `ex` selects (split, in-kernel gather `ex.GPR`, fused `ex.FUSED`) fit
-        their slot pages.
+        With `ex`, also checks that its `CacheExec.page_size` matches the layout
+        and that the per-rank recurrent state and the conv window of every pool
+        I/O path `ex` selects (split, in-kernel gather `GPR`, fused `FUSED`)
+        fit their slot pages.
         """
 
         def _need(ok: bool, msg: str) -> None:
@@ -231,8 +234,8 @@ class PoolLayout:
         )
         if ex is not None:
             _need(
-                ex.page_size == self.page_size,
-                f"ExecSpec.page_size={ex.page_size} != layout page_size",
+                cache_exec(ex).page_size == self.page_size,
+                f"CacheExec.page_size={cache_exec(ex).page_size} != layout page_size",
             )
         if not self.has_recurrent:
             return
@@ -288,8 +291,8 @@ class PoolLayout:
         qkv_rows = self.qkv_per_rank(R) // LANES
         hr = rup(self.conv_taps + ex.T, 8)
         for on, path, rows in (
-            (ex.GPR, "in-kernel gather (GPR)", hr * qkv_rows),
-            (ex.FUSED, "fused pool I/O", max(16, hr) * qkv_rows),
+            (cache_exec(ex).GPR, "in-kernel gather (GPR)", hr * qkv_rows),
+            (cache_exec(ex).FUSED, "fused pool I/O", max(16, hr) * qkv_rows),
         ):
             _need(
                 not on or rows <= self.conv_page_rows,

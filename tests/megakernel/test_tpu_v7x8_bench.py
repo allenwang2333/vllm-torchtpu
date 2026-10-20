@@ -40,6 +40,7 @@ from jax import lax  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
+from vllm_torchtpu import megakernel as mk  # noqa: E402
 from vllm_torchtpu.megakernel import (  # noqa: E402
     cache,
     kernel,
@@ -938,16 +939,19 @@ def _init_pooled_bucket_on_tpu(
     G = g.G(R)
     H = g.H
     G_PER_ATT = max(1, g.att_every - 1)
-    pages_per_seq = ctx // ex.page_size
+    pages_per_seq = ctx // mk.cache_exec(ex).page_size
     kv_pages_total = NS * pages_per_seq
     n_ckpt_slots = G_PER_ATT * NS * (T + 1)
     base_slot = (kv_pages_total + 4) // 5
     base_page = base_slot * 5
     gdn_pages = n_ckpt_slots * 5
     min_num_pages = base_page + gdn_pages
-    assert ex.num_pages >= min_num_pages, (ex.num_pages, min_num_pages)
+    assert mk.cache_exec(ex).num_pages >= min_num_pages, (
+        mk.cache_exec(ex).num_pages,
+        min_num_pages,
+    )
 
-    pt_cols = max(ex.resolved_max_pages_per_seq, pages_per_seq)
+    pt_cols = max(mk.pool.resolved_max_pages_per_seq(ex), pages_per_seq)
     pt_np = np.zeros((NS, pt_cols), dtype=np.int32)
     for s in range(NS):
         pt_np[s, :pages_per_seq] = np.arange(
@@ -987,18 +991,18 @@ def _init_pooled_bucket_on_tpu(
         k_gdn_base = jax.random.fold_in(root, 100 + me)
         kv_tile = jax.random.normal(
             k_kv_base,
-            (1, 16, 2, 64, 4, ex.page_size),
+            (1, 16, 2, 64, 4, mk.cache_exec(ex).page_size),
             dtype=BF16,
         ) * jnp.bfloat16(0.08)
         gdn_tile = jax.random.normal(
             k_gdn_base,
-            (1, gdn_pages, 2, 64, 2, ex.page_size),
+            (1, gdn_pages, 2, 64, 2, mk.cache_exec(ex).page_size),
             dtype=BF16,
         ) * jnp.bfloat16(0.02)
 
         pools = []
-        assert ex.num_pages % 16 == 0, ex.num_pages
-        n_rep = ex.num_pages // 16
+        assert mk.cache_exec(ex).num_pages % 16 == 0, mk.cache_exec(ex).num_pages
+        n_rep = mk.cache_exec(ex).num_pages // 16
         for g_idx in range(g.NATT):
             scale = jnp.bfloat16(1.0 - 0.01 * g_idx)
             kv_p = jnp.tile(
@@ -1009,11 +1013,13 @@ def _init_pooled_bucket_on_tpu(
             gdn_fp8 = (
                 lax.bitcast_convert_type(gdn_bf16, FP8)
                 .swapaxes(-2, -1)
-                .reshape(1, gdn_pages, 2, 64, 4, ex.page_size)
+                .reshape(1, gdn_pages, 2, 64, 4, mk.cache_exec(ex).page_size)
             )
             pool_g = lax.dynamic_update_slice(
                 kv_p, gdn_fp8, (0, base_page, 0, 0, 0, 0)
-            ).reshape(ex.num_pages, 2, 64, 4, ex.page_size)
+            ).reshape(
+                mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
+            )
             pools.append(pool_g)
         return hid_m, tuple(pools)
 
@@ -1123,12 +1129,14 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
             T=T,
             R=8,
             ctx=ctx,
-            paged_kv=True,
-            num_pages=num_pages,
             stack_e=True,
-            pool_gather=False,
-            fused_pool_io=False,
             tiles=frozen_parity_tiles(B),
+            cache=mk.CacheExec(
+                paged_kv=True,
+                num_pages=num_pages,
+                pool_gather=False,
+                fused_pool_io=False,
+            ),
         )
         c_f = frozen_mk.MKConfig(
             R=8,
@@ -1140,7 +1148,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
             ctx=ctx,
             paged_kv=True,
             num_pages=num_pages,
-            max_pages_per_seq=ex.resolved_max_pages_per_seq,
+            max_pages_per_seq=mk.pool.resolved_max_pages_per_seq(ex),
             stack_e=True,
         )
         tiles_f = frozen_mk.default_tiles(c_f)
@@ -1165,7 +1173,11 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
         ckpt_host_np = np.asarray(jax.device_get(ckpt))
         kv_page_ids = jnp.asarray(
             [
-                int(pt_host_np[b // T, int(pos_host_np[b]) // ex.page_size])
+                int(
+                    pt_host_np[
+                        b // T, int(pos_host_np[b]) // mk.cache_exec(ex).page_size
+                    ]
+                )
                 for b in range(B)
             ],
             dtype=jnp.int32,
@@ -1323,7 +1335,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
             "B": B,
             "NS": B // T,
             "ctx": ctx,
-            "max_pages_per_seq": ex.resolved_max_pages_per_seq,
+            "max_pages_per_seq": mk.pool.resolved_max_pages_per_seq(ex),
             "lib_median_us": round(lib_stats["median_us"], 1),
             "frozen_median_us": round(frozen_stats["median_us"], 1),
             "delta_pct": round(delta_pct, 2),
@@ -1339,7 +1351,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
             "max_abs_diff": max_abs_diff,
         }
         pooled_results.append(row)
-        pt_cols = ex.resolved_max_pages_per_seq
+        pt_cols = mk.pool.resolved_max_pages_per_seq(ex)
         print(
             f"[M3 PallasWriter T={T} B={B:2d} ctx={ctx:6d} (pt_cols={pt_cols:4d})] "
             f"lib={row['lib_median_us']:6.1f} us vs "
@@ -1371,13 +1383,15 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
         T=1,
         R=8,
         ctx=131072,
-        paged_kv=True,
-        num_pages=4608,
-        max_pages_per_seq=1024,
         stack_e=True,
-        pool_gather=False,
-        fused_pool_io=False,
         tiles=frozen_parity_tiles(64),
+        cache=mk.CacheExec(
+            paged_kv=True,
+            num_pages=4608,
+            max_pages_per_seq=1024,
+            pool_gather=False,
+            fused_pool_io=False,
+        ),
     )
     step_128k_b64, info_128k_b64 = cache.PallasWriter().make_step(
         mesh, g, ex_128k_b64, donate=True
@@ -1433,12 +1447,11 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
         T=1,
         R=8,
         ctx=4096,
-        paged_kv=True,
-        num_pages=4096,
         stack_e=False,
-        pool_gather=False,
-        fused_pool_io=False,
         tiles=frozen_parity_tiles(16),
+        cache=mk.CacheExec(
+            paged_kv=True, num_pages=4096, pool_gather=False, fused_pool_io=False
+        ),
     )
     c_f_pw_u = frozen_mk.MKConfig(
         R=8,
@@ -1450,7 +1463,7 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
         ctx=4096,
         paged_kv=True,
         num_pages=4096,
-        max_pages_per_seq=ex_pw_u.resolved_max_pages_per_seq,
+        max_pages_per_seq=mk.pool.resolved_max_pages_per_seq(ex_pw_u),
         stack_e=False,
     )
     tiles_f_pw_u = frozen_mk.default_tiles(c_f_pw_u)
@@ -1468,7 +1481,10 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     pt_pu_np = np.asarray(jax.device_get(pt_pu))
     ckpt_pu_np = np.asarray(jax.device_get(ckpt_pu))
     pu_kv_ids = jnp.asarray(
-        [int(pt_pu_np[b, int(pos_pu_np[b]) // ex_pw_u.page_size]) for b in range(16)],
+        [
+            int(pt_pu_np[b, int(pos_pu_np[b]) // mk.cache_exec(ex_pw_u).page_size])
+            for b in range(16)
+        ],
         dtype=jnp.int32,
     )
     pu_gdn_ids = jnp.asarray(
@@ -1791,8 +1807,8 @@ def test_m3_tpu_v7x8_paged_eplb_tp_bench():
     eplb_results = []
     for ecopy_opt in (0, 1):
         for T, B in [(1, 16), (4, 16)]:
-            tiles_lib_e = dataclasses.replace(
-                frozen_parity_tiles(B), ecopy_opt=ecopy_opt
+            tiles_lib_e = frozen_parity_tiles(B).with_blocks(
+                {"moe": {"ecopy_opt": ecopy_opt}}
             )
             ex_e = ExecSpec(B=B, T=T, R=8, ctx=4096, stack_e=True, tiles=tiles_lib_e)
             c_f_e = frozen_mk.MKConfig(
@@ -2036,12 +2052,12 @@ def _check_pooled_hlo_or_fail(
     g = spec.config
     ok, msg = cache.check_pooled_step_hlo(
         compiled_text,
-        page_size=ex.page_size,
+        page_size=mk.cache_exec(ex).page_size,
         kvh=max(1, int(g.NKV) // ex.R),
         hd=int(g.HD),
         min_pool_pages=16,
         fused_pool_io=fused,
-        kernel_names=spec.pool_backend.kernel_names,
+        kernel_names=spec.cache_backend.kernel_names,
     )
     assert ok, f"HLO check failed for {tag}: {msg}"
 
@@ -2093,7 +2109,9 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
 
     p_def = get_profile("qwen35-baseline")
     p_c30 = get_profile("qwen35-candidate30")
-    base = ExecSpec(R=8, ctx=4096, paged_kv=True, num_pages=4096, stack_e=True)
+    base = ExecSpec(
+        R=8, ctx=4096, stack_e=True, cache=mk.CacheExec(paged_kv=True, num_pages=4096)
+    )
     buckets = [(1, 4), (1, 16), (1, 32), (1, 64), (4, 4), (4, 16), (4, 64)]
     rows = []
 
@@ -2136,7 +2154,7 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
         ex_c30 = p_c30.exec_for(base, B=B, T=T, g=g)
         row["c30_gpr"] = _record("c30", ex_c30, False, *ref)
         if row["c30_gpr"]:
-            ex_off = dataclasses.replace(ex_c30, pool_gather=False)
+            ex_off = mk.with_cache(ex_c30, pool_gather=False)
             _record("c30_gpr_off", ex_off, False, *ref)
         if should_fuse_pool_io(spec, ex_c30, fused_pool_io="auto"):
             _record("c30_fused", ex_c30, True, *ref)
@@ -2146,6 +2164,10 @@ def test_m5_tpu_v7x8_profile_ablation_bench():
     print("\n=== M5_TPU_V7X8_BENCH_JSON_START ===")
     print(json.dumps({"m5_profile_bench": rows}, indent=2))
     print("=== M5_TPU_V7X8_BENCH_JSON_END ===", flush=True)
+
+
+# Block owning each bisect flag (`Tiles.blocks`).
+_BISECT_FLAG_BLOCK = {"gqa_qv": "gqa", "moe_unroll": "moe"}
 
 
 @pytest.mark.parametrize(
@@ -2163,7 +2185,9 @@ def test_m5_tpu_v7x8_frozen_parity_bisect(variant: str, monkeypatch):
     monkeypatch.setitem(
         globals(),
         "frozen_parity_tiles",
-        lambda B, **kw: dataclasses.replace(baseline_tiles(B, **kw), **flags),
+        lambda B, **kw: baseline_tiles(B, **kw).with_blocks(
+            {_BISECT_FLAG_BLOCK[f]: {f: v} for f, v in flags.items()}
+        ),
     )
     print(f"\n=== M5_BISECT variant={variant} flags={flags}", flush=True)
     try:
@@ -2206,8 +2230,6 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         _tiny_geom,
     )
 
-    from vllm_torchtpu import megakernel as mk
-
     T = 4
     mesh = Mesh(np.array(jax.devices()[:2]), ("tp",))
     tp = NamedSharding(mesh, P("tp"))
@@ -2218,18 +2240,26 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         ex0 = _tiny_exec(
             R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=num_pages, stack_e=False
         )
-        ex = dataclasses.replace(
-            ex0,
-            tiles=dataclasses.replace(
-                ex0.resolved_tiles, conv_stage=False, gdn_head_major=True
+        ex = mk.with_cache(
+            dataclasses.replace(
+                ex0,
+                tiles=ex0.resolved_tiles.with_blocks(
+                    {"gdn": {"conv_stage": False, "gdn_head_major": True}}
+                ),
+                interpret=False,
             ),
             pool_gather=False,
-            interpret=False,
         )
         key = 710 + T * 10 + B + 1000 * seed
     else:
         prof = get_profile("qwen35-candidate30-fused")
-        base = ExecSpec(R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=num_pages)
+        base = ExecSpec(
+            R=2,
+            B=B,
+            T=T,
+            ctx=256,
+            cache=mk.CacheExec(paged_kv=True, num_pages=num_pages),
+        )
         ex = prof.exec_for(base, B=B, T=T, g=g)
         t = ex.resolved_tiles
         t = dataclasses.replace(
@@ -2238,11 +2268,13 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
             nbd=10,
             nbe=max(6, min(t.nbe, 12)),
             ebank=256 << 10,
-            kv_blk=256,
             vmem_mib=32,
-            kv_sub=128 if t.kv_sub else 0,
+        ).with_blocks(
+            {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
         )
-        ex = dataclasses.replace(ex, tiles=t, pool_gather=False, interpret=False)
+        ex = mk.with_cache(
+            dataclasses.replace(ex, tiles=t, interpret=False), pool_gather=False
+        )
         key = 810 + B + 1000 * seed
     assert should_fuse_pool_io(spec, ex, fused_pool_io=True)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(key), g, ex)
@@ -2280,7 +2312,7 @@ def test_fused_vs_split_t4_tpu_bitwise(tiles: str, B: int, seed: int):
         (np.asarray(r).view(np.uint8) != p).any() for r, p in zip(raw_s, pools_in)
     )
     kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
-    summary = _pool_diff_summary(raw_f, raw_s, ex.num_pages, kinds)
+    summary = _pool_diff_summary(raw_f, raw_s, mk.cache_exec(ex).num_pages, kinds)
     print(
         f"[FUSED_T4_TPU tiles={tiles} B={B} seed={seed}] "
         f"hidden_equal={bool((hs == hf).all())} pool_diff={summary}",

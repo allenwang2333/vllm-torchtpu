@@ -25,16 +25,27 @@ from __future__ import annotations
 
 import dataclasses
 
+from ..blocks.gqa import GQABlock, GQATunables
+from ..blocks.moe import MoEBlock
 from ..profile import Profile, register_profile
 from ..spec import Tiles
 
 # `ModelSpec.name` of the Qwen3.5 model (`qwen35.qwen35_spec`).
 QWEN35_MODEL_NAME = "qwen3_5"
+_GQA, _MOE = GQABlock.name, MoEBlock.name
 
 # Decode (`B <= 4`), verify (`8 < B <= 16`) and wide (`B > 16`) tiles.
-DECODE_TILES = Tiles(hier=1, pack=1, mb8=2)
-VERIFY_TILES = dataclasses.replace(DECODE_TILES, nkv=4, rsag=True, hier=2, ecopy_opt=1)
-WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, nkv=3, vmem_mib=62, hier=0)
+DECODE_TILES = Tiles(hier=1, mb8=2, blocks={_GQA: GQATunables(pack=1)})
+VERIFY_TILES = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_blocks(
+    {_GQA: {"nkv": 4}, _MOE: {"ecopy_opt": 1}}
+)
+WIDE_TILES = dataclasses.replace(VERIFY_TILES, nbd=10, vmem_mib=62, hier=0).with_blocks(
+    {_GQA: {"nkv": 3}}
+)
+# Small banks and rings for CPU interpret runs of tiny geometries.
+TINY_TILES = Tiles(
+    bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32
+).with_blocks({_GQA: {"kv_blk": 256, "nkv": 3}})
 
 
 def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -58,7 +69,9 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     elif B > 8:
         t = VERIFY_TILES
     elif B > 4:
-        t = dataclasses.replace(DECODE_TILES, rsag=True, hier=2, ecopy_opt=1)
+        t = dataclasses.replace(DECODE_TILES, rsag=True, hier=2).with_blocks(
+            {_MOE: {"ecopy_opt": 1}}
+        )
     else:
         t = DECODE_TILES
     if R not in (1, 8) and t.hier != 0:
@@ -85,6 +98,7 @@ __all__ = [
     "DECODE_TILES",
     "PROFILE",
     "QWEN35_MODEL_NAME",
+    "TINY_TILES",
     "VERIFY_TILES",
     "WIDE_TILES",
     "baseline_tiles",

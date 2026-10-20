@@ -13,12 +13,13 @@
 # limitations under the License.
 """Hook through which blocks reach the optional fused pool I/O helpers.
 
-`GQABlock` and `GDNBlock` never import `experimental.fused_pool_io`; when
-`ex.FUSED` is set they call `fused_io()`, which returns the implementation that
-`experimental/fused_pool_io.py` registers on import (the package `__init__`
-imports `experimental`). Without a registered implementation, `"auto"` fused
-selection falls back to split pool I/O (`fused_io_available()`), and an explicit
-fused build fails with `MegakernelConfigError`.
+`GQABlock` and `GDNBlock` never import `experimental.fused_pool_io`; when fused
+pool I/O is selected (`CacheExec.FUSED`) they call `fused_io()`, which returns
+the implementation that `experimental/fused_pool_io.py` registers on import
+(the package `__init__` imports `experimental`). Without a registered
+implementation, `"auto"` fused selection falls back to split pool I/O
+(`fused_io_available()`), and an explicit fused build fails with
+`MegakernelConfigError`.
 
 This module depends only on `errors`, so importing the experimental helpers does
 not load any block.
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 
 
 class FusedPoolIO(Protocol):
-    """Fused pool I/O helpers called by `GQABlock` / `GDNBlock` under `ex.FUSED`."""
+    """Fused pool I/O helpers called by `GQABlock` / `GDNBlock` (`CacheExec.FUSED`)."""
 
     def gqa_fused_states(self, ex: ExecSpec) -> list[StateDecl]: ...
 
@@ -75,7 +76,7 @@ def fused_io_available() -> bool:
 
 
 def fused_io() -> FusedPoolIO:
-    """Return the registered fused pool I/O helpers (only used when `ex.FUSED`)."""
+    """Return the registered fused pool I/O helpers (used under `CacheExec.FUSED`)."""
     impl = _REGISTRY.get(_KEY)
     if impl is None:
         raise MegakernelConfigError(

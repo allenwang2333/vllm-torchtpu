@@ -28,7 +28,8 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from ..ops import I32, rup
-from ..spec import ExecSpec, PoolBackend
+from ..spec import ExecSpec
+from .config import PoolBackend, cache_exec
 from .layout import PoolLayout
 
 GATHER_KERNEL_NAME = "gather_gdn_states"
@@ -135,26 +136,38 @@ def kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
         jax.debug.callback(_cb, cond)
 
 
-def can_pool_gather(layout: PoolLayout, ex: ExecSpec) -> bool:
+# `ex -> (chunk rows, state ring depth)` of the recurrent block's chunked path.
+RecChunk = Callable[[ExecSpec], tuple[int, int]]
+
+
+def can_pool_gather(
+    layout: PoolLayout, ex: ExecSpec, rec_chunk: RecChunk | None = None
+) -> bool:
     """Whether verify bucket `ex` can gather recurrent state in-kernel (`GPR`).
 
-    Depends only on the pool layout and the GDN chunk tiles: `GPR` needs the
-    chunked (`gdn_rows`) verify path and a conv window that fits the K half of
-    one pool page as `(rows, 4, page_size)` fp8 rows.
+    Depends only on the pool layout and the recurrent block's chunking
+    (`rec_chunk(ex)`, e.g. `GDNBlock.chunk_rows`; `None`: no in-kernel gather):
+    `GPR` needs the chunked verify path and a conv window that fits the K half
+    of one pool page as `(rows, 4, page_size)` fp8 rows.
     """
-    if not layout.has_recurrent or ex.page_size != layout.page_size or ex.T <= 1:
+    if (
+        not layout.has_recurrent
+        or cache_exec(ex).page_size != layout.page_size
+        or ex.T <= 1
+    ):
         return False
-    if ex.pool_gather in (False, "split"):
+    if cache_exec(ex).pool_gather in (False, "split"):
         return False
-    if ex.pool_gather is None and not ex.WIDE:
+    if cache_exec(ex).pool_gather is None and not ex.WIDE:
         return False
-    tiles = ex.resolve_tiles()
-    cb = tiles.gdn_rows
+    if rec_chunk is None:
+        return False
+    cb, bufs = rec_chunk(ex)
     if cb <= 0 or cb % 8 != 0 or cb % ex.T != 0:
         return False
     _, tr = divmod(ex.B, cb)
     nch = ex.B // cb + int(tr > 0)
-    nrb = min(tiles.gdn_bufs, nch)
+    nrb = min(bufs, nch)
     if nch > 1 and nrb < 2:
         return False
     hr = rup(layout.conv_taps + ex.T, 8)
@@ -170,13 +183,15 @@ def make_pool_backend(
     layout: PoolLayout,
     *,
     check: Callable[[ExecSpec], None] | None = None,
+    rec_chunk: RecChunk | None = None,
     supports_fused_io: bool = True,
     supports_pool_gather: bool = True,
 ) -> PoolBackend:
     """Build the `PoolBackend` (gather / scatter callbacks) for `layout`.
 
     `check(ex)`, if given, runs before each gather / scatter launch (e.g. the
-    model geometry's `check`).
+    model geometry's `check`). `rec_chunk` enables in-kernel gather (see
+    `can_pool_gather`).
     """
     # Local imports: the kernels import the shared checks from this module.
     from .gather import gather_gdn_states
@@ -191,7 +206,7 @@ def make_pool_backend(
         read_offsets: jax.Array | None,
         active_seqs: Any,
     ) -> dict[str, Any]:
-        if not has_rec or ex_paged.GPR:
+        if not has_rec or cache_exec(ex_paged).GPR:
             return {}
         assert ckpt_indices is not None and read_offsets is not None
         if check is not None:
@@ -233,11 +248,11 @@ def make_pool_backend(
             ckpt_indices if has_rec else None,
             active_seqs,
             interpret=ex_paged.interpret,
-            conv_partial=ex_paged.GPR,
+            conv_partial=cache_exec(ex_paged).GPR,
         )
 
     def _can_pool_gather(ex_paged: ExecSpec) -> bool:
-        return can_pool_gather(layout, ex_paged)
+        return can_pool_gather(layout, ex_paged, rec_chunk)
 
     return PoolBackend(
         layout=layout,

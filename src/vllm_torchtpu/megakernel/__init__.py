@@ -80,7 +80,16 @@ from .models.qwen35_pool import (
 )
 from .ops import rup
 from .planner import encode_ecopy
-from .pool import PoolLayout, allocate_test_layout, make_pool_backend
+from .pool import (
+    POOL_STATE_NAME,
+    CacheExec,
+    PoolBackend,
+    PoolLayout,
+    allocate_test_layout,
+    cache_exec,
+    make_pool_backend,
+    with_cache,
+)
 from .profile import (
     DEFAULT_PROFILE,
     Baseline,
@@ -91,13 +100,12 @@ from .profile import (
     register_profile,
 )
 from .spec import (
-    POOL_STATE_NAME,
     Block,
     DebugOptions,
     ExecSpec,
+    ExtraInput,
     LayerType,
     ModelSpec,
-    PoolBackend,
     ScratchReq,
     SmallField,
     Spec,
@@ -116,10 +124,12 @@ __all__ = [
     "AllReduceRing",
     "Baseline",
     "Block",
+    "CacheExec",
     "CachePipe",
     "DebugOptions",
     "DirectHBM",
     "ExecSpec",
+    "ExtraInput",
     "GDNBlock",
     "GDNLinInLayout",
     "GDNParams",
@@ -148,6 +158,7 @@ __all__ = [
     "allocate_test_layout",
     "build",
     "cache",
+    "cache_exec",
     "cache_experimental",
     "check_fused_pooled_step_hlo",
     "check_pooled_step_hlo",
@@ -194,4 +205,5 @@ __all__ = [
     "stream",
     "unfold",
     "vmem",
+    "with_cache",
 ]

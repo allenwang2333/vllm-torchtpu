@@ -26,6 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ..ops import BF16, FP8, I32, U32, rup
 from ..spec import ExecSpec
 from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
+from .config import cache_exec
 from .layout import LANES, PoolLayout
 
 # Pallas kernel name (unchanged from the Qwen3.5-only module so TPU traces and
@@ -76,7 +77,7 @@ def scatter_pool_states(
 
     NS, B, T, MR = ex.NS, ex.B, ex.T, ex.MR
     G_PER_ATT = layout.slots_per_pool
-    page_size = ex.page_size
+    page_size = cache_exec(ex).page_size
     HD = layout.hd
     h4 = HD // 4
     page_shape = layout.kv_page_shape
@@ -93,7 +94,7 @@ def scatter_pool_states(
         )
     has_gdn = G_PER_ATT > 0
     use_conv_partial = (
-        bool(ex.GPR if conv_partial is None else conv_partial)
+        bool(cache_exec(ex).GPR if conv_partial is None else conv_partial)
         and has_gdn
         and not bool(interpret)
     )
@@ -103,7 +104,7 @@ def scatter_pool_states(
     if has_gdn:
         check_ckpt_bounds(
             ckpt_indices,
-            ex.num_pages,
+            cache_exec(ex).num_pages,
             layout,
             act_mode=act_mode,
             active_mask=active_mask,
@@ -114,7 +115,9 @@ def scatter_pool_states(
     pos_st = pos[: NS * T].reshape(NS, T)
     lp_idx = jnp.clip(lax.div(pos_st, page_size), 0, pt_cols - 1)
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
-    kv_pages = jnp.clip(page_table[s_idx_arr, lp_idx], 0, ex.num_pages - 1).astype(I32)
+    kv_pages = jnp.clip(
+        page_table[s_idx_arr, lp_idx], 0, cache_exec(ex).num_pages - 1
+    ).astype(I32)
 
     conv_in: Any = None
     conv_buf_shape: Any = None
@@ -261,11 +264,11 @@ def scatter_pool_states(
             )
             pb = layout.page_base(slot, sub, ckpt_indices.ndim)
             kernel_debug_check(
-                jnp.logical_and(pb >= 0, pb + span <= ex.num_pages),
+                jnp.logical_and(pb >= 0, pb + span <= cache_exec(ex).num_pages),
                 "GDN scatter checkpoint slot maps outside [0, num_pages)",
                 interpret=bool(interpret),
             )
-            return jnp.clip(pb, 0, ex.num_pages - span)
+            return jnp.clip(pb, 0, cache_exec(ex).num_pages - span)
 
         def is_contig_ckpt(sub, s):
             if not ckpt_is_3d or T <= 1:
@@ -345,7 +348,9 @@ def scatter_pool_states(
 
         def slot_copy(raw_out_ref, slot, t, pb_t):
             src = page_buf.at[slot].reshape(T * pps * page_rows, 4, page_size)
-            dst = raw_out_ref.reshape(ex.num_pages * page_rows, 4, page_size)
+            dst = raw_out_ref.reshape(
+                cache_exec(ex).num_pages * page_rows, 4, page_size
+            )
             r0 = pl.multiple_of(pb_t * page_rows, page_rows)
             return pltpu.make_async_copy(
                 src.at[pl.ds(t * pps * page_rows, SLOT_ROWS)],
@@ -545,7 +550,7 @@ def scatter_pool_states(
         def scatter_single_token_across_att(s_idx, b_idx, t_idx):
             p = pos_ref[b_idx]
             ln = lax.rem(p, page_size)
-            kp = jnp.clip(kv_pages_ref[s_idx, t_idx], 0, ex.num_pages - 1)
+            kp = jnp.clip(kv_pages_ref[s_idx, t_idx], 0, cache_exec(ex).num_pages - 1)
             mask_ln = lane_iota == ln
             sh_b = lax.rem(ln + (page_size - lax.rem(b_idx, page_size)), page_size)
 
@@ -630,12 +635,15 @@ def scatter_pool_states(
                 @pl.when(is_active(s))
                 def _():
                     b0 = s * T
-                    kp0 = jnp.clip(kv_pages_ref[s, 0], 0, ex.num_pages - 1)
+                    kp0 = jnp.clip(kv_pages_ref[s, 0], 0, cache_exec(ex).num_pages - 1)
                     same_page = jnp.bool_(True)
                     for t in range(1, T):
                         same_page = jnp.logical_and(
                             same_page,
-                            jnp.clip(kv_pages_ref[s, t], 0, ex.num_pages - 1) == kp0,
+                            jnp.clip(
+                                kv_pages_ref[s, t], 0, cache_exec(ex).num_pages - 1
+                            )
+                            == kp0,
                         )
 
                     @pl.when(same_page)

@@ -36,7 +36,8 @@ from jax.sharding import PartitionSpec as P  # noqa: E402
 import vllm_torchtpu.megakernel as mk  # noqa: E402
 from vllm_torchtpu.megakernel import planner  # noqa: E402
 from vllm_torchtpu.megakernel.models import qwen35  # noqa: E402
-from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec  # noqa: E402
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
+from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (  # noqa: E402
     build_pooled_step_op,
     execute_pooled_step_inplace,
@@ -81,18 +82,18 @@ def _tiny_exec(
     num_pages: int = 64,
     stack_e: bool = False,
 ) -> ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10, kv_blk=min(TINY_TILES.kv_blk, ctx))
+    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
+        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
+    )
     return ExecSpec(
         R=R,
         B=B,
         T=T,
         ctx=ctx,
-        paged_kv=True,
-        num_pages=num_pages,
-        max_pages_per_seq=2,
         stack_e=stack_e,
         tiles=tiles,
         interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=num_pages, max_pages_per_seq=2),
     )
 
 
@@ -237,7 +238,9 @@ def test_verify_and_export_pooled_step_hlo() -> None:
             w_flat_local.append(torch.zeros(sh, dtype=t_dt))
 
     pools_local = [
-        torch.zeros((ex.num_pages, 2, 64, 4, 128), dtype=torch.float8_e4m3fn)
+        torch.zeros(
+            (mk.cache_exec(ex).num_pages, 2, 64, 4, 128), dtype=torch.float8_e4m3fn
+        )
         for _ in range(g.NATT)
     ]
 
@@ -247,7 +250,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=ex.max_pages_per_seq,
+        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
         compile_hlo=True,
     )
     assert ok, f"verify_pooled_step_hlo failed: {msg}"
@@ -258,7 +261,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=ex.max_pages_per_seq,
+        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
         compile_hlo=True,
         ckpt_cols=2,
     )
@@ -270,7 +273,7 @@ def test_verify_and_export_pooled_step_hlo() -> None:
         ex,
         w_flat_local,
         pools_local,
-        max_pages_per_seq=ex.max_pages_per_seq,
+        max_pages_per_seq=mk.cache_exec(ex).max_pages_per_seq,
         platforms=("cpu",),
         ckpt_cols=2,
     )

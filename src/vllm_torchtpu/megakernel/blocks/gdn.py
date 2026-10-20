@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -36,9 +36,11 @@ from ..ops import (
     rnd,
     rup,
 )
+from ..pool.config import cache_exec
 from ..spec import (
     Block,
     ExecSpec,
+    NumericsClass,
     SmallField,
     StateDecl,
     WeightDecl,
@@ -190,12 +192,40 @@ class _GprRecIn:
             ).reshape(vh, KD, VD)
 
 
+@dataclass(frozen=True)
+class GDNTunables:
+    """`GDNBlock` knobs (`Tiles.blocks["gdn"]`); `NUMERICS` classes each field."""
+
+    gdn_rows: int = 8  # State row chunk size of the chunked (`GCH`) path
+    gdn_bufs: int = 3  # State ring depth of the chunked path
+    # Opt-in performance flags (off by default; named profiles turn them on).
+    conv_stage: bool = False  # Stage fused-path conv taps through VMEM `sb`
+    # Head-major recurrence (per-head state update; reassociates the sums)
+    gdn_head_major: bool = False
+
+    # `exact`: moving the field keeps hidden states and caches bit-identical
+    # (scheduling only); `approx`: changes or may change the arithmetic.
+    NUMERICS: ClassVar[dict[str, NumericsClass]] = {
+        "gdn_rows": "approx",  # chunked state rows (GCH)
+        "gdn_bufs": "exact",  # state ring depth (scheduling)
+        "conv_stage": "approx",  # fused-path conv staging
+        "gdn_head_major": "approx",  # head-major state update (reassociates)
+    }
+
+
 class GDNBlock(Block):
     """GatedDeltaNet block supporting decode (`T=1`), verify (`T>1`), and `GCH`."""
 
     name = "gdn"
     reduction = "allreduce"
     input_norm: str | None = "in_norm"
+    Tunables = GDNTunables
+
+    @classmethod
+    def chunk_rows(cls, ex: ExecSpec) -> tuple[int, int]:
+        """`(gdn_rows, gdn_bufs)` of the chunked state path for `ex`."""
+        tt = ex.resolved_tiles.block(cls.name, GDNTunables)
+        return tt.gdn_rows, tt.gdn_bufs
 
     @staticmethod
     def lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
@@ -273,11 +303,15 @@ class GDNBlock(Block):
         ]
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        if ex.FUSED or ex.GPR:
+        if cache_exec(ex).FUSED or cache_exec(ex).GPR:
             g_per_att = g.att_every - 1
-            k_ckpt = ex.ckpt_k if ex.ckpt_k > 0 else ex.T
-            ckpt_sh = (ex.NS, k_ckpt) if ex.ckpt_2d else (g_per_att, ex.NS, k_ckpt)
-            roff_sh = (ex.NS,) if ex.roff_1d else (g_per_att, ex.NS)
+            k_ckpt = cache_exec(ex).ckpt_k if cache_exec(ex).ckpt_k > 0 else ex.T
+            ckpt_sh = (
+                (ex.NS, k_ckpt)
+                if cache_exec(ex).ckpt_2d
+                else (g_per_att, ex.NS, k_ckpt)
+            )
+            roff_sh = (ex.NS,) if cache_exec(ex).roff_1d else (g_per_att, ex.NS)
             st = [
                 StateDecl(
                     "ckpt_indices",
@@ -296,7 +330,7 @@ class GDNBlock(Block):
                     memory_space="smem",
                 ),
             ]
-            if ex.act_mode == "ref":
+            if cache_exec(ex).act_mode == "ref":
                 st.append(
                     StateDecl(
                         "active_seqs",
@@ -322,7 +356,7 @@ class GDNBlock(Block):
         ]
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             return []
         lay = self.lin_in_layout(g, ex)
         if ex.VER:
@@ -330,7 +364,7 @@ class GDNBlock(Block):
                 StateDecl(
                     "conv_ckpt",
                     shape=(ex.NS, rup(3 + ex.T, 8), lay.QKV),
-                    dtype=BF16 if ex.GPR else F32,
+                    dtype=BF16 if cache_exec(ex).GPR else F32,
                     access="w",
                 ),
                 StateDecl(
@@ -370,6 +404,7 @@ class GDNBlock(Block):
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
         tiles = ex.resolve_tiles(g)
+        tt: GDNTunables = self.tunables(ex)
         R, B, T = ex.R, ex.B, ex.T
         assert not (ex.VER and tiles.inplace), (
             "verify returns per-token checkpoints: no aliasing"
@@ -395,15 +430,15 @@ class GDNBlock(Block):
 
         ngdn = plan.block_layer_counts.get(self.name, 0)
         GCH = (
-            (ex.WIDE or bool(ex.GPR))
-            and tiles.gdn_rows > 0
+            (ex.WIDE or bool(cache_exec(ex).GPR))
+            and tt.gdn_rows > 0
             and ngdn > 0
-            and not ex.FUSED
+            and not cache_exec(ex).FUSED
         )
-        CB = tiles.gdn_rows if GCH else B
+        CB = tt.gdn_rows if GCH else B
         assert not GCH or CB % 8 == 0, (
             "gdn_rows must be a multiple of 8",
-            tiles.gdn_rows,
+            tt.gdn_rows,
         )
         assert not (GCH and ex.VER) or CB % T == 0, (
             "gdn_rows must be a multiple of T",
@@ -412,18 +447,18 @@ class GDNBlock(Block):
         )
         NF, TR = divmod(B, CB)
         NCH = NF + int(TR > 0)
-        NRB = min(tiles.gdn_bufs, NCH)
-        assert not GCH or NCH == 1 or NRB >= 2, ("gdn_bufs >= 2", tiles.gdn_bufs)
+        NRB = min(tt.gdn_bufs, NCH)
+        assert not GCH or NCH == 1 or NRB >= 2, ("gdn_bufs >= 2", tt.gdn_bufs)
         CBV = CB * lay.vh
 
-        GPR = bool(ex.GPR and GCH and ex.VER)
-        assert not ex.GPR or GPR, (
+        GPR = bool(cache_exec(ex).GPR and GCH and ex.VER)
+        assert not cache_exec(ex).GPR or GPR, (
             "pool_gather needs the paged chunked verify path",
             B,
             T,
         )
         GCONV_ROWS = (HR * lay.QKV * 2) // (4 * 128)
-        assert not GPR or ex.page_size == 128, ex.page_size
+        assert not GPR or cache_exec(ex).page_size == 128, cache_exec(ex).page_size
         assert not GPR or (HR * lay.QKV * 2) % (4 * 128) == 0, (HR, lay.QKV)
         assert not GPR or GCONV_ROWS <= 64, GCONV_ROWS
 
@@ -436,11 +471,11 @@ class GDNBlock(Block):
         qkv_128 = lay.QKV // 128
         A_conv = max(16, rup(3 + T, 8))
         conv8_rows = A_conv * qkv_128
-        NGI = min(ex.NS, 8) if ex.FUSED else 0
-        NGO = min(ex.NS, 2) if ex.FUSED else 0
-        K_ckpt = ex.ckpt_k if ex.ckpt_k > 0 else T
+        NGI = min(ex.NS, 8) if cache_exec(ex).FUSED else 0
+        NGO = min(ex.NS, 2) if cache_exec(ex).FUSED else 0
+        K_ckpt = cache_exec(ex).ckpt_k if cache_exec(ex).ckpt_k > 0 else T
         ckpt_t_off = K_ckpt - T if K_ckpt > T else 0
-        if ex.FUSED or GPR:
+        if cache_exec(ex).FUSED or GPR:
             pool_layout = self._pool_layout(plan, ex, g_per_att, ssm_u32_rows)
             REC_PAGES = pool_layout.rec_pages_per_slot
             GDN_PAGES = pool_layout.pages_per_slot
@@ -482,14 +517,14 @@ class GDNBlock(Block):
             qkv_128=qkv_128,
             A_conv=A_conv,
             conv8_rows=conv8_rows,
-            ckpt_is_3d=not ex.ckpt_2d,
-            roff_is_2d=not ex.roff_1d,
+            ckpt_is_3d=not cache_exec(ex).ckpt_2d,
+            roff_is_2d=not cache_exec(ex).roff_1d,
             K_ckpt=K_ckpt,
             ckpt_t_off=ckpt_t_off,
             GPR=GPR,
             GCONV_ROWS=GCONV_ROWS,
-            conv_stage=bool(tiles.conv_stage),
-            head_major=bool(tiles.gdn_head_major),
+            conv_stage=bool(tt.conv_stage),
+            head_major=bool(tt.gdn_head_major),
             pool_layout=pool_layout,
         )
 
@@ -502,7 +537,7 @@ class GDNBlock(Block):
         the pools, so the slot geometry must come from the pool backend's
         layout; raise `MegakernelConfigError` when it can't serve this block.
         """
-        pb = plan.model_spec.pool_backend
+        pb = plan.model_spec.cache_backend
         if pb is None or pb.layout is None:
             raise MegakernelConfigError(
                 f"GDN in-kernel pool I/O needs a pool backend with a layout on "
@@ -525,7 +560,7 @@ class GDNBlock(Block):
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_scratch(ex, gp, plan)
         scr: dict[str, Any] = {
             "recb": (
@@ -565,16 +600,16 @@ class GDNBlock(Block):
         return scr
 
     def init_buffers(self, ctx: Any) -> None:
-        if not ctx.ex.FUSED:
+        if not cache_exec(ctx.ex).FUSED:
             return
         gp: GDNParams = ctx.block_params(self.name)
         fused_io().gdn_fused_init_buffers(ctx, gp)
 
     def _is_seq_active(self, ctx: Any, gp: GDNParams, s: Any) -> Any:
         ex, ST = ctx.ex, ctx.ST
-        if ex.act_mode == "all":
+        if cache_exec(ex).act_mode == "all":
             return jnp.bool_(True)
-        if ex.act_mode == "ref":
+        if cache_exec(ex).act_mode == "ref":
             return ST["active_seqs"][s] != 0
         return (
             (ST["ckpt_indices"][0, s, 0] > 0)
@@ -602,11 +637,11 @@ class GDNBlock(Block):
         else:
             pb = gp.pool_layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
         _kernel_debug_check(
-            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= ex.num_pages),
+            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= cache_exec(ex).num_pages),
             "GDN gather checkpoint slot maps outside [0, num_pages)",
             interpret=bool(ex.interpret),
         )
-        return jnp.clip(pb, 0, ex.num_pages - GDN_PAGES)
+        return jnp.clip(pb, 0, cache_exec(ex).num_pages - GDN_PAGES)
 
     def _gpr_start(
         self,
@@ -844,7 +879,7 @@ class GDNBlock(Block):
                     out = rnd(jnp.sum(sb[...] * qc, axis=1))
                     st[h0 : h0 + vh] = sb[...].astype(BF16)
                 else:
-                    # Head-major recurrence (opt-in `Tiles.gdn_head_major`):
+                    # Head-major recurrence (opt-in `GDNTunables.gdn_head_major`):
                     # per-head update with `colsk` K/Q double-buffered in `sb`.
                     cb = (bb % NCB) * 2 * kh
                     sb[cb : cb + kh] = colsk(k)
@@ -918,7 +953,7 @@ class GDNBlock(Block):
         ex = ctx.ex
         gp: GDNParams = ctx.block_params(self.name)
         o = ctx.stream.sp.block_ord(l, self.name)
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_emit(ctx, gp, o, slot)
         scr, ST, O = ctx.scr, ctx.ST, ctx.O  # noqa: E741
         raw_refs = ctx.raw_refs
@@ -1086,7 +1121,7 @@ class GDNBlock(Block):
 
     def epilogue(self, ctx: Any) -> None:
         gp: GDNParams = ctx.block_params(self.name)
-        if ctx.ex.FUSED:
+        if cache_exec(ctx.ex).FUSED:
             fused_io().gdn_fused_epilogue(ctx, gp)
             return
         if gp.NGDN > 0 and "gdn_state" not in ctx.skip:
@@ -1115,7 +1150,7 @@ class GDNBlock(Block):
         states: dict[str, Any],
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             return {}
         if ex.VER:
             return {

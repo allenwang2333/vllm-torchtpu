@@ -11,20 +11,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Core specifications for the config-driven TPU megakernel library."""
+"""Core specifications for the config-driven TPU megakernel library.
+
+Only core execution knobs live here. A block with its own knobs declares a
+frozen `Tunables` dataclass (`Block.Tunables`, with a per-field `NUMERICS`
+class); `Tiles.blocks` holds one instance per block name, and blocks read theirs
+through `Block.tunables(ex)`. Execution extensions owned by other packages ride
+on `ExecSpec.cache` / `ModelSpec.cache_backend`.
+"""
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, ClassVar, Literal, TypeVar
 
-import jax.numpy as jnp
-
-from . import pool_alias
 from .ops import rup
 
-if TYPE_CHECKING:
-    from .pool.layout import PoolLayout
+NumericsClass = Literal["exact", "approx"]
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,22 @@ class StateDecl:
 
 
 @dataclass(frozen=True)
+class ExtraInput:
+    """Positional kernel input after the states, declared by a block.
+
+    Used for optional debug inputs (e.g. externally forced routing). The kernel
+    passes them in block declaration order after the state inputs; the block
+    reads the ref as `ctx.extra[name]`. HBM inputs are sharded across ranks,
+    SMEM inputs replicated and counted against the SMEM budget.
+    """
+
+    name: str
+    memory_space: Literal["hbm", "smem"]
+    shape: tuple[int, ...] = ()  # Per-rank shape (SMEM budget accounting)
+    dtype: Any = None
+
+
+@dataclass(frozen=True)
 class SmallField:
     """Per-layer 1D vector packed into the double-buffered `smalls` table."""
 
@@ -88,172 +110,220 @@ class ScratchReq:
     phase: str = "persistent"  # "persistent" or phase tag for non-overlapping overlay
 
 
+# ---------------------------------------------------------------------------
+# Block tunables
+# ---------------------------------------------------------------------------
+# Block name -> its `Tunables` class (registered by `Block` subclasses).
+_TUNABLES: dict[str, type] = {}
+
+
+def register_tunables(name: str, cls: type) -> None:
+    """Register `cls` as the `Tunables` of blocks named `name`.
+
+    `cls` must be a frozen dataclass whose `NUMERICS` class attribute maps
+    every field to `"exact"` or `"approx"`. Re-registering the same class is a
+    no-op; a different class for a registered name is an error.
+    """
+    if not (dataclasses.is_dataclass(cls) and cls.__dataclass_params__.frozen):  # type: ignore[attr-defined]
+        raise TypeError(f"{cls.__name__} must be a frozen dataclass")
+    fields = {f.name for f in dataclasses.fields(cls)}
+    numerics = dict(getattr(cls, "NUMERICS", {}))
+    if set(numerics) != fields:
+        raise TypeError(
+            f"{cls.__name__}.NUMERICS must cover exactly its fields: missing "
+            f"{sorted(fields - set(numerics))}, "
+            f"unknown {sorted(set(numerics) - fields)}"
+        )
+    bad = {k: v for k, v in numerics.items() if v not in ("exact", "approx")}
+    if bad:
+        raise TypeError(f"{cls.__name__}.NUMERICS has invalid classes {bad}")
+    prev = _TUNABLES.get(name)
+    if prev is not None and prev is not cls:
+        raise ValueError(
+            f"block {name!r} already registered tunables {prev.__name__}, "
+            f"not {cls.__name__}"
+        )
+    _TUNABLES[name] = cls
+
+
+def tunables_class(name: str) -> type:
+    """The registered `Tunables` class of blocks named `name`."""
+    try:
+        return _TUNABLES[name]
+    except KeyError:
+        raise KeyError(
+            f"no tunables registered for block {name!r}; known: {sorted(_TUNABLES)}"
+        ) from None
+
+
+def registered_tunables() -> dict[str, type]:
+    """All registered `{block name: Tunables class}` (a copy)."""
+    return dict(_TUNABLES)
+
+
+class TunablesMap(Mapping[str, Any]):
+    """Immutable, hashable `{block name: Tunables}` mapping (`Tiles.blocks`).
+
+    Entries equal to their class defaults are dropped, so tiles that leave a
+    block at its defaults compare equal however they were built.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: Mapping[str, Any] | None = None) -> None:
+        pairs = []
+        for name, val in dict(items or {}).items():
+            if not dataclasses.is_dataclass(val) or isinstance(val, type):
+                raise TypeError(
+                    f"Tiles.blocks[{name!r}] must be a Tunables instance, got "
+                    f"{type(val).__name__} (use Tiles.with_blocks for field dicts)"
+                )
+            if val != type(val)():
+                pairs.append((name, val))
+        self._items: tuple[tuple[str, Any], ...] = tuple(sorted(pairs))
+
+    def __getitem__(self, key: str) -> Any:
+        for name, val in self._items:
+            if name == key:
+                return val
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(name for name, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __hash__(self) -> int:
+        return hash(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, TunablesMap):
+            return self._items == other._items
+        return isinstance(other, Mapping) and dict(self._items) == dict(other)
+
+    def __repr__(self) -> str:
+        return f"TunablesMap({dict(self._items)!r})"
+
+
+# ---------------------------------------------------------------------------
+# Tiles
+# ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Tiles:
-    """Execution tiling and pipeline depth parameters.
+    """Core execution tiling, ring depths, budgets and collectives.
 
-    Every field declares its numerics class in `TILE_NUMERICS` (below).
+    Every core field declares its numerics class in `TILE_NUMERICS` (below);
+    block knobs live in `blocks` (`{block name: Tunables}`, see `block` and
+    `with_blocks`).
     """
 
     bank: int = 2 << 20  # Bytes per dense ring slot
     nbd: int = 14  # Dense ring slots
     nbe: int = 10  # Expert ring slots
     ebank: int = 1 << 20  # Bytes per expert ring slot
-    kv_blk: int = 2048  # KV tokens per block
-    nkv: int = 3  # KV ring depth
     vmem_mib: int = 62  # VMEM limit in MiB
     smem_mib: int = 1  # SMEM limit in MiB
     bounds_checks: bool = False
-    lazy: bool = True  # Refill attention/MoE dense slots after their streams
-    pipe: bool = True  # Software-pipeline single-tile experts
-    topk: bool = True  # One-reduction top-k picks on packed (value, lane) keys
+    lazy: bool = True  # Refill block dense slots after their streams
     inplace: bool = False  # Alias state inputs to outputs where supported
-    split: bool = True  # Sequence-split attention across G ranks sharing a KV head
     rsag: bool = False  # Two-round reduce-scatter + all-gather
     hier: int = 0  # Hierarchical all-reduce on v7x-8 (0, 1, 2, 3)
     war: int = -1  # Unfolded [MR, H] all-reduce payload (-1: auto, 0: off, 1: on)
-    pack: int = -1  # Pack PB = 8 // nh rows per 8-row tile (-1: auto)
     mb8: int = 0  # Internal activation row count MB (0: M, 1: max(16, MR), 2: MR)
-    gdn_rows: int = 8  # GDN state row chunk size above 16 rows
-    gdn_bufs: int = 3  # GDN state ring depth
-    kv_sub: int = 0  # KV tokens per online-softmax update inside a block (0: full)
-    amask: int = 1  # Attention mask mode (0..4)
-    ecopy_opt: int = 0  # Redundant expert dedup optimization (0 or 1)
-    # Per-bucket schedule thresholds (row counts). Blocks never compare `B` to a
-    # literal; they read these, and tile rules (`profiles/`) may tune them.
-    wide_rows: int = 16  # `B > wide_rows`: WIDE schedule (chunked GDN, auto pack/war)
-    # Unrolled / PIPE_EP experts: paired ring releases + unrolled refills up to here
-    moe_group_rows: int = 40
-    kv_scatter_vec_ns: int = 16  # Non-paged host KV update: one scatter above this NS
+    # Per-bucket schedule threshold (rows). Blocks never compare `B` to a
+    # literal; they read this, and tile rules (`profiles/`) may tune it.
+    wide_rows: int = 16  # `B > wide_rows`: WIDE schedule (`ExecSpec.WIDE`)
     # Opt-in performance flags below default to off. Named profiles
     # (`profile.py`, `profiles/`) turn them on; defaults never do.
-    pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
-    r2_direct_store: bool = False  # Direct VMEM store on MoE r2 tile 0
-    # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
-    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.route` holds)
-    route_vec: bool = False
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
-    kv_ering: bool = False  # Alias KV DMA ring onto epool when unused in GQA
-    pair_kv: bool = False  # Pair KV attention items to overlap KV DMA + softmax
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
-    gqa_qv: bool = False  # Head-batched Q/K norm+RoPE and 128-lane Q/O staging
-    gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
-    topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
-    conv_stage: bool = False  # Stage fused-path GDN conv taps through VMEM `sb`
-    # Head-major GDN recurrence (per-head state update; reassociates the sums)
-    gdn_head_major: bool = False
-    moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
+    # Per-block tunables (`Block.Tunables` instances keyed by block name).
+    blocks: Mapping[str, Any] = TunablesMap()
 
-    def tk(self, K: int, N: int, dtype: Any, bank: int) -> int:
-        """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank`."""
-        best = None
-        for tk in range(128, K + 1, 128):
-            if (
-                K % tk == 0
-                and pool_alias.storage_size((tk, N), jnp.dtype(dtype)) <= bank
-            ):
-                best = tk
-        assert best is not None, ("no 128-row tile fits a bank", K, N, dtype, bank)
-        return best
+    def __post_init__(self) -> None:
+        if not isinstance(self.blocks, TunablesMap):
+            object.__setattr__(self, "blocks", TunablesMap(self.blocks))
+
+    def block(self, name: str, cls: type[_T] | None = None) -> _T:
+        """Tunables of block `name` (class defaults when unset)."""
+        val = self.blocks.get(name)
+        if val is not None:
+            return val
+        return (cls if cls is not None else tunables_class(name))()
+
+    def with_blocks(self, updates: Mapping[str, Any]) -> Tiles:
+        """Copy with block tunables replaced: `{block name: {field: value}}`.
+
+        A value may also be a `Tunables` instance (replaces the block's whole
+        set). Unknown blocks or fields raise.
+        """
+        blocks = dict(self.blocks)
+        for name, upd in updates.items():
+            if isinstance(upd, Mapping):
+                blocks[name] = dataclasses.replace(self.block(name), **upd)
+            else:
+                blocks[name] = upd
+        return dataclasses.replace(self, blocks=TunablesMap(blocks))
 
 
-NumericsClass = Literal["exact", "approx"]
-
-# Numerics class of every `Tiles` field (`profile.approx_features` reads this).
+# Numerics class of every core `Tiles` field (`profile.approx_features` reads
+# this together with each block's `Tunables.NUMERICS`, see `tile_numerics`).
 # `exact`: moving the field off the reference profile's value keeps hidden
-# states and pools bit-identical, because it only changes DMA / ring
+# states and caches bit-identical, because it only changes DMA / ring
 # scheduling, budgets or debug checks. `approx`: changes the
-# arithmetic (matmul K-tiling, reduction / softmax order, rounding, routing) or
+# arithmetic (matmul K-tiling, reduction order, rounding, routing) or
 # is not proven exact; profiles that move any of these are `approx`.
 TILE_NUMERICS: dict[str, NumericsClass] = {
-    "bank": "approx",  # dense K-tiling (`Tiles.tk`)
+    "bank": "approx",  # dense K-tiling (`planner.k_tile`)
     "nbd": "exact",  # dense ring depth (scheduling)
-    "nbe": "approx",  # expert ring depth also gates PIPE / PIPE_EP and KVE paths
+    "nbe": "approx",  # expert ring depth also gates block pipelining paths
     "ebank": "approx",  # expert K-tiling
-    "kv_blk": "approx",  # online-softmax block size
-    "nkv": "exact",  # KV ring depth (scheduling)
     "vmem_mib": "exact",  # budget only
     "smem_mib": "exact",  # budget only
     "bounds_checks": "exact",  # debug checks only
     "lazy": "exact",  # dense refill placement (scheduling)
-    "pipe": "approx",  # single-tile expert pipelining
-    "topk": "approx",  # packed-key top-k
     "inplace": "approx",  # state input/output aliasing (not proven exact)
-    "split": "approx",  # sequence-split attention (partial-softmax merge)
     "rsag": "approx",  # rounds all-reduce partial sums to bf16
     "hier": "approx",  # all-reduce reduction order
     "war": "approx",  # all-reduce payload layout
-    "pack": "approx",  # split-attention row packing
     "mb8": "approx",  # activation row count
-    "gdn_rows": "approx",  # chunked GDN state rows (GCH)
-    "gdn_bufs": "exact",  # GDN state ring depth (scheduling)
-    "kv_sub": "approx",  # online-softmax sub-block updates
-    "amask": "approx",  # attention mask mode
-    "ecopy_opt": "approx",  # redundant-expert dispatch policy
-    "wide_rows": "approx",  # WIDE schedule threshold (GCH, auto pack / war)
-    "moe_group_rows": "exact",  # paired expert-ring releases (scheduling)
-    "kv_scatter_vec_ns": "exact",  # host KV update: one scatter vs per-sequence
-    "pipe_ep": "approx",  # EP expert software pipeline
-    "r2_direct_store": "approx",  # `=` instead of zero-fill + `+=` (signed zero)
-    "route_vec": "approx",  # vectorized routing policy
+    "wide_rows": "approx",  # WIDE schedule threshold
     "dense_acc_pair": "approx",  # paired dense accumulation
-    "kv_ering": "exact",  # KV ring staged in the expert pool (TPU bisect, CPU test)
-    "pair_kv": "exact",  # paired KV items (TPU bisect, CPU test)
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
-    "gqa_qv": "exact",  # head-batched Q/K norm + RoPE (TPU bisect, CPU test)
-    "gq_pack": "approx",  # packed G*nh query tiles
-    "topk_lanes": "approx",  # Batcher odd-even lane top-k
-    "conv_stage": "approx",  # fused-path conv staging
-    "gdn_head_major": "approx",  # head-major GDN state update (reassociates)
-    "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
 }
 
-# Numerics class of the pool-I/O modes selected by profiles.
-POOL_IO_NUMERICS: dict[str, NumericsClass] = {
-    "fused_pool_io": "approx",  # always runs the head-major GDN recurrence
-    # GPR, auto (`Profile.pool_gather=None`): WIDE verify buckets only, where
-    # GCH is already on (bitwise vs split at T=4 B=24).
-    "pool_gather": "exact",
-    # GPR on every eligible bucket (`Profile.pool_gather=True`): may reassociate
-    # non-WIDE verify buckets under tuned tile schedules.
-    "pool_gather_eligible": "approx",
-}
 
-TINY_TILES = Tiles(
-    bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, kv_blk=256, nkv=3, vmem_mib=32
-)
+def tile_numerics() -> dict[str, NumericsClass]:
+    """Numerics class of every tile knob: core fields plus `<block>.<field>`."""
+    out: dict[str, NumericsClass] = dict(TILE_NUMERICS)
+    for name, cls in sorted(_TUNABLES.items()):
+        out.update({f"{name}.{k}": v for k, v in cls.NUMERICS.items()})  # type: ignore[attr-defined]
+    return out
 
 
-def default_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+def default_tiles(B: int, **kw: Any) -> Tiles:
     """Model-agnostic default tiles (`profiles/default.py:default_tiles`).
 
     Used for `ExecSpec.tiles=None`; the kernel builder then fits their ring
-    depths to the model's VMEM budget (`vmem.fit_default_tiles`).
+    depths to the model's VMEM budget (`vmem.fit_default_tiles`). Keyword
+    arguments follow the tile-rule signature (`profile.TileRule`).
     """
     from .profiles.default import default_tiles as _rule
 
-    return _rule(B, moe_tp=moe_tp, R=R)
-
-
-# Valid `ExecSpec.pool_gather` values (see the field comment).
-POOL_GATHER_VALUES: tuple[Any, ...] = (False, "split", None, "eligible", True)
+    return _rule(B, **kw)
 
 
 @dataclass(frozen=True)
 class DebugOptions:
     """Debug and ablation flags kept separate from model geometry and execution."""
 
-    forced_routing: bool = False  # Use external rbias HBM input for MoE routing
-    row_mask: bool = False  # Use external moe_rows SMEM mask for MoE routing
     skip: frozenset[str] = (
         frozenset()
     )  # Ablation skip set (e.g. {"dense", "comm", "kv", "experts"})
     scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
-    # Host-side ckpt_indices bounds validation on every eager pooled-step call
-    # (device-to-host sync + Python loop). In-kernel clamps always apply.
-    check_ckpt_bounds: bool = False
 
 
 @dataclass(frozen=True)
@@ -265,60 +335,22 @@ class ExecSpec:
     R: int = 8  # Tensor-parallel / expert-parallel ranks
     ctx: int = 2048  # Max KV sequence length
     stack_e: bool = False  # True: 4D stacked expert weights; False: per-layer 3D
-    paged_kv: bool = False  # True: stream KV from paged FP8 pools via page_table
-    page_size: int = 128  # Tokens per KV page
-    num_pages: int = 4096  # Total pages per attention pool per rank
-    max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
-    fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
-    # In-kernel GDN gather (GPR): False (default) = split gather kernel, which
-    # a profile may override; "split" = split, explicitly (wins over a profile);
-    # None = auto (WIDE verify buckets where eligible); "eligible" = every bucket
-    # the pool backend can gather on; True = required (`MegakernelConfigError`
-    # if the bucket cannot).
-    pool_gather: bool | None | Literal["eligible", "split"] = False
-    act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
-    ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
-    ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
-    roff_1d: bool = False  # True: 1D read_offsets (NS,); False: 2D (G_PER_ATT, NS)
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     # None -> default_tiles(B, R=R), ring depths fitted to VMEM at build
     tiles: Tiles | None = None
     debug: DebugOptions = DebugOptions()
-
-    def __post_init__(self) -> None:
-        if self.pool_gather not in POOL_GATHER_VALUES:
-            raise ValueError(
-                f"ExecSpec.pool_gather must be one of {POOL_GATHER_VALUES}, "
-                f"got {self.pool_gather!r}"
-            )
-
-    @property
-    def FUSED(self) -> bool:
-        return bool(self.paged_kv and self.fused_pool_io)
-
-    @property
-    def GPR(self) -> bool:
-        """In-kernel GDN gather on (only after `pool_gather` is resolved to `True`)."""
-        return bool(
-            self.paged_kv and not self.fused_pool_io and self.pool_gather is True
-        )
+    # Cache extension (a frozen `CacheExec` from the cache package; None: plain
+    # states without page tables). Core code never reads it.
+    cache: Any = None
 
     @property
     def resolved_tiles(self) -> Tiles:
         return self.tiles if self.tiles is not None else default_tiles(self.B, R=self.R)
 
     def resolve_tiles(self, g: Any = None) -> Tiles:
-        """Same as `resolved_tiles` (`g` kept for callers; defaults ignore `moe_tp`)."""
+        """Same as `resolved_tiles` (`g` kept for callers; the defaults ignore it)."""
         del g
         return self.resolved_tiles
-
-    @property
-    def resolved_max_pages_per_seq(self) -> int:
-        return (
-            self.max_pages_per_seq
-            if self.max_pages_per_seq > 0
-            else max(1, self.ctx // self.page_size)
-        )
 
     @property
     def NS(self) -> int:
@@ -347,14 +379,6 @@ class ExecSpec:
         return self.resolved_tiles.wide_rows < self.B
 
     @property
-    def forced_routing(self) -> bool:
-        return self.debug.forced_routing
-
-    @property
-    def row_mask(self) -> bool:
-        return self.debug.row_mask
-
-    @property
     def skip(self) -> frozenset[str]:
         return frozenset(self.debug.skip)
 
@@ -364,11 +388,30 @@ class ExecSpec:
 
 
 class Block:
-    """Composable megakernel building block (attention, GDN, MoE, MLP, etc.)."""
+    """Composable megakernel building block (attention, recurrent, FFN, etc.).
+
+    A block with its own knobs sets `Tunables` to a frozen dataclass (fields
+    with defaults plus a `NUMERICS` class attribute); defining the subclass
+    registers it under `name`, and the block reads its values with
+    `self.tunables(ex)`.
+    """
 
     name: str = "block"
     reduction: Literal["allreduce", "none", "custom"] = "allreduce"
     input_norm: str | None = None
+    Tunables: ClassVar[type | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if cls.Tunables is not None and (
+            "Tunables" in cls.__dict__ or "name" in cls.__dict__
+        ):
+            register_tunables(cls.name, cls.Tunables)
+
+    def tunables(self, ex: ExecSpec) -> Any:
+        """This block's `Tunables` in `ex`'s tiles (class defaults when unset)."""
+        assert self.Tunables is not None, f"block {self.name!r} declares no Tunables"
+        return ex.resolved_tiles.block(self.name, self.Tunables)
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         return []
@@ -377,6 +420,10 @@ class Block:
         return []
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
+        return []
+
+    def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
+        """Positional inputs after the states (see `ExtraInput`)."""
         return []
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
@@ -425,7 +472,7 @@ class Block:
 
 @dataclass(frozen=True)
 class SwitchSlot:
-    """Conditional slot inside a single layer loop body (e.g. GDN vs GQA).
+    """Conditional slot inside a single layer loop body (e.g. two mixer kinds).
 
     In each repeating cycle of `period = sum(branch_counts)` layers, `branches[i]`
     executes for `branch_counts[i]` consecutive layers.
@@ -470,46 +517,6 @@ class LayerType:
     slots: tuple[Block | SwitchSlot, ...]
 
 
-# State name of the unified raw-pool tuple (`ST[...]` / `O[...]`). This is the
-# single definition: blocks, the kernel builder and the cache pipes use this
-# constant (or `KernelContext.raw_refs`).
-POOL_STATE_NAME = "raw"
-
-
-@dataclass(frozen=True)
-class PoolBackend:
-    """Model-injected unified pool layout and gather/scatter callbacks.
-
-    Built by `pool.make_pool_backend(layout, ...)`. Pool count, recurrent-slot
-    count and checkpoint slot stride are derived from `layout`.
-    """
-
-    layout: PoolLayout
-    kernel_names: tuple[str, str]
-    gather_states: Any = None
-    scatter_states: Any = None
-    can_pool_gather: Any = None
-    page_table_state_name: str = "page_table"
-    supports_fused_io: bool = False
-    supports_pool_gather: bool = False
-
-    @property
-    def num_pools(self) -> int:
-        return self.layout.num_pools
-
-    @property
-    def has_recurrent_pool(self) -> bool:
-        return self.layout.has_recurrent
-
-    @property
-    def recurrent_slots_per_pool(self) -> int:
-        return self.layout.recurrent_slots_per_pool
-
-    @property
-    def ckpt_pages_per_slot(self) -> int:
-        return self.layout.pages_per_slot
-
-
 @dataclass(frozen=True)
 class ModelSpec:
     """Complete declarative model architecture specification."""
@@ -517,7 +524,9 @@ class ModelSpec:
     name: str
     config: Any
     layer_type: LayerType
-    pool_backend: PoolBackend | None = None
+    # Model-injected cache backend (layout + gather / scatter callbacks) from
+    # the cache package; None for models without a page-based cache.
+    cache_backend: Any = None
 
     def all_blocks(self) -> list[Block]:
         """Return unique active blocks in deterministic declaration order."""

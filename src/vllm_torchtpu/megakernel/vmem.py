@@ -26,7 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from . import pool_alias
 from .errors import MegakernelConfigError
 from .ops import BF16, F32, FP8, rup
-from .planner import Plan, plan
+from .planner import Plan, extra_inputs, plan
 from .spec import ExecSpec, ModelSpec, ScratchReq
 
 U8 = jnp.uint8
@@ -335,10 +335,11 @@ def build_scratch(
         for k in p.dynamic_kinds:
             scratch["ering_" + k] = pltpu.VMEM((NBE,) + vshape[k], vdtype[k])
             phase_map["ering_" + k] = "persistent"
-        if p.dynamic_kinds and any(
-            getattr(bp, "KVE", False) for bp in block_plans.values()
-        ):
-            scratch["epool"] = pltpu.VMEM((NBE, 2, g.HD // 4, 4, tiles.kv_blk), FP8)
+        # A block that stages its KV ring in the expert pool (`KVE`) needs the
+        # typed pool to hold `(2, HD // 4, 4, BLK)` fp8 KV items.
+        kve = [bp for bp in block_plans.values() if getattr(bp, "KVE", False)]
+        if p.dynamic_kinds and kve:
+            scratch["epool"] = pltpu.VMEM((NBE, 2, g.HD // 4, 4, kve[0].BLK), FP8)
             phase_map["epool"] = "persistent"
     else:
         scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
@@ -351,9 +352,10 @@ def build_scratch(
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {}
     smem_bytes = B * 4  # pos_ref [B] int32
     smem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {"pos": ((B,), jnp.int32)}
-    if ex.row_mask:
-        smem_bytes += B * 4
-        smem_shapes["moe_rows"] = ((B,), jnp.int32)
+    for x in extra_inputs(model_spec, ex):
+        if x.memory_space == "smem":
+            smem_bytes += math.prod(x.shape) * jnp.dtype(x.dtype).itemsize
+            smem_shapes[x.name] = (tuple(x.shape), x.dtype)
     for k, st in p.state_decls.items():
         if st.memory_space == "smem":
             l_cnt = max(1, p.block_layer_counts[p.state_owners[k]])

@@ -39,6 +39,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import pool
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 
 FP8 = jnp.float8_e4m3fn
 NUM_PAGES = 128
@@ -67,21 +68,18 @@ def _layout(slots: int, num_pools: int = 2) -> mk.PoolLayout:
 
 
 def _exec(R: int, B: int, T: int, ctx: int = 256) -> mk.ExecSpec:
-    tiles = replace(
-        mk.spec.TINY_TILES,
-        bank=512 << 10,
-        kv_blk=min(mk.spec.TINY_TILES.kv_blk, ctx),
+    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
+        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
     )
     return mk.ExecSpec(
         R=R,
         B=B,
         T=T,
         ctx=ctx,
-        paged_kv=True,
-        num_pages=NUM_PAGES,
         stack_e=True,
         interpret=True,
         tiles=tiles,
+        cache=mk.CacheExec(paged_kv=True, num_pages=NUM_PAGES),
     )
 
 
@@ -116,8 +114,11 @@ def _tables(
     lay: mk.PoolLayout, ex: mk.ExecSpec, ckpt_ndim: int
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     pt, ckpt, roff, min_pages = pool.allocate_test_layout(lay, ex)
-    assert ex.num_pages >= min_pages
-    assert int(jnp.min(pt[:, : ex.ctx // ex.page_size])) >= lay.reserved_pages
+    assert mk.cache_exec(ex).num_pages >= min_pages
+    assert (
+        int(jnp.min(pt[:, : ex.ctx // mk.cache_exec(ex).page_size]))
+        >= lay.reserved_pages
+    )
     if lay.has_recurrent and ckpt_ndim == 2:
         ckpt, roff = ckpt[0], roff[0]
     return pt, ckpt, roff
@@ -157,19 +158,23 @@ def test_layout_validate_rejects_unvalidated_geometry():
         with pytest.raises(mk.MegakernelConfigError):
             bad.validate()
     with pytest.raises(mk.MegakernelConfigError, match="page_size"):
-        _layout(3).validate(replace(_exec(R=2, B=2, T=1), page_size=64))
+        _layout(3).validate(mk.with_cache(_exec(R=2, B=2, T=1), page_size=64))
 
 
 def test_layout_validate_checks_in_kernel_conv_windows():
     """GPR and fused stage the whole verify conv window in the conv page."""
     lay = replace(_layout(3), kh=8, vh=8)  # 24 conv rows of 128 lanes per rank
-    split = replace(_exec(R=1, B=6, T=6), paged_kv=True)
+    split = mk.with_cache(_exec(R=1, B=6, T=6), paged_kv=True)
     lay.validate(split)  # split path: 3 taps fit
-    lay.validate(replace(split, B=4, T=4, pool_gather=True))  # 8 * 24 = 192 rows
+    lay.validate(
+        mk.with_cache(replace(split, B=4, T=4), pool_gather=True)
+    )  # 8 * 24 = 192 rows
     with pytest.raises(mk.MegakernelConfigError, match="in-kernel gather"):
-        lay.validate(replace(split, pool_gather=True))  # 16 * 24 = 384 rows
+        lay.validate(mk.with_cache(split, pool_gather=True))  # 16 * 24 = 384 rows
     with pytest.raises(mk.MegakernelConfigError, match="fused pool I/O"):
-        lay.validate(replace(split, B=1, T=1, fused_pool_io=True))  # 16 * 24 rows
+        lay.validate(
+            mk.with_cache(replace(split, B=1, T=1), fused_pool_io=True)
+        )  # 16 * 24 rows
 
 
 def _gpr_spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:
@@ -177,14 +182,14 @@ def _gpr_spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:
         L=4, H=256, I=256, IS=256, E=128, TOPK=2, NH=4, NKV=2, HD=256, ROT=64,
         KH=2, VH=4, KD=128, VD=128, att_every=4,
     )  # fmt: skip
-    return qwen35.qwen35_spec(g), replace(_exec(R=2, B=8, T=4), pool_gather=True)
+    return qwen35.qwen35_spec(g), mk.with_cache(_exec(R=2, B=8, T=4), pool_gather=True)
 
 
 def test_gdn_in_kernel_pool_io_takes_slot_geometry_from_layout():
     spec, ex = _gpr_spec_and_exec()
-    assert ex.GPR
+    assert mk.cache_exec(ex).GPR
     gp = mk.planner.plan(spec, ex).block_params["gdn"]
-    lay = spec.pool_backend.layout
+    lay = spec.cache_backend.layout
     assert gp.pool_layout is lay
     assert (
         lay.rec_pages_per_slot,
@@ -196,14 +201,14 @@ def test_gdn_in_kernel_pool_io_takes_slot_geometry_from_layout():
 
 def test_gdn_in_kernel_pool_io_rejects_mismatched_layout():
     spec, ex = _gpr_spec_and_exec()
-    lay = spec.pool_backend.layout
+    lay = spec.cache_backend.layout
     wrong = replace(
-        spec, pool_backend=mk.make_pool_backend(replace(lay, slots_per_pool=1))
+        spec, cache_backend=mk.make_pool_backend(replace(lay, slots_per_pool=1))
     )
     with pytest.raises(mk.MegakernelConfigError, match="slots_per_pool=1"):
         mk.planner.plan(wrong, ex)
     with pytest.raises(mk.MegakernelConfigError, match="pool backend"):
-        mk.planner.plan(replace(spec, pool_backend=None), ex)
+        mk.planner.plan(replace(spec, cache_backend=None), ex)
 
 
 def test_qwen35_pool_layout_matches_geometry():
@@ -257,7 +262,10 @@ def test_states_to_pool_roundtrip(name: str, ckpt_ndim: int):
     pt, ckpt, roff = _tables(lay, ex, ckpt_ndim)
     raw_pools = pool.states_to_pool(lay, ex, st, pt, ckpt, roff)
     assert len(raw_pools) == lay.num_pools
-    assert raw_pools[0].shape == (ex.R * ex.num_pages, *lay.kv_page_shape)
+    assert raw_pools[0].shape == (
+        ex.R * mk.cache_exec(ex).num_pages,
+        *lay.kv_page_shape,
+    )
     out = pool.pool_to_states(lay, ex, raw_pools, pt, ckpt)
     np.testing.assert_array_equal(_bytes(out["kc"]), _bytes(st["kc"]))
     np.testing.assert_array_equal(_bytes(out["vc"]), _bytes(st["vc"]))
@@ -330,7 +338,7 @@ def _check_scatter(
     if cold_start and lay.has_recurrent:
         fresh = int(jnp.max(ckpt)) + 1 + jnp.arange(ckpt[..., 0].size, dtype=ckpt.dtype)
         ckpt_in = jnp.concatenate([fresh.reshape(ckpt[..., :1].shape), ckpt], axis=-1)
-        pool.check_ckpt_bounds(ckpt_in, ex.num_pages, lay)
+        pool.check_ckpt_bounds(ckpt_in, mk.cache_exec(ex).num_pages, lay)
         conv0, rec0 = pool.gather_gdn_states(
             lay,
             ex,
@@ -438,7 +446,7 @@ def test_scatter_on_one_rank_of_two(name: str, ckpt_ndim: int):
 def test_cold_start_ckpt_k_plus_one():
     """`K = T + 1` checkpoint table with `read_offsets = -1` (no prior state)."""
     lay = _layout(2, num_pools=3)
-    ex = replace(_exec(R=1, B=6, T=2), num_pages=2 * NUM_PAGES)
+    ex = mk.with_cache(_exec(R=1, B=6, T=2), num_pages=2 * NUM_PAGES)
     _check_scatter(lay, ex, 3, seed=81, cold_start=True)
 
 
@@ -446,12 +454,16 @@ def test_ckpt_bounds_rejects_out_of_range_and_shared_slots():
     lay = _layout(2, num_pools=3)
     ex = _exec(R=1, B=4, T=2)
     _, ckpt, _ = _tables(lay, ex, 3)
-    pool.check_ckpt_bounds(ckpt, ex.num_pages, lay)
-    past_end = ex.num_pages // lay.pages_per_slot
+    pool.check_ckpt_bounds(ckpt, mk.cache_exec(ex).num_pages, lay)
+    past_end = mk.cache_exec(ex).num_pages // lay.pages_per_slot
     with pytest.raises(ValueError, match="exceeds pool capacity"):
-        pool.check_ckpt_bounds(ckpt.at[1, 0, 1].set(past_end), ex.num_pages, lay)
+        pool.check_ckpt_bounds(
+            ckpt.at[1, 0, 1].set(past_end), mk.cache_exec(ex).num_pages, lay
+        )
     with pytest.raises(ValueError, match="shared between"):
-        pool.check_ckpt_bounds(ckpt.at[1, 0, 0].set(ckpt[0, 0, 0]), ex.num_pages, lay)
+        pool.check_ckpt_bounds(
+            ckpt.at[1, 0, 0].set(ckpt[0, 0, 0]), mk.cache_exec(ex).num_pages, lay
+        )
 
 
 def test_check_pooled_step_hlo_uses_layout_page_shape():
@@ -491,7 +503,7 @@ def test_full_pooled_step_att_every_2():
         VD=128,
         att_every=2,
     )
-    ex = replace(_exec(R=2, B=2, T=1), num_pages=96)
+    ex = mk.with_cache(_exec(R=2, B=2, T=1), num_pages=96)
     lay = mk.qwen35_pool_layout(g)
     assert (lay.num_pools, lay.slots_per_pool) == (2, 1)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(5), g, ex)
@@ -507,7 +519,7 @@ def test_full_pooled_step_att_every_2():
     ref_hid, mk_st = mk_paged_step(pos, hid_mk, w_mk, st_mk_paged)
 
     spec = qwen35.qwen35_spec(g)
-    assert spec.pool_backend.layout == lay
+    assert spec.cache_backend.layout == lay
     st_before = mk.pool_to_states(g, ex, raw_pools, pt, ckpt)
     step, _ = mk.PallasWriter().make_step(mesh, spec, ex, donate=False)
     out_hid, raw_out = step(pos, hid_mk, w_mk, raw_pools, pt, ckpt, roff)

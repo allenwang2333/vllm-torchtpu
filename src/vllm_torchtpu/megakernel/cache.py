@@ -8,7 +8,7 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
 
 1. **Default split pool I/O (`fused_pool_io=False`)**:
    - **3-stage split (or 2-stage with `GPR` in-kernel GDN gather)**:
-     - Non-communicating gather (`pool_backend.gather_states`, or in-kernel
+     - Non-communicating gather (`cache_backend.gather_states`, or in-kernel
        read-only `GPR` gather on wide `T > 1` verify) reads per-sequence
        recurrent/conv checkpoints from the unified block pools.
      - Communicating megakernel (`kernel.build(..., paged_kv=True)`) takes the
@@ -16,7 +16,7 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
        Pallas pool aliasing, performs all layer compute and cross-chip
        collectives, and emits small per-step state outputs (`knew`, `vnew`,
        `conv`/`conv_ckpt`, `rec`/`rec_ckpt`).
-     - Non-communicating scatter (`pool_backend.scatter_states`) runs with
+     - Non-communicating scatter (`cache_backend.scatter_states`) runs with
        `collective_id=None` and Pallas `input_output_aliases` to scatter new KV
        and recurrent/conv states in-place into the unified block pools.
 
@@ -36,7 +36,6 @@ unified `[num_pages, 2 * kvh, hd // 4, 4, page_size] fp8` block pools:
 from __future__ import annotations
 
 import abc
-import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,8 +46,16 @@ from jax.sharding import PartitionSpec as P
 from . import cache_experimental, kernel
 from .cache_experimental import should_fuse_pool_io
 from .errors import MegakernelConfigError
+from .planner import extra_inputs
 from .pool import POOL_KERNEL_NAMES, PoolLayout, check_ckpt_bounds
-from .spec import POOL_STATE_NAME, ExecSpec, ModelSpec, PoolBackend
+from .pool.config import (
+    POOL_STATE_NAME,
+    PoolBackend,
+    cache_exec,
+    resolved_max_pages_per_seq,
+    with_cache,
+)
+from .spec import ExecSpec, ModelSpec
 
 
 @jax.tree_util.register_pytree_node_class
@@ -113,11 +120,11 @@ def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
 
 
 def _require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
-    if model_spec.pool_backend is None:
+    if model_spec.cache_backend is None:
         raise ValueError(
-            f"ModelSpec {model_spec.name!r} does not configure a pool_backend"
+            f"ModelSpec {model_spec.name!r} does not configure a cache_backend"
         )
-    return model_spec.pool_backend
+    return model_spec.cache_backend
 
 
 def _validate_page_table_shape(page_table: Any, ex: ExecSpec) -> None:
@@ -241,23 +248,23 @@ def _should_use_pool_gather(
     use_fused: bool,
 ) -> bool:
     """Return True when non-fused verify should gather GDN states in-kernel (`GPR`)."""
-    if use_fused or ex.pool_gather in (False, "split"):
+    if use_fused or cache_exec(ex).pool_gather in (False, "split"):
         return False
     if not pb.supports_pool_gather or not pb.has_recurrent_pool:
-        if ex.pool_gather is True:
+        if cache_exec(ex).pool_gather is True:
             raise MegakernelConfigError(
-                f"ModelSpec {ms.name!r} pool_backend does not support pool_gather"
+                f"ModelSpec {ms.name!r} cache_backend does not support pool_gather"
             )
         return False
     if pb.can_pool_gather is not None:
         ok = bool(pb.can_pool_gather(ex))
-        if ex.pool_gather is True and not ok:
+        if cache_exec(ex).pool_gather is True and not ok:
             raise MegakernelConfigError(
                 f"pool_gather=True is not supported for ExecSpec(B={ex.B}, T={ex.T}, "
-                f"page_size={ex.page_size})"
+                f"page_size={cache_exec(ex).page_size})"
             )
         return ok
-    return bool(ex.pool_gather)
+    return bool(cache_exec(ex).pool_gather)
 
 
 def _require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) -> None:
@@ -303,7 +310,7 @@ def make_flat_pooled_step(
     )
     use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
     _require_fused_donation(ms, use_fused, donate_pools)
-    ex_paged = dataclasses.replace(
+    ex_paged = with_cache(
         ex,
         paged_kv=True,
         fused_pool_io=use_fused,
@@ -317,7 +324,7 @@ def make_flat_pooled_step(
     ) -> tuple[Any, dict[str, Any]]:
         key = (act_mode, ckpt_2d, ckpt_k, roff_1d)
         if key not in _build_cache:
-            ex_k = dataclasses.replace(
+            ex_k = with_cache(
                 ex_paged,
                 act_mode=act_mode,
                 ckpt_2d=ckpt_2d,
@@ -327,10 +334,9 @@ def make_flat_pooled_step(
             _build_cache[key] = kernel.build(ms, ex_k)
         return _build_cache[key]
 
-    default_ckpt_k = ex_paged.ckpt_k if ex_paged.ckpt_k > 0 else ex_paged.T
-    call, info = _get_compiled(
-        ex_paged.act_mode, ex_paged.ckpt_2d, default_ckpt_k, ex_paged.roff_1d
-    )
+    cx = cache_exec(ex_paged)
+    default_ckpt_k = cx.ckpt_k if cx.ckpt_k > 0 else ex_paged.T
+    call, info = _get_compiled(cx.act_mode, cx.ckpt_2d, default_ckpt_k, cx.roff_1d)
     p = info["plan"]
     w_names = p.w_names
     s_names = p.s_names
@@ -354,7 +360,7 @@ def make_flat_pooled_step(
         + (P(), P(), P())
     )
     out_specs = (P("tp"),) + (P("tp"),) * num_pools
-    max_pt = ex_paged.resolved_max_pages_per_seq
+    max_pt = resolved_max_pages_per_seq(ex_paged)
 
     def _body(pos: Any, hidden: Any, *rest: Any) -> tuple[Any, ...]:
         w_flat = rest[:n_w_flat]
@@ -406,10 +412,10 @@ def make_flat_pooled_step(
 
         if use_fused or use_gpr:
             act_mode_l = "from_ckpt" if has_rec else "all"
-            if has_rec and ex_paged.debug.check_ckpt_bounds:
+            if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
                 check_ckpt_bounds(
                     ckpt_indices,
-                    ex_paged.num_pages,
+                    cache_exec(ex_paged).num_pages,
                     pb.layout,
                     act_mode=act_mode_l,
                 )
@@ -511,13 +517,14 @@ def make_pooled_step(
     `donate_argnums=(3,) if donate_pools else ()`, where argument 3 is always
     `raw_pools: tuple[jax.Array, ...]`:
       1. States dict (`PallasWriter.make_step` / `make_step` compatible):
-         `hid, states = step(pos, hidden, weights, states, [rbias])`
+         `hid, states = step(pos, hidden, weights, states, [*extra_inputs])`
       2. Recurrent + attention positional:
          `hid, raw_pools = step(pos, hidden, weights, raw_pools, page_table,
-                                ckpt_indices, read_offsets, [rbias], [active_seqs])`
-      3. Attention-only (`not pool_backend.has_recurrent_pool`) positional:
+                                ckpt_indices, read_offsets, [*extra_inputs],
+                                [active_seqs])`
+      3. Attention-only (`not cache_backend.has_recurrent_pool`) positional:
          `hid, raw_pools = step(pos, hidden, weights, raw_pools, page_table,
-                                [rbias], [active_seqs])`
+                                [*extra_inputs], [active_seqs])`
     """
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
@@ -531,13 +538,16 @@ def make_pooled_step(
     )
     use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
     _require_fused_donation(ms, use_fused, donate_pools)
-    ex_paged = dataclasses.replace(
+    ex_paged = with_cache(
         ex,
         paged_kv=True,
         fused_pool_io=use_fused,
         pool_gather=use_gpr,
     )
     pb.layout.validate(ex_paged)
+    # Block extra inputs (`Block.extra_inputs`) follow the pool arguments.
+    extras = extra_inputs(ms, ex_paged)
+    n_extra = len(extras)
     _build_cache: dict[tuple[str, bool, int, bool], tuple[Any, dict[str, Any]]] = {}
 
     def _get_compiled(
@@ -545,7 +555,7 @@ def make_pooled_step(
     ) -> tuple[Any, dict[str, Any]]:
         key = (act_mode, ckpt_2d, ckpt_k, roff_1d)
         if key not in _build_cache:
-            ex_k = dataclasses.replace(
+            ex_k = with_cache(
                 ex_paged,
                 act_mode=act_mode,
                 ckpt_2d=ckpt_2d,
@@ -555,10 +565,9 @@ def make_pooled_step(
             _build_cache[key] = kernel.build(ms, ex_k)
         return _build_cache[key]
 
-    default_ckpt_k = ex_paged.ckpt_k if ex_paged.ckpt_k > 0 else ex_paged.T
-    call, info = _get_compiled(
-        ex_paged.act_mode, ex_paged.ckpt_2d, default_ckpt_k, ex_paged.roff_1d
-    )
+    cx = cache_exec(ex_paged)
+    default_ckpt_k = cx.ckpt_k if cx.ckpt_k > 0 else ex_paged.T
+    call, info = _get_compiled(cx.act_mode, cx.ckpt_2d, default_ckpt_k, cx.roff_1d)
     p = info["plan"]
     w_names = p.w_names
     s_names = p.s_names
@@ -568,7 +577,7 @@ def make_pooled_step(
     rec_slots = pb.recurrent_slots_per_pool
     pool_key = POOL_STATE_NAME
     pt_key = pb.page_table_state_name
-    max_pt = ex_paged.resolved_max_pages_per_seq
+    max_pt = resolved_max_pages_per_seq(ex_paged)
 
     def _run_local(
         pos: Any,
@@ -623,10 +632,10 @@ def make_pooled_step(
             act_mode_l, active_mask_l = _resolve_active_seqs_mode(
                 active_seqs, default_mode="from_ckpt" if has_rec else "all"
             )
-            if has_rec and ex_paged.debug.check_ckpt_bounds:
+            if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
                 check_ckpt_bounds(
                     ckpt_indices,
-                    ex_paged.num_pages,
+                    cache_exec(ex_paged).num_pages,
                     pb.layout,
                     act_mode=act_mode_l,
                     active_mask=active_mask_l,
@@ -735,7 +744,7 @@ def make_pooled_step(
             for k in weights
         }
         raw_spec = tuple(P("tp") for _ in raw_pools)
-        rb_specs = (P("tp"),) if ex_paged.forced_routing else ()
+        rb_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
 
         meta: dict[str, Any] = {pt_key: page_table}
         meta_specs: dict[str, Any] = {
@@ -816,7 +825,7 @@ def make_pooled_step(
             ckpt_indices = states.get("ckpt_indices")
             read_offsets = states.get("read_offsets")
             active_seqs = _wrap_active_seqs(states.get("active_seqs"))
-            rb_tuple = rest[:1] if ex_paged.forced_routing else ()
+            rb_tuple = tuple(rest[:n_extra])
             return (
                 True,
                 states,
@@ -839,12 +848,8 @@ def make_pooled_step(
             read_offsets = None
             tail = rest[1:]
 
-        if ex_paged.forced_routing:
-            rb_tuple = (tail[0],)
-            active_seqs = _wrap_active_seqs(tail[1] if len(tail) > 1 else None)
-        else:
-            rb_tuple = ()
-            active_seqs = _wrap_active_seqs(tail[0] if len(tail) > 0 else None)
+        rb_tuple = tuple(tail[:n_extra])
+        active_seqs = _wrap_active_seqs(tail[n_extra] if len(tail) > n_extra else None)
 
         return (
             False,
@@ -870,14 +875,14 @@ def make_pooled_step(
             active_seqs,
             rb_tuple,
         ) = _parse_call_args(states_or_raw, rest)
-        if has_rec and ex_paged.debug.check_ckpt_bounds:
+        if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
             act_m, act_arr = _resolve_active_seqs_mode(
                 _unwrap_active_seqs(active_seqs),
                 default_mode="from_ckpt",
             )
             check_ckpt_bounds(
                 ckpt_indices,
-                ex_paged.num_pages,
+                cache_exec(ex_paged).num_pages,
                 pb.layout,
                 act_mode=act_m,
                 active_mask=act_arr,
@@ -959,7 +964,7 @@ class DirectHBM(CachePipe):
     ) -> Any:
         use_donate = donate if donate_states is None else bool(donate_states)
         ms = _resolve_model_spec(g_or_spec)
-        ex_direct = dataclasses.replace(ex, paged_kv=False, fused_pool_io=False)
+        ex_direct = with_cache(ex, paged_kv=False, fused_pool_io=False)
         return kernel.make_step(mesh, ms, ex_direct, donate_states=use_donate)
 
 

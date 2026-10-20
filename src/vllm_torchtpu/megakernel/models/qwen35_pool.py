@@ -14,6 +14,7 @@ from typing import Any
 import jax
 
 from .. import pool
+from ..blocks.gdn import GDNBlock
 from ..pool import (
     PoolLayout,
     conv_to_raw_page,
@@ -23,7 +24,8 @@ from ..pool import (
     raw_pages_to_ssm,
     ssm_to_raw_pages,
 )
-from ..spec import ExecSpec, PoolBackend
+from ..pool.config import PoolBackend
+from ..spec import ExecSpec
 
 
 def qwen35_pool_layout(g: Any) -> PoolLayout:
@@ -44,7 +46,9 @@ def qwen35_pool_layout(g: Any) -> PoolLayout:
 def qwen35_pool_backend(g: Any) -> PoolBackend:
     """Create the model-injected `PoolBackend` for `Qwen35Geometry`."""
     return pool.make_pool_backend(
-        qwen35_pool_layout(g), check=getattr(g, "check", None)
+        qwen35_pool_layout(g),
+        check=getattr(g, "check", None),
+        rec_chunk=GDNBlock.chunk_rows,
     )
 
 

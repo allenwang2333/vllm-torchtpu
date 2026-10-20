@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -39,10 +39,11 @@ from ..ops import (
     rope_partial,
     rup,
 )
+from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
 from ..spec import (
-    POOL_STATE_NAME,
     Block,
     ExecSpec,
+    NumericsClass,
     SmallField,
     StateDecl,
     WeightDecl,
@@ -105,12 +106,47 @@ class GQAParams:
         return b // self.PB, (b % self.PB) * self.nh
 
 
+@dataclass(frozen=True)
+class GQATunables:
+    """`GQABlock` knobs (`Tiles.blocks["gqa"]`); `NUMERICS` classes each field."""
+
+    kv_blk: int = 2048  # KV tokens per block
+    nkv: int = 3  # KV ring depth
+    split: bool = True  # Sequence-split attention across G ranks sharing a KV head
+    pack: int = -1  # Pack PB = 8 // nh rows per 8-row tile (-1: auto, WIDE buckets)
+    kv_sub: int = 0  # KV tokens per online-softmax update inside a block (0: full)
+    amask: int = 1  # Attention mask mode (0..4)
+    kv_scatter_vec_ns: int = 16  # Non-paged host KV update: one scatter above this NS
+    # Opt-in performance flags (off by default; named profiles turn them on).
+    kv_ering: bool = False  # Alias KV DMA ring onto epool when unused
+    pair_kv: bool = False  # Pair KV attention items to overlap KV DMA + softmax
+    gqa_qv: bool = False  # Head-batched Q/K norm+RoPE and 128-lane Q/O staging
+    gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
+
+    # `exact`: moving the field keeps hidden states and caches bit-identical
+    # (scheduling only); `approx`: changes or may change the arithmetic.
+    NUMERICS: ClassVar[dict[str, NumericsClass]] = {
+        "kv_blk": "approx",  # online-softmax block size
+        "nkv": "exact",  # KV ring depth (scheduling)
+        "split": "approx",  # sequence-split attention (partial-softmax merge)
+        "pack": "approx",  # split-attention row packing
+        "kv_sub": "approx",  # online-softmax sub-block updates
+        "amask": "approx",  # attention mask mode
+        "kv_scatter_vec_ns": "exact",  # host KV update: one scatter vs per-sequence
+        "kv_ering": "exact",  # KV ring staged in the expert pool (TPU bisect, CPU test)
+        "pair_kv": "exact",  # paired KV items (TPU bisect, CPU test)
+        "gqa_qv": "exact",  # head-batched Q/K norm + RoPE (TPU bisect, CPU test)
+        "gq_pack": "approx",  # packed G*nh query tiles
+    }
+
+
 class GQABlock(Block):
     """Full GQA block with QK RMSNorm, partial RoPE, Q/softmax exchange, and gate."""
 
     name: str = "gqa"
     reduction = "allreduce"
     input_norm: str | None = "in_norm"
+    Tunables = GQATunables
 
     def __init__(self, pool_layout: Any = None) -> None:
         # `PoolLayout` of the model's paged pools (None: the default page
@@ -123,7 +159,7 @@ class GQABlock(Block):
         Raises `MegakernelConfigError` if the layout's page packing differs from
         the `(2, HD // 4, 4, page_size)` packing the paged KV reads assume.
         """
-        shape = (2, g.HD // 4, 4, ex.page_size)
+        shape = (2, g.HD // 4, 4, cache_exec(ex).page_size)
         if self.pool_layout is None:
             return shape
         lay_shape = tuple(self.pool_layout.kv_page_shape)
@@ -154,11 +190,11 @@ class GQABlock(Block):
         ]
 
     def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             st = [
                 StateDecl(
                     POOL_STATE_NAME,
-                    (ex.num_pages, *self.kv_page_shape(g, ex)),
+                    (cache_exec(ex).num_pages, *self.kv_page_shape(g, ex)),
                     FP8,
                     access="r",
                     per_layer=True,
@@ -167,14 +203,14 @@ class GQABlock(Block):
                 ),
                 StateDecl(
                     "page_table",
-                    (ex.NS, ex.resolved_max_pages_per_seq),
+                    (ex.NS, resolved_max_pages_per_seq(ex)),
                     I32,
                     access="r",
                     per_layer=False,
                     memory_space="smem",
                 ),
             ]
-            if ex.FUSED:
+            if cache_exec(ex).FUSED:
                 st.extend(fused_io().gqa_fused_states(ex))
             return st
         return [
@@ -183,9 +219,9 @@ class GQABlock(Block):
         ]
 
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             return fused_io().gqa_fused_outputs(g, ex)
-        kv_dt = FP8 if ex.paged_kv else F32
+        kv_dt = FP8 if cache_exec(ex).paged_kv else F32
         return [
             StateDecl("knew", (ex.MR, g.HD), kv_dt, access="w"),
             StateDecl("vnew", (ex.MR, g.HD), kv_dt, access="w"),
@@ -203,33 +239,36 @@ class GQABlock(Block):
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
         tiles = ex.resolve_tiles(g)
+        tt: GQATunables = self.tunables(ex)
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
         G = max(1, ex.R // g.NKV)
-        BLK = tiles.kv_blk
-        PAIR_KV = tiles.pair_kv
-        NKV = max(tiles.nkv, 4) if PAIR_KV else tiles.nkv
+        BLK = tt.kv_blk
+        PAIR_KV = tt.pair_kv
+        NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv
         assert ex.ctx % BLK == 0 and BLK % 128 == 0, (ex.ctx, BLK)
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             assert g.HD % 4 == 0, f"paged_kv requires HD % 4 == 0, got {g.HD}"
             assert (
-                ex.page_size > 0 and ex.page_size % 128 == 0 and BLK % ex.page_size == 0
+                cache_exec(ex).page_size > 0
+                and cache_exec(ex).page_size % 128 == 0
+                and BLK % cache_exec(ex).page_size == 0
             ), (
                 BLK,
-                ex.page_size,
+                cache_exec(ex).page_size,
             )
             assert (
-                ex.ctx % ex.page_size == 0
-                and ex.num_pages >= 1
-                and ex.resolved_max_pages_per_seq >= ex.ctx // ex.page_size
+                ex.ctx % cache_exec(ex).page_size == 0
+                and cache_exec(ex).num_pages >= 1
+                and resolved_max_pages_per_seq(ex) >= ex.ctx // cache_exec(ex).page_size
             ), (
-                ex.page_size,
+                cache_exec(ex).page_size,
                 ex.ctx,
-                ex.num_pages,
-                ex.resolved_max_pages_per_seq,
+                cache_exec(ex).num_pages,
+                resolved_max_pages_per_seq(ex),
             )
-            assert tiles.amask not in (3, 4), (
-                f"paged_kv requires amask in {{0, 1, 2}}, got {tiles.amask}"
+            assert tt.amask not in (3, 4), (
+                f"paged_kv requires amask in {{0, 1, 2}}, got {tt.amask}"
             )
         KV_ITEM = 2 * (g.HD // 4) * BLK * 4
         EBROWS = tiles.ebank // 128
@@ -238,46 +277,46 @@ class GQABlock(Block):
         # `vmem.build_scratch` allocates a separate typed `epool`, so the
         # aliasing itself is only exercised on TPU (the KV math is shared).
         KVE = bool(
-            ex.paged_kv
-            and tiles.kv_ering
+            cache_exec(ex).paged_kv
+            and tt.kv_ering
             and bool(plan.dynamic_kinds)
             and tiles.nbe >= NKV
             and tiles.ebank >= KV_ITEM
             and g.HD == KVE_HD
         )
         NKVR = tiles.nbe if KVE else NKV
-        SUB = tiles.kv_sub or BLK
+        SUB = tt.kv_sub or BLK
         assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
-        SPLIT = tiles.split and G > 1
+        SPLIT = tt.split and G > 1
         assert not SPLIT or (G & (G - 1) == 0), G
         TS = G if SPLIT else 1
         QR = rup(G * nh, 8) if SPLIT else 8
         TQ = ex.T * QR
         PW = g.HD + 128
         eff_ctx = (
-            max(ex.ctx, ex.resolved_max_pages_per_seq * ex.page_size)
-            if ex.paged_kv
+            max(ex.ctx, resolved_max_pages_per_seq(ex) * cache_exec(ex).page_size)
+            if cache_exec(ex).paged_kv
             else ex.ctx
         )
         max_nb = -(-eff_ctx // BLK)
         NWL = rup(ex.NS * -(-max_nb // TS), 8)
-        PACK = (ex.WIDE if tiles.pack < 0 else bool(tiles.pack)) and SPLIT and nh < 8
+        PACK = (ex.WIDE if tt.pack < 0 else bool(tt.pack)) and SPLIT and nh < 8
         PB = 8 // nh if PACK else 1
         NBP = -(-ex.B // PB)
         NHH = g.HD // 128
         SR = 8 // PB
         QV = (
-            tiles.gqa_qv
+            tt.gqa_qv
             and (SPLIT or ex.VER)
             and g.HD % 128 == 0
             and nh <= 8
             and (not PACK or PB * nh == 8)
         )
-        if tiles.gq_pack and not tiles.gqa_qv:
-            raise MegakernelConfigError("Tiles.gq_pack requires gqa_qv")
+        if tt.gq_pack and not tt.gqa_qv:
+            raise MegakernelConfigError("GQATunables.gq_pack requires gqa_qv")
         QG = ex.T * nh
         GQ = bool(
-            tiles.gq_pack
+            tt.gq_pack
             and QV
             and SPLIT
             and ex.VER
@@ -307,7 +346,7 @@ class GQABlock(Block):
             EBROWS=EBROWS,
             PAIR_KV=PAIR_KV,
             SUB=SUB,
-            AMASK=tiles.amask,
+            AMASK=tt.amask,
             SPLIT=SPLIT,
             TS=TS,
             QR=QR,
@@ -333,13 +372,13 @@ class GQABlock(Block):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         ap: GQAParams = plan.block_params[self.name]
         scr: dict[str, Any] = {}
-        if not ex.paged_kv:
+        if not cache_exec(ex).paged_kv:
             scr["kbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
             scr["vbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
         scr.update(
             {
                 "kv_sem": pltpu.SemaphoreType.DMA(
-                    (ap.NKVR,) if ex.paged_kv else (2, ap.NKV)
+                    (ap.NKVR,) if cache_exec(ex).paged_kv else (2, ap.NKV)
                 ),
                 "wl_b": pltpu.SMEM((ap.NWL,), I32),
                 "wl_t": pltpu.SMEM((ap.NWL,), I32),
@@ -354,16 +393,18 @@ class GQABlock(Block):
                 "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
             }
         )
-        if not ex.FUSED:
+        if not cache_exec(ex).FUSED:
             scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
         else:
             scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             if not ap.KVE:
                 scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
             scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
             scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
-            scr["wl_kp"] = pltpu.SMEM((ap.NWL * (ap.BLK // ex.page_size),), I32)
+            scr["wl_kp"] = pltpu.SMEM(
+                (ap.NWL * (ap.BLK // cache_exec(ex).page_size),), I32
+            )
         if ap.SPLIT:
             q_rows = ap.NBP if ap.PACK else ex.B
             scr.update(
@@ -404,12 +445,12 @@ class GQABlock(Block):
         NS, T, BLK, TS, SPLIT = ex.NS, ex.T, ap.BLK, ap.TS, ap.SPLIT
         gi = lax.rem(ctx.me, ap.G) if SPLIT else jnp.int32(0)
         eff_ctx = (
-            max(ex.ctx, ex.resolved_max_pages_per_seq * ex.page_size)
-            if ex.paged_kv
+            max(ex.ctx, resolved_max_pages_per_seq(ex) * cache_exec(ex).page_size)
+            if cache_exec(ex).paged_kv
             else ex.ctx
         )
         max_nb = -(-eff_ctx // BLK)
-        max_p = ex.resolved_max_pages_per_seq
+        max_p = resolved_max_pages_per_seq(ex)
 
         n = jnp.int32(0)
         for b in range(NS):
@@ -420,15 +461,15 @@ class GQABlock(Block):
             def put(j, carry, b=b, t0=t0, n=n):
                 scr["wl_b"][n + j] = jnp.int32(b)
                 scr["wl_t"][n + j] = t0 + j * TS
-                if ex.paged_kv:
+                if cache_exec(ex).paged_kv:
                     pt_ref_ = ST["page_table"]
-                    pb = BLK // ex.page_size
+                    pb = BLK // cache_exec(ex).page_size
                     p0 = (t0 + j * TS) * pb
                     k0 = (n + j) * pb
                     for p in range(pb):
                         col = jnp.minimum(p0 + p, max_p - 1)
                         scr["wl_kp"][k0 + p] = jnp.clip(
-                            pt_ref_[b, col], 0, ex.num_pages - 1
+                            pt_ref_[b, col], 0, cache_exec(ex).num_pages - 1
                         )
                 return carry
 
@@ -443,10 +484,10 @@ class GQABlock(Block):
         scr, pos_ref = ctx.scr, ctx.pos_ref
         scr["knew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
         scr["vnew"][...] = jnp.zeros((ex.MR, ap.HD), F32)
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             scr["knew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
             scr["vnew_o"][...] = jnp.zeros((ex.MR, ap.HD), FP8)
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             fused_io().gqa_fused_init_buffers(ctx)
         if ap.SPLIT and not ap.GQ:
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
@@ -500,14 +541,14 @@ class GQABlock(Block):
         ksem = scr["kv_sem"]
         am, al, aacc = scr["am"], scr["al"], scr["aacc"]
         n_items = scr["wl_cnt"][0]
-        KR = NKVR if ex.paged_kv else NKV
+        KR = NKVR if cache_exec(ex).paged_kv else NKV
 
         kvbuf: Any = None
         kbuf: Any = None
         vbuf: Any = None
-        if ex.paged_kv:
+        if cache_exec(ex).paged_kv:
             raw_refs = ctx.raw_refs
-            P_BLK = BLK // ex.page_size
+            P_BLK = BLK // cache_exec(ex).page_size
 
             if KVE:
                 epool_ref = stream.borrow_epool()
@@ -521,7 +562,12 @@ class GQABlock(Block):
 
                     def kv_dst(s, p):
                         return kv_slot(s).at[
-                            :, :, :, pl.ds(p * ex.page_size, ex.page_size)
+                            :,
+                            :,
+                            :,
+                            pl.ds(
+                                p * cache_exec(ex).page_size, cache_exec(ex).page_size
+                            ),
                         ]
 
                 else:
@@ -534,11 +580,19 @@ class GQABlock(Block):
                         )
 
                     def kv_src(r, kp):
-                        return r.at[kp].bitcast(U32).reshape(2, HD // 4, ex.page_size)
+                        return (
+                            r.at[kp]
+                            .bitcast(U32)
+                            .reshape(2, HD // 4, cache_exec(ex).page_size)
+                        )
 
                     def kv_dst(s, p):
                         return kv_slot(s).at[
-                            :, :, pl.ds(p * ex.page_size, ex.page_size)
+                            :,
+                            :,
+                            pl.ds(
+                                p * cache_exec(ex).page_size, cache_exec(ex).page_size
+                            ),
                         ]
 
             else:
@@ -548,7 +602,13 @@ class GQABlock(Block):
                     return r.at[kp]
 
                 def kv_dst(s, p):
-                    return kvbuf.at[s, :, :, :, pl.ds(p * ex.page_size, ex.page_size)]
+                    return kvbuf.at[
+                        s,
+                        :,
+                        :,
+                        :,
+                        pl.ds(p * cache_exec(ex).page_size, cache_exec(ex).page_size),
+                    ]
 
             def kv_stage(s):
                 return kv_slot(s) if KVE else kvbuf.at[s]
@@ -693,7 +753,7 @@ class GQABlock(Block):
                     )
                     for d in qx:
                         d.start()
-            if ex.FUSED:
+            if cache_exec(ex).FUSED:
                 with sc("att_kvrd"):
                     fused_io().gqa_fused_kvrd_issue(ctx, a)
             with sc("att_kvnew"):
@@ -708,7 +768,7 @@ class GQABlock(Block):
                     k = rms_zc(ybuf[:B, koff : koff + HD], kn)
                     v = ybuf[:B, koff + HD : koff + 2 * HD]
                     k = rope(k, cos, sin)
-                    if ex.paged_kv:
+                    if cache_exec(ex).paged_kv:
                         k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
                         v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
                         scr["knew"][:B, :] = k_fp8.astype(F32)
@@ -724,7 +784,7 @@ class GQABlock(Block):
                         k = rms_zc(ybuf[b : b + 1, koff : koff + HD], kn)
                         v = ybuf[b : b + 1, koff + HD : koff + 2 * HD]
                         k = rope(k, cos, sin)
-                        if ex.paged_kv:
+                        if cache_exec(ex).paged_kv:
                             k_fp8 = jnp.clip(k, -448.0, 448.0).astype(FP8)
                             v_fp8 = jnp.clip(v, -448.0, 448.0).astype(FP8)
                             scr["knew"][b : b + 1, :] = k_fp8.astype(F32)
@@ -732,12 +792,12 @@ class GQABlock(Block):
                         else:
                             scr["knew"][b : b + 1, :] = k
                             scr["vnew"][b : b + 1, :] = v
-                if ex.paged_kv:
+                if cache_exec(ex).paged_kv:
                     scr["knew_o"][...] = scr["knew"][...].astype(FP8)
                     scr["vnew_o"][...] = scr["vnew"][...].astype(FP8)
-                if not ex.FUSED:
-                    k_src = scr["knew_o"] if ex.paged_kv else scr["knew"]
-                    v_src = scr["vnew_o"] if ex.paged_kv else scr["vnew"]
+                if not cache_exec(ex).FUSED:
+                    k_src = scr["knew_o"] if cache_exec(ex).paged_kv else scr["knew"]
+                    v_src = scr["vnew_o"] if cache_exec(ex).paged_kv else scr["vnew"]
                     kv_out = (
                         pltpu.make_async_copy(
                             k_src, O["knew"].at[a], scr["kv_out_sem"].at[0]
@@ -797,7 +857,7 @@ class GQABlock(Block):
                 col = lax.broadcasted_iota(I32, (1 if AMASK else TQ, SUB), 1)
                 col_v: Any = (
                     lax.broadcasted_iota(I32, (HD, SUB), 1)
-                    if (ex.paged_kv and AMASK == 0)
+                    if (cache_exec(ex).paged_kv and AMASK == 0)
                     else None
                 )
                 am[...] = jnp.full(am.shape, -1e30, F32)
@@ -812,7 +872,7 @@ class GQABlock(Block):
                     k_full: Any = None
                     v_full: Any = None
                     v_u32: Any = None
-                    if ex.paged_kv:
+                    if cache_exec(ex).paged_kv:
                         if interpret:
                             kst = kv_slot(s) if KVE else kvbuf.at[s]
                             k_u32 = lax.bitcast_convert_type(
@@ -840,7 +900,7 @@ class GQABlock(Block):
                         off = t * BLK + j * SUB
                         rem = plen - off
                         full_blk = off + SUB <= plen
-                        if ex.paged_kv:
+                        if cache_exec(ex).paged_kv:
                             kj = (
                                 k_full
                                 if SUB == BLK
@@ -913,7 +973,9 @@ class GQABlock(Block):
                         m_new = jnp.maximum(m_old, rmax)
                         alpha = jnp.exp(m_old - m_new)
                         pr = jnp.exp(scores - m_new[:, 0:1])
-                        pv = stream.mm(pr.astype(BF16), vj, NT if ex.paged_kv else NN)
+                        pv = stream.mm(
+                            pr.astype(BF16), vj, NT if cache_exec(ex).paged_kv else NN
+                        )
                         al[b] = al[b] * alpha + jnp.sum(pr, axis=-1, keepdims=True)
                         aacc[b] = aacc[b] * alpha[:, 0:1] + pv
                         am[b] = m_new
@@ -1004,7 +1066,7 @@ class GQABlock(Block):
             if SPLIT:
                 mx = gq_merge_start() if GQ else slab_merge_start()
                 pri = scr["pri"]
-                if ex.FUSED:
+                if cache_exec(ex).FUSED:
                     with sc("att_kvwr"):
                         fused_io().gqa_fused_kv_rmw(ctx, ap, a)
                 with sc("att_gate"):
@@ -1171,9 +1233,9 @@ class GQABlock(Block):
                         scr["mix"][:B, h * HD : (h + 1) * HD] = rnd(oh * gh)
 
             with sc("att_out"):
-                if ex.FUSED and not SPLIT:
+                if cache_exec(ex).FUSED and not SPLIT:
                     fused_io().gqa_fused_kv_rmw(ctx, ap, a)
-                elif not ex.FUSED:
+                elif not cache_exec(ex).FUSED:
                     for d in kv_out:
                         d.wait()
                 NO = nh * HD
@@ -1183,7 +1245,7 @@ class GQABlock(Block):
         return yo * ctx.sm(slot, "out_s")
 
     def epilogue(self, ctx: Any) -> None:
-        if ctx.ex.FUSED:
+        if cache_exec(ctx.ex).FUSED:
             fused_io().gqa_fused_epilogue(ctx)
 
     def host_update_states(
@@ -1195,15 +1257,15 @@ class GQABlock(Block):
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
         """Scatter `knew` and `vnew` into `kc` and `vc` inside `shard_map`."""
-        if ex.FUSED:
+        if cache_exec(ex).FUSED:
             if POOL_STATE_NAME in raw_outputs:
                 return {POOL_STATE_NAME: raw_outputs[POOL_STATE_NAME]}
             return {}
         knew, vnew = raw_outputs["knew"], raw_outputs["vnew"]
-        if ex.paged_kv or "kc" not in states:
+        if cache_exec(ex).paged_kv or "kc" not in states:
             return {"knew": knew, "vnew": vnew}
         kc, vc = states["kc"], states["vc"]
-        if ex.resolve_tiles(g).kv_scatter_vec_ns < ex.NS:
+        if self.tunables(ex).kv_scatter_vec_ns < ex.NS:
             bi = jnp.arange(ex.B) if ex.T == 1 else jnp.arange(ex.B) // ex.T
             kw = dict(
                 indices_are_sorted=True, unique_indices=True, mode="promise_in_bounds"

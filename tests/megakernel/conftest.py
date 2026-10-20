@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 _xla_flags = os.environ.get("XLA_FLAGS", "")
 for _flag_prefix, _flag in (
@@ -38,9 +40,9 @@ os.environ["XLA_FLAGS"] = _xla_flags
 import pytest  # noqa: E402
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
 from vllm_torchtpu.megakernel.spec import (  # noqa: E402
-    TINY_TILES,
     Block,
     ExecSpec,
     LayerType,
@@ -86,12 +88,23 @@ class FakeGeometry:
     zero_centered_norm: bool = True
 
 
+@dataclass(frozen=True)
+class FakeMixerTunables:
+    """Block-owned knobs of `FakeMixerBlock` (no core `Tiles` field needed)."""
+
+    kv_blk: int = 256
+    nkv: int = 3
+
+    NUMERICS: ClassVar[dict[str, str]] = {"kv_blk": "approx", "nkv": "exact"}
+
+
 class FakeMixerBlock(Block):
     """Fake attention-style mixer block for testing declarative planning and VMEM."""
 
     name = "fake_gqa"
     reduction = "allreduce"
     input_norm = "in_norm"
+    Tunables = FakeMixerTunables
 
     def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
         nh = g.NH // ex.R
@@ -135,7 +148,7 @@ class FakeMixerBlock(Block):
         }
 
     def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
-        t = ex.resolved_tiles
+        t = self.tunables(ex)
         return [
             ScratchReq(
                 "kbuf", pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16), phase="persistent"
@@ -336,8 +349,7 @@ class MiniCtx:
     me: Any
     stream: Any
     comm: Any
-    rb_hbm: Any = None
-    mr_ref: Any = None
+    extra: dict[str, Any] = dataclasses.field(default_factory=dict)
     skip: frozenset[str] = frozenset()
     sc: Any = lambda *_: contextlib.nullcontext()
     norm_x: Any = None
@@ -364,30 +376,50 @@ class MiniCtx:
         self.norm_x = x
 
 
-# Exact-class fields: (id, field, value off the default, (T, B), extra kwargs).
+def with_tile_fields(t: Any, fields: Mapping[str, Any]) -> Any:
+    """`t` with knobs replaced: core `field` keys and `<block>.<field>` keys."""
+    core = {k: v for k, v in fields.items() if "." not in k}
+    blocks: dict[str, dict[str, Any]] = {}
+    for k, v in fields.items():
+        if "." in k:
+            block, field = k.split(".", 1)
+            blocks.setdefault(block, {})[field] = v
+    return dataclasses.replace(t, **core).with_blocks(blocks)
+
+
+def tile_field(t: Any, key: str) -> Any:
+    """Value of knob `key` (`field` or `<block>.<field>`) in tiles `t`."""
+    if "." not in key:
+        return getattr(t, key)
+    block, field = key.split(".", 1)
+    return getattr(t.block(block), field)
+
+
+# Exact-class knobs (core `field` or `<block>.<field>`): (id, knob, value off the
+# model default, (T, B), extra knobs).
 EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
     ("nbd", "nbd", 8, (2, 4), {}),
-    ("nkv", "nkv", 4, (2, 4), {}),
+    ("nkv", "gqa.nkv", 4, (2, 4), {}),
     ("lazy", "lazy", False, (2, 4), {}),
-    ("pair_kv", "pair_kv", True, (2, 4), {}),
-    ("kv_ering", "kv_ering", True, (2, 4), {}),
-    ("gqa_qv", "gqa_qv", True, (2, 4), {}),
+    ("pair_kv", "gqa.pair_kv", True, (2, 4), {}),
+    ("kv_ering", "gqa.kv_ering", True, (2, 4), {}),
+    ("gqa_qv", "gqa.gqa_qv", True, (2, 4), {}),
     ("rel_fetch", "rel_fetch", True, (2, 4), {}),
     ("bounds_checks", "bounds_checks", True, (2, 4), {}),
     ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
     ("smem_mib", "smem_mib", 2, (2, 4), {}),
-    ("moe_group_rows", "moe_group_rows", 0, (2, 4), {"moe_unroll": True}),
+    ("moe_group_rows", "moe.moe_group_rows", 0, (2, 4), {"moe.moe_unroll": True}),
     # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
     (
         "moe_group_rows-pipe_ep",
-        "moe_group_rows",
+        "moe.moe_group_rows",
         0,
         (2, 4),
-        {"pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+        {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
     ),
     # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
-    ("gdn_bufs-wide", "gdn_bufs", 2, (4, 24), {}),
-    ("pair_kv-wide", "pair_kv", True, (4, 24), {}),
-    ("kv_ering-wide", "kv_ering", True, (4, 24), {}),
-    ("gqa_qv-wide", "gqa_qv", True, (4, 24), {}),
+    ("gdn_bufs-wide", "gdn.gdn_bufs", 2, (4, 24), {}),
+    ("pair_kv-wide", "gqa.pair_kv", True, (4, 24), {}),
+    ("kv_ering-wide", "gqa.kv_ering", True, (4, 24), {}),
+    ("gqa_qv-wide", "gqa.gqa_qv", True, (4, 24), {}),
 ]

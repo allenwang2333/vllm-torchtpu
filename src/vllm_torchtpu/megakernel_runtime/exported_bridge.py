@@ -56,6 +56,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import cache
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.pool.config import cache_exec
 from vllm_torchtpu.megakernel.spec import ExecSpec, ModelSpec
 
 
@@ -311,7 +312,7 @@ def verify_pooled_step_hlo(
     g: Any = spec.config
     kvh = int(g.nkv(ex.R)) if hasattr(g, "nkv") else 1
     hd = int(getattr(g, "HD", 256))
-    pb = spec.pool_backend
+    pb = spec.cache_backend
     k_names = (
         pb.kernel_names
         if pb is not None
@@ -323,7 +324,7 @@ def verify_pooled_step_hlo(
         kvh=kvh,
         hd=hd,
         min_pool_pages=max(16, num_pages),
-        fused_pool_io=ex.FUSED,
+        fused_pool_io=cache_exec(ex).FUSED,
         kernel_names=k_names,
     )
 
@@ -549,9 +550,8 @@ def build_pooled_step_op(
     )
     _OP_COUNTER += 1
     if op_name is None:
-        op_name = (
-            f"megakernel_runtime::step_t{ex.T}_b{ex.B}_p{ex.num_pages}_{_OP_COUNTER}"
-        )
+        n_pages = cache_exec(ex).num_pages
+        op_name = f"megakernel_runtime::step_t{ex.T}_b{ex.B}_p{n_pages}_{_OP_COUNTER}"
     elif "::" not in op_name:
         op_name = f"megakernel_runtime::{op_name}"
 

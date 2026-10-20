@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from conftest import EXACT_FLIPS
+from conftest import EXACT_FLIPS, tile_field, with_tile_fields
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -36,7 +36,7 @@ from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
 from vllm_torchtpu.megakernel.cache import _should_use_pool_gather
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 
 
 @pytest.fixture(autouse=True)
@@ -69,8 +69,8 @@ def test_per_bucket_thresholds_come_from_tiles():
     )
     spec = qwen35.qwen35_spec(g)
     for B, rows, want in ((40, 40, True), (48, 40, False), (8, 4, False)):
-        tiles = dataclasses.replace(
-            mk.spec.TINY_TILES, bank=512 << 10, moe_group_rows=rows
+        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_blocks(
+            {"moe": {"moe_group_rows": rows}}
         )
         ex = mk.ExecSpec(B=B, R=2, ctx=256, tiles=tiles, interpret=True)
         plan = mk.planner.plan(spec, ex)
@@ -90,25 +90,31 @@ def test_profile_numerics_are_derived_and_enforced():
     # Qwen3.5 profiles are measured against `qwen35-baseline`, not `default`.
     c30 = mk.get_profile("qwen35-candidate30")
     feats = set(profile_mod.approx_features(c30))
-    assert {"tiles.kv_sub", "tiles.gdn_head_major", "tiles.moe_unroll"} <= feats
+    assert {
+        "tiles.gqa.kv_sub",
+        "tiles.gdn.gdn_head_major",
+        "tiles.moe.moe_unroll",
+    } <= feats
     # Exact-class flags the profile turns on are not listed.
-    assert not feats & {"tiles.pair_kv", "tiles.kv_ering", "tiles.gqa_qv"}
+    assert not feats & {"tiles.gqa.pair_kv", "tiles.gqa.kv_ering", "tiles.gqa.gqa_qv"}
     fused = mk.get_profile("qwen35-candidate30-fused")
     assert fused.numerics == "approx" and fused.fused_pool_io == "auto"
     assert "fused_pool_io" in profile_mod.approx_features(fused)
 
     # A profile declared exact that turns on an approx feature is rejected.
     def _kv_sub_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return dataclasses.replace(mk.default_tiles(B, R=R), kv_sub=1024)
+        return mk.default_tiles(B, R=R).with_blocks({"gqa": {"kv_sub": 1024}})
 
-    with pytest.raises(ValueError, match="tiles.kv_sub"):
+    with pytest.raises(ValueError, match="tiles.gqa.kv_sub"):
         mk.Profile(name="bad-exact", tiles=_kv_sub_rule)
     with pytest.raises(ValueError, match="fused_pool_io"):
         mk.Profile(name="bad-exact-fused", fused_pool_io="auto")
 
     # Exact-class changes keep an exact profile exact.
     def _sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
-        return dataclasses.replace(mk.default_tiles(B, R=R), pair_kv=True, nkv=4)
+        return mk.default_tiles(B, R=R).with_blocks(
+            {"gqa": {"pair_kv": True, "nkv": 4}}
+        )
 
     assert mk.Profile(name="sched-only", tiles=_sched_rule).numerics == "exact"
 
@@ -173,9 +179,9 @@ def _tiny(t: mk.Tiles) -> mk.Tiles:
         nbd=10,
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
-        kv_blk=256,
         vmem_mib=32,
-        kv_sub=128 if t.kv_sub else 0,
+    ).with_blocks(
+        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
     )
 
 
@@ -191,12 +197,12 @@ def _flip_exec(
     """Geometry + ExecSpec of one tiny paged bucket under `prof` (+ tile overrides)."""
     g = _geom(**(geom_kw or {}))
     base = mk.ExecSpec(
-        R=2, B=B, T=T, ctx=256, paged_kv=True, num_pages=512 if B <= 8 else 2048,
-        stack_e=False, interpret=True,
+        R=2, B=B, T=T, ctx=256, stack_e=False, interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=512 if B <= 8 else 2048),
     )  # fmt: skip
     ex = mk.get_profile(prof).exec_for(base, B=B, T=T, g=g)
     ex = dataclasses.replace(
-        ex, tiles=dataclasses.replace(_tiny(ex.resolved_tiles), **tile_kw)
+        ex, tiles=with_tile_fields(_tiny(ex.resolved_tiles), tile_kw)
     )
     return g, ex
 
@@ -252,14 +258,14 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
     bp, sp = info["plan"].block_params, info["core_plan"].stream
     return {
         "nbd": sp.NBD,
-        "nkv": bp["gqa"].NKV,
-        "gdn_bufs": bp["gdn"].NRB,
+        "gqa.nkv": bp["gqa"].NKV,
+        "gdn.gdn_bufs": bp["gdn"].NRB,
         "lazy": (bp["gqa"].LAZY_ATT, bp["moe"].LAZY_MOE),
-        "pair_kv": bp["gqa"].PAIR_KV,
-        "kv_ering": bp["gqa"].KVE,
-        "gqa_qv": bp["gqa"].QV,
+        "gqa.pair_kv": bp["gqa"].PAIR_KV,
+        "gqa.kv_ering": bp["gqa"].KVE,
+        "gqa.gqa_qv": bp["gqa"].QV,
         "rel_fetch": sp.rel_fetch,
-        "moe_group_rows": bp["moe"].group_rel,
+        "moe.moe_group_rows": bp["moe"].group_rel,
     }.get(field)
 
 
@@ -280,11 +286,13 @@ def test_exact_tile_fields_reproduce_model_default(
     T, B = tb
     g0, ex0 = _flip_exec(_QWEN35_DEFAULT, T=T, B=B, **extra)
     g1, ex1 = _flip_exec(_QWEN35_DEFAULT, T=T, B=B, **extra, **{field: value})
-    assert getattr(ex1.resolved_tiles, field) != getattr(ex0.resolved_tiles, field)
+    assert tile_field(ex1.resolved_tiles, field) != tile_field(
+        ex0.resolved_tiles, field
+    )
     before, after = _plan_effect(field, g0, ex0), _plan_effect(field, g1, ex1)
     if before is not None:
         assert before != after, (field, before, after)
-    if "pipe_ep" in extra:
+    if "moe.pipe_ep" in extra:
         _, info = qwen35.build(g1, ex1)
         assert info["plan"].block_params["moe"].PIPE_EP
     ref = _pooled_outputs(_QWEN35_DEFAULT, T=T, B=B, **extra)
@@ -300,8 +308,8 @@ def test_exact_kv_scatter_vec_ns_non_paged():
     g = _geom()
     outs = []
     for ns in (16, 0):
-        tiles = dataclasses.replace(
-            mk.spec.TINY_TILES, bank=512 << 10, kv_scatter_vec_ns=ns
+        tiles = dataclasses.replace(TINY_TILES, bank=512 << 10).with_blocks(
+            {"gqa": {"kv_scatter_vec_ns": ns}}
         )
         ex = mk.ExecSpec(B=B, T=1, R=R, ctx=256, tiles=tiles, interpret=True)
         pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(jax.random.key(5), g, ex)
@@ -322,13 +330,12 @@ def test_exact_kv_scatter_vec_ns_non_paged():
 def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
     """Test-only tile rule: the Qwen3.5 baseline plus exact-class schedule changes."""
     return dataclasses.replace(
-        baseline_tiles(B, moe_tp=moe_tp, R=R),
-        pair_kv=True,
-        kv_ering=True,
-        gqa_qv=True,
-        rel_fetch=True,
-        moe_group_rows=0,
-        nkv=4,
+        baseline_tiles(B, moe_tp=moe_tp, R=R), rel_fetch=True
+    ).with_blocks(
+        {
+            "gqa": {"pair_kv": True, "kv_ering": True, "gqa_qv": True, "nkv": 4},
+            "moe": {"moe_group_rows": 0},
+        }
     )
 
 
@@ -392,11 +399,11 @@ def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
     With qwen35-candidate30 tiles GPR is bitwise only on WIDE buckets (pools
     differ at B=8, hidden and pools at B=16), which is why
     `pool_gather=True` ("every eligible bucket") is classed approx and auto
-    GPR (WIDE only) exact in `spec.POOL_IO_NUMERICS`.
+    GPR (WIDE only) exact in `pool.POOL_IO_NUMERICS`.
     """
     g, ex = _flip_exec(prof, T=4, B=B)
     spec = qwen35.qwen35_spec(g)
-    assert _should_use_pool_gather(spec, spec.pool_backend, ex, use_fused=False)
+    assert _should_use_pool_gather(spec, spec.cache_backend, ex, use_fused=False)
     _assert_same(
         _pooled_outputs(prof, T=4, B=B), _pooled_outputs(_QWEN35_DEFAULT, T=4, B=B)
     )
@@ -405,18 +412,22 @@ def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
 def test_profile_pool_gather_true_means_where_eligible():
     g = _geom()
     spec = qwen35.qwen35_spec(g)
-    pb = spec.pool_backend
+    pb = spec.cache_backend
     prof = mk.DEFAULT_PROFILE.with_overrides(pool_gather=True)
-    base = mk.ExecSpec(R=2, ctx=256, paged_kv=True, num_pages=512, interpret=True)
+    base = mk.ExecSpec(
+        R=2, ctx=256, interpret=True, cache=mk.CacheExec(paged_kv=True, num_pages=512)
+    )
     ex1 = prof.exec_for(base, B=4, T=1, g=g)
-    assert ex1.pool_gather == "eligible" and ex1.GPR is False
+    assert (
+        mk.cache_exec(ex1).pool_gather == "eligible" and mk.cache_exec(ex1).GPR is False
+    )
     assert _should_use_pool_gather(spec, pb, ex1, use_fused=False) is False  # no raise
     ex4 = prof.exec_for(base, B=24, T=4, g=g)
     assert _should_use_pool_gather(spec, pb, ex4, use_fused=False) is True
     # An explicit (strict) request on an ineligible bucket is a config error.
     with pytest.raises(mk.MegakernelConfigError, match="pool_gather=True"):
         _should_use_pool_gather(
-            spec, pb, dataclasses.replace(ex1, pool_gather=True), use_fused=False
+            spec, pb, mk.with_cache(ex1, pool_gather=True), use_fused=False
         )
     with pytest.raises(ValueError, match="pool_gather"):
         mk.Profile(name="bad-pg", pool_gather="eligible")  # type: ignore[arg-type]
@@ -425,12 +436,13 @@ def test_profile_pool_gather_true_means_where_eligible():
 def test_exec_for_explicit_base_settings_win():
     g = _geom()
     gpr = mk.DEFAULT_PROFILE.with_overrides(pool_gather=None)
-    base = mk.ExecSpec(R=2, ctx=256, paged_kv=True, interpret=True)
-    assert gpr.exec_for(base, B=24, T=4, g=g).pool_gather is None
+    base = mk.ExecSpec(R=2, ctx=256, interpret=True, cache=mk.CacheExec(paged_kv=True))
+    assert mk.cache_exec(gpr.exec_for(base, B=24, T=4, g=g)).pool_gather is None
     for explicit in (True, "eligible"):
-        b2 = dataclasses.replace(base, pool_gather=explicit)
-        assert mk.DEFAULT_PROFILE.exec_for(b2, B=24, T=4, g=g).pool_gather == explicit
-    t = mk.spec.TINY_TILES
+        b2 = mk.with_cache(base, pool_gather=explicit)
+        ex_b2 = mk.DEFAULT_PROFILE.exec_for(b2, B=24, T=4, g=g)
+        assert mk.cache_exec(ex_b2).pool_gather == explicit
+    t = TINY_TILES
     assert gpr.exec_for(dataclasses.replace(base, tiles=t), B=8, T=1, g=g).tiles is t
 
 
@@ -443,10 +455,9 @@ def test_scratch_budget_overflow_is_config_error(field: str, match: str):
         B=4,
         T=1,
         ctx=256,
-        paged_kv=True,
-        num_pages=512,
         interpret=True,
         tiles=tiles,
+        cache=mk.CacheExec(paged_kv=True, num_pages=512),
     )
     with pytest.raises(mk.MegakernelConfigError, match=match):
         qwen35.build(_geom(), ex)
@@ -495,27 +506,36 @@ def test_builtin_profile_registration_is_idempotent():
 
 def test_exec_spec_pool_gather_values_and_explicit_split():
     with pytest.raises(ValueError, match="pool_gather must be one of"):
-        mk.ExecSpec(pool_gather="sometimes")  # type: ignore[arg-type]
+        mk.ExecSpec(cache=mk.CacheExec(pool_gather="sometimes"))  # type: ignore[arg-type]
     g = _geom()
     spec = qwen35.qwen35_spec(g)
     gpr = mk.DEFAULT_PROFILE.with_overrides(pool_gather=None)
-    base = mk.ExecSpec(R=2, ctx=256, paged_kv=True, num_pages=2048, interpret=True)
-    ex_auto = gpr.exec_for(base, B=24, T=4, g=g)
-    assert _should_use_pool_gather(spec, spec.pool_backend, ex_auto, use_fused=False)
-    # An explicit "split" wins over a GPR profile; the default False does not.
-    ex_split = gpr.exec_for(
-        dataclasses.replace(base, pool_gather="split"), B=24, T=4, g=g
+    base = mk.ExecSpec(
+        R=2, ctx=256, interpret=True, cache=mk.CacheExec(paged_kv=True, num_pages=2048)
     )
-    assert ex_split.pool_gather == "split" and ex_split.GPR is False
+    ex_auto = gpr.exec_for(base, B=24, T=4, g=g)
+    assert _should_use_pool_gather(spec, spec.cache_backend, ex_auto, use_fused=False)
+    # An explicit "split" wins over a GPR profile; the default False does not.
+    ex_split = gpr.exec_for(mk.with_cache(base, pool_gather="split"), B=24, T=4, g=g)
+    assert (
+        mk.cache_exec(ex_split).pool_gather == "split"
+        and mk.cache_exec(ex_split).GPR is False
+    )
     assert not _should_use_pool_gather(
-        spec, spec.pool_backend, ex_split, use_fused=False
+        spec, spec.cache_backend, ex_split, use_fused=False
     )
 
 
 def test_gq_pack_without_gqa_qv_is_config_error():
-    t = dataclasses.replace(_tiny(mk.default_tiles(8, R=2)), gq_pack=True)
+    t = _tiny(mk.default_tiles(8, R=2)).with_blocks({"gqa": {"gq_pack": True}})
     ex = mk.ExecSpec(
-        R=2, B=8, T=4, ctx=256, paged_kv=True, num_pages=512, interpret=True, tiles=t
+        R=2,
+        B=8,
+        T=4,
+        ctx=256,
+        interpret=True,
+        tiles=t,
+        cache=mk.CacheExec(paged_kv=True, num_pages=512),
     )
     with pytest.raises(mk.MegakernelConfigError, match="gq_pack requires gqa_qv"):
         mk.planner.plan(qwen35.qwen35_spec(_geom()), ex)

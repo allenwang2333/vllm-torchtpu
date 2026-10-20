@@ -98,9 +98,14 @@ def _tiny(t: mk.Tiles, ctx: int) -> mk.Tiles:
         nbd=10,
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
-        kv_blk=min(256, ctx),
         vmem_mib=32,
-        kv_sub=128 if t.kv_sub else 0,
+    ).with_blocks(
+        {
+            "gqa": {
+                "kv_blk": min(256, ctx),
+                "kv_sub": 128 if t.block("gqa").kv_sub else 0,
+            }
+        }
     )
 
 
@@ -128,22 +133,26 @@ def run_case(
     g = _geom(moe_tp=moe_tp, e_slots=e_slots)
     ctx = 256
     base = mk.ExecSpec(
-        R=R, B=B, T=T, ctx=ctx, paged_kv=True, num_pages=512 if B <= 8 else 2048,
-        stack_e=stack_e, interpret=True,
+        R=R, B=B, T=T, ctx=ctx, stack_e=stack_e, interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=512 if B <= 8 else 2048),
     )  # fmt: skip
     ex = mk.get_profile(profile).exec_for(base, B=B, T=T, g=g)
     t = ex.resolved_tiles
     if tiles_mode == "tiny":
         t = _tiny(t, ctx)
     else:  # production ring / bank sizes; only the KV block must fit `ctx`
-        t = dataclasses.replace(
-            t,
-            kv_blk=min(t.kv_blk, ctx),
-            kv_sub=min(t.kv_sub, ctx // 2) if t.kv_sub else 0,
+        gqa = t.block("gqa")
+        t = t.with_blocks(
+            {
+                "gqa": {
+                    "kv_blk": min(gqa.kv_blk, ctx),
+                    "kv_sub": min(gqa.kv_sub, ctx // 2) if gqa.kv_sub else 0,
+                }
+            }
         )
     ex = dataclasses.replace(ex, tiles=t)
     if pool_gather is not None:
-        ex = dataclasses.replace(ex, pool_gather=pool_gather)
+        ex = mk.with_cache(ex, pool_gather=pool_gather)
     spec = qwen35.qwen35_spec(g)
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.key(900 + 10 * T + B), g, ex
@@ -165,7 +174,11 @@ def run_case(
         mesh, spec, ex, donate=fused
     )
     out, raw = step(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
-    return {"hid": _h(out), "pools": [_h(r) for r in raw], "gpr": bool(ex.GPR)}
+    return {
+        "hid": _h(out),
+        "pools": [_h(r) for r in raw],
+        "gpr": bool(mk.cache_exec(ex).GPR),
+    }
 
 
 @pytest.mark.slow

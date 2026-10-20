@@ -30,7 +30,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 
 
 @pytest.fixture(autouse=True)
@@ -89,25 +89,27 @@ def _tiny_exec(
     amask: int = 1,
     kv_sub: int = 0,
 ) -> mk.ExecSpec:
-    tiles = replace(
-        mk.spec.TINY_TILES,
-        bank=512 << 10,
-        kv_blk=min(mk.spec.TINY_TILES.kv_blk, ctx),
-        kv_sub=kv_sub,
-        amask=amask,
-        ecopy_opt=ecopy_opt,
+    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
+        {
+            "gqa": {
+                "kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx),
+                "kv_sub": kv_sub,
+                "amask": amask,
+            },
+            "moe": {"ecopy_opt": ecopy_opt},
+        }
     )
     return mk.ExecSpec(
         R=R,
         B=B,
         T=T,
         ctx=ctx,
-        paged_kv=paged_kv,
-        num_pages=num_pages,
-        max_pages_per_seq=max_pages_per_seq,
         stack_e=stack_e,
         interpret=True,
         tiles=tiles,
+        cache=mk.CacheExec(
+            paged_kv=paged_kv, num_pages=num_pages, max_pages_per_seq=max_pages_per_seq
+        ),
     )
 
 
@@ -121,20 +123,27 @@ def _pack_kv_to_raw_pools(
 ) -> tuple[tuple[jax.Array, ...], jax.Array]:
     """Pack `[R, NATT, NS, ctx_tokens, HD]` `kc`/`vc` into `g.NATT` raw pools."""
     ctx_tokens = kc.shape[3]
-    pages_per_seq = ctx_tokens // ex.page_size
-    pt_cols = max(ex.resolved_max_pages_per_seq, pages_per_seq)
+    pages_per_seq = ctx_tokens // mk.cache_exec(ex).page_size
+    pt_cols = max(mk.pool.resolved_max_pages_per_seq(ex), pages_per_seq)
     if pt is None:
         pt = np.zeros((ex.NS, pt_cols), dtype=np.int32)
         rng = np.random.default_rng(1337)
         # Reserve pages 0..3 as unreferenced sentinels and permute remaining pages
-        perm = rng.permutation(ex.num_pages - 4).astype(np.int32) + 4
+        perm = rng.permutation(mk.cache_exec(ex).num_pages - 4).astype(np.int32) + 4
         for s in range(ex.NS):
             pt[s, :pages_per_seq] = perm[s * pages_per_seq : (s + 1) * pages_per_seq]
 
     raw_list = []
     for g_idx in range(g.NATT):
         pool_g = np.zeros(
-            (ex.R, ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
+            (
+                ex.R,
+                mk.cache_exec(ex).num_pages,
+                2,
+                g.HD // 4,
+                4,
+                mk.cache_exec(ex).page_size,
+            ),
             dtype=jnp.dtype(jnp.float8_e4m3fn),
         )
         kc_g = np.asarray(
@@ -147,13 +156,19 @@ def _pack_kv_to_raw_pools(
             for s in range(ex.NS):
                 for p in range(pages_per_seq):
                     kp = int(pt[s, p])
-                    t0 = p * ex.page_size
-                    k_sl = kc_g[r, s, t0 : t0 + ex.page_size]
-                    v_sl = vc_g[r, s, t0 : t0 + ex.page_size]
+                    t0 = p * mk.cache_exec(ex).page_size
+                    k_sl = kc_g[r, s, t0 : t0 + mk.cache_exec(ex).page_size]
+                    v_sl = vc_g[r, s, t0 : t0 + mk.cache_exec(ex).page_size]
                     pool_g[r, kp] = np.asarray(mk.kv_to_raw_page(k_sl, v_sl))
         raw_list.append(
             jnp.asarray(
-                pool_g.reshape(ex.R * ex.num_pages, 2, g.HD // 4, 4, ex.page_size)
+                pool_g.reshape(
+                    ex.R * mk.cache_exec(ex).num_pages,
+                    2,
+                    g.HD // 4,
+                    4,
+                    mk.cache_exec(ex).page_size,
+                )
             )
         )
     return tuple(raw_list), jnp.asarray(pt)
@@ -216,9 +231,11 @@ def test_states_to_pool_roundtrip(att_every: int, use_2d_ckpt: bool):
     st_in["conv"] = st_l["conv"].astype(jnp.bfloat16).astype(jnp.float32)
 
     pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
-    assert ex.num_pages >= min_np
+    assert mk.cache_exec(ex).num_pages >= min_np
     # Pages 0..5*G_PER_ATT-1 are reserved; active sequences start at page >= 5*G_PER_ATT
-    assert int(jnp.min(pt[:, : ex.ctx // ex.page_size])) >= 5 * (att_every - 1)
+    assert int(jnp.min(pt[:, : ex.ctx // mk.cache_exec(ex).page_size])) >= 5 * (
+        att_every - 1
+    )
     assert int(jnp.min(ckpt)) >= 1
     if use_2d_ckpt:
         ckpt = ckpt[0]
@@ -308,7 +325,9 @@ def test_gather_gdn_states_cpu_interpret(T: int, NS: int, att_every: int):
         with pytest.raises(ValueError, match="Unsupported active_seqs mode"):
             mk.gather_gdn_states(g, ex, raw_r0, ckpt_use, roff_use, "invalid")
         with pytest.raises(ValueError, match="maps to pages"):
-            mk.gather_gdn_states(g, ex, raw_r0, ckpt_use + ex.num_pages, roff_use)
+            mk.gather_gdn_states(
+                g, ex, raw_r0, ckpt_use + mk.cache_exec(ex).num_pages, roff_use
+            )
         if NS == 2 and T == 1 and att_every == 4:
             from jax.experimental import pallas as pl
 
@@ -321,7 +340,7 @@ def test_gather_gdn_states_cpu_interpret(T: int, NS: int, att_every: int):
             ):
                 c_bad, _ = jax.jit(
                     lambda ck: mk.gather_gdn_states(g, ex, raw_r0, ck, roff_use)
-                )(ckpt_use + ex.num_pages)
+                )(ckpt_use + mk.cache_exec(ex).num_pages)
                 c_bad.block_until_ready()
 
 
@@ -381,8 +400,8 @@ def test_paged_gqa_make_step_cpu_interpret(T: int, B: int):
 
         tp_s = NamedSharding(mesh, P("tp"))
         pt_3d = jnp.broadcast_to(
-            pt[None, :, : ex.resolved_max_pages_per_seq],
-            (ex.R, ex.NS, ex.resolved_max_pages_per_seq),
+            pt[None, :, : mk.pool.resolved_max_pages_per_seq(ex)],
+            (ex.R, ex.NS, mk.pool.resolved_max_pages_per_seq(ex)),
         )
         st_don = {
             "conv": jax.device_put(np.asarray(st_mk_paged["conv"]).copy(), tp_s),
@@ -496,14 +515,26 @@ def test_long_context_128k_page_table_plan_and_interpret():
     """Verify `ctx=131072` SMEM budgets, SMEM limit check, and `eff_ctx > ex.ctx`."""
     g_full = qwen35.Qwen35Geometry()
     t64 = baseline_tiles(64, R=8)
-    ex_4k_direct = mk.ExecSpec(R=8, B=64, T=1, ctx=4096, paged_kv=False, tiles=t64)
+    ex_4k_direct = mk.ExecSpec(
+        R=8, B=64, T=1, ctx=4096, tiles=t64, cache=mk.CacheExec(paged_kv=False)
+    )
     ex_4k_paged = mk.ExecSpec(
-        R=8, B=64, T=1, ctx=4096, paged_kv=True, num_pages=65536, tiles=t64
+        R=8,
+        B=64,
+        T=1,
+        ctx=4096,
+        tiles=t64,
+        cache=mk.CacheExec(paged_kv=True, num_pages=65536),
     )
     ex_128k_paged = mk.ExecSpec(
-        R=8, B=64, T=1, ctx=131072, paged_kv=True, num_pages=65536, tiles=t64
+        R=8,
+        B=64,
+        T=1,
+        ctx=131072,
+        tiles=t64,
+        cache=mk.CacheExec(paged_kv=True, num_pages=65536),
     )
-    assert ex_128k_paged.resolved_max_pages_per_seq == 1024
+    assert mk.pool.resolved_max_pages_per_seq(ex_128k_paged) == 1024
 
     spec_full = qwen35.qwen35_spec(g_full)
     cp_4k_direct, _ = mk.vmem.build_scratch(spec_full, ex_4k_direct)
@@ -549,10 +580,8 @@ def test_long_context_128k_page_table_plan_and_interpret():
         B=64,
         T=1,
         ctx=131072,
-        paged_kv=True,
-        num_pages=65536,
-        max_pages_per_seq=65536,
         tiles=t64,
+        cache=mk.CacheExec(paged_kv=True, num_pages=65536, max_pages_per_seq=65536),
     )
     with pytest.raises(mk.MegakernelConfigError, match="exceeds tiles.smem_mib budget"):
         mk.vmem.build_scratch(spec_full, ex_smem_overflow)
@@ -651,7 +680,7 @@ def test_pallas_writer_pooled_step_cpu_interpret(T: int, B: int):
         pos, hid_l, w_l, st_l, g, ex, mesh=mesh, build_default_pool=True
     )
     pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
-    assert ex.num_pages >= min_np
+    assert mk.cache_exec(ex).num_pages >= min_np
     raw_pools = tuple(
         jax.device_put(r, tp) for r in mk.states_to_pool(g, ex, st_l, pt, ckpt, roff)
     )
@@ -792,7 +821,7 @@ def test_scatter_pool_states_multi_ns_and_from_ckpt(NS: int, att_every: int):
         jax.random.key(30 + NS + att_every), g, ex
     )
     pt, ckpt, roff, min_np = mk.default_pool_layout(g, ex)
-    assert ex.num_pages >= min_np
+    assert mk.cache_exec(ex).num_pages >= min_np
     ckpt_use = ckpt[0] if att_every == 3 else ckpt
     roff_use = roff[0] if att_every == 3 else roff
     raw_pools = mk.states_to_pool(g, ex, st_l, pt, ckpt_use, roff_use)
@@ -905,7 +934,7 @@ def test_scatter_pool_states_multi_ns_and_from_ckpt(NS: int, att_every: int):
                         rec_new,
                         ck,
                     )
-                )(ckpt_use + ex.num_pages)
+                )(ckpt_use + mk.cache_exec(ex).num_pages)
                 r_bad[0].block_until_ready()
 
 
@@ -1046,7 +1075,7 @@ def test_donate_pools_all_call_shapes_no_pool_copy():
     assert "jax.buffer_donor = true" in lowered_1.as_text()
     compiled_hlo_1 = lowered_1.compile().as_text()
     ok_real, msg_real = mk.check_pooled_step_hlo(
-        compiled_hlo_1, page_size=ex.page_size, kvh=1, hd=g.HD
+        compiled_hlo_1, page_size=mk.cache_exec(ex).page_size, kvh=1, hd=g.HD
     )
     assert ok_real, msg_real
     out_1, _ = pw_step(pos, hid_mk, w_mk, st_d)
@@ -1244,14 +1273,17 @@ def test_eplb_ecopy_stack_e_and_split_hf_weights(T: int, B: int):
     ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
     ex_opt0_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=0)
     ex_opt0 = replace(
-        ex_opt0_base, tiles=replace(ex_opt0_base.resolved_tiles, route_vec=False)
+        ex_opt0_base,
+        tiles=ex_opt0_base.resolved_tiles.with_blocks({"moe": {"route_vec": False}}),
     )
     ex_po2c_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False, ecopy_opt=1)
     ex_po2c = replace(
-        ex_po2c_base, tiles=replace(ex_po2c_base.resolved_tiles, route_vec=False)
+        ex_po2c_base,
+        tiles=ex_po2c_base.resolved_tiles.with_blocks({"moe": {"route_vec": False}}),
     )
     ex_vec = replace(
-        ex_po2c_base, tiles=replace(ex_po2c_base.resolved_tiles, route_vec=True)
+        ex_po2c_base,
+        tiles=ex_po2c_base.resolved_tiles.with_blocks({"moe": {"route_vec": True}}),
     )
     ex_eplb_unstacked = replace(ex_vec, stack_e=False)
 
@@ -1586,13 +1618,7 @@ def test_m3_bit_exact_vs_frozen_pool_io_and_eplb(T: int, B: int):
         atol=1e-3,
     )
 
-    c_fe = replace(
-        c_f,
-        R=2,
-        NKV=2,
-        paged_kv=False,
-        e_slots=68,
-    )
+    c_fe = replace(c_f, R=2, NKV=2, e_slots=68, paged_kv=False)
     tiles_fe = replace(tiles_f, ecopy_opt=1)
     f_lay_e, f_Se = frozen_mk.smalls_layout(c_fe)
     l_lay_e = info_lib_e["plan"].smalls_layout
@@ -1635,9 +1661,14 @@ def test_gdn_gch_non_multiple_of_8_tail_and_padded_mr(T: int, B: int):
     # B=20 -> MR=24 (B < MR), WIDE=True, gdn_rows=8 -> CB=8, NF=2, TR=4 (n % 8 != 0)
     ex_base = _tiny_exec(R=2, B=B, T=T, ctx=256, paged_kv=False)
     ex_gch = replace(
-        ex_base, tiles=replace(ex_base.resolved_tiles, gdn_rows=8, gdn_bufs=2)
+        ex_base,
+        tiles=ex_base.resolved_tiles.with_blocks(
+            {"gdn": {"gdn_rows": 8, "gdn_bufs": 2}}
+        ),
     )
-    ex_noch = replace(ex_base, tiles=replace(ex_base.resolved_tiles, gdn_rows=0))
+    ex_noch = replace(
+        ex_base, tiles=ex_base.resolved_tiles.with_blocks({"gdn": {"gdn_rows": 0}})
+    )
     assert ex_gch.B < ex_gch.MR
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
@@ -1722,7 +1753,9 @@ def test_scatter_pool_states_odd_and_even_natt(natt: int, T: int, B: int):
     raw_updated = []
     for r in range(ex.R):
         pools_r = [
-            raw_init[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            raw_init[g_i].reshape(
+                ex.R, mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
+            )[r]
             for g_i in range(g.NATT)
         ]
         out_r = mk.scatter_pool_states(
@@ -1741,7 +1774,7 @@ def test_scatter_pool_states_odd_and_even_natt(natt: int, T: int, B: int):
         raw_updated.append(out_r)
     raw_folded = tuple(
         jnp.stack([raw_updated[r][g_i] for r in range(ex.R)], axis=0).reshape(
-            ex.R * ex.num_pages, 2, 64, 4, ex.page_size
+            ex.R * mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
         )
         for g_i in range(g.NATT)
     )
@@ -1781,14 +1814,24 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
     for g_i in range(g.NATT):
         p_arr = (
             np.asarray(raw_pools[g_i])
-            .reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)
+            .reshape(
+                ex.R, mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
+            )
             .copy()
         )
         for sub in range(g.att_every - 1):
             slot_s0 = int(ckpt[sub, 0, 0])
             p_arr[:, slot_s0 * 5 : (slot_s0 + 1) * 5].view(np.uint8)[:] = 0x7F
         raw_corrupted.append(
-            jnp.asarray(p_arr.reshape(ex.R * ex.num_pages, 2, 64, 4, ex.page_size))
+            jnp.asarray(
+                p_arr.reshape(
+                    ex.R * mk.cache_exec(ex).num_pages,
+                    2,
+                    64,
+                    4,
+                    mk.cache_exec(ex).page_size,
+                )
+            )
         )
 
     # Sequence 0 is cold-start (roff = -1), sequence 1 has real state (roff = 0)
@@ -1798,7 +1841,9 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
 
     for r in range(ex.R):
         pools_r = [
-            raw_corrupted[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            raw_corrupted[g_i].reshape(
+                ex.R, mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
+            )[r]
             for g_i in range(g.NATT)
         ]
         conv_g, rec_g = mk.gather_gdn_states(
@@ -1824,7 +1869,9 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
             )
         # Sequence 1 must match the real state from raw_pools (roff=0)
         pools_r_clean = [
-            raw_pools[g_i].reshape(ex.R, ex.num_pages, 2, 64, 4, ex.page_size)[r]
+            raw_pools[g_i].reshape(
+                ex.R, mk.cache_exec(ex).num_pages, 2, 64, 4, mk.cache_exec(ex).page_size
+            )[r]
             for g_i in range(g.NATT)
         ]
         conv_ref, rec_ref = mk.gather_gdn_states(
@@ -1864,7 +1911,12 @@ def test_gather_gdn_states_cold_start_negative_read_offsets(T: int, B: int):
         assert ex_uncoal.NS * vh_u > 128  # coal_rec is False
         pools_u0 = [
             raw_u[g_i].reshape(
-                ex_uncoal.R, ex_uncoal.num_pages, 2, 64, 4, ex_uncoal.page_size
+                ex_uncoal.R,
+                mk.cache_exec(ex_uncoal).num_pages,
+                2,
+                64,
+                4,
+                mk.cache_exec(ex_uncoal).page_size,
             )[0]
             for g_i in range(g_uncoal.NATT)
         ]
@@ -2112,9 +2164,13 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     )
     # The fused GDN path always runs the head-major recurrence, so the split
     # reference opts into `gdn_head_major` too. conv_stage=True is tested below.
-    ex = replace(
-        ex_base,
-        tiles=replace(ex_base.resolved_tiles, conv_stage=False, gdn_head_major=True),
+    ex = mk.with_cache(
+        replace(
+            ex_base,
+            tiles=ex_base.resolved_tiles.with_blocks(
+                {"gdn": {"conv_stage": False, "gdn_head_major": True}}
+            ),
+        ),
         pool_gather=False,
     )
     spec = qwen35.qwen35_spec(g)
@@ -2186,7 +2242,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     pools_f = _fresh_pools()
     hlo_f = step_fused.lower(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff).as_text("hlo")
     ok_f, msg_f = mk.check_pooled_step_hlo(
-        hlo_f, page_size=ex.page_size, kvh=1, hd=g.HD, fused_pool_io=True
+        hlo_f, page_size=mk.cache_exec(ex).page_size, kvh=1, hd=g.HD, fused_pool_io=True
     )
     assert ok_f, msg_f
 
@@ -2194,7 +2250,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
     out_f, raw_f = step_fused(pos, hid_mk, w_mk, pools_f, pt, ckpt, roff)
 
     kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
-    pools_cmp = (raw_f, raw_s, ex.num_pages, kinds)
+    pools_cmp = (raw_f, raw_s, mk.cache_exec(ex).num_pages, kinds)
     if T == 1:
         _assert_hidden_equal_per_row(out_f, out_s, ex.R, pools=pools_cmp)
     else:
@@ -2210,7 +2266,7 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
         # so this is not head-major vs key-major. Bounded at the measured value
         # and reported as XFAIL instead of widening a tolerance to fit.
         worst = max(
-            _rec_pool_max_ulp(r_f, r_s, ex.num_pages, kinds)
+            _rec_pool_max_ulp(r_f, r_s, mk.cache_exec(ex).num_pages, kinds)
             for r_f, r_s in zip(raw_f, raw_s)
         )
         assert worst <= WIDE_FUSED_REC_ULP_BOUND, (worst, WIDE_FUSED_REC_ULP_BOUND)
@@ -2231,13 +2287,16 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
             # checkpoints differ from split by up to T - 1 ULP on CPU interpret;
             # hidden output and KV / conv pages match exactly for these seeds.
             _assert_pools_equal_up_to_rec_ulp(
-                r_f, r_s, ex.num_pages, kinds, max_ulp=rec_ulp
+                r_f, r_s, mk.cache_exec(ex).num_pages, kinds, max_ulp=rec_ulp
             )
 
     if seed == 0 and (T, B) in ((1, 2), (2, 4)):
         # Verify conv_stage=True (conv_fast VMEM staging) on CPU interpret
-        ex_cstage = replace(
-            ex, tiles=replace(ex.resolved_tiles, conv_stage=True), fused_pool_io=True
+        ex_cstage = mk.with_cache(
+            replace(
+                ex, tiles=ex.resolved_tiles.with_blocks({"gdn": {"conv_stage": True}})
+            ),
+            fused_pool_io=True,
         )
         step_cstage, _ = mk.PallasWriter(fused_pool_io=True).make_step(
             mesh, spec, ex_cstage, donate=True
@@ -2256,13 +2315,13 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
                 np.asarray(r_f0).view(np.uint8),
             )
             _assert_pools_equal_up_to_rec_ulp(
-                r_cs, r_s, ex.num_pages, kinds, max_ulp=rec_ulp
+                r_cs, r_s, mk.cache_exec(ex).num_pages, kinds, max_ulp=rec_ulp
             )
 
     if (T, B) == (1, 2):
         # Verify act_mode="ref" with explicit active_seqs mask [1, 0]
         act_mask = jnp.asarray([1, 0], dtype=jnp.int32)
-        ex_ref = replace(ex, act_mode="ref")
+        ex_ref = mk.with_cache(ex, act_mode="ref")
         step_s_ref, _ = mk.PallasWriter(fused_pool_io=False).make_step(
             mesh, spec, ex_ref, donate=False
         )
@@ -2286,7 +2345,9 @@ def test_fused_pool_io_bit_exact_and_hlo(T: int, B: int, seed: int):
             )
 
         # Also trace non-interpret TPU path for fused_pool_io=True
-        ex_tpu = replace(ex, interpret=False, fused_pool_io=True, ckpt_k=2)
+        ex_tpu = mk.with_cache(
+            replace(ex, interpret=False), fused_pool_io=True, ckpt_k=2
+        )
         step_tpu, _ = mk.PallasWriter(fused_pool_io=True).make_step(
             mesh, spec, ex_tpu, donate=True
         )
@@ -2333,9 +2394,8 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
         B=B,
         T=T,
         ctx=256,
-        paged_kv=True,
-        num_pages=512 if B <= 8 else 2048,
         interpret=True,
+        cache=mk.CacheExec(paged_kv=True, num_pages=512 if B <= 8 else 2048),
     )
     ex = prof.exec_for(base, B=B, T=T, g=g)
     t = ex.resolved_tiles
@@ -2345,13 +2405,13 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
         nbd=10,
         nbe=max(6, min(t.nbe, 12)),
         ebank=256 << 10,
-        kv_blk=256,
         vmem_mib=32,
-        kv_sub=128 if t.kv_sub else 0,
+    ).with_blocks(
+        {"gqa": {"kv_blk": 256, "kv_sub": 128 if t.block("gqa").kv_sub else 0}}
     )
-    ex = replace(ex, tiles=t, pool_gather=False)
+    ex = mk.with_cache(replace(ex, tiles=t), pool_gather=False)
     assert mk.should_fuse_pool_io(spec, ex, fused_pool_io=prof.fused_pool_io)
-    assert t.conv_stage and t.gdn_head_major
+    assert t.block("gdn").conv_stage and t.block("gdn").gdn_head_major
 
     pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
         jax.random.key(810 + B + 1000 * seed), g, ex
@@ -2383,10 +2443,14 @@ def test_candidate30_fused_profile_vs_split(B: int, seed: int):
     out_f, raw_f = step_f(pos, hid_mk, w_mk, _fresh_pools(), pt, ckpt, roff)
     kinds = _pool_page_kinds(pt, ckpt, g_per_att=g.att_every - 1)
     _xfail_on_cpu_fused_artifact(
-        out_f, out_s, ex.R, (raw_f, raw_s, ex.num_pages, kinds), case=("c30f", B, seed)
+        out_f,
+        out_s,
+        ex.R,
+        (raw_f, raw_s, mk.cache_exec(ex).num_pages, kinds),
+        case=("c30f", B, seed),
     )
     worst = max(
-        _rec_pool_max_ulp(r_f, r_s, ex.num_pages, kinds)
+        _rec_pool_max_ulp(r_f, r_s, mk.cache_exec(ex).num_pages, kinds)
         for r_f, r_s in zip(raw_f, raw_s)
     )
     if ex.WIDE:
@@ -2404,12 +2468,14 @@ def test_pool_gather_verify_wide_cpu_interpret():
     g = _tiny_geom(L=4, att_every=4)
     ex_gpr_base = _tiny_exec(R=R, B=B, T=T, ctx=256, paged_kv=True, num_pages=512)
     # KVE is opt-in (`kv_ering`); GPR is opt-in (`pool_gather=True`).
-    ex_gpr = replace(
-        ex_gpr_base,
-        tiles=replace(ex_gpr_base.resolved_tiles, kv_ering=True),
+    ex_gpr = mk.with_cache(
+        replace(
+            ex_gpr_base,
+            tiles=ex_gpr_base.resolved_tiles.with_blocks({"gqa": {"kv_ering": True}}),
+        ),
         pool_gather=True,
     )
-    ex_split = replace(ex_gpr, pool_gather=False)
+    ex_split = mk.with_cache(ex_gpr, pool_gather=False)
     spec = qwen35.qwen35_spec(g)
     step_gpr, info_gpr = mk.PallasWriter(fused_pool_io=False).make_step(
         mesh, spec, ex_gpr, donate=False
@@ -2494,13 +2560,26 @@ def test_pool_gather_verify_wide_cpu_interpret():
     for r_arr in _fresh_pools():
         p_np = (
             np.asarray(r_arr)
-            .reshape(R, ex_gpr.num_pages, 2, 64, 4, ex_gpr.page_size)
+            .reshape(
+                R,
+                mk.cache_exec(ex_gpr).num_pages,
+                2,
+                64,
+                4,
+                mk.cache_exec(ex_gpr).page_size,
+            )
             .copy()
         )
         for sub in range(g.att_every - 1):
             s0_slot = int(ckpt[sub, 0, 0])
             p_np[:, s0_slot * 5 : (s0_slot + 1) * 5].view(np.uint8)[:] = 0x7F
-        corrupted = p_np.reshape(R * ex_gpr.num_pages, 2, 64, 4, ex_gpr.page_size)
+        corrupted = p_np.reshape(
+            R * mk.cache_exec(ex_gpr).num_pages,
+            2,
+            64,
+            4,
+            mk.cache_exec(ex_gpr).page_size,
+        )
         pools_cold_gpr.append(jax.device_put(corrupted.copy(), tp))
         pools_cold_split.append(jax.device_put(corrupted.copy(), tp))
     out_gpr_cold, raw_gpr_cold = step_gpr(
@@ -2530,24 +2609,32 @@ def test_pool_gather_verify_wide_cpu_interpret():
     ex_gq_on = _tiny_exec(
         R=4, B=8, T=4, ctx=256, paged_kv=True, num_pages=256, stack_e=False
     )
-    ex_gq_on = replace(
-        ex_gq_on,
-        tiles=replace(
-            ex_gq_on.resolved_tiles,
-            gqa_qv=True,
-            gq_pack=True,
-            kv_ering=True,
-            split=True,
+    ex_gq_on = mk.with_cache(
+        replace(
+            ex_gq_on,
+            tiles=ex_gq_on.resolved_tiles.with_blocks(
+                {
+                    "gqa": {
+                        "gqa_qv": True,
+                        "gq_pack": True,
+                        "kv_ering": True,
+                        "split": True,
+                    }
+                }
+            ),
         ),
         pool_gather=False,
     )
     ex_gq_off = replace(
         ex_gq_on,
-        tiles=replace(
-            ex_gq_on.resolved_tiles, gqa_qv=False, gq_pack=False, kv_ering=False
+        tiles=ex_gq_on.resolved_tiles.with_blocks(
+            {"gqa": {"gqa_qv": False, "gq_pack": False, "kv_ering": False}}
         ),
     )
-    ex_kve = replace(ex_gq_off, tiles=replace(ex_gq_off.resolved_tiles, kv_ering=True))
+    ex_kve = replace(
+        ex_gq_off,
+        tiles=ex_gq_off.resolved_tiles.with_blocks({"gqa": {"kv_ering": True}}),
+    )
     spec_gq = qwen35.qwen35_spec(g_gq)
     steps, infos = {}, {}
     for name, ex_v in (("on", ex_gq_on), ("off", ex_gq_off), ("kve", ex_kve)):

@@ -15,7 +15,8 @@
 
 Framework-free (jax + numpy only) and model-agnostic: everything is driven by a
 `PoolLayout` (see `pool/layout.py`). Models build their layout and wrap it in a
-`PoolBackend` with `make_pool_backend(layout)`.
+`PoolBackend` with `make_pool_backend(layout)`. Paged execution settings are
+the `CacheExec` extension of `ExecSpec` (`pool/config.py`).
 """
 
 from __future__ import annotations
@@ -27,6 +28,17 @@ from .backend import (
     can_pool_gather,
     check_ckpt_bounds,
     make_pool_backend,
+)
+from .config import (
+    DEFAULT_CACHE_EXEC,
+    POOL_GATHER_VALUES,
+    POOL_IO_NUMERICS,
+    POOL_STATE_NAME,
+    CacheExec,
+    PoolBackend,
+    cache_exec,
+    resolved_max_pages_per_seq,
+    with_cache,
 )
 from .gather import gather_gdn_states
 from .layout import PoolLayout
@@ -44,7 +56,16 @@ from .pack import (
 from .scatter import scatter_pool_states
 
 __all__ = [
+    "DEFAULT_CACHE_EXEC",
     "GATHER_KERNEL_NAME",
+    "POOL_GATHER_VALUES",
+    "POOL_IO_NUMERICS",
+    "POOL_STATE_NAME",
+    "CacheExec",
+    "PoolBackend",
+    "cache_exec",
+    "resolved_max_pages_per_seq",
+    "with_cache",
     "POOL_KERNEL_NAMES",
     "SCATTER_KERNEL_NAME",
     "PoolLayout",

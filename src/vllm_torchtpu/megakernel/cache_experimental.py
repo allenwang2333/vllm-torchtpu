@@ -6,7 +6,7 @@ Contract & Safety Model:
 Mosaic TPU rejects `input_output_aliases` on large HBM pool operands inside a
 communicating (`collective_id != None`) `pallas_call` by inserting a full-pool
 HBM copy before the kernel. To avoid that 2.30 GiB/pool copy in 1-launch mode
-(`ex.FUSED=True`):
+(`CacheExec.FUSED`):
 
 1. **On TPU (`ex.interpret == False`)**:
    - The communicating `decode_megakernel` declares `ST[POOL_STATE_NAME]` with
@@ -43,7 +43,8 @@ from typing import Any
 from .errors import MegakernelConfigError
 from .fused_io_hook import fused_io_available
 from .pool import POOL_KERNEL_NAMES
-from .spec import ExecSpec, ModelSpec, PoolBackend
+from .pool.config import PoolBackend, cache_exec
+from .spec import ExecSpec, ModelSpec
 
 
 def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
@@ -58,11 +59,11 @@ def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
 
 
 def _require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
-    if model_spec.pool_backend is None:
+    if model_spec.cache_backend is None:
         raise ValueError(
-            f"ModelSpec {model_spec.name!r} does not configure a pool_backend"
+            f"ModelSpec {model_spec.name!r} does not configure a cache_backend"
         )
-    return model_spec.pool_backend
+    return model_spec.cache_backend
 
 
 def should_fuse_pool_io(
@@ -77,9 +78,9 @@ def should_fuse_pool_io(
 
     Args:
       model_spec: `ModelSpec` or geometry config implementing `.to_model_spec()`.
-      ex: Execution specification (`ex.B`, `ex.fused_pool_io`).
+      ex: Execution specification (`ex.B`, `cache_exec(ex).fused_pool_io`).
       fused_pool_io:
-        - `None`: defer to `bool(ex.fused_pool_io)` (default `False`).
+        - `None`: defer to `bool(cache_exec(ex).fused_pool_io)` (default `False`).
         - `False` (default) / `"false"` / `"0"` / `"off"` / `"split"` / `"3stage"`:
           use the default split pool I/O pipeline.
         - `True` / `"true"` / `"1"` / `"on"` / `"fused"`: force 1-launch fused I/O.
@@ -95,7 +96,7 @@ def should_fuse_pool_io(
     ms = _resolve_model_spec(model_spec)
     pb = _require_pool_backend(ms)
     if fused_pool_io is None:
-        want_fused = bool(ex.fused_pool_io)
+        want_fused = bool(cache_exec(ex).fused_pool_io)
         explicit_true = want_fused
     elif isinstance(fused_pool_io, bool):
         want_fused = fused_pool_io
@@ -124,7 +125,7 @@ def should_fuse_pool_io(
     if not pb.supports_fused_io:
         if explicit_true:
             raise MegakernelConfigError(
-                f"ModelSpec {ms.name!r} pool_backend does not support fused_pool_io"
+                f"ModelSpec {ms.name!r} cache_backend does not support fused_pool_io"
             )
         return False
     if want_fused and not fused_io_available():

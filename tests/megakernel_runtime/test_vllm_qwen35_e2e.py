@@ -41,7 +41,9 @@ from tests.megakernel_runtime.test_weight_collector import (  # noqa: E402
     make_synthetic_qwen35_backbone,
 )
 from vllm_torchtpu.megakernel.models import qwen35, qwen35_pool  # noqa: E402
-from vllm_torchtpu.megakernel.spec import TINY_TILES, ExecSpec  # noqa: E402
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES  # noqa: E402
+from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache  # noqa: E402
+from vllm_torchtpu.megakernel.spec import ExecSpec  # noqa: E402
 from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     MegakernelDriver,
     MKABCalibrator,
@@ -91,18 +93,18 @@ def _tiny_exec(
     ctx: int = 256,
     num_pages: int = 96,
 ) -> ExecSpec:
-    tiles = replace(TINY_TILES, bank=512 << 10, kv_blk=min(TINY_TILES.kv_blk, ctx))
+    tiles = replace(TINY_TILES, bank=512 << 10).with_blocks(
+        {"gqa": {"kv_blk": min(TINY_TILES.block("gqa").kv_blk, ctx)}}
+    )
     return ExecSpec(
         R=R,
         B=B,
         T=T,
         ctx=ctx,
-        paged_kv=True,
-        num_pages=num_pages,
-        max_pages_per_seq=2,
         stack_e=False,
         tiles=tiles,
         interpret=True,
+        cache=CacheExec(paged_kv=True, num_pages=num_pages, max_pages_per_seq=2),
     )
 
 
@@ -1303,7 +1305,9 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     )
 
     # Independent split 3-stage `qwen35.make_pooled_step` oracle
-    ex_t1 = replace(driver.base_exec, B=2, T=1, fused_pool_io=False, pool_gather=False)
+    ex_t1 = with_cache(
+        replace(driver.base_exec, B=2, T=1), fused_pool_io=False, pool_gather=False
+    )
     step_ref_t1, _ = qwen35.make_pooled_step(
         mesh, g, ex_t1, donate_pools=False, fused_pool_io=False
     )
@@ -1355,7 +1359,9 @@ def test_megakernel_driver_e2e_decode_verify_and_spec_accept(
     out_t4 = driver(input_ids_t4, positions_t4, num_tokens=4, runner=runner)
     assert out_t4.shape == (4, g.H)
 
-    ex_t4 = replace(driver.base_exec, B=4, T=4, fused_pool_io=False, pool_gather=False)
+    ex_t4 = with_cache(
+        replace(driver.base_exec, B=4, T=4), fused_pool_io=False, pool_gather=False
+    )
     step_ref_t4, _ = qwen35.make_pooled_step(
         mesh, g, ex_t4, donate_pools=False, fused_pool_io=False
     )

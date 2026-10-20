@@ -29,33 +29,37 @@ from __future__ import annotations
 
 import dataclasses
 
+from ..blocks.gdn import GDNBlock
+from ..blocks.gqa import GQABlock
+from ..blocks.moe import MoEBlock
 from ..profile import Baseline, Profile, register_profile
 from ..spec import Tiles
 
-# Opt-in performance flags enabled by this profile.
-_C30_FLAGS = dict(
-    kv_sub=1024,
-    ecopy_opt=1,
-    pipe_ep=True,
-    r2_direct_store=True,
-    route_vec=True,
-    dense_acc_pair=True,
-    kv_ering=True,
-    pair_kv=True,
-    dmm_unroll=8,
-    gq_pack=True,
-    topk_lanes=True,
-    gdn_head_major=True,
-    gqa_qv=True,
-    moe_unroll=True,
-    rel_fetch=True,
+_GQA, _GDN, _MOE = GQABlock.name, GDNBlock.name, MoEBlock.name
+# Opt-in performance flags enabled by this profile (core, then per block).
+_C30_CORE_FLAGS = dict(dense_acc_pair=True, dmm_unroll=8, rel_fetch=True)
+_C30_BLOCK_FLAGS = {
+    _GQA: dict(kv_sub=1024, kv_ering=True, pair_kv=True, gq_pack=True, gqa_qv=True),
+    _GDN: dict(gdn_head_major=True),
+    _MOE: dict(
+        ecopy_opt=1,
+        pipe_ep=True,
+        r2_direct_store=True,
+        route_vec=True,
+        topk_lanes=True,
+        moe_unroll=True,
+    ),
+}
+_BASE = Tiles(hier=1, mb8=2, **_C30_CORE_FLAGS).with_blocks(
+    {**_C30_BLOCK_FLAGS, _GQA: {**_C30_BLOCK_FLAGS[_GQA], "pack": 1}}
 )
-_BASE = Tiles(hier=1, pack=1, mb8=2, **_C30_FLAGS)
 # candidate30 stages the fused-path conv checkpoint only from this many verify rows
 # up (`CONV_STAGE_MIN_B` in its kernel); smaller buckets keep the plain conv path.
 CONV_STAGE_MIN_B = 8
-_VERIFY = dataclasses.replace(_BASE, nkv=4, rsag=True, hier=2)
-_WIDE = dataclasses.replace(_VERIFY, nbd=10, nkv=3, vmem_mib=62, hier=0)
+_VERIFY = dataclasses.replace(_BASE, rsag=True, hier=2).with_blocks({_GQA: {"nkv": 4}})
+_WIDE = dataclasses.replace(_VERIFY, nbd=10, vmem_mib=62, hier=0).with_blocks(
+    {_GQA: {"nkv": 3}}
+)
 
 
 def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -76,7 +80,7 @@ def candidate30_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
         t = dataclasses.replace(_BASE, nbe=nbe_small, rsag=True, hier=2)
     else:
         t = dataclasses.replace(_BASE, nbe=nbe_small)
-    t = dataclasses.replace(t, conv_stage=B >= CONV_STAGE_MIN_B)
+    t = t.with_blocks({_GDN: {"conv_stage": B >= CONV_STAGE_MIN_B}})
     if R != 8 and t.hier in (1, 2):
         is_pow2_r = R >= 2 and (R & (R - 1)) == 0
         t = dataclasses.replace(t, hier=3 if (B <= 32 and is_pow2_r) else 0)

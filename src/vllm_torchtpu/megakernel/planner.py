@@ -19,17 +19,31 @@ import warnings
 from dataclasses import dataclass, replace
 from typing import Any
 
+import jax.numpy as jnp
+
+from . import pool_alias
 from .errors import MegakernelConfigError
 from .ops import BF16, F32, rup
 from .spec import (
     Block,
     ExecSpec,
+    ExtraInput,
     ModelSpec,
     Spec,
     StateDecl,
     SwitchSlot,
     WeightDecl,
 )
+
+
+def k_tile(K: int, N: int, dtype: Any, bank: int) -> int:
+    """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank` bytes."""
+    best = None
+    for tk in range(128, K + 1, 128):
+        if K % tk == 0 and pool_alias.storage_size((tk, N), jnp.dtype(dtype)) <= bank:
+            best = tk
+    assert best is not None, ("no 128-row tile fits a bank", K, N, dtype, bank)
+    return best
 
 
 @dataclass(frozen=True)
@@ -265,7 +279,7 @@ def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
             shared_widths[buf_name] = max(shared_widths.get(buf_name, 0), req_w)
 
     tk = {
-        k: tiles.tk(K, N, dt, tiles.ebank if k in dynamic_kinds else tiles.bank)
+        k: k_tile(K, N, dt, tiles.ebank if k in dynamic_kinds else tiles.bank)
         for k, (K, N, dt) in kinds.items()
     }
     nt = {k: kinds[k][0] // tk[k] for k in kinds}
@@ -464,4 +478,16 @@ def encode_ecopy(E: int, ER: int, EW: int, moe_tp: bool, cores: Any) -> list[flo
                     stacklevel=2,
                 )
             out[v] = float(1 + r1 * extra + k)
+    return out
+
+
+def extra_inputs(model_spec: ModelSpec, ex: ExecSpec) -> list[ExtraInput]:
+    """Every block's `extra_inputs`, in block declaration order (unique names)."""
+    g = model_spec.config
+    out: list[ExtraInput] = []
+    for b in model_spec.all_blocks():
+        out.extend(b.extra_inputs(g, ex))
+    names = [x.name for x in out]
+    if len(set(names)) != len(names):
+        raise MegakernelConfigError(f"duplicate block extra inputs {names}")
     return out

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Experimental in-kernel fused KV and GDN pool I/O helpers (`ex.FUSED=True`).
+"""Experimental in-kernel fused KV and GDN pool I/O helpers (`CacheExec.FUSED`).
 
 `GQABlock` / `GDNBlock` reach these helpers only through the block hook
 (`fused_io_hook.fused_io()`); this module registers itself there on
@@ -21,7 +21,7 @@ Contract & Aliasing Model (TPU vs. CPU `interpret=True`):
 ---------------------------------------------------------
 Mosaic TPU rejects `input_output_aliases` on large HBM pool operands inside a
 communicating (`collective_id != None`) `pallas_call` by materializing a full-pool
-HBM copy before the kernel. Therefore, `ex.FUSED` uses two backend-specific
+HBM copy before the kernel. Therefore, `cache_exec(ex).FUSED` uses two backend-specific
 aliasing contracts:
 
 1. **TPU (`ex.interpret == False`)**:
@@ -64,7 +64,7 @@ tests cover the arithmetic but not every TPU lowering:
   TPU writes the live rows only and relies on the zero-initialized staging page.
 Only the TPU paths are exercised by the TPU benches (`test_tpu_v7x8_bench.py`).
 
-The fused GDN recurrence is always head-major (`Tiles.gdn_head_major=True`
+The fused GDN recurrence is always head-major (`GDNTunables.gdn_head_major=True`
 numerics); compare it against the split path with that flag enabled.
 """
 
@@ -81,8 +81,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..fused_io_hook import FusedPoolIO, register_fused_io
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, rnd, rup
+from ..pool.config import POOL_STATE_NAME, cache_exec
 from ..pool.layout import LANES
-from ..spec import POOL_STATE_NAME, ExecSpec, StateDecl
+from ..spec import ExecSpec, StateDecl
 
 
 def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
@@ -98,11 +99,11 @@ def _kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GQA Fused Pool I/O (`GQABlock` when `ex.FUSED=True`)
+# GQA Fused Pool I/O (`GQABlock` when `CacheExec.FUSED`)
 # ---------------------------------------------------------------------------
 def gqa_fused_states(ex: ExecSpec) -> list[StateDecl]:
-    """Extra SMEM state declarations for `GQABlock` when `ex.FUSED=True`."""
-    if ex.act_mode == "ref":
+    """Extra SMEM state declarations for `GQABlock` when `CacheExec.FUSED`."""
+    if cache_exec(ex).act_mode == "ref":
         return [
             StateDecl(
                 "active_seqs",
@@ -117,12 +118,12 @@ def gqa_fused_states(ex: ExecSpec) -> list[StateDecl]:
 
 
 def gqa_fused_outputs(g: Any, ex: ExecSpec) -> list[StateDecl]:
-    """Output declarations for `GQABlock` when `ex.FUSED=True`."""
+    """Output declarations for `GQABlock` when `CacheExec.FUSED`."""
     if bool(ex.interpret):
         return [
             StateDecl(
                 POOL_STATE_NAME,
-                (ex.num_pages, 2, g.HD // 4, 4, ex.page_size),
+                (cache_exec(ex).num_pages, 2, g.HD // 4, 4, cache_exec(ex).page_size),
                 FP8,
                 access="w",
                 per_layer=True,
@@ -134,9 +135,11 @@ def gqa_fused_outputs(g: Any, ex: ExecSpec) -> list[StateDecl]:
 
 
 def gqa_fused_scratch(ex: ExecSpec, hd: int) -> dict[str, Any]:
-    """Scratch buffers for in-kernel KV page RMW (`ex.FUSED=True`)."""
+    """Scratch buffers for in-kernel KV page RMW (`CacheExec.FUSED`)."""
     return {
-        "kv_scat_page": pltpu.VMEM((ex.NS, 2, hd // 4, 4, ex.page_size), FP8),
+        "kv_scat_page": pltpu.VMEM(
+            (ex.NS, 2, hd // 4, 4, cache_exec(ex).page_size), FP8
+        ),
         "kv_rd_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
         "kv_wr_sem": pltpu.SemaphoreType.DMA((ex.NS,)),
         "kv_rd_pend": pltpu.SMEM((ex.NS,), I32),
@@ -154,14 +157,14 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
 
 def _gqa_seq_active(ctx: Any, s: Any) -> Any:
     ex, ST = ctx.ex, ctx.ST
-    if ex.act_mode == "all":
+    if cache_exec(ex).act_mode == "all":
         return jnp.bool_(True)
-    if ex.act_mode == "ref":
+    if cache_exec(ex).act_mode == "ref":
         return (ST["active_seqs"][s] != 0) if "active_seqs" in ST else jnp.bool_(True)
     if "ckpt_indices" not in ST:
         return jnp.bool_(True)
     ck_ref = ST["ckpt_indices"]
-    return (ck_ref[s, 0] > 0) if ex.ckpt_2d else (ck_ref[0, s, 0] > 0)
+    return (ck_ref[s, 0] > 0) if cache_exec(ex).ckpt_2d else (ck_ref[0, s, 0] > 0)
 
 
 def _gqa_seq_same_page(ctx: Any, s: Any) -> Any:
@@ -170,10 +173,12 @@ def _gqa_seq_same_page(ctx: Any, s: Any) -> Any:
     if T == 1:
         return jnp.bool_(True)
     b0 = s * T
-    lp0 = lax.div(jnp.maximum(pos_ref[b0], jnp.int32(0)), ex.page_size)
+    lp0 = lax.div(jnp.maximum(pos_ref[b0], jnp.int32(0)), cache_exec(ex).page_size)
     ok = jnp.bool_(True)
     for t in range(1, T):
-        lp_t = lax.div(jnp.maximum(pos_ref[b0 + t], jnp.int32(0)), ex.page_size)
+        lp_t = lax.div(
+            jnp.maximum(pos_ref[b0 + t], jnp.int32(0)), cache_exec(ex).page_size
+        )
         ok = jnp.logical_and(ok, lp_t == lp0)
     return ok
 
@@ -226,8 +231,10 @@ def gqa_fused_kvrd_issue(ctx: Any, a_cur: Any) -> None:
         @pl.when(do_rd)
         def _(s=s):
             p0 = jnp.maximum(pos_ref[s * T], jnp.int32(0))
-            lp0 = jnp.minimum(lax.div(p0, ex.page_size), pt_ref.shape[1] - 1)
-            kp0 = jnp.clip(pt_ref[s, lp0], 0, ex.num_pages - 1)
+            lp0 = jnp.minimum(
+                lax.div(p0, cache_exec(ex).page_size), pt_ref.shape[1] - 1
+            )
+            kp0 = jnp.clip(pt_ref[s, lp0], 0, cache_exec(ex).num_pages - 1)
             bswitch(
                 a_cur,
                 [
@@ -253,12 +260,14 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     kv_scat = scr["kv_scat_page"]
     rd_sem, wr_sem = scr["kv_rd_sem"], scr["kv_wr_sem"]
     rd_pend, wr_pend = scr["kv_rd_pend"], scr["kv_wr_pend"]
-    lane_iota_kv = lax.broadcasted_iota(I32, (h4, ex.page_size), 1)
+    lane_iota_kv = lax.broadcasted_iota(I32, (h4, cache_exec(ex).page_size), 1)
 
     def _batch_to_i32_cols(tok_mr_hd):
         rows_bf16 = tok_mr_hd.astype(BF16)
-        if ex.page_size > ex.MR:
-            rows_bf16 = jnp.pad(rows_bf16, ((0, ex.page_size - ex.MR), (0, 0)))
+        if cache_exec(ex).page_size > ex.MR:
+            rows_bf16 = jnp.pad(
+                rows_bf16, ((0, cache_exec(ex).page_size - ex.MR), (0, 0))
+            )
         cols_fp8 = jnp.swapaxes(rows_bf16, 0, 1).astype(FP8)
         return pltpu.bitcast(cols_fp8, I32)
 
@@ -280,14 +289,18 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                 k_cur = lax.bitcast_convert_type(jnp.swapaxes(kv_scat[s, 0], 1, 2), I32)
                 v_cur = lax.bitcast_convert_type(jnp.swapaxes(kv_scat[s, 1], 1, 2), I32)
             else:
-                k_view = kv_scat.at[s, 0].bitcast(I32).reshape(h4, ex.page_size)
-                v_view = kv_scat.at[s, 1].bitcast(I32).reshape(h4, ex.page_size)
+                k_view = (
+                    kv_scat.at[s, 0].bitcast(I32).reshape(h4, cache_exec(ex).page_size)
+                )
+                v_view = (
+                    kv_scat.at[s, 1].bitcast(I32).reshape(h4, cache_exec(ex).page_size)
+                )
                 k_cur = k_view[...]
                 v_cur = v_view[...]
             for t in range(T):
                 b_t = b0 + t
                 p_t = jnp.maximum(pos_ref[b_t], jnp.int32(0))
-                ln_t = lax.rem(p_t, ex.page_size)
+                ln_t = lax.rem(p_t, cache_exec(ex).page_size)
                 mask_ln = lane_iota_kv == ln_t
                 if interpret:
                     mask_b = lane_iota_kv == b_t
@@ -303,8 +316,9 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                     )
                 else:
                     sh_t = lax.rem(
-                        ln_t + (ex.page_size - b_t % ex.page_size),
-                        ex.page_size,
+                        ln_t
+                        + (cache_exec(ex).page_size - b_t % cache_exec(ex).page_size),
+                        cache_exec(ex).page_size,
                     )
                     k_col = pltpu.roll(k_cols, sh_t, 1)
                     v_col = pltpu.roll(v_cols, sh_t, 1)
@@ -317,8 +331,10 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                 k_view[...] = k_cur
                 v_view[...] = v_cur
             p0 = jnp.maximum(pos_ref[b0], jnp.int32(0))
-            lp0 = jnp.minimum(lax.div(p0, ex.page_size), pt_ref.shape[1] - 1)
-            kp0 = jnp.clip(pt_ref[s, lp0], 0, ex.num_pages - 1)
+            lp0 = jnp.minimum(
+                lax.div(p0, cache_exec(ex).page_size), pt_ref.shape[1] - 1
+            )
+            kp0 = jnp.clip(pt_ref[s, lp0], 0, cache_exec(ex).num_pages - 1)
             bswitch(
                 a_cur,
                 [
@@ -338,9 +354,11 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                 for t in range(T):
                     b_t = b0 + t
                     p_t = jnp.maximum(pos_ref[b_t], jnp.int32(0))
-                    lp_t = jnp.minimum(lax.div(p_t, ex.page_size), pt_ref.shape[1] - 1)
-                    ln_t = lax.rem(p_t, ex.page_size)
-                    kp_t = jnp.clip(pt_ref[s, lp_t], 0, ex.num_pages - 1)
+                    lp_t = jnp.minimum(
+                        lax.div(p_t, cache_exec(ex).page_size), pt_ref.shape[1] - 1
+                    )
+                    ln_t = lax.rem(p_t, cache_exec(ex).page_size)
+                    kp_t = jnp.clip(pt_ref[s, lp_t], 0, cache_exec(ex).num_pages - 1)
                     bswitch(
                         a_cur,
                         [
@@ -365,8 +383,12 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                         )
                     else:
                         sh_t = lax.rem(
-                            ln_t + (ex.page_size - b_t % ex.page_size),
-                            ex.page_size,
+                            ln_t
+                            + (
+                                cache_exec(ex).page_size
+                                - b_t % cache_exec(ex).page_size
+                            ),
+                            cache_exec(ex).page_size,
                         )
                         k_col = pltpu.roll(k_cols, sh_t, 1)
                         v_col = pltpu.roll(v_cols, sh_t, 1)
@@ -387,8 +409,16 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                             1, 2
                         )
                     else:
-                        k_view = kv_scat.at[s, 0].bitcast(I32).reshape(h4, ex.page_size)
-                        v_view = kv_scat.at[s, 1].bitcast(I32).reshape(h4, ex.page_size)
+                        k_view = (
+                            kv_scat.at[s, 0]
+                            .bitcast(I32)
+                            .reshape(h4, cache_exec(ex).page_size)
+                        )
+                        v_view = (
+                            kv_scat.at[s, 1]
+                            .bitcast(I32)
+                            .reshape(h4, cache_exec(ex).page_size)
+                        )
                         k_cur = jnp.where(mask_ln, k_col, k_view[...])
                         v_cur = jnp.where(mask_ln, v_col, v_view[...])
                         k_view[...] = k_cur
@@ -418,10 +448,10 @@ def gqa_fused_epilogue(ctx: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GDN Fused Pool I/O (`GDNBlock` when `ex.FUSED=True`)
+# GDN Fused Pool I/O (`GDNBlock` when `CacheExec.FUSED`)
 # ---------------------------------------------------------------------------
 def gdn_fused_scratch(ex: ExecSpec, gp: Any, plan: Any) -> dict[str, Any]:
-    """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`ex.FUSED=True`).
+    """Scratch buffers for in-kernel GDN checkpoint gather/scatter (`CacheExec.FUSED`).
 
     The staged checkpoint pages follow the pool backend's `PoolLayout`
     (`gp.pool_layout`, checked by `GDNBlock.plan_params`), which also sets the
@@ -511,9 +541,9 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
     sb = scr["sbuf"]
 
     def _is_seq_active(s):
-        if ex.act_mode == "all":
+        if cache_exec(ex).act_mode == "all":
             return jnp.bool_(True)
-        if ex.act_mode == "ref":
+        if cache_exec(ex).act_mode == "ref":
             return ST["active_seqs"][s] != 0
         return (
             (ST["ckpt_indices"][0, s, 0] > 0)
@@ -531,11 +561,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         else:
             pb = layout.page_base(ST["ckpt_indices"][s, roff], sub, 2)
         _kernel_debug_check(
-            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= ex.num_pages),
+            jnp.logical_and(pb >= 0, pb + GDN_PAGES <= cache_exec(ex).num_pages),
             "GDN gather checkpoint slot maps outside [0, num_pages)",
             interpret=interpret,
         )
-        return jnp.clip(pb, 0, ex.num_pages - GDN_PAGES)
+        return jnp.clip(pb, 0, cache_exec(ex).num_pages - GDN_PAGES)
 
     def _gdn_pb_out(sub, s, t, span: int = GDN_PAGES):
         if gp.ckpt_is_3d:
@@ -543,11 +573,11 @@ def gdn_fused_emit(ctx: Any, gp: Any, o: Any, slot: Any) -> Any:
         else:
             pb = layout.page_base(ST["ckpt_indices"][s, t + gp.ckpt_t_off], sub, 2)
         _kernel_debug_check(
-            jnp.logical_and(pb >= 0, pb + span <= ex.num_pages),
+            jnp.logical_and(pb >= 0, pb + span <= cache_exec(ex).num_pages),
             "GDN scatter checkpoint slot maps outside [0, num_pages)",
             interpret=interpret,
         )
-        return jnp.clip(pb, 0, ex.num_pages - span)
+        return jnp.clip(pb, 0, cache_exec(ex).num_pages - span)
 
     def _gdn_contig_ckpt(sub, s):
         if not gp.ckpt_is_3d or T <= 1:

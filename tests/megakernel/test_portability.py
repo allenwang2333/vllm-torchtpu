@@ -51,6 +51,7 @@ def test_megakernel_portability_ast_guard():
         "experimental/fused_pool_io.py",
         "models/qwen35.py",
         "pool/backend.py",
+        "pool/config.py",
         "pool/gather.py",
         "pool/layout.py",
         "pool/pack.py",
@@ -165,6 +166,7 @@ def test_pool_package_is_framework_free():
         "gather.py",
         "scatter.py",
         "backend.py",
+        "config.py",
     } <= rel_paths, rel_paths
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
     allowed_core = {"ops", "errors", "spec"}

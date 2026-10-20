@@ -52,6 +52,7 @@ except ImportError:
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.megakernel.blocks.gqa import GQABlock, GQATunables
 from vllm_torchtpu.megakernel.cache import (
     _should_use_pool_gather,
     should_fuse_pool_io,
@@ -59,6 +60,7 @@ from vllm_torchtpu.megakernel.cache import (
 from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
+from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
 from vllm_torchtpu.megakernel.profile import (
     Profile,
     get_profile,
@@ -974,12 +976,12 @@ class MegakernelDriver:
                 R=r_cnt,
                 B=max(self.max_bucket, self.max_verify_bucket, 8),
                 T=1,
-                paged_kv=True,
                 stack_e=False,
+                cache=CacheExec(paged_kv=True),
             )
         else:
-            base_exec = dataclasses.replace(
-                base_exec, R=r_cnt, paged_kv=True, stack_e=False
+            base_exec = with_cache(
+                dataclasses.replace(base_exec, R=r_cnt, stack_e=False), paged_kv=True
             )
         self.base_exec = base_exec
 
@@ -1225,7 +1227,7 @@ class MegakernelDriver:
             "runner._unified_kv_layout must be True "
             "(unified KV+GDN cache layout required)",
         )
-        pb = getattr(self.spec, "pool_backend", None)
+        pb = getattr(self.spec, "cache_backend", None)
         natt = int(pb.num_pools) if pb is not None else int(self.geom.NATT)
         g_per_att = (
             int(pb.recurrent_slots_per_pool)
@@ -1296,14 +1298,15 @@ class MegakernelDriver:
         self.attn_layer_name = self.backbone.layers[g_per_att].self_attn.attn.layer_name
 
         kv_blk = int(
-            self.profile.exec_for(
-                self.base_exec, B=self.base_exec.B, T=1, g=self.geom
-            ).resolved_tiles.kv_blk
+            self.profile.exec_for(self.base_exec, B=self.base_exec.B, T=1, g=self.geom)
+            .resolved_tiles.block(GQABlock.name, GQATunables)
+            .kv_blk
         )
         aligned_ctx = ((self.max_pages_per_seq * self.page_size) // kv_blk) * kv_blk
-        self.base_exec = dataclasses.replace(
-            self.base_exec,
-            ctx=max(self.base_exec.ctx, aligned_ctx),
+        self.base_exec = with_cache(
+            dataclasses.replace(
+                self.base_exec, ctx=max(self.base_exec.ctx, aligned_ctx)
+            ),
             num_pages=self.num_pages,
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
@@ -1380,8 +1383,8 @@ class MegakernelDriver:
             max_b_low=self.fused_pool_io_max_b,
             min_b_hi=self.fused_pool_io_min_b_hi,
         )
-        ex_cand2 = dataclasses.replace(ex_cand, fused_pool_io=use_fused)
-        pb = self.spec.pool_backend
+        ex_cand2 = with_cache(ex_cand, fused_pool_io=use_fused)
+        pb = self.spec.cache_backend
         use_gpr = (
             False
             if (use_fused or pb is None)
@@ -1392,10 +1395,7 @@ class MegakernelDriver:
                 use_fused=use_fused,
             )
         )
-        ex = dataclasses.replace(
-            ex_cand2,
-            pool_gather=use_gpr,
-        )
+        ex = with_cache(ex_cand2, pool_gather=use_gpr)
         is_tpu = self.raw_pools[0].device.type == "tpu"
         ckpt_cols_hlo = 2 if tokens_per_seq == 1 else tokens_per_seq
         bkt_key = (tokens_per_seq, bucket_t)
@@ -1612,7 +1612,7 @@ class MegakernelDriver:
         # spv = spp * max T slots per variant; snapshot them all. The step inputs
         # carry three recurrent sub-layers per pool (`s0..s2` / `c0..c2`, the
         # Qwen3.5 schedule), so the sentinel writes are wired for three too.
-        pb = self.spec.pool_backend
+        pb = self.spec.cache_backend
         if pb is None or pb.layout is None:
             raise MegakernelLayoutError(
                 f"MegakernelDriver: ModelSpec {self.spec.name!r} has no pool "

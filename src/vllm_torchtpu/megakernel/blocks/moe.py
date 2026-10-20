@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +37,8 @@ from ..ops import (
 from ..spec import (
     Block,
     ExecSpec,
+    ExtraInput,
+    NumericsClass,
     SmallField,
     WeightDecl,
 )
@@ -134,11 +136,51 @@ class MoEParams:
     r2_direct_store: bool
     unroll: bool
     # Paired expert-ring releases + unrolled refill loop (unrolled / PIPE_EP
-    # expert paths) for buckets up to `Tiles.moe_group_rows` rows.
+    # expert paths) for buckets up to `MoETunables.moe_group_rows` rows.
     group_rel: bool
     ecopy_opt: int
     eps: float
     zero_centered_norm: bool
+
+
+@dataclass(frozen=True)
+class MoETunables:
+    """`MoEBlock` knobs (`Tiles.blocks["moe"]`); `NUMERICS` classes each field."""
+
+    pipe: bool = True  # Software-pipeline single-tile experts
+    topk: bool = True  # One-reduction top-k picks on packed (value, lane) keys
+    ecopy_opt: int = 0  # Redundant expert dedup optimization (0 or 1)
+    # Unrolled / PIPE_EP experts: paired ring releases + unrolled refills up to
+    # this many rows
+    moe_group_rows: int = 40
+    # Opt-in performance flags (off by default; named profiles turn them on).
+    pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
+    r2_direct_store: bool = False  # Direct VMEM store on r2 tile 0
+    # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
+    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.route` holds)
+    route_vec: bool = False
+    topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
+    moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
+    # Debug: route from an external `rbias` HBM input / mask rows with an
+    # external `moe_rows` SMEM input (`MoEBlock.extra_inputs`).
+    forced_routing: bool = False
+    row_mask: bool = False
+
+    # `exact`: moving the field keeps hidden states and caches bit-identical
+    # (scheduling only); `approx`: changes or may change the arithmetic.
+    NUMERICS: ClassVar[dict[str, NumericsClass]] = {
+        "pipe": "approx",  # single-tile expert pipelining
+        "topk": "approx",  # packed-key top-k
+        "ecopy_opt": "approx",  # redundant-expert dispatch policy
+        "moe_group_rows": "exact",  # paired expert-ring releases (scheduling)
+        "pipe_ep": "approx",  # EP expert software pipeline
+        "r2_direct_store": "approx",  # `=` instead of zero-fill + `+=` (signed zero)
+        "route_vec": "approx",  # vectorized routing policy
+        "topk_lanes": "approx",  # Batcher odd-even lane top-k
+        "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
+        "forced_routing": "approx",  # replaces the router's routing
+        "row_mask": "approx",  # replaces the routed rows
+    }
 
 
 class MoEBlock(Block):
@@ -147,6 +189,18 @@ class MoEBlock(Block):
     name: str = "moe"
     reduction = "allreduce"
     input_norm: str | None = "post_norm"
+    Tunables = MoETunables
+
+    def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
+        """Debug routing inputs: `rbias` (HBM, `forced_routing`) and `moe_rows`
+        (SMEM `[B]` int32 row mask, `row_mask`)."""
+        tt: MoETunables = self.tunables(ex)
+        out = []
+        if tt.forced_routing:
+            out.append(ExtraInput("rbias", "hbm"))
+        if tt.row_mask:
+            out.append(ExtraInput("moe_rows", "smem", (ex.B,), I32))
+        return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         er = g.E // ex.R
@@ -209,6 +263,7 @@ class MoEBlock(Block):
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> MoEParams:
         tiles = ex.resolve_tiles(g)
+        tt: MoETunables = self.tunables(ex)
         er = g.E // ex.R
         isr = g.IS // ex.R
         ir = g.I // ex.R if g.moe_tp else g.I
@@ -220,14 +275,14 @@ class MoEBlock(Block):
         te = t13 + t2
         nbe = tiles.nbe
         nss = 3 + (nbe - 1) // te
-        pipe = tiles.pipe and t13 == 1 and t2 == 1
+        pipe = tt.pipe and t13 == 1 and t2 == 1
         pipe_ep = (
-            tiles.pipe_ep and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
+            tt.pipe_ep and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
         )
         n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
         lazy_moe = tiles.lazy and n_moe <= tiles.nbd
         ecopy = not g.moe_tp and g.e_slots > er
-        assert not (ex.row_mask and ecopy), "row_mask: identity expert placement only"
+        assert not (tt.row_mask and ecopy), "row_mask: identity expert placement only"
         return MoEParams(
             H=g.H,
             E=g.E,
@@ -250,13 +305,13 @@ class MoEBlock(Block):
             ECOPY=ecopy,
             moe_tp=g.moe_tp,
             stack_e=ex.stack_e,
-            topk_packed=tiles.topk,
-            topk_lanes=tiles.topk_lanes,
-            route_vec=tiles.route_vec,
-            r2_direct_store=tiles.r2_direct_store,
-            unroll=bool(tiles.moe_unroll or pipe_ep),
-            group_rel=tiles.moe_group_rows >= ex.B,
-            ecopy_opt=tiles.ecopy_opt,
+            topk_packed=tt.topk,
+            topk_lanes=tt.topk_lanes,
+            route_vec=tt.route_vec,
+            r2_direct_store=tt.r2_direct_store,
+            unroll=bool(tt.moe_unroll or pipe_ep),
+            group_rel=tt.moe_group_rows >= ex.B,
+            ecopy_opt=tt.ecopy_opt,
             eps=g.eps,
             zero_centered_norm=bool(g.zero_centered_norm),
         )
@@ -291,7 +346,7 @@ class MoEBlock(Block):
             )
             if mp.ecopy_opt == 1:
                 scr["ulist"] = pltpu.SMEM((nb_picks,), I32)
-        if ex.forced_routing:
+        if self.tunables(ex).forced_routing:
             scr["rb"] = pltpu.VMEM((2, ex.M, mp.E), F32)
             scr["rb_sem"] = pltpu.SemaphoreType.DMA((2,))
         return scr
@@ -312,9 +367,9 @@ class MoEBlock(Block):
                 scr["ecopy"].at[0],
                 scr["ec_sem"].at[0],
             ).start()
-        if ex.forced_routing:
+        if self.tunables(ex).forced_routing:
             pltpu.make_async_copy(
-                ctx.rb_hbm.at[0], scr["rb"].at[0], scr["rb_sem"].at[0]
+                ctx.extra["rbias"].at[0], scr["rb"].at[0], scr["rb_sem"].at[0]
             ).start()
 
     def init_buffers(self, ctx: Any) -> None:
@@ -824,16 +879,16 @@ class MoEBlock(Block):
 
         def route(l_idx, p8):
             choice = p8
-            if ex.forced_routing:
+            if self.tunables(ex).forced_routing:
                 rs = l_idx % 2
                 pltpu.make_async_copy(
-                    ctx.rb_hbm.at[0], scr["rb"].at[rs], scr["rb_sem"].at[rs]
+                    ctx.extra["rbias"].at[0], scr["rb"].at[rs], scr["rb_sem"].at[rs]
                 ).wait()
 
                 @pl.when(l_idx + 1 < sp.L)
                 def _():
                     pltpu.make_async_copy(
-                        ctx.rb_hbm.at[l_idx + 1],
+                        ctx.extra["rbias"].at[l_idx + 1],
                         scr["rb"].at[1 - rs],
                         scr["rb_sem"].at[1 - rs],
                     ).start()
@@ -1147,8 +1202,8 @@ class MoEBlock(Block):
                     new = seen != stamp
                     if not mp.moe_tp:
                         new = jnp.logical_and(new, lax.div(e, ER) == me)
-                    if ex.row_mask:
-                        on = ctx.mr_ref[b] != 0
+                    if self.tunables(ex).row_mask:
+                        on = ctx.extra["moe_rows"][b] != 0
                         new = jnp.logical_and(new, on)
                         scr["seen"][hi, lo] = jnp.where(on, stamp, seen)
                     else:

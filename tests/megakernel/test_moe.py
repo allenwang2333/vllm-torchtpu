@@ -31,9 +31,9 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
 from vllm_torchtpu.megakernel.spec import (
-    TINY_TILES,
     ExecSpec,
     LayerType,
     ModelSpec,
@@ -233,7 +233,9 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     H, E, TOPK, IR, ISR = 128, 128, 2, 128, 128
     ER = E // R
     EW = E if moe_tp else ER
-    tiles = dataclasses.replace(TINY_TILES, pipe=pipe, war=1, mb8=2)
+    tiles = dataclasses.replace(TINY_TILES, war=1, mb8=2).with_blocks(
+        {"moe": {"pipe": pipe}}
+    )
     ex = ExecSpec(B=2, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=True)
     g = FakeGeometry(
         L=1,

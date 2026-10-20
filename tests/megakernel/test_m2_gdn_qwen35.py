@@ -31,10 +31,9 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.megakernel import kernel, planner
 from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import baseline_tiles
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd, rup
 from vllm_torchtpu.megakernel.spec import (
-    TINY_TILES,
     ExecSpec,
     LayerType,
     ModelSpec,
@@ -194,12 +193,8 @@ def test_m2_gdn_block_standalone_interpret(B: int, T: int, gdn_rows: int):
         layer_type=LayerType(name="gdn_layer", slots=(GDNBlock(),)),
     )
     tiles = dataclasses.replace(
-        TINY_TILES,
-        bank=256 << 10,
-        gdn_rows=gdn_rows,
-        gdn_bufs=2,
-        inplace=not T > 1,
-    )
+        TINY_TILES, bank=256 << 10, inplace=not T > 1
+    ).with_blocks({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=128, tiles=tiles, interpret=True)
     p = planner.plan(spec, ex)
     gp = p.block_params["gdn"]
@@ -433,12 +428,9 @@ def test_m2_qwen35_hybrid_pack_and_step_vs_logical_reference(
         moe_tp=moe_tp,
     )
     tiles = dataclasses.replace(
-        TINY_TILES,
-        bank=256 << 10,
-        split=True,
-        gdn_rows=gdn_rows,
-        gdn_bufs=2,
-        inplace=R == 1 and not T > 1,
+        TINY_TILES, bank=256 << 10, inplace=R == 1 and not T > 1
+    ).with_blocks(
+        {"gqa": {"split": True}, "gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}}
     )
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
@@ -520,13 +512,8 @@ def test_m2_qwen35_hybrid_r8_multi_rank_interpret(T: int):
         moe_tp=False,
     )
     tiles = dataclasses.replace(
-        TINY_TILES,
-        bank=256 << 10,
-        split=True,
-        hier=1,
-        mb8=2,
-        inplace=False,
-    )
+        TINY_TILES, bank=256 << 10, hier=1, mb8=2, inplace=False
+    ).with_blocks({"gqa": {"split": True}})
     ex = ExecSpec(B=2 * T, T=T, R=8, ctx=256, tiles=tiles, interpret=True)
 
     key = jax.random.PRNGKey(909 + T)
@@ -648,12 +635,8 @@ def test_m2_bit_exact_vs_frozen_qwen35_hybrid(B: int, T: int, gdn_rows: int):
         moe_tp=False,
     )
     tiles_lib = dataclasses.replace(
-        TINY_TILES,
-        bank=256 << 10,
-        gdn_rows=gdn_rows,
-        gdn_bufs=2,
-        inplace=not T > 1,
-    )
+        TINY_TILES, bank=256 << 10, inplace=not T > 1
+    ).with_blocks({"gdn": {"gdn_rows": gdn_rows, "gdn_bufs": 2}})
     ex = ExecSpec(B=B, T=T, R=1, ctx=256, tiles=tiles_lib, interpret=True)
     pos, hid_lib, w_lib, st_lib = qwen35.random_inputs(
         jax.random.PRNGKey(B * 10 + T), g, ex, mesh=mesh
@@ -666,12 +649,12 @@ def test_m2_bit_exact_vs_frozen_qwen35_hybrid(B: int, T: int, gdn_rows: int):
         nbd=10,
         nbe=6,
         ebank=256 << 10,
+        vmem_mib=32,
+        inplace=not T > 1,
         kv_blk=256,
         nkv=3,
-        vmem_mib=32,
         gdn_rows=gdn_rows,
         gdn_bufs=2,
-        inplace=not T > 1,
     )
     c_f = frozen_mk.MKConfig(
         R=1,

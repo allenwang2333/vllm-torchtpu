@@ -28,9 +28,9 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import comm, planner, stream, vmem
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES
 from vllm_torchtpu.megakernel.ops import BF16, F32, I32, rnd
 from vllm_torchtpu.megakernel.spec import (
-    TINY_TILES,
     Block,
     ExecSpec,
     LayerType,

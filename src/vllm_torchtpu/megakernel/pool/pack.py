@@ -28,6 +28,7 @@ import numpy as np
 from ..ops import BF16, F32, FP8
 from ..spec import ExecSpec
 from .backend import check_ckpt_bounds
+from .config import cache_exec, resolved_max_pages_per_seq
 from .layout import LANES, PoolLayout
 
 _DEFAULT_LAYOUT = PoolLayout()
@@ -169,9 +170,9 @@ def allocate_test_layout(
     G_PER_ATT = layout.slots_per_pool
     pps = layout.pages_per_slot
     reserved_pages = layout.reserved_pages
-    pages_per_seq = ex.ctx // ex.page_size
+    pages_per_seq = ex.ctx // cache_exec(ex).page_size
     kv_pages_total = reserved_pages + ex.NS * pages_per_seq
-    pt_cols = max(ex.resolved_max_pages_per_seq, pages_per_seq)
+    pt_cols = max(resolved_max_pages_per_seq(ex), pages_per_seq)
     pt = np.zeros((ex.NS, pt_cols), dtype=np.int32)
     for s in range(ex.NS):
         pt[s, :pages_per_seq] = np.arange(
@@ -210,7 +211,7 @@ def states_to_pool(
     G_PER_ATT = layout.slots_per_pool
     page_shape = layout.kv_page_shape
     pt = np.asarray(page_table)
-    pages_per_seq = ex.ctx // ex.page_size
+    pages_per_seq = ex.ctx // cache_exec(ex).page_size
 
     kc = states["kc"]
     vc = states["vc"]
@@ -224,7 +225,7 @@ def states_to_pool(
     rec_st: Any = None
     if G_PER_ATT > 0:
         assert ckpt_indices is not None
-        check_ckpt_bounds(ckpt_indices, ex.num_pages, layout)
+        check_ckpt_bounds(ckpt_indices, cache_exec(ex).num_pages, layout)
         ckpt = np.asarray(ckpt_indices)
         ckpt_is_3d = ckpt.ndim == 3
         if read_offsets is None:
@@ -253,16 +254,18 @@ def states_to_pool(
     rec_pages = layout.rec_pages_per_slot
     raw_list = []
     for g_idx in range(layout.num_pools):
-        pool_g = np.zeros((R, ex.num_pages, *page_shape), dtype=jnp.dtype(FP8))
+        pool_g = np.zeros(
+            (R, cache_exec(ex).num_pages, *page_shape), dtype=jnp.dtype(FP8)
+        )
         kc_g = np.asarray(jnp.clip(kc[:, g_idx], -448.0, 448.0).astype(FP8))
         vc_g = np.asarray(jnp.clip(vc[:, g_idx], -448.0, 448.0).astype(FP8))
         for r in range(R):
             for s in range(NS):
                 for p in range(pages_per_seq):
                     kp = int(pt[s, p])
-                    t0 = p * ex.page_size
-                    k_sl = kc_g[r, s, t0 : t0 + ex.page_size]
-                    v_sl = vc_g[r, s, t0 : t0 + ex.page_size]
+                    t0 = p * cache_exec(ex).page_size
+                    k_sl = kc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
+                    v_sl = vc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
                     pool_g[r, kp] = np.asarray(kv_to_raw_page(k_sl, v_sl))
 
         for sub in range(G_PER_ATT):
@@ -288,7 +291,9 @@ def states_to_pool(
                         conv_to_raw_page(tap_rows, layout)
                     )
 
-        raw_list.append(jnp.asarray(pool_g.reshape(R * ex.num_pages, *page_shape)))
+        raw_list.append(
+            jnp.asarray(pool_g.reshape(R * cache_exec(ex).num_pages, *page_shape))
+        )
     return tuple(raw_list)
 
 
@@ -305,7 +310,7 @@ def pool_to_states(
     G_PER_ATT = layout.slots_per_pool
     page_shape = layout.kv_page_shape
     pt = np.asarray(page_table)
-    pages_per_seq = ex.ctx // ex.page_size
+    pages_per_seq = ex.ctx // cache_exec(ex).page_size
     natt, hd = layout.num_pools, layout.hd
 
     kc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(FP8))
@@ -316,7 +321,7 @@ def pool_to_states(
     conv_out: Any = None
     if G_PER_ATT > 0:
         assert ckpt_indices is not None
-        check_ckpt_bounds(ckpt_indices, ex.num_pages, layout)
+        check_ckpt_bounds(ckpt_indices, cache_exec(ex).num_pages, layout)
         ckpt = np.asarray(ckpt_indices)
         ckpt_is_3d = ckpt.ndim == 3
         ckpt_k = ckpt.shape[-1]
@@ -333,15 +338,21 @@ def pool_to_states(
 
     rec_pages = layout.rec_pages_per_slot
     for g_idx in range(natt):
-        pool_g = np.asarray(raw_pools[g_idx]).reshape(R, ex.num_pages, *page_shape)
+        pool_g = np.asarray(raw_pools[g_idx]).reshape(
+            R, cache_exec(ex).num_pages, *page_shape
+        )
         for r in range(R):
             for s in range(NS):
                 for p in range(pages_per_seq):
                     kp = int(pt[s, p])
-                    t0 = p * ex.page_size
+                    t0 = p * cache_exec(ex).page_size
                     k_sl, v_sl = raw_page_to_kv(pool_g[r, kp])
-                    kc_out[r, g_idx, s, t0 : t0 + ex.page_size] = np.asarray(k_sl)
-                    vc_out[r, g_idx, s, t0 : t0 + ex.page_size] = np.asarray(v_sl)
+                    kc_out[r, g_idx, s, t0 : t0 + cache_exec(ex).page_size] = (
+                        np.asarray(k_sl)
+                    )
+                    vc_out[r, g_idx, s, t0 : t0 + cache_exec(ex).page_size] = (
+                        np.asarray(v_sl)
+                    )
 
         for sub in range(G_PER_ATT):
             o = g_idx * G_PER_ATT + sub

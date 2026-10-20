@@ -30,12 +30,12 @@ profile: the default profile of the profile's model (`Profile.model`), or the
   head-major GDN, hierarchical all-reduce variants, fused pool I/O); must pass
   the accuracy ladder.
 
-Every `Tiles` field and pool-I/O mode declares its class in
-`spec.TILE_NUMERICS` / `spec.POOL_IO_NUMERICS`. `approx_features(profile)`
-lists the approx features a profile turns on relative to its reference; a
-profile declared `exact` that turns any of them on is rejected at
-construction, and `Profile.with_overrides` re-labels (`<name>+overrides`, class
-derived) instead of silently staying `exact`.
+Every tile knob (core `Tiles` fields and each block's `Tunables`) and pool-I/O
+mode declares its class (`spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
+`approx_features(profile)` lists the approx features a profile turns on
+relative to its reference; a profile declared `exact` that turns any of them on
+is rejected at construction, and `Profile.with_overrides` re-labels
+(`<name>+overrides`, class derived) instead of silently staying `exact`.
 """
 
 from __future__ import annotations
@@ -45,8 +45,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .pool.config import POOL_IO_NUMERICS, cache_exec, with_cache
 from .profiles.default import default_tiles
-from .spec import POOL_IO_NUMERICS, TILE_NUMERICS, ExecSpec, Tiles
+from .spec import ExecSpec, Tiles, tile_numerics
 
 # Name of the model-agnostic library default profile.
 DEFAULT_PROFILE_NAME = "default"
@@ -85,7 +86,7 @@ class Profile:
     fused_pool_io_min_b_hi: int = 56
     # In-kernel GDN gather (GPR): False (split) | None (auto: WIDE verify buckets
     # where eligible; exact) | True (every bucket where eligible, never a T=1
-    # bucket; approx, see `spec.POOL_IO_NUMERICS`).
+    # bucket; approx, see `pool.POOL_IO_NUMERICS`).
     pool_gather: bool | None = False
     baseline: Baseline | None = None
     description: str = ""
@@ -162,7 +163,8 @@ class Profile:
         - `tiles`: `base.tiles` if set, else the profile's tile rule (left
           `None` for the library default rule, which the kernel builder fits
           to the model's VMEM budget);
-        - `pool_gather`: `base.pool_gather` unless it is the library default
+        - `pool_gather`: the `CacheExec.pool_gather` of `base` unless it is the
+          library default
           `False` ("no explicit choice"), else the profile's: `None` -> auto,
           `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
           never on a `T=1` bucket). Pass `pool_gather="split"` to force split
@@ -174,11 +176,17 @@ class Profile:
         tiles = base.tiles
         if tiles is None and self.tiles is not None:
             tiles = self.tiles_for(B, R=base.R, moe_tp=moe_tp)
-        if base.pool_gather is not False:
-            pool_gather = base.pool_gather
+        base_gather = cache_exec(base).pool_gather
+        if base_gather is not False:
+            pool_gather = base_gather
         else:
             pool_gather = "eligible" if self.pool_gather is True else self.pool_gather
-        return dataclasses.replace(base, B=B, T=T, tiles=tiles, pool_gather=pool_gather)
+        ex = dataclasses.replace(base, B=B, T=T, tiles=tiles)
+        return (
+            ex
+            if pool_gather == base_gather
+            else with_cache(ex, pool_gather=pool_gather)
+        )
 
 
 _REGISTRY: dict[str, Profile] = {}
@@ -191,14 +199,23 @@ _NUMERICS_GRID_B = range(1, 65)
 _NUMERICS_GRID_R = (1, 2, 4, 8, 16)
 
 
+def _knob(t: Tiles, key: str) -> Any:
+    """Value of tile knob `key` (`field` or `<block>.<field>`) in `t`."""
+    if "." not in key:
+        return getattr(t, key)
+    block, field = key.split(".", 1)
+    return getattr(t.block(block), field)
+
+
 def approx_features(profile: Profile) -> tuple[str, ...]:
     """Approx-class features `profile` turns on relative to its reference.
 
     The reference is `model_default_profile(profile.model)`; a model default
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
-    1..64, `R` in {1, 2, 4, 8, 16}, EP and TP MoE) and the field is `approx` in
-    `TILE_NUMERICS`; a pool-I/O mode the profile turns on and the reference
+    1..64, `R` in {1, 2, 4, 8, 16}, EP and TP MoE) and the knob is `approx` in
+    `spec.tile_numerics()` (block knobs as `tiles.<block>.<field>`); a pool-I/O
+    mode the profile turns on and the reference
     does not counts per `POOL_IO_NUMERICS`.
     """
     if profile.model_default:
@@ -213,15 +230,14 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     ref_fused = False if ref is None else ref.fused_pool_io
     ref_gather = False if ref is None else ref.pool_gather
     feats: set[str] = set()
-    names = [f.name for f in dataclasses.fields(Tiles)]
-    approx_names = [n for n in names if TILE_NUMERICS[n] == "approx"]
+    approx_knobs = [k for k, v in tile_numerics().items() if v == "approx"]
     for R in _NUMERICS_GRID_R:
         for moe_tp in (False, True):
             for B in _NUMERICS_GRID_B:
                 t = profile.tiles_for(B, moe_tp=moe_tp, R=R)
                 d = ref_tiles(B, moe_tp=moe_tp, R=R)
                 feats.update(
-                    f"tiles.{n}" for n in approx_names if getattr(t, n) != getattr(d, n)
+                    f"tiles.{k}" for k in approx_knobs if _knob(t, k) != _knob(d, k)
                 )
     if (
         profile.fused_pool_io is not False

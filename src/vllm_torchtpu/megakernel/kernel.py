@@ -30,11 +30,13 @@ from .comm import AllReduceRing
 from .errors import MegakernelConfigError
 from .ops import BF16, F32, I32, rmsnorm
 from .planner import (
+    extra_inputs,
     kernel_out_shapes,
     state_shapes,
     weight_shapes,
 )
-from .spec import POOL_STATE_NAME, ExecSpec, ModelSpec, SwitchSlot
+from .pool.config import POOL_STATE_NAME, cache_exec
+from .spec import ExecSpec, ModelSpec, SwitchSlot
 from .stream import TwoRing
 from .vmem import CorePlan, build_scratch, fit_default_tiles
 
@@ -55,8 +57,7 @@ class KernelContext:
     ST: dict[str, Any]
     O: dict[str, Any]  # noqa: E741
     out_ref: Any
-    rb_hbm: Any
-    mr_ref: Any
+    extra: dict[str, Any]  # `Block.extra_inputs` refs by name
     scr: dict[str, Any]
     me: Any
     live: Any
@@ -128,28 +129,24 @@ def build(
     o_names = p.o_names
     n_w, n_s = len(w_names), len(st_names)
     blocks = model_spec.all_blocks()
+    extras = extra_inputs(model_spec, ex)
+    x_names = [x.name for x in extras]
 
     def kernel(*refs):
         pos_ref, hid_ref = refs[:2]
         W = dict(zip(w_names, refs[2 : 2 + n_w]))
         ST = dict(zip(st_names, refs[2 + n_w : 2 + n_w + n_s]))
         k_ = 2 + n_w + n_s
-        rb_hbm = None
-        if ex.forced_routing:
-            rb_hbm = refs[k_]
-            k_ += 1
-        mr_ref = None
-        if ex.row_mask:
-            mr_ref = refs[k_]
-            k_ += 1
+        extra = dict(zip(x_names, refs[k_ : k_ + len(x_names)]))
+        k_ += len(x_names)
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
         out_ref = O["hidden"]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
         pool_key = POOL_STATE_NAME
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])
-            if ex.FUSED
-            else (ST.get(pool_key) if ex.paged_kv else None)
+            if cache_exec(ex).FUSED
+            else (ST.get(pool_key) if cache_exec(ex).paged_kv else None)
         )
 
         me = lax.axis_index("tp").astype(I32)
@@ -168,8 +165,7 @@ def build(
             ST=ST,
             O=O,
             out_ref=out_ref,
-            rb_hbm=rb_hbm,
-            mr_ref=mr_ref,
+            extra=extra,
             scr=scr,
             me=me,
             live=live,
@@ -323,8 +319,7 @@ def build(
         [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.VMEM)]
         + w_specs
         + s_specs
-        + ([pl.BlockSpec(memory_space=pltpu.HBM)] if ex.forced_routing else [])
-        + ([pl.BlockSpec(memory_space=pltpu.SMEM)] if ex.row_mask else [])
+        + [pl.BlockSpec(memory_space=_mem_space(x.memory_space)) for x in extras]
     )
     out_shape = [
         tuple(jax.ShapeDtypeStruct(s.shape, s.dtype) for s in osh[k])
@@ -352,7 +347,12 @@ def build(
     )
     pool_key = POOL_STATE_NAME
     aliases: dict[int, int] = {}
-    if ex.FUSED and bool(ex.interpret) and pool_key in st_names and pool_key in o_names:
+    if (
+        cache_exec(ex).FUSED
+        and bool(ex.interpret)
+        and pool_key in st_names
+        and pool_key in o_names
+    ):
         raw_s_offset = sum(
             len(ssh[k]) if p.state_decls[k].tupled else 1
             for k in st_names[: st_names.index(pool_key)]
@@ -483,6 +483,7 @@ def make_step(
     o_names = p.o_names
     wsh = info["wshape"]
     blocks = model_spec.all_blocks()
+    extras = extra_inputs(model_spec, ex)
 
     def local(pos, hidden, weights, states, *extra):
         w = [
@@ -566,10 +567,8 @@ def make_step(
             for k in weights
         }
         ss = {k: _state_pspec(k, states[k]) for k in states}
-        in_specs = (
-            (P(), P("tp"), ws, ss)
-            + ((P("tp"),) if ex.forced_routing else ())
-            + ((P(),) if ex.row_mask else ())
+        in_specs = (P(), P("tp"), ws, ss) + tuple(
+            P("tp") if x.memory_space == "hbm" else P() for x in extras
         )
         return jax.shard_map(
             local,
