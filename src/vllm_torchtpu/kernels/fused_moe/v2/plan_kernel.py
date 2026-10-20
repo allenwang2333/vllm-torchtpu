@@ -337,10 +337,10 @@ def build_decode_plan(
     out_shape += [jax.ShapeDtypeStruct((1, G), i32) for _ in range(3)]
     out_shape.append(jax.ShapeDtypeStruct((8, ep), i32))
     out_shape += [jax.ShapeDtypeStruct((1, P), i32) for _ in range(2)]
-    vmem = pltpu.MemorySpace.VMEM
     inputs = [pairs_g.astype(i32).reshape(ep, P)]
     if quantized:
         inputs.append(scale_bits_g.astype(i32).reshape(ep, t_local))
+    vmem = pltpu.MemorySpace.VMEM
     outs = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -369,3 +369,100 @@ def build_decode_plan(
         pos=pos.reshape(t_local, topk),
         mirror_pos=mir.reshape(t_local, topk),
     )
+
+
+def _combine_kernel(
+    tables_hbm,
+    arr_hbm,
+    scale_hbm,
+    out_ref,
+    tables_sm,
+    rows_vm,
+    scales_vm,
+    sums_vm,
+    sems,
+    *,
+    t_local,
+    topk,
+    tile_m,
+    out_dtype,
+):
+    n = t_local * topk
+    fetch = pltpu.make_async_copy(tables_hbm, tables_sm, sems.at[2])
+    fetch.start()
+    fetch.wait()
+    recv_rows = arr_hbm.shape[0]
+    mirror_elems = scale_hbm.shape[0] * tile_m
+    shift = pow2_shift(tile_m, "tile_m")
+    mirror = [jnp.minimum(tables_sm[n + p], mirror_elems - 1) for p in range(n)]
+    copies = []
+    for p in range(n):
+        row = jnp.minimum(tables_sm[p], recv_rows - 1)
+        sub = jnp.right_shift(mirror[p], shift)
+        copies.append(pltpu.make_async_copy(arr_hbm.at[row], rows_vm.at[p], sems.at[0]))
+        copies.append(
+            pltpu.make_async_copy(
+                scale_hbm.at[pl.ds(sub, 1)], scales_vm.at[p], sems.at[1]
+            )
+        )
+    for c in copies:
+        c.start()
+    for c in copies:
+        c.wait()
+    lane = _iota((1, tile_m), 1)
+    for t in range(t_local):
+        acc = None
+        for k in range(topk):
+            p = t * topk + k
+            row_scale = jnp.sum(
+                jnp.where(lane == (mirror[p] & (tile_m - 1)), scales_vm[p], 0.0),
+                axis=1,
+                keepdims=True,
+            )
+            weight = lax.bitcast_convert_type(tables_sm[2 * n + p], jnp.float32)
+            term = rows_vm[p].astype(jnp.float32) * (row_scale * weight)
+            acc = term if acc is None else acc + term
+        sums_vm[t] = acc.astype(out_dtype)
+    store = pltpu.make_async_copy(sums_vm, out_ref, sems.at[0])
+    store.start()
+    store.wait()
+
+
+def build_decode_combine(arrivals, arrival_scales, pos, mirror_pos, weights, out_dtype):
+    """out[t] = sum_k scale(mirror[t, k]) * weights[t, k] * arrivals[pos[t, k]].
+
+    The decode-bucket combine as one Mosaic call: topk row DMAs per token in
+    place of two SparseCore gathers. Returns [t_local, lane blocks, 128].
+    Positions are clamped into both buffers as the XLA gather clamps them.
+    The three per-slot tables travel as one HBM array the kernel fetches into
+    SMEM itself, rather than as three operands XLA copies there one by one.
+    """
+    t_local, topk = pos.shape
+    _, lane_blocks, lanes = arrivals.shape
+    tile_m = arrival_scales.shape[1]
+    n = t_local * topk
+    hbm = pltpu.MemorySpace.HBM
+    tables = jnp.concatenate(
+        [
+            pos.astype(jnp.int32).reshape(n),
+            mirror_pos.astype(jnp.int32).reshape(n),
+            lax.bitcast_convert_type(weights.astype(jnp.float32), jnp.int32).reshape(n),
+        ]
+    )
+    kernel = functools.partial(
+        _combine_kernel, t_local=t_local, topk=topk, tile_m=tile_m, out_dtype=out_dtype
+    )
+    return pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=hbm)] * 3,
+        out_specs=pl.BlockSpec(memory_space=hbm),
+        scratch_shapes=(
+            pltpu.SMEM((3 * n,), jnp.int32),
+            pltpu.VMEM((n, lane_blocks, lanes), arrivals.dtype),
+            pltpu.VMEM((n, 1, tile_m), jnp.float32),
+            pltpu.VMEM((t_local, lane_blocks, lanes), out_dtype),
+            pltpu.SemaphoreType.DMA((3,)),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, lane_blocks, lanes), out_dtype),
+        name="fused_ep_moe_v2_decode_combine",
+    )(tables, arrivals, arrival_scales)

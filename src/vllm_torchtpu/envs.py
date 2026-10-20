@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_MERGED_EXCHANGE: bool = False
     MOE_FUSED_EP_V2_ONEHOT_SCATTER: bool = False
     MOE_FUSED_EP_V2_PALLAS_PLAN: bool = False
+    MOE_FUSED_EP_V2_DECODE_COMBINE: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
@@ -805,10 +806,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SMALL_BATCH_LOCAL_TOKENS): carry the routing exchange inside the
     # activation all-gather (needs the sharded plan), and build the slab
     # tables by TensorCore one-hot rather than SparseCore scatter, or build
-    # the whole routing plan in one Pallas call (needs the sharded plan).
+    # the whole routing plan in one Pallas call (needs the sharded plan), and
+    # sum the arrivals in one Pallas call rather than two SparseCore gathers.
     "MOE_FUSED_EP_V2_MERGED_EXCHANGE": env_bool("MOE_FUSED_EP_V2_MERGED_EXCHANGE"),
     "MOE_FUSED_EP_V2_ONEHOT_SCATTER": env_bool("MOE_FUSED_EP_V2_ONEHOT_SCATTER"),
     "MOE_FUSED_EP_V2_PALLAS_PLAN": env_bool("MOE_FUSED_EP_V2_PALLAS_PLAN"),
+    "MOE_FUSED_EP_V2_DECODE_COMBINE": env_bool("MOE_FUSED_EP_V2_DECODE_COMBINE"),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py). Empty: the
     # checkpoint's contiguous blocks.
