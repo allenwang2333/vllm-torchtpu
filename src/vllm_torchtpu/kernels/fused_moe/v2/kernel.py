@@ -41,6 +41,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     QB4,
     ROWBLK,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.tuned_block_sizes import (
+    HeightKey,
+    get_height_rungs,
+)
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
@@ -139,7 +143,7 @@ def _apply_act(gate, up, act_fn):
     )
 
 
-def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
+def tile_height_rungs(tile_m, rows_alloc, g_local, ep, *, tuned_rungs=None):
     """The ascending static tile heights a build emits, ending at tile_m.
 
     Equally spaced so that a tail tile's rounding-up waste is bounded by one
@@ -156,6 +160,15 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     what a shard's `g_local` experts actually expect to hold.
 
     """
+    if tuned_rungs is not None:
+        if (
+            not tuned_rungs
+            or tuned_rungs[-1] != tile_m
+            or tuple(sorted(set(tuned_rungs))) != tuple(tuned_rungs)
+            or any(height <= 0 or height % ROWBLK for height in tuned_rungs)
+        ):
+            raise ValueError(f"invalid tuned tile heights {tuned_rungs}")
+        return tuple(tuned_rungs)
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
     step = tile_m // rungs
     if (
@@ -433,6 +446,90 @@ def expert_ffn_blockscale(
     return acc2, mid_scale
 
 
+def _expert_ffn_fp4_prefill(
+    act_q,
+    act_scale,
+    w1_block,
+    w2_block,
+    w1s_blocks,
+    w2s_blocks,
+    down_bf16_vm,
+    *,
+    logical_inter,
+    qb,
+    act_fn,
+):
+    """Retire gate/up pairs and down chunks before quantizing each full row."""
+    inter = w1s_blocks.shape[-1] // 2
+    hidden = w2s_blocks.shape[-1]
+
+    def contract_chunk(lhs, rhs_block, scales, n_start, n_end):
+        acc = None
+        for b in range(-(-lhs.shape[-1] // qb)):
+            k_start = b * qb
+            k_end = min(k_start + qb, lhs.shape[-1])
+            part = lax.dot_general(
+                lhs[:, k_start:k_end],
+                rhs_block(b, n_start, n_end)[: k_end - k_start],
+                DN,
+                preferred_element_type=jnp.float32,
+            )
+            part = part * scales[b : b + 1, n_start:n_end]
+            acc = part if acc is None else acc + part
+        return acc
+
+    chunks, amax = [], None
+    for c0 in range(0, logical_inter, FP4_OUTPUT_CHUNK):
+        c1 = min(c0 + FP4_OUTPUT_CHUNK, logical_inter)
+        gate = contract_chunk(act_q, w1_block, w1s_blocks, c0, c1)
+        up = contract_chunk(act_q, w1_block, w1s_blocks, inter + c0, inter + c1)
+        gate = gate * act_scale
+        up = up * act_scale
+        chunk = _apply_act(gate, up, act_fn).astype(jnp.bfloat16)
+        chunks.append(chunk)
+        chunk_amax = _absmax_rows(chunk)
+        amax = chunk_amax if amax is None else jnp.maximum(amax, chunk_amax)
+    mid_scale, mid_sinv, usable = _row_scale(amax)
+    mid_q = jnp.concatenate(
+        [
+            _quant_apply(chunk, mid_sinv.astype(jnp.bfloat16), usable)
+            for chunk in chunks
+        ],
+        axis=-1,
+    )
+    down_amax = None
+    for n in range(0, hidden, FP4_OUTPUT_CHUNK):
+        chunk = (
+            contract_chunk(
+                mid_q,
+                w2_block,
+                w2s_blocks,
+                n,
+                n + FP4_OUTPUT_CHUNK,
+            )
+            * mid_scale
+        )
+        chunk = chunk.astype(jnp.bfloat16)
+        down_bf16_vm[pl.ds(0, act_q.shape[0]), pl.ds(n, FP4_OUTPUT_CHUNK)] = chunk
+        chunk_amax = _absmax_rows(chunk)
+        down_amax = (
+            chunk_amax if down_amax is None else jnp.maximum(down_amax, chunk_amax)
+        )
+    wire_scale, wire_sinv, wire_usable = _row_scale(down_amax)
+    wire_rows = jnp.concatenate(
+        [
+            _quant_apply(
+                down_bf16_vm[pl.ds(0, act_q.shape[0]), pl.ds(n, FP4_OUTPUT_CHUNK)],
+                wire_sinv.astype(jnp.bfloat16),
+                wire_usable,
+            )
+            for n in range(0, hidden, FP4_OUTPUT_CHUNK)
+        ],
+        axis=-1,
+    )
+    return wire_rows, wire_scale
+
+
 def expert_ffn_bf16(act, w1, w2, act_fn="silu", w1b=None):
     """One expert's FFN on unquantized sixteen-bit weights.
 
@@ -572,6 +669,7 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     pad_scale_rows=False,
     logical_intermediate_size=None,
+    logical_inter=None,
 ):
     """Build the pallas_call and the function that invokes it.
 
@@ -598,6 +696,17 @@ def _build_fused_ep_moe_kernel(
     # of the wire is the weight format's, not a literal here.
     form = host.weight_form(weight_format)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
+    if logical_inter is not None:
+        if not isinstance(logical_inter, int) or not 0 < logical_inter <= inter:
+            raise ValueError(
+                f"logical_inter must be in [1, {inter}], got {logical_inter}"
+            )
+        if (
+            logical_intermediate_size is not None
+            and logical_intermediate_size != logical_inter
+        ):
+            raise ValueError("logical_inter and logical_intermediate_size must agree")
+        logical_intermediate_size = logical_inter
     if (
         logical_intermediate_size is not None
         and int(logical_intermediate_size) != logical_intermediate_size
@@ -705,6 +814,30 @@ def _build_fused_ep_moe_kernel(
     lane_blocks = host.row_lane_blocks(hidden)
     has_scales = form.has_scales
     has_act_scale = form.quantized_activations
+    active_inter = effective_inter
+    tuned_rungs = None
+    if ragged_rows_alloc is not None and ragged_rows_alloc > ep * g_local * capacity:
+        tuned_rungs = get_height_rungs(
+            HeightKey(
+                host.chip_generation(),
+                ep,
+                g_local,
+                hidden,
+                inter,
+                capacity,
+                ragged_rows_alloc,
+                str(weight_format),
+                rhs_qb,
+                act_fn,
+                has_w1_bias or has_w2_bias,
+            )
+        )
+    fp4_prefill = tuned_rungs is not None and logical_inter is not None
+    if logical_inter is not None and active_inter != inter and not fp4_prefill:
+        raise ValueError(
+            "logical_inter cropping requires a tuned FP4 prefill workload and "
+            f"a multiple of {FP4_OUTPUT_CHUNK}; got {active_inter} of {inter}"
+        )
     # The prefetch schedule this build can afford: the deepest runway whose
     # nbuf copies of one expert still leave the rest of the buffers inside
     # the budget, walked down from the ceiling one slot at a time. Every
@@ -719,6 +852,8 @@ def _build_fused_ep_moe_kernel(
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        fp4_prefill=fp4_prefill,
+        logical_inter=active_inter,
     )
     prefetch_distance = slots.distance
     nbuf = slots.nbuf
@@ -809,7 +944,9 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    height_rungs = tile_height_rungs(
+        tile_m, ragged_rows_alloc, g_local, ep, tuned_rungs=tuned_rungs
+    )
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -963,6 +1100,10 @@ def _build_fused_ep_moe_kernel(
             # Never cp_sem: its start+wait users must not consume these.
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
+
+        if fp4_prefill:
+            w2_wide_vm = next(it)
+            down_bf16_vm = next(it)
 
         me = rank_sm[0, 0]
 
@@ -1165,6 +1306,36 @@ def _build_fused_ep_moe_kernel(
                 ].astype(host.BF16)
 
             return w1_chunk, w2_chunk
+
+        def _fp4_prefill_readers(slot, wait_slab, slab_retired):
+            packed_rows = rhs_qb // PACK4
+
+            def w1_block(b, n_start, n_end):
+                if n_start == 0:
+                    wait_slab(w1_copy, b)
+                block = pltpu.bitcast(
+                    w1_vm[
+                        slot,
+                        pl.ds(b * packed_rows, packed_rows),
+                        pl.ds(n_start, n_end - n_start),
+                    ],
+                    FP4,
+                ).astype(FP8)
+                if (
+                    slab_retired is not None
+                    and b == hidden // rhs_qb - 1
+                    and n_end == inter + active_inter
+                ):
+                    slab_retired()
+                return block
+
+            def w2_block(b, n_start, n_end):
+                active_rows = min(rhs_qb, active_inter - b * rhs_qb)
+                return w2_wide_vm[
+                    pl.ds(b * rhs_qb, active_rows), pl.ds(n_start, n_end - n_start)
+                ]
+
+            return w1_block, w2_block
 
         # ---- ragged tile machinery ----
         # One-tile lookahead, double-buffered on the global tile parity:
@@ -1405,6 +1576,16 @@ def _build_fused_ep_moe_kernel(
                     # the in-order token-gather queue.
                     weight_starts(ahead, refill_slot)
 
+            if fp4_prefill:
+                w2_copy(e, slot).wait()
+                for b in range(-(-active_inter // rhs_qb)):
+                    active_rows = min(rhs_qb, active_inter - b * rhs_qb)
+                    packed = w2_vm[
+                        slot, pl.ds(b * rhs_qb // PACK4, active_rows // PACK4), :
+                    ]
+                    w2_wide_vm[pl.ds(b * rhs_qb, active_rows), :] = pltpu.bitcast(
+                        packed, FP4
+                    ).astype(FP8)
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
             n_tiles = -(-rows // tile_m)
@@ -1647,6 +1828,7 @@ def _build_fused_ep_moe_kernel(
                     height above them is pure waste; `height` is the smallest
                     rung that still covers them.
                     """
+                    acc2 = mid_scale = wire_rows = wire_scales = None
                     full = height == tile_m
                     act_rows = (
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
@@ -1659,7 +1841,33 @@ def _build_fused_ep_moe_kernel(
                     w1b_row = (
                         cast(jax.Ref, w1b_vm)[pl.ds(e, 1), :] if has_w1_bias else None
                     )
-                    if rhs_packed4:
+                    if fp4_prefill:
+                        assert w1s_vm is not None and w2s_vm is not None
+                        w1s_blocks = w1s_vm[slot, pl.ds(0, hidden // rhs_qb), :]
+                        w2s_blocks = w2s_vm[slot, pl.ds(0, inter // rhs_qb), :]
+                        first_tile, last_tile = t == 0, t == n_tiles - 1
+                        w1_block, w2_block = _fp4_prefill_readers(
+                            slot,
+                            _slab_waiter(e, slot, first_tile),
+                            (
+                                _start_next_gate_up(visit_i, slot, last_tile)
+                                if starts_next_weights
+                                else None
+                            ),
+                        )
+                        wire_rows, wire_scales = _expert_ffn_fp4_prefill(
+                            act_rows,
+                            act_scales,
+                            w1_block,
+                            w2_block,
+                            w1s_blocks,
+                            w2s_blocks,
+                            down_bf16_vm,
+                            logical_inter=active_inter,
+                            qb=rhs_qb,
+                            act_fn=act_fn,
+                        )
+                    elif rhs_packed4:
                         # The block scales apply inside
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
@@ -1741,22 +1949,25 @@ def _build_fused_ep_moe_kernel(
                     # placement of each of these -- and the down bias's
                     # add-once property in particular -- has a host-side
                     # witness rather than only a device-marked one.
-                    wire_rows, wire_scales = wire_row_and_scale(
-                        acc2,
-                        mid_scale,
-                        w2s=(
-                            cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
-                            if (has_scales and not rhs_packed4)
-                            else None
-                        ),
-                        w2b=(
-                            cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
-                            if has_w2_bias
-                            else None
-                        ),
-                        wire_dtype=form.wire_dtype,
-                        tile_m=height,
-                    )
+                    if not fp4_prefill:
+                        assert acc2 is not None
+                        wire_rows, wire_scales = wire_row_and_scale(
+                            acc2,
+                            mid_scale,
+                            w2s=(
+                                cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
+                                if (has_scales and not rhs_packed4)
+                                else None
+                            ),
+                            w2b=(
+                                cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
+                                if has_w2_bias
+                                else None
+                            ),
+                            wire_dtype=form.wire_dtype,
+                            tile_m=height,
+                        )
+                    assert wire_rows is not None and wire_scales is not None
                     wire_rows_staged = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
                     )
@@ -2046,6 +2257,13 @@ def _build_fused_ep_moe_kernel(
             ]
         )
     )
+    if fp4_prefill:
+        scratch += [
+            pltpu.VMEM(shape, dtype)
+            for _, shape, dtype in host.fp4_prefill_scratch_arrays(
+                capacity, hidden, inter
+            )
+        ]
     # The staging buffer and the two weight slabs are always operands; the
     # activation row scale, the two weight scale tables and the two bias
     # tables are there only where the build has them.

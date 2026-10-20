@@ -282,6 +282,8 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    packed_fp4=False,
+    logical_inter=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -356,6 +358,16 @@ def fused_ep_moe_v2(
     which is what the reference hash router does. Everything downstream of
     selection -- renormalization, the routed scale, the empty-row mask,
     dispatch, the matmuls and the combine -- is the top-k path unchanged.
+
+    packed_fp4 accepts int32/uint32 words containing eight consecutive K-axis
+    FP4 values, lowest nibble first: w1 [E, H/8, 2*I], w2 [E, I/8, H].
+    Scales retain the ordinary FP4 layout and meaning.
+
+    logical_inter declares a loader-verified zero-padded intermediate: gate/up
+    channels [logical_inter, I) in both halves and down rows in that range
+    must be zero. Cropping is enabled only for the measured prefill workload;
+    omitted metadata preserves the full stored intermediate width.
+    It also sets logical_intermediate_size; if both are supplied, they must agree.
     """
     form = weight_form(weight_format)
     rhs_qb = QB4 if rhs_qb is None else int(rhs_qb)
@@ -369,8 +381,15 @@ def fused_ep_moe_v2(
     # read with correct-looking shapes all the way down. This is the
     # documented public entry, so the check belongs where the operands come
     # in rather than only in the serving adapter above it.
+    if packed_fp4 and weight_format != WeightFormat.FP4:
+        raise ValueError("packed_fp4 requires FP4 weight semantics")
     for name, w in (("w1", w1), ("w2", w2)):
-        actual = weight_format_of_dtype(w.dtype)
+        if packed_fp4:
+            if w.dtype not in (jnp.int32, jnp.uint32):
+                raise ValueError(f"{name} requires packed 32-bit words")
+            actual = WeightFormat.FP4
+        else:
+            actual = weight_format_of_dtype(w.dtype)
         if actual != weight_format:
             raise ValueError(
                 f"weight format {weight_format!r} takes "
@@ -389,6 +408,14 @@ def fused_ep_moe_v2(
     T, hidden = x.shape
     e_total = w1.shape[0]
     inter = w1.shape[2] // 2
+    if packed_fp4:
+        for name, w, k, n in (
+            ("w1", w1, hidden, 2 * inter),
+            ("w2", w2, inter, hidden),
+        ):
+            want = (e_total, k // 8, n)
+            if k % 8 or tuple(w.shape) != want:
+                raise ValueError(f"{name} packed shape {w.shape}, expected {want}")
     # Where the weight scales' layout is fixed: [E, N] per output channel,
     # [E, blocks, N] per contraction block, which is what the kernel's own
     # operands are. The scales are constants of the weights, so whatever
@@ -520,6 +547,7 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
         logical_intermediate_size=logical_intermediate_size,
+        logical_inter=logical_inter,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -988,6 +1016,8 @@ def fused_ep_moe_v2(
         stage,
         gather_positions,
         logical_intermediate_size,
+        bool(packed_fp4),
+        logical_inter,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

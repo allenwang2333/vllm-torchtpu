@@ -1492,7 +1492,14 @@ def vmem_scratch_arrays(
 
 
 def vmem_tile_body_arrays(
-    capacity, hidden, inter, *, weight_format=WeightFormat.FP8, rhs_qb=QB4
+    capacity,
+    hidden,
+    inter,
+    *,
+    weight_format=WeightFormat.FP8,
+    rhs_qb=QB4,
+    fp4_prefill=False,
+    logical_inter=None,
 ):
     """What one tile body keeps live, as (name, shape, dtype).
 
@@ -1515,6 +1522,19 @@ def vmem_tile_body_arrays(
     """
     form = weight_form(weight_format)
     tile_m = capacity
+    if fp4_prefill:
+        if weight_format != WeightFormat.FP4:
+            raise ValueError("FP4 prefill accounting requires FP4 weights")
+        active = inter if logical_inter is None else logical_inter
+        chunk = 256
+        return [
+            ("gate_up_accumulators", (4, tile_m, chunk), jnp.float32),
+            ("mid_chunks", (tile_m, active), jnp.bfloat16),
+            ("mid_q", (tile_m, active), FP8),
+            ("down_accumulators", (3, tile_m, chunk), jnp.float32),
+            ("wire_rows", (tile_m, hidden), FP8),
+            ("widened_weight_block", (2, rhs_qb, chunk), FP8),
+        ]
     arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
@@ -1557,6 +1577,14 @@ def vmem_tile_body_arrays(
     return arrays
 
 
+def fp4_prefill_scratch_arrays(capacity, hidden, inter):
+    """Additional persistent scratch shared by accounting and the kernel."""
+    return [
+        ("down_weight_cache", (inter, hidden), FP8),
+        ("down_bf16", (capacity, hidden), jnp.bfloat16),
+    ]
+
+
 def vmem_estimate_bytes(
     g_local,
     capacity,
@@ -1568,6 +1596,8 @@ def vmem_estimate_bytes(
     has_w1_bias=False,
     has_w2_bias=False,
     info=None,
+    fp4_prefill=False,
+    logical_inter=None,
 ):
     """VMEM one built kernel occupies, from the arrays it declares.
 
@@ -1595,8 +1625,16 @@ def vmem_estimate_bytes(
         has_w2_bias=has_w2_bias,
     )
     arrays += vmem_tile_body_arrays(
-        capacity, hidden, inter, weight_format=weight_format, rhs_qb=rhs_qb
+        capacity,
+        hidden,
+        inter,
+        weight_format=weight_format,
+        rhs_qb=rhs_qb,
+        fp4_prefill=fp4_prefill,
+        logical_inter=logical_inter,
     )
+    if fp4_prefill:
+        arrays += fp4_prefill_scratch_arrays(capacity, hidden, inter)
     return sum(array_vmem_bytes(shape, dtype, info) for _, shape, dtype in arrays)
 
 
@@ -1632,6 +1670,8 @@ def fit_weight_slots(
     has_w2_bias=False,
     info=None,
     limit=None,
+    fp4_prefill=False,
+    logical_inter=None,
 ):
     """The deepest prefetch schedule this shape's VMEM leaves room for.
 
@@ -1674,6 +1714,8 @@ def fit_weight_slots(
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
                 info=info,
+                fp4_prefill=fp4_prefill,
+                logical_inter=logical_inter,
             ),
             limit,
         )
