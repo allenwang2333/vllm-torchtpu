@@ -1158,6 +1158,27 @@ def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
         )
 
 
+def test_glm_manifest_admits_seq_along_lane_indexer_as_whole_pages():
+    named = glm_named_kv_caches(idx_shape=(16, 33, 4, _GLM_BLOCK_SIZE))
+
+    def build(**kwargs):
+        return rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+            **kwargs,
+        )
+
+    (pool,) = build(indexer_seq_along_lane=True).pools_of_class(rpm.TAG_DSA_IDX)
+    page_bytes = 33 * 4 * _GLM_BLOCK_SIZE
+    assert pool.block_stride_bytes == page_bytes
+    assert [(region.unit_bytes, region.num_units) for region in pool.regions] == [
+        (page_bytes, 1)
+    ]
+    with pytest.raises(rpm.ManifestError, match="KV block size"):
+        build()
+
+
 def test_glm_manifest_rejects_rank3_indexer_cache():
     # Only the MLA caches have a SparseCore layout.
     named = glm_named_kv_caches()
