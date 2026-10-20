@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Prefix-cache hits finer than the DCP logical block for one KV cache group.
 
 See `_patch_vllm_dcp_fine_prefix_hits`: with DCP=16 and block_size=256 the
@@ -90,7 +102,13 @@ def _stub_config(
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
         ),
-        kv_transfer_config=object() if connector else None,
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector=connector)
+            if isinstance(connector, str)
+            else object()
+            if connector
+            else None
+        ),
     )
 
 
@@ -110,6 +128,13 @@ def test_resolve_gated_to_single_group_dcp():
     ):
         assert _resolve(mla, config) == (LOGICAL_BLOCK, LOGICAL_BLOCK)
     assert _resolve(mla, _stub_config(dcp=1)) == (BLOCK_SIZE, BLOCK_SIZE)
+    # CPU offloading connectors keep the fine unit; P/D connectors do not.
+    for name in ("TPURaidenOffloadingConnector", "OffloadingConnector"):
+        assert _resolve(mla, _stub_config(connector=name)) == (LOGICAL_BLOCK, UNIT)
+    assert _resolve(mla, _stub_config(connector="NixlConnector")) == (
+        LOGICAL_BLOCK,
+        LOGICAL_BLOCK,
+    )
     swa = SlidingWindowSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,

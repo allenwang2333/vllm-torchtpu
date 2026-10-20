@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.interfaces import supports_pp
@@ -10,6 +22,19 @@ from vllm_torchtpu.models.vllm.qwen3_5_mtp import Qwen3_5MoeMTP, Qwen3_5MTP
 def test_qwen35_mtp_drafts_declare_pipeline_support():
     assert supports_pp(Qwen3_5MTP)
     assert supports_pp(Qwen3_5MoeMTP)
+
+
+def test_qwen35_mtp_drafts_accept_the_upstream_constructor_assignment():
+    """Upstream's `__init__` sets `make_empty_intermediate_tensors` on the
+    instance; a read-only property on the subclass would make every Qwen3.5
+    MTP draft fail to construct ("property ... has no setter")."""
+    import torch
+
+    for cls in (Qwen3_5MTP, Qwen3_5MoeMTP):
+        draft = cls.__new__(cls)
+        torch.nn.Module.__init__(draft)
+        draft.make_empty_intermediate_tensors = lambda *args: None
+        assert callable(draft.make_empty_intermediate_tensors)
 
 
 def test_qwen35_mtp_drafts_are_registered_over_upstream():

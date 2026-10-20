@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the tpu-inference project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import functools
 import os
@@ -86,6 +97,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -97,6 +109,8 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
+    TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -105,6 +119,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
+    TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -175,6 +190,7 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
 
 
 def env_with_choices(
@@ -731,6 +747,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Keep the fused EP MoE mesh in EP-rank order and do the activation
+    # all-gather outside the kernel's program, over a process group in
+    # ascending device-id order, so the SparseCore gather gets its
+    # N-dimensional algorithm without moving the program's DeviceAssignment.
+    "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
     # live rows, so one is the ladder off. Zero leaves the choice to the
@@ -772,6 +793,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
+    # so local rank 0 starts on the biggest one. Off keeps vLLM's order.
+    "TPU_PRECOMPILE_BIGGEST_FIRST": env_bool(
+        "TPU_PRECOMPILE_BIGGEST_FIRST", default=False
+    ),
+    # Replay a bucket another rank of the host compiled instead of compiling
+    # it again: under TPU_PARALLEL_PRECOMPILE each bucket gets one owner rank
+    # per host and the others wait for its artifact. Off compiles every bucket
+    # on every rank, sharing only through the Tier-2 cache.
+    "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -826,6 +857,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
+    # Query-token chunk size for sparse MLA attention (GLM-5.2 / DSv3.2-style):
+    # each chunk gathers its tokens' top-k KV rows into one buffer and then
+    # attends over it. The chunk loop is unrolled at trace time, so a graph
+    # holds `num_tokens / chunk` gather + attention kernel pairs per layer;
+    # bigger chunks compile faster but need a bigger gather buffer
+    # (chunk * top-k rows) and pipeline gather with attention more coarsely.
+    # Unset keeps the kernel default (64).
+    "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
+        "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
@@ -1073,6 +1114,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
+    # without getting one KV block of tokens before it moves ahead of the
+    # other prefill chunks and is no longer held (0 disables hold-back).
+    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
+    # copies it automatically to DP/Ray engine-core actors.
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
 }
 
 

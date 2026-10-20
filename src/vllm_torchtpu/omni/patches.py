@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU runtime patches for vLLM-Omni diffusion models."""
 
 from functools import cache as run_once
@@ -152,6 +164,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_startup_warmup_sync()
+    _patch_wan_fused_qk_norm_rope()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
@@ -278,3 +291,46 @@ def _patch_diffusion_startup_warmup_sync() -> None:
 
     DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
     logger.info("Applied TPU patch: device sync after diffusion startup warmup.")
+
+
+def _patch_wan_fused_qk_norm_rope() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once XLA fuses the q/k RMSNorm and RoPE into one
+    # pass at HBM bandwidth, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
+    # hook for a fused q/k norm + RoPE op.
+    #
+    # WanSelfAttention normalizes q and k (RMSNorm over all heads) and then
+    # rotates them. XLA splits this into a row-reduction fusion for the norm
+    # statistics, an apply fusion and the RoPE fusion, each streaming the
+    # (tokens, 5120) q and k through HBM; the row reduction also runs well
+    # below HBM bandwidth. Together ~0.78 ms per block at 8190 tokens per
+    # core on v7x. A Pallas kernel that reads q and k once and writes them
+    # once takes 0.23 ms and is closer to an f64 reference (single rounding).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanSelfAttention,
+    )
+
+    from vllm_torchtpu.omni.rope import (
+        can_fuse_qk_norm_rope,
+        wan_self_attention_fused,
+    )
+
+    if hasattr(WanSelfAttention, "_tpu_orig_forward"):
+        return
+    WanSelfAttention._tpu_orig_forward = WanSelfAttention.forward
+
+    def _fused_self_attention_forward(
+        self: Any,
+        hidden_states: torch.Tensor,
+        rotary_emb: Any = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        if not can_fuse_qk_norm_rope(self, hidden_states, rotary_emb):
+            return WanSelfAttention._tpu_orig_forward(
+                self, hidden_states, rotary_emb, attn_metadata
+            )
+        return wan_self_attention_fused(self, hidden_states, rotary_emb, attn_metadata)
+
+    WanSelfAttention.forward = _fused_self_attention_forward
+    logger.info("Applied TPU patch: fused q/k RMSNorm + RoPE for Wan attention.")
