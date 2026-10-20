@@ -291,7 +291,8 @@ class TestTpuPlatform:
         vllm_config.compilation_config.mode = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
-        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        # Within the largest compile size, which the platform requires.
+        vllm_config.scheduler_config.max_num_batched_tokens = 32
         vllm_config.scheduler_config.max_num_seqs = 16
         vllm_config.scheduler_config.max_num_scheduled_tokens = None
         vllm_config.scheduler_config.enable_chunked_prefill = True
@@ -582,6 +583,7 @@ class TestTpuPlatform:
         expected_type,
     ):
         vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.scheduler_config.max_num_batched_tokens = max(compile_sizes)
         vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -589,6 +591,22 @@ class TestTpuPlatform:
         assert (
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_budget_above_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # A step of up to 2048 tokens would have no compile size to pad to.
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+
+        with pytest.raises(ValueError, match=r"--max-num-batched-tokens \(2048\)"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.max_num_scheduled_tokens is None
 
     @pytest.mark.parametrize(
         ("linear", "max_model_len", "added"),
@@ -619,6 +637,7 @@ class TestTpuPlatform:
         monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
         vllm_config.compilation_config.compile_sizes = None
         vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
         vllm_config.scheduler_config.max_num_seqs = 8
 
         TpuPlatform.check_and_update_config(vllm_config)
