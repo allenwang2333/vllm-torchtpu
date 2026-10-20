@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
     TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
     TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
+    TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
@@ -870,6 +871,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
     # needs no padding rows, and hence no slice copy after it.
     "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
+    # DSpark greedy drafting: shard the Markov head over the vocabulary and
+    # exchange per-rank (max, argmax) pairs instead of reading the replicated
+    # full-vocabulary weight at every draft position.
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
