@@ -334,6 +334,5 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     )
     assert selected.shape == (rows, 512)
     assert calls == [rows]
-    # Both cond branches trace for Q8; unsupported Q9 and ragged buckets
-    # must bypass candidate scoring entirely.
-    assert cached_calls == ([(48, 8)] if rows == 384 else [])
+    # Both cond branches trace for uniform Q8/Q9; ragged buckets bypass scoring.
+    assert cached_calls == ([(48, rows // 48)] if rows % 48 == 0 else [])

@@ -8,7 +8,15 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
+from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    candidate,
+    tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.gather import (
+    gather_packed_candidate_keys,
+    is_supported_by_gather_packed_candidate_keys,
+)
 
 from .cache import (
     IndexCacheRows,
@@ -44,14 +52,12 @@ def prepare_candidate_cache_jax(
     capacity: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Gather request-local candidate blocks; capacity counts Index-K records."""
-    if block_size <= 0 or block_size % 2 or capacity <= 0 or capacity % block_size:
+    if block_size <= 0 or block_size % SLOTS or capacity <= 0 or capacity % block_size:
         raise ValueError("Candidate capacity must contain whole even-sized blocks")
     groups = records.shape[0]
-    key_shape = (groups, capacity // 2, 128)
-    if (
-        candidate_block_ids.shape[0] % groups
-        or not 1 <= candidate_block_ids.shape[0] // groups <= 8
-    ):
+    key_shape = (groups, capacity // SLOTS, ROW_WORDS)
+    queries = candidate.request_query_count(candidate_block_ids.shape[0], groups)
+    if queries is None:
         # These shapes are concrete in JAX lowering, unlike Dynamo token rows.
         return (
             jnp.zeros(key_shape, jnp.int32),
@@ -60,25 +66,39 @@ def prepare_candidate_cache_jax(
             jnp.zeros((groups,), jnp.int32),
             jnp.zeros((1,), jnp.bool_),
         )
-    queries = candidate_block_ids.shape[0] // groups
     expected = jnp.repeat(jnp.arange(groups, dtype=jnp.int32), queries)
     regular = jnp.all((requests == expected) | (lengths == 0))
-    if records.shape[1] > 131072:
+    logical_blocks = (records.shape[1] + block_size - 1) // block_size
+    if logical_blocks > tuned_block_sizes.CANDIDATE_DENSE_UNION_MAX_BLOCKS:
         candidate_block_ids = jnp.where(lengths[:, None] > 0, candidate_block_ids, -1)
     meta = candidate.union_metadata(
         candidate_block_ids.reshape(groups, queries, -1),
-        logical_blocks=(records.shape[1] + block_size - 1) // block_size,
+        logical_blocks=logical_blocks,
         capacity_blocks=capacity // block_size,
     )
     starts, membership = candidate.union_record_starts(
-        meta, records, block_size=block_size, pool_records=_cache_num_rows(pool) * 2
+        meta, records, block_size=block_size, pool_records=_cache_num_rows(pool) * SLOTS
     )
     usable = regular & ~jnp.any(meta.overflow)
+    use_sparsecore_kernel = is_supported_by_gather_packed_candidate_keys(
+        pool, starts, block_size
+    )
+    if use_sparsecore_kernel:
+        starts = jnp.where(usable, starts, -1)
 
     def gather():
-        return gather_cache_page_words(pool, starts, block_size, 128).reshape(key_shape)
+        keys = (
+            gather_packed_candidate_keys(pool, starts, block_size)
+            if use_sparsecore_kernel
+            else gather_cache_page_words(pool, starts, block_size, DIM)
+        )
+        return keys.reshape(key_shape)
 
-    keys = jax.lax.cond(usable, gather, lambda: jnp.zeros(key_shape, jnp.int32))
+    keys = (
+        gather()
+        if use_sparsecore_kernel
+        else jax.lax.cond(usable, gather, lambda: jnp.zeros(key_shape, jnp.int32))
+    )
     return (
         keys,
         meta.union_block_ids,
@@ -129,9 +149,10 @@ def select_candidate_cache_jax(
     from .attention_kernels import paged_indexer_jax
 
     groups = records.shape[0]
-    queries = q.shape[0] // groups
+    queries = candidate.request_query_count(q.shape[0], groups)
 
     def cached():
+        assert queries is not None
         return candidate.candidate_indexer(
             split_halves(q).reshape(groups, queries, *q.shape[1:]),
             weights.astype(jnp.float32).reshape(groups, queries, q.shape[1]),
@@ -141,7 +162,6 @@ def select_candidate_cache_jax(
             lengths.reshape(groups, queries),
             block_size=block_size,
             request_tile=request_tile,
-            halfplane=True,
         )
 
     def fallback():
@@ -162,7 +182,7 @@ def select_candidate_cache_jax(
             page_records,
         )[0]
 
-    if q.shape[0] % groups or not 1 <= queries <= 8:
+    if queries is None:
         return fallback()
 
     # Preserve the old batch-wide short-context bypass. The fallback retains
@@ -238,17 +258,17 @@ def initialize_candidate_cache() -> None:
     )
 
     def fake_prepare(
-        pool,
-        records,
-        candidate_block_ids,
-        requests,
-        lengths,
-        block_size,
-        capacity,
-    ):
+        pool: torch.Tensor,
+        records: torch.Tensor,
+        candidate_block_ids: torch.Tensor,
+        requests: torch.Tensor,
+        lengths: torch.Tensor,
+        block_size: int,
+        capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         groups = records.shape[0]
         return (
-            pool.new_empty((groups, capacity // 2, 128), dtype=torch.int32),
+            pool.new_empty((groups, capacity // SLOTS, ROW_WORDS), dtype=torch.int32),
             records.new_empty((groups, capacity // block_size)),
             records.new_empty((groups, capacity // block_size)),
             records.new_empty((groups,)),
@@ -264,7 +284,7 @@ def initialize_candidate_cache() -> None:
         lengths: torch.Tensor,
         block_size: int,
         capacity: int,
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return fake_prepare(
             pool_lo,
             records,

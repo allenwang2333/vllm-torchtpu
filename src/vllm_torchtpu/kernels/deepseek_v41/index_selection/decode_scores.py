@@ -16,7 +16,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, SLOTS
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-    scores,
+    prefill_scores,
     tuned_block_sizes,
 )
 
@@ -532,7 +532,9 @@ def _grouped_decode_scores(
                     write_values(tokens, r, start, values)
                     if block_size:
                         block_parts.append(
-                            scores._block_max(values, info.num_lanes, block_size)
+                            prefill_scores._block_max(
+                                values, info.num_lanes, block_size
+                            )
                         )
                 if block_size:
                     write_values(

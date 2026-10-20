@@ -4,6 +4,9 @@
 
 The caller owns cache lifetime and falls back when any union overflows. IDs are
 ascending logical blocks; membership is applied before selection for every Q.
+
+Keys are int32 [groups, capacity_records // 2, 128]: low/high halves hold
+even/odd records, each in even64-then-odd64 BF16 channel order.
 """
 
 import functools
@@ -16,7 +19,15 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode, tuned_block_sizes
+from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    decode,
+    decode_scores,
+    tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
+    streaming_topk,
+)
 
 
 class UnionMetadata(NamedTuple):
@@ -24,6 +35,14 @@ class UnionMetadata(NamedTuple):
     membership: jax.Array
     union_block_count: jax.Array
     overflow: jax.Array
+
+
+def request_query_count(rows: int, requests: int) -> int | None:
+    """Uniform request groups whose query memberships fit in one int32 word."""
+    if requests < 1:
+        return None
+    queries, tail = divmod(rows, requests)
+    return queries if not tail and 0 < queries <= jnp.iinfo(jnp.int32).bits else None
 
 
 def _sorted_union_metadata(
@@ -58,10 +77,15 @@ def union_metadata(
 ) -> UnionMetadata:
     """Compact request-local logical block IDs and retain full union counts."""
     requests, queries, _ = candidate_block_ids.shape
-    if not 1 <= queries <= 8 or min(logical_blocks, capacity_blocks) < 1:
-        raise ValueError("Union requires 1..8 queries and positive block capacities")
+    if (
+        not 1 <= queries <= jnp.iinfo(jnp.int32).bits
+        or min(logical_blocks, capacity_blocks) < 1
+    ):
+        raise ValueError("Query memberships must fit int32 and capacities be positive")
+    if logical_blocks > jnp.iinfo(jnp.int32).max // queries:
+        raise ValueError("Encoded block/query IDs must fit int32")
     # For longer contexts, bound metadata work by candidate count, not ID space.
-    if logical_blocks > 131072 // 8:
+    if logical_blocks > tuned_block_sizes.CANDIDATE_DENSE_UNION_MAX_BLOCKS:
         return _sorted_union_metadata(
             candidate_block_ids, logical_blocks, capacity_blocks
         )
@@ -70,24 +94,23 @@ def union_metadata(
         and candidate_block_ids.dtype == jnp.int32
         and requests > 0
         and candidate_block_ids.shape[-1] > 0
-        and candidate_block_ids.shape[-1] % 128 == 0
     ):
-        from jax.experimental.pallas import tpu as pltpu
-
-        from .union import sparse_union_metadata
+        from .union import metadata_layout, sparse_union_metadata
 
         tpu_info = pltpu.get_tpu_info()
         info = tpu_info.sparse_core
-        if info is None or tpu_info.chip_version != pltpu.ChipVersion.TPU_7X:
+        if (
+            info is None
+            or tpu_info.chip_version != pltpu.ChipVersion.TPU_7X
+            or candidate_block_ids.shape[-1] % tpu_info.num_lanes
+        ):
             return _dense_union_metadata(
                 candidate_block_ids, logical_blocks, capacity_blocks
             )
-        hist_size = queries * pl.cdiv(logical_blocks, 128) * 128
-        out_size = pl.cdiv(capacity_blocks, 128) * 128 + info.num_lanes
-        scratch_bytes = 4 * (
-            hist_size + candidate_block_ids.shape[-1] + 2 * out_size + 128
+        layout = metadata_layout(
+            candidate_block_ids.shape, logical_blocks, capacity_blocks
         )
-        if scratch_bytes <= info.vmem_capacity_bytes:
+        if layout.scratch_bytes <= info.vmem_capacity_bytes:
             return UnionMetadata(
                 *sparse_union_metadata(
                     candidate_block_ids, logical_blocks, capacity_blocks
@@ -131,56 +154,269 @@ def union_record_starts(
     valid &= (starts >= 0) & (starts + block_size <= pool_records)
     # D128 BF16 packs two records into one pool word row. Logical blocks
     # need not start at a multiple of block_size in the physical allocation.
-    valid &= starts % 2 == 0
+    valid &= starts % SLOTS == 0
     return jnp.where(valid, starts, -1), jnp.where(valid, metadata.membership, 0)
 
 
-def _unpack_words(words, scratch):
-    rows = words.shape[0]
-    scratch[pl.ds(0, rows, stride=2), :] = words
-    scratch[pl.ds(1, rows, stride=2), :] = pltpu.roll(words, 64, 1)
-    words = scratch[...]
-    lo = jax.lax.bitcast_convert_type(words << 16, jnp.float32).astype(jnp.bfloat16)
-    hi = jax.lax.bitcast_convert_type(words & jnp.int32(-65536), jnp.float32).astype(
-        jnp.bfloat16
+def _expand_metadata(values, repeats, group_width):
+    if repeats == 1:
+        return values
+    # Lane-local gather avoids repeat's unsupported narrow-minor reshape.
+    width = math.gcd(values.shape[0], group_width)
+    source = values.reshape(-1, width)
+    indices = jnp.broadcast_to(
+        (jnp.arange(width * repeats) // repeats)[None, :, None],
+        (source.shape[0], width * repeats, 1),
     )
-    return jnp.where(
-        jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < 64,
-        lo,
-        pltpu.roll(hi, 64, 1),
-    )
+    return jax.lax.gather(
+        source,
+        indices,
+        jax.lax.GatherDimensionNumbers(
+            offset_dims=(),
+            collapsed_slice_dims=(1,),
+            start_index_map=(1,),
+            operand_batching_dims=(0,),
+            start_indices_batching_dims=(0,),
+        ),
+        slice_sizes=(1, 1),
+        mode="promise_in_bounds",
+    ).reshape(-1)
 
 
-def _unpack_kernel(words_ref, out_ref, *scratch, halfplane=False):
-    out_ref[0] = (
-        pltpu.bitcast(words_ref[0], jnp.bfloat16)
-        if halfplane
-        else _unpack_words(words_ref[0], scratch[0])
-    )
+def _score_kernel(
+    start,
+    q,
+    weights,
+    keys,
+    ids,
+    membership,
+    lengths,
+    offsets,
+    out,
+    key_buffers,
+    input_sems,
+    *,
+    queries,
+    request_tile,
+    compute_tile,
+    head_stripe,
+):
+    dim = q.shape[-1]
+    heads = math.prod(q.shape[1:-1]) // queries
+    width = out.shape[-1]
+    repeat = width // ids.shape[-1]
+    group = out.shape[0] // queries
+    first = pl.program_id(1) * group
+    tile_start = pl.program_id(0) * width
+    dma_tile = key_buffers.shape[1] * SLOTS
+    fragments = width // dma_tile
+    tasks = jnp.minimum(group, request_tile - first) * fragments
+    if request_tile % group:
+
+        @pl.when(first + group > request_tile)
+        def clear_padding():
+            start_row = request_tile % group * queries
+            out[pl.ds(start_row, out.shape[0] - start_row), :] = jnp.full(
+                (out.shape[0] - start_row, width), -jnp.inf, jnp.float32
+            )
+
+    def copy(task):
+        row = start[0] + first + task // fragments
+        key_start = tile_start + task % fragments * dma_tile
+        return pltpu.make_async_copy(
+            keys.at[row, pl.ds(key_start // SLOTS, dma_tile // SLOTS), :],
+            key_buffers.at[task % 2],
+            input_sems.at[task % 2],
+        )
+
+    copy(0).start()
+
+    def body(local, task, unused):
+        copy(task).wait()
+
+        @pl.when(task + 1 < tasks)
+        def prefetch():
+            copy(task + 1).start()
+
+        row = start[0] + first + local
+        fragment_start = task % fragments * dma_tile
+        for offset in range(0, dma_tile, compute_tile):
+            key_start = fragment_start + offset
+            section = pl.ds(key_start, compute_tile)
+            kk = pltpu.bitcast(
+                key_buffers[task % 2, pl.ds(offset // SLOTS, compute_tile // SLOTS), :],
+                jnp.bfloat16,
+            )
+            logits = jax.lax.dot_general(
+                q[row].reshape(queries * heads, dim),
+                kk,
+                (((1,), (1,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            if head_stripe is None:
+                logits = logits.reshape(queries, heads, compute_tile)
+                values = (jnp.maximum(logits, 0) * weights[row][:, :, None]).sum(1)
+            else:
+                values = decode_scores._reduce_heads(
+                    logits, weights[row], queries, head_stripe
+                )
+            # Divide the static strides first so Mosaic can prove lane alignment.
+            meta_start = task % fragments * (dma_tile // repeat) + offset // repeat
+            meta_section = pl.ds(meta_start, compute_tile // repeat)
+            base = _expand_metadata(ids[row, meta_section], repeat, dim)
+            logical = base + offsets[section]
+            members = _expand_metadata(membership[row, meta_section], repeat, dim)
+            allow = ((members[None, :] >> jnp.arange(queries)[:, None]) & 1) != 0
+            allow &= (logical[None, :] >= 0) & (
+                logical[None, :] < lengths[row][:, None]
+            )
+            out[pl.ds(local * queries, queries), section] = jnp.where(
+                allow, values, -jnp.inf
+            )
+        return unused
+
+    # Q=6 output rows cross sublane boundaries; keep their offsets static.
+    for local in range(group):
+        jax.lax.fori_loop(
+            local * fragments,
+            jnp.minimum((local + 1) * fragments, tasks),
+            functools.partial(body, local),
+            None,
+        )
 
 
-@functools.partial(jax.jit, static_argnames=("interpret", "halfplane"))
-def unpack_candidate_words(
-    words: jax.Array, *, interpret: bool = False, halfplane: bool = False
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "block_size",
+        "key_tile",
+        "interpret",
+        "request_tile",
+        "compute_tile",
+        "head_stripe",
+        "dma_tile",
+    ),
+)
+def _candidate_scores(
+    q: jax.Array,
+    weights: jax.Array,
+    keys: jax.Array,
+    ids: jax.Array,
+    membership: jax.Array,
+    lengths: jax.Array,
+    *,
+    start_request: jax.Array,
+    request_tile: int,
+    block_size: int,
+    key_tile: int = 4096,
+    interpret: bool = False,
+    compute_tile: int | None = None,
+    head_stripe: int | None = None,
+    dma_tile: int | None = None,
 ) -> jax.Array:
-    """Unpack native word pairs once into split-order BF16 [request, key, 128]."""
-    groups, rows, dim = words.shape
-    if dim != 128 or words.dtype != jnp.int32 or rows < 1:
-        raise ValueError("Expected nonempty int32 [requests, word rows, 128]")
-    tile = math.gcd(rows, 1024)
+    """Stream packed keys into request-major 2-D score windows."""
+    groups, queries, heads, dim = q.shape
+    width = ids.shape[1] * block_size
+    key_rows = width // SLOTS
+    request_group = request_tile
+    if not interpret:
+        sublanes = pltpu.get_tpu_info().num_sublanes
+        request_group = min(request_tile, sublanes // math.gcd(queries, sublanes))
+    compute_tile = key_tile if compute_tile is None else compute_tile
+    dma_tile = math.lcm(compute_tile, SLOTS) if dma_tile is None else dma_tile
+    if (
+        dim != DIM
+        or q.dtype != jnp.bfloat16
+        or keys.dtype != jnp.int32
+        or weights.dtype != jnp.float32
+        or weights.shape != (groups, queries, heads)
+        or keys.shape != (groups, key_rows, ROW_WORDS)
+        or membership.shape != ids.shape
+        or lengths.shape != (groups, queries)
+        or width < SLOTS
+        or width % SLOTS
+        or key_tile < SLOTS
+        or width % key_tile
+        or key_tile % SLOTS
+        or compute_tile < 1
+        or key_tile % compute_tile
+        or dma_tile < SLOTS
+        or dma_tile % SLOTS
+        or key_tile % dma_tile
+        or dma_tile % compute_tile
+    ):
+        raise ValueError("Expected aligned halfplane int32 candidate keys")
+    if head_stripe is not None:
+        if head_stripe < 1 or head_stripe & (head_stripe - 1):
+            raise ValueError("head_stripe must be a positive power of two")
+        query_group = math.gcd(queries, head_stripe)
+        head_group = head_stripe // query_group
+        if heads % head_group:
+            raise ValueError("head_stripe must not require padding the head axis")
+        shape = (
+            groups,
+            queries // query_group,
+            query_group,
+            heads // head_group,
+            head_group,
+        )
+        q = (
+            q.reshape(*shape, dim)
+            .transpose(0, 3, 1, 4, 2, 5)
+            .reshape(groups, queries * heads, dim)
+        )
+        weights = (
+            weights.reshape(shape)
+            .transpose(0, 3, 1, 4, 2)
+            .reshape(groups, heads // head_group, queries * head_group)
+        )
+    # Keep compact metadata windows lane-aligned, including sub-block key tiles.
+    metadata_stride = math.gcd(block_size, key_tile // min(key_tile, dim))
+    metadata_tile = key_tile // metadata_stride
+    if compute_tile % metadata_stride:
+        raise ValueError("compute_tile must align with compact metadata")
+    # A negative block must stay negative after adding any within-block offset.
+    bases = jnp.where(ids >= 0, ids * block_size, -block_size)
+    bases = jnp.repeat(bases, block_size // metadata_stride, axis=1)
+    members = jnp.repeat(membership, block_size // metadata_stride, axis=1)
+    offsets = jnp.arange(width, dtype=jnp.int32) % block_size
+    metadata_spec = pl.BlockSpec((groups, metadata_tile), lambda t, g, start: (0, t))
     return pl.pallas_call(
-        functools.partial(_unpack_kernel, halfplane=halfplane),
-        out_shape=jax.ShapeDtypeStruct((groups, rows * 2, dim), jnp.bfloat16),
-        grid=(groups, rows // tile),
-        in_specs=[pl.BlockSpec((1, tile, dim), lambda g, t: (g, t, 0))],
-        out_specs=pl.BlockSpec((1, tile * 2, dim), lambda g, t: (g, t, 0)),
-        scratch_shapes=[] if halfplane else [pltpu.VMEM((tile * 2, dim), jnp.int32)],
+        functools.partial(
+            _score_kernel,
+            queries=queries,
+            request_tile=request_tile,
+            compute_tile=compute_tile,
+            head_stripe=head_stripe,
+        ),
+        out_shape=jax.ShapeDtypeStruct((request_tile * queries, width), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(width // key_tile, pl.cdiv(request_tile, request_group)),
+            in_specs=[
+                pl.BlockSpec(q.shape, lambda t, g, start: (0,) * q.ndim),
+                pl.BlockSpec(weights.shape, lambda t, g, start: (0,) * weights.ndim),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+                metadata_spec,
+                metadata_spec,
+                pl.BlockSpec((groups, queries), lambda t, g, start: (0, 0)),
+                pl.BlockSpec((key_tile,), lambda t, g, start: (t,)),
+            ],
+            out_specs=pl.BlockSpec(
+                (request_group * queries, key_tile), lambda t, g, start: (g, t)
+            ),
+            scratch_shapes=(
+                pltpu.VMEM((2, dma_tile // SLOTS, ROW_WORDS), jnp.int32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
+        ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
         interpret=interpret,
-        name="candidate_unpack_cache",
-    )(words)
+        name="candidate_union_packed_scores",
+    )(start_request.reshape(1), q, weights, keys, bases, members, lengths, offsets)
 
 
+@functools.partial(jax.jit, static_argnames=("block_size", "key_tile", "interpret"))
 def candidate_scores(
     q: jax.Array,
     weights: jax.Array,
@@ -192,215 +428,21 @@ def candidate_scores(
     block_size: int,
     key_tile: int = 4096,
     interpret: bool = False,
-    halfplane: bool = False,
-    skip: bool = False,
 ) -> jax.Array:
-    """Grouped view of the common scorer; retained for kernel-level callers."""
-    return candidate_scores_flat(
+    """Score canonical int32 keys with per-query membership and causal masks."""
+    return _candidate_scores(
         q,
         weights,
         keys,
         ids,
         membership,
         lengths,
+        start_request=jnp.int32(0),
+        request_tile=q.shape[0],
         block_size=block_size,
         key_tile=key_tile,
-        group_tile=1,
         interpret=interpret,
-        halfplane=halfplane,
-        skip=skip,
-    ).reshape(*q.shape[:2], ids.shape[1] * block_size)
-
-
-def _flat_score_kernel(
-    tiles,
-    q,
-    weights,
-    keys,
-    ids,
-    membership,
-    lengths,
-    out,
-    *scratch,
-    packed=False,
-    halfplane=False,
-):
-    """R whole requests per step; rows r*Q..r*Q+Q-1 of the out block are request r."""
-    group_tile, queries, heads, dim = q.shape
-    if out.ndim == 3:
-        out = out.at[0]
-
-    @pl.when(pl.program_id(1) < tiles[pl.program_id(0)])
-    def _():
-        for r in range(group_tile):
-            kk = (
-                (
-                    pltpu.bitcast(keys[r], jnp.bfloat16)
-                    if halfplane
-                    else _unpack_words(keys[r], scratch[0])
-                )
-                if packed
-                else keys[r]
-            )
-            logits = jax.lax.dot_general(
-                q[r].reshape(queries * heads, dim),
-                kk,
-                (((1,), (1,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            ).reshape(queries, heads, kk.shape[0])
-            values = (jnp.maximum(logits, 0) * weights[r][:, :, None]).sum(1)
-            logical = ids[r] if ids.ndim == 2 else ids[r, 0]
-            member = membership[r] if membership.ndim == 2 else membership[r, 0]
-            allow = ((member[None, :] >> jnp.arange(queries)[:, None]) & 1) != 0
-            allow &= (logical[None, :] >= 0) & (
-                logical[None, :] < lengths[r, 0][:, None]
-            )
-            out[r * queries : (r + 1) * queries, :] = jnp.where(allow, values, -jnp.inf)
-
-    @pl.when(pl.program_id(1) >= tiles[pl.program_id(0)])
-    def _():
-        out[...] = jnp.full(out.shape, -jnp.inf, out.dtype)
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "block_size",
-        "key_tile",
-        "group_tile",
-        "skip",
-        "interpret",
-        "halfplane",
-    ),
-)
-def candidate_scores_flat(
-    q: jax.Array,
-    weights: jax.Array,
-    keys: jax.Array,
-    ids: jax.Array,
-    membership: jax.Array,
-    lengths: jax.Array,
-    *,
-    block_size: int,
-    key_tile: int = 4096,
-    group_tile: int = 8,
-    skip: bool = True,
-    interpret: bool = False,
-    halfplane: bool = False,
-) -> jax.Array:
-    """`candidate_scores` as request-major [groups * queries, width].
-
-    Scores ``group_tile`` whole requests per grid step into one 8-row-aligned
-    (group_tile * queries, key_tile) block, so top-k reads the output without
-    a [G, Q, W] -> [G * Q, W] relayout. Groups of eight also take the
-    per-record logical/membership arrays as 2-D [G, W] blocks. Accepts BF16
-    keys or packed int32 word rows (ordinary or halfplane). ``skip`` skips
-    key tiles past the longest union in each group, as in `candidate_scores`.
-    With group_tile=1, unaligned query counts use a singleton-axis output
-    block in the same kernel, without padding any queries or keys.
-    """
-    groups, queries, heads, dim = q.shape
-    width = ids.shape[1] * block_size
-    packed = keys.dtype == jnp.int32
-    key_rows = width // 2 if packed else width
-    if (
-        dim != 128
-        or q.dtype != jnp.bfloat16
-        or keys.dtype not in (jnp.bfloat16, jnp.int32)
-        or weights.dtype != jnp.float32
-        or weights.shape != (groups, queries, heads)
-        or keys.shape != (groups, key_rows, dim)
-        or membership.shape != ids.shape
-        or lengths.shape != (groups, queries)
-        or group_tile < 1
-        or groups % group_tile
-        or ((group_tile * queries) % 8 and group_tile != 1)
-        or key_tile < 1
-        or width % key_tile
-        or (packed and key_tile % 2)
-    ):
-        raise ValueError(
-            "Expected aligned BF16 or packed int32 keys and an 8-row-aligned "
-            "request tile"
-        )
-    logical = jnp.repeat(ids, block_size, 1) * block_size
-    logical += jnp.arange(width)[None, :] % block_size
-    logical = jnp.where(jnp.repeat(ids >= 0, block_size, 1), logical, -1)
-    members = jnp.repeat(membership, block_size, 1)
-    steps = groups // group_tile
-    if skip:
-        # Union IDs are compacted to the front: tiles past the last valid block
-        # of every request in the step hold only masked (-1) slots.
-        valid = jnp.sum(ids >= 0, axis=1).astype(jnp.int32) * block_size
-        valid = valid.reshape(steps, group_tile).max(1)
-        tiles = jnp.maximum(pl.cdiv(valid, key_tile), 1).astype(jnp.int32)
-    else:
-        tiles = jnp.full((steps,), width // key_tile, jnp.int32)
-
-    def clamp(s, t, tl):
-        return jnp.minimum(t, tl[s] - 1)
-
-    if group_tile % 8 == 0:
-        # 2-D [groups, width] records: (R, key_tile) blocks are (8, 128)-tile
-        # aligned, so XLA keeps their natural layout (no [G, 1, W] relayout).
-        record_spec = pl.BlockSpec(
-            (group_tile, key_tile), lambda s, t, tl: (s, clamp(s, t, tl))
-        )
-    else:
-        logical, members = logical[:, None], members[:, None]
-        record_spec = pl.BlockSpec(
-            (group_tile, 1, key_tile), lambda s, t, tl: (s, 0, clamp(s, t, tl))
-        )
-
-    # Untuned, non-aligned batches use a singleton major axis. This is the
-    # same scorer and dot shape, with no padded Q/K rows or lost requests.
-    flat_output = (group_tile * queries) % 8 == 0
-    result = pl.pallas_call(
-        functools.partial(_flat_score_kernel, packed=packed, halfplane=halfplane),
-        out_shape=jax.ShapeDtypeStruct(
-            (groups * queries, width) if flat_output else (groups, queries, width),
-            jnp.float32,
-        ),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(steps, width // key_tile),
-            in_specs=[
-                pl.BlockSpec(
-                    (group_tile, queries, heads, dim), lambda s, t, tl: (s, 0, 0, 0)
-                ),
-                pl.BlockSpec((group_tile, queries, heads), lambda s, t, tl: (s, 0, 0)),
-                pl.BlockSpec(
-                    (group_tile, key_tile // 2 if packed else key_tile, dim),
-                    lambda s, t, tl: (s, clamp(s, t, tl), 0),
-                ),
-                record_spec,
-                record_spec,
-                pl.BlockSpec((group_tile, 1, queries), lambda s, t, tl: (s, 0, 0)),
-            ],
-            out_specs=(
-                pl.BlockSpec((group_tile * queries, key_tile), lambda s, t, tl: (s, t))
-                if flat_output
-                else pl.BlockSpec((1, queries, key_tile), lambda s, t, tl: (s, 0, t))
-            ),
-            scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)]
-            if packed and not halfplane
-            else [],
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel",) * 2,
-            # Eight requests' keys, records and (48, key_tile) scores per step.
-            vmem_limit_bytes=(
-                None
-                if interpret
-                else int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
-            ),
-        ),
-        interpret=interpret,
-        name="candidate_union_packed_scores_flat"
-        if packed
-        else "candidate_union_scores_flat",
-    )(tiles, q, weights, keys, logical, members, lengths[:, None])
-    return result.reshape(groups * queries, width)
+    )
 
 
 @functools.partial(
@@ -411,7 +453,6 @@ def candidate_scores_flat(
         "request_tile",
         "k",
         "overlap",
-        "halfplane",
     ),
 )
 def candidate_indexer(
@@ -427,67 +468,73 @@ def candidate_indexer(
     request_tile: int | None = None,
     k: int = 512,
     overlap: bool = True,
-    halfplane: bool = False,
 ) -> jax.Array:
-    """Pipeline whole-request score groups and SC selection over a reusable union."""
+    """Pipeline canonical int32 key scoring and SC selection over a reusable union."""
     requests, queries = q.shape[:2]
     width = ids.shape[1] * block_size
-    if key_tile is None:
-        key_tile = tuned_block_sizes.get_candidate_key_tile(
+    config = tuned_block_sizes.get_candidate_block_sizes(
+        tuned_block_sizes.CandidateTuningKey(
             jax.devices()[0].device_kind,
-            q.shape,
+            queries,
+            q.shape[2],
             width,
+            key_tile,
             k,
-            keys.dtype == jnp.int32,
-            halfplane=halfplane,
-        )
+        ),
+        requests,
+    )
     if request_tile is None:
-        request_tile = tuned_block_sizes.get_candidate_request_tile(
-            tuned_block_sizes.CandidateTuningKey(
-                jax.devices()[0].device_kind,
-                requests,
-                queries,
-                q.shape[2],
-                width,
-                key_tile,
-                k,
-                keys.dtype == jnp.int32,
-                halfplane=halfplane and keys.dtype == jnp.int32,
-            )
-        )
-    if request_tile < 1 or requests % request_tile:
-        raise ValueError("request_tile must divide the request-major batch")
-    group_tile = tuned_block_sizes.get_candidate_score_group(request_tile, queries)
+        request_tile = config.request_tile
+    elif type(request_tile) is not int or request_tile < 1:
+        raise ValueError("request_tile must be a positive integer")
+    request_tile = min(request_tile, requests)
+    fuse_topk_id_mapping = config.fuse_topk_id_mapping
 
     def prepare(i):
-        return jax.tree.map(
-            lambda x: jax.lax.dynamic_slice_in_dim(x, i * request_tile, request_tile),
-            (q, weights, keys, ids, membership, lengths),
-        )
+        return i * request_tile
 
-    def score(args):
-        return candidate_scores_flat(
-            *args,
+    def score(start, size=request_tile):
+        return _candidate_scores(
+            q,
+            weights,
+            keys,
+            ids,
+            membership,
+            lengths,
+            start_request=start,
+            request_tile=size,
             block_size=block_size,
-            key_tile=key_tile,
-            group_tile=group_tile,
-            skip=True,
-            halfplane=halfplane,
+            key_tile=config.key_tile,
+            compute_tile=config.compute_tile,
+            head_stripe=config.head_stripe,
+            dma_tile=config.dma_tile,
         )
 
     def select(i, values):
-        group_ids = prepare(i)[3]
-        # Only scan the compacted union; membership remains per query.
-        union = jnp.sum(group_ids >= 0, axis=1).astype(jnp.int32) * block_size
-        scan = jnp.repeat(jnp.maximum(union, 1), queries)
+        group_size = values.shape[0] // queries
+        group_ids = jax.lax.dynamic_slice_in_dim(ids, prepare(i), group_size)
+        union_lengths = jnp.maximum(jnp.sum(group_ids >= 0, axis=1) * block_size, 1)
+        scan_lengths = jnp.broadcast_to(
+            union_lengths[:, None], (group_size, queries)
+        ).astype(jnp.int32)
+        if fuse_topk_id_mapping:
+            return streaming_topk(
+                values,
+                valid_lengths=scan_lengths,
+                k=k,
+                block_size=config.topk_block_size,
+                reconstruct_threshold=config.reconstruct_threshold,
+                exclude_neg_inf=True,
+                logical_blocks=ids,
+                start_request=prepare(i),
+            )
         selected = decode._select(
             values,
-            scan,
+            scan_lengths.reshape(-1),
             k,
-            8192,
-            8192,
-            True,
-        ).reshape(request_tile, queries, k)
+            config.topk_block_size,
+            config.reconstruct_threshold,
+        ).reshape(group_size, queries, k)
         blocks = jnp.take_along_axis(
             group_ids[:, None, :], jnp.maximum(selected, 0) // block_size, axis=2
         )
@@ -499,8 +546,35 @@ def candidate_indexer(
             out, selected, i * request_tile * queries, axis=0
         )
 
+    count, tail = divmod(requests, request_tile)
+    if overlap and (fuse_topk_id_mapping or tail):
+        count += bool(tail)
+        current = score(jnp.int32(0))
+        previous = None
+        selected_groups = []
+        for i in range(count - 1):
+            next_start = jnp.int32(prepare(i + 1))
+            if previous is None:
+                next_start, current = jax.lax.optimization_barrier(
+                    (next_start, current)
+                )
+            else:
+                next_start, current, previous = jax.lax.optimization_barrier(
+                    (next_start, current, previous)
+                )
+                selected_groups.append(previous)
+            following = score(
+                next_start, min(request_tile, requests - (i + 1) * request_tile)
+            )
+            previous = select(i, current)
+            current = following
+        if previous is not None:
+            previous, current = jax.lax.optimization_barrier((previous, current))
+            selected_groups.append(previous)
+        selected_groups.append(select(count - 1, current))
+        return selected_groups[0] if count == 1 else jnp.concatenate(selected_groups)
+
     out = jnp.full((requests * queries, k), -1, jnp.int32)
-    count = requests // request_tile
     if overlap:
         return indexer.pipeline_score_topk(count, prepare, score, select, write, out)
 
@@ -508,7 +582,11 @@ def candidate_indexer(
         args, out = jax.lax.optimization_barrier((prepare(i), out))
         return write(i, select(i, score(args)), out)
 
-    return jax.lax.fori_loop(0, count, serial, out)
+    out = jax.lax.fori_loop(0, count, serial, out)
+    if tail:
+        start, out = jax.lax.optimization_barrier((prepare(count), out))
+        out = write(count, select(count, score(start, tail)), out)
+    return out
 
 
 def cache_capacity(
@@ -521,17 +599,21 @@ def cache_capacity(
     """Static envelope without specializing Torch's dynamic token dimension.
 
     Request/query alignment is checked after JAX lowering, where bucket shapes
-    are concrete. Python guards on ``rows == requests * 6`` break Dynamo's
-    explicitly dynamic input contract.
+    are concrete. Python guards on the token count break Dynamo's explicitly
+    dynamic input contract.
     """
     _, width = record_shape
     _, heads, dim = query_shape
-    capacity = tuned_block_sizes.CANDIDATE_KEY_CAPACITY
+    if block_size < SLOTS or block_size % SLOTS:
+        return None
+    capacity = tuned_block_sizes.CANDIDATE_KEY_CAPACITY // block_size * block_size
     if (
-        (heads, dim) != (32, 128)
-        or (candidate_count, block_size) != (2048, 8)
-        or not capacity < width <= 1048576
-        or page_records < 16
+        dim != DIM
+        or heads < 1
+        or candidate_count < 1
+        or candidate_count * block_size > capacity
+        or not 0 < capacity < width
+        or page_records < block_size
         or page_records % block_size
         or width % page_records
     ):
