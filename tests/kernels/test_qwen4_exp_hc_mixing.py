@@ -23,13 +23,9 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
-from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
-from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
     build_full_mix_op,
     build_gated_residual_op,
-    build_norm_op,
-    build_up_epilogue_op,
 )
 
 
@@ -58,7 +54,6 @@ def reference(x, weight, down, up, branches=4):
     return mixed, norm, mid
 
 
-@pytest.mark.parametrize("kernel", ["norm", "up", "full"])
 @pytest.mark.parametrize(
     "tokens,branches,hidden,tile,lowrank",
     [
@@ -72,40 +67,24 @@ def reference(x, weight, down, up, branches=4):
         (256, 0, 128, 128, 128),
     ],
 )
-def test_hc_rejects_invalid_geometry(kernel, tokens, branches, hidden, tile, lowrank):
+def test_hc_rejects_invalid_geometry(tokens, branches, hidden, tile, lowrank):
     shape = jax.ShapeDtypeStruct
     width = branches * hidden
     x = shape((tokens, width), jnp.bfloat16)
     weight = shape((width,), jnp.bfloat16)
     down = shape((lowrank, width), jnp.bfloat16)
     up = shape((width, lowrank), jnp.bfloat16)
-    if kernel == "norm":
-        fn = functools.partial(
-            _normalize, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
-        )
-        args = (x, weight)
-    elif kernel == "up":
-        fn = functools.partial(
-            _up_epilogue, branches=branches, hidden=hidden, token_tile=tile
-        )
-        args = (shape((tokens, lowrank), jnp.bfloat16), x, up)
-    else:
-        fn = functools.partial(
-            _full_mix, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
-        )
-        args = (x, weight, down, up)
+    fn = functools.partial(
+        _full_mix, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
+    )
     with pytest.raises(ValueError, match="HC .* requires"):
-        jax.eval_shape(fn, *args)
+        jax.eval_shape(fn, x, weight, down, up)
 
 
-@pytest.mark.parametrize("kernel", ["residual", "norm", "up", "full"])
+@pytest.mark.parametrize("kernel", ["residual", "full"])
 def test_hc_torch_fake_shapes(kernel):
     if kernel == "residual":
         op = build_gated_residual_op(4, 128, 128)
-    elif kernel == "norm":
-        op = build_norm_op(4, 128, 1e-6, 64)
-    elif kernel == "up":
-        op = build_up_epilogue_op(4, 128, 128)
     else:
         op = build_full_mix_op(4, 128, 1e-6, 128)
     with FakeTensorMode():
@@ -117,10 +96,6 @@ def test_hc_torch_fake_shapes(kernel):
         if kernel == "residual":
             result = (op(x, mid, torch.empty(256, 4, dtype=torch.float32)),)
             shapes = ((256, 512),)
-        elif kernel == "norm":
-            result, shapes = (op(x, weight),), ((256, 512),)
-        elif kernel == "up":
-            result, shapes = (op(mid, x, up),), ((256, 128),)
         else:
             result, shapes = op(x, weight, down, up), ((256, 128), (256, 512))
         for tensor, expected_shape in zip(result, shapes, strict=True):
@@ -139,9 +114,7 @@ def test_hc_torch_fake_shapes(kernel):
         (512, 4, 2560, 320, 256),
     ],
 )
-def test_hc_staged_and_full_mix_match_cpu_reference(
-    tokens, branches, hidden, lowrank, tile
-):
+def test_hc_full_mix_matches_cpu_reference(tokens, branches, hidden, lowrank, tile):
     cpu = jax.devices("cpu")[0]
     tpu = jax.devices("tpu")[0]
     with jax.default_device(cpu):
@@ -149,26 +122,13 @@ def test_hc_staged_and_full_mix_match_cpu_reference(
             jnp.asarray(a, jnp.bfloat16)
             for a in inputs(tokens, branches, hidden, lowrank)
         )
-        expected_mix, expected_norm, mid = reference(*arrays, branches=branches)
+        expected_mix, expected_norm, _ = reference(*arrays, branches=branches)
     x, weight, down, up = tuple(jax.device_put(a, tpu) for a in arrays)
-    norm = _normalize(
-        x, weight, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
-    )
-    mixed = _up_epilogue(
-        jax.device_put(mid, tpu),
-        norm,
-        up,
-        branches=branches,
-        hidden=hidden,
-        token_tile=tile,
-    )
     full_mix, full_norm = _full_mix(
         x, weight, down, up, branches=branches, hidden=hidden, eps=1e-6, token_tile=tile
     )
     # Use the existing HC layer's NRMSE/cosine numerical acceptance contract.
     for actual, expected in [
-        (norm, expected_norm),
-        (mixed, expected_mix),
         (full_norm, expected_norm),
         (full_mix, expected_mix),
     ]:
@@ -182,24 +142,22 @@ def test_hc_staged_and_full_mix_match_cpu_reference(
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("tile", [64, 128])
-def test_hc_norm_preserves_affine_cancellation(tile):
+@pytest.mark.parametrize("tile", [128, 256])
+def test_hc_full_mix_preserves_affine_cancellation(tile):
     cpu = jax.devices("cpu")[0]
     tpu = jax.devices("tpu")[0]
     with jax.default_device(cpu):
-        arrays = list(jnp.asarray(a, jnp.bfloat16) for a in inputs())
+        arrays = list(jnp.asarray(a, jnp.bfloat16) for a in inputs(tokens=2 * tile))
         # Premature BF16 rounding of norm * weight loses this small residual.
         arrays[1] = jnp.full((512,), -1 + 2**-8, dtype=jnp.bfloat16)
         _, expected, _ = reference(*arrays)
     x, weight, down, up = tuple(jax.device_put(a, tpu) for a in arrays)
-    norm = _normalize(x, weight, branches=4, hidden=128, eps=1e-6, token_tile=tile)
     _, full_norm = _full_mix(
-        x, weight, down, up, branches=4, hidden=128, eps=1e-6, token_tile=128
+        x, weight, down, up, branches=4, hidden=128, eps=1e-6, token_tile=tile
     )
-    for actual in (norm, full_norm):
-        a, e = (np.asarray(v, np.float32) for v in (actual, expected))
-        assert np.isfinite(a).all()
-        assert np.linalg.norm(a - e) / np.linalg.norm(e) <= 0.01
+    a, e = (np.asarray(v, np.float32) for v in (full_norm, expected))
+    assert np.isfinite(a).all()
+    assert np.linalg.norm(a - e) / np.linalg.norm(e) <= 0.01
 
 
 @pytest.mark.tpu_test
