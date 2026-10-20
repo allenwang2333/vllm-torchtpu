@@ -39,8 +39,9 @@ D 处理只对 Raiden Stage-3 consumer、`fail` 策略和一个 `TPURaidenConnec
 `recompute` 策略保留原路径。启用响应处理时，入口拒绝自定义 scheduler 子类；
 官方同步和异步类均支持。
 
-容量抢占终止是独立开关，见[容量策略](abort_on_preemption.md)。同时启用 D 加载失败
-处理与容量终止时，两个状态对象各自管理数据，不共用错误状态。
+KV consumer 的 `kv_load_failure_policy="fail"` 同时启用容量抢占终止，
+无需额外配置，见[容量策略](abort_on_preemption.md)。D 加载失败处理与容量终止
+各自管理数据，不共用错误状态。
 
 ## 保留的生命周期
 

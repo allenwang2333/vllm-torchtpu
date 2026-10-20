@@ -2,10 +2,11 @@
 
 ## TL;DR
 
-在 KV consumer 的 `--additional-config` 中设置
-`{"abort_on_preemption": true}`，被容量调度选中的请求将结束为
+KV consumer 使用 `kv_load_failure_policy="fail"` 时，被容量调度选中的请求将结束为
 `FINISHED_ERROR`，携带 `model.KVCachePreempt`，不再进入 waiting 重算。
-默认关闭；producer、`kv_both` 和没有 KV connector 的实例不能开启。
+不再读取额外的 `additional_config.abort_on_preemption` 开关，避免漏配。
+`kv_load_failure_policy` 在 vLLM 中默认为 `fail`；设置 `recompute` 时沿用上游容量重算。
+producer、`kv_both` 和没有 KV transfer 配置的实例保持原有行为。
 本实现通过 TPU init patch 接入 vLLM 0.29，使用官方 scheduler，并保留 Raiden
 加载失败的独立响应适配器。
 
@@ -14,20 +15,18 @@ FCFS 和 PRIORITY 继续使用上游 victim 选择规则。
 
 ## 配置与边界
 
-仅在 D 的已有启动参数中增加：
+在 D 的已有 KV transfer 配置中设置：
 
-```bash
---additional-config '{"abort_on_preemption": true}'
+```python
+config["kv_transfer_config"]["kv_load_failure_policy"] = "fail"
 ```
 
-如果已有 `additional_config`，将此字段合并到同一个 JSON 对象。
-Python 入口使用 `EngineArgs(additional_config={"abort_on_preemption": True}, ...)`。
-值必须是布尔类型。关闭时删除字段或设置 `false`。
+这一个策略同时决定远端 KV 加载失败和运行中 KV 容量抢占的处理方式：`fail` 终止请求，
+`recompute` 允许重算。删除旧的 `additional_config.abort_on_preemption` 字段。
 
-该入口替代上游源码补丁中的原生 `--abort-on-preemption` 参数，
-不要求修改已安装的 vLLM 文件或扩展其配置 dataclass。
+无需修改已安装的 vLLM 文件或扩展其配置 dataclass。
 原生 `Scheduler`、`AsyncScheduler` 可用；覆盖了 `schedule()` 的自定义 scheduler
-在构造时拒绝开启。Raiden 的临时 scheduler 类已删除，迁移方式见
+在 consumer/fail 配置下构造时拒绝启动。Raiden 的临时 scheduler 类已删除，迁移方式见
 [响应完成与错误](raiden_pd_completion.md)。
 管理接口 `reset_prefix_cache(reset_running_requests=True)` 仍走上游
 `_preempt_request()`，不套用容量失败策略。
@@ -117,11 +116,12 @@ done
 每组使用新的 `RUN_DIR`，运行后清理本次启动的服务，保留日志与
 `capacity_preemption_result.json`。脚本沿用既有 launcher 的文件名，实际拓扑
 固定为 P4D4，使用 async scheduling、P MTP1 / D MTP3。
-两组均在官方 AsyncScheduler 上开启 D 的 `kv_load_failure_policy="fail"`，
-同时验证加载失败响应适配器与容量策略的组合；P 非流式调用保持发送完成开关关闭。
+两组均使用官方 AsyncScheduler：`abort` 设置 D 的 `kv_load_failure_policy="fail"`，
+同时验证加载失败响应适配器与容量终止的组合；`recompute` 设置相应 policy 为 `recompute`。
+两组均不传额外容量开关，P 非流式调用保持发送完成开关关闭。
 P 侧沿用 correctness 的 `PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=256`，
 两侧启用 `TPU_RAIDEN_PREFIX_AWARE_LOAD=1`。
-D 编译尺寸包含 `256,4096`，调度 token 上限为 4096，使关闭策略时的
+D 编译尺寸包含 `256,4096`，调度 token 上限为 4096，使 `recompute` 策略下的
 完整 prompt 重算也落在已编译范围内。
 
 压力场景使用 31-block 池及两条跨 decode block 边界的并发请求，
