@@ -1115,6 +1115,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     interleave_size: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    conv_state_dtype: jnp.dtype = jnp.bfloat16,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
     pcp_axis = "pcp"
@@ -1243,6 +1244,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             pool_block_tokens=pool_block_tokens,
             qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
             recurrent_state_dtype=recurrent_state_dtype,
+            conv_state_dtype=conv_state_dtype,
         )
 
         return gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn(
@@ -1319,6 +1321,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: jnp.dtype = jnp.float32,
+    conv_state_dtype: jnp.dtype = jnp.bfloat16,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1485,6 +1489,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            recurrent_state_dtype=recurrent_state_dtype,
+            conv_state_dtype=conv_state_dtype,
         )
 
         seq_output_shard = seq_output_shard.reshape(
