@@ -1,429 +1,201 @@
-# The megakernel backend: Kimi-K3 P/D on the tpu-megakernel Pallas kernels
+# Kimi-K3 on the megakernel backend
 
-Kimi-K3 served as a prefill/decode pair, both roles running the
-tpu-megakernel Pallas kernels instead of vLLM's layer stack: a
-sequence-parallel prefill stack on the KV producer and a fused 93-layer
-decoder on the KV consumer. vLLM keeps scheduling, the unified block pool,
-prefix caching, the Raiden Stage-3 KV transfer, sampling parameters, the
-OpenAI API and its parsers.
+This backend serves Kimi-K3 as a prefill/decode (P/D) pair on TPU v7x. Each
+role runs the tpu-megakernel Pallas kernels instead of vLLM's layer stack.
+vLLM still provides scheduling, prefix caching, the Raiden KV transfer
+between the roles, sampling parameters and the OpenAI API.
 
-## Running
+## Requirements
 
-Each role is a `vllm serve` over one 32-chip (4-host 2x2x4) slice, run with
-the configuration below on every host; vLLM 0.29 with this checkout
-installed editable. The prefill role is the Raiden KV producer and the
-decode role the consumer; a P/D proxy in front
-(`examples/disagg/toy_proxy_server.py --prefiller-hosts ... --decoder-hosts
-...`) sends each request to the prefill, then to the decode instance.
+- Two 32-chip TPU v7x slices (four hosts each, 2x2x4): one for prefill and
+  one for decode.
+- vLLM 0.29 with this checkout installed editable.
+- The Kimi-K3 checkpoint and, for speculative decoding, the DSpark
+  speculator checkpoint.
 
-The producer's premapped host pool is twice its explicit KV budget, with
-an 8 GiB minimum to fit the largest presharded weight upload. Bounded Raiden
-staging uses at most the device KV storage size; the remaining space provides
-transfer headroom. A `TPU_PREMAPPED_BUFFER_SIZE` override takes precedence.
+## 1. Pre-shard the weights
 
-### The configuration
-
-There is one, on both roles:
-
-- `--load-format megakernel --model-loader-extra-config
-  '{"presharded": "/path/to/kimi-k3-tp32"}'` selects the
-  megakernel backend (`megakernel/backend.py`); `presharded` is the TP32
-  pre-shard directory (the kernel-layout weights, the prefill's
-  `prefill-sp-cache` and the DSpark draft's `dspark-<revision>`). The
-  load format builds the model without weights (the program loads its own)
-  and the platform turns vLLM's compilation off. Unknown loader keys, or a
-  missing `presharded`, fail at startup;
-- `--tensor-parallel-size 32 --enable-expert-parallel`, `--block-size 256`;
-- `--decode-context-parallel-size 32 --cp-kv-cache-interleave-size 256`:
-  each rank stores global page `k` of a sequence with `k % 32 == rank`, in
-  logical block `k // 32`;
-- a Raiden `--kv-transfer-config` (the role comes from `kv_role`: producer
-  -> prefill program, consumer -> decode program) and prefix caching on;
-- decode: async scheduling; optionally
-  `--speculative-config '{"method": "dspark", "num_speculative_tokens": 7,
-  "num_speculative_tokens_per_batch_size": [[1, 4, 7], [5, 8, 3]]}'` — the
-  per-batch-size schedule says how many drafts each batch size verifies (the
-  decoder derives its speculation shapes from it and rejects one it cannot
-  run; the compiled kernels support 3 or 7 drafts at batches 1–8, and 3 at
-  batches 9–16, through compiled request buckets 1, 2, 4, 8 and 16 up to
-  `--max-num-seqs`, and 0 anywhere);
-- decode, under `"rejection_sample_method": "synthetic"`: optionally
-  `"synthetic_acceptance_lengths": {"3": 2.87, "7": 3.78}` in the decode
-  role's `--model-loader-extra-config` gives each draft width of the
-  schedule its own mean acceptance length (vLLM's min-variance rates for
-  that width); without it every width draws from `--speculative-config`'s
-  one rate vector, truncated. Every width the schedule runs needs a length,
-  and the 7-draft one must match `synthetic_acceptance_length`;
-- with DSpark, `"draft": "<the speculator checkpoint>"` in the prefill's
-  loader config: the prefill computes each request's draft ring, and a
-  decoder with a DSpark `--speculative-config` imports it. Both peers'
-  transfer manifests carry the ring rows only then, so a pair where one side
-  has DSpark and the other doesn't has different layout fingerprints.
-
-### FP8 decode attention
-
-Both roles may select `--kv-cache-dtype fp8` (or `fp8_e4m3`) together with
-`--block-size 512 --cp-kv-cache-interleave-size 512`. BF16 is the default;
-the two roles must agree.
-
-The FP8 pool holds 512 tokens in `[128, 4, 640]` E4M3FN pages, with scale one
-for latent and RoPE cache values. Its physical row and slot sizes match the
-256-token BF16 pool exactly, so recurrent FP32 state, BF16 convolution and
-DSpark draft-ring state keep their byte offsets and precision. A logical
-DCP32 cache block spans 16,384 tokens; this also coarsens prefix reuse.
-Producer and consumer cache encoding must match; the transfer fingerprint
-rejects mixed BF16/FP8 layouts.
-
-Cached-page decode attention quantizes each absorbed query head once after
-its BF16 all-gather, using its maximum magnitude to map into E4M3FN's range.
-QK and PV use native FP8 matrix operations with FP32 accumulation. Softmax
-statistics and the denominator stay FP32; probabilities are multiplied by
-256 before E4M3FN conversion and PV is divided by 256 afterward. The small
-current-token/verification-chunk merge is FP32, and the decoder's
-projection/output contract and the query exchange are BF16. This is not
-numerical equivalence to a GPU kernel.
-
-Prefill computes its window attention in BF16 and writes FP8 latents into
-the shared pool. Cached prefixes are converted back to BF16 before
-prefill's key/value expansion. Every decode/verification commit uses the
-same encoding and preserves other tokens in the packed word.
-
-Standalone tools accept the same option, for example:
+The kernels load their weights from a pre-shard directory in a per-rank
+layout. Create it once with `python -m tools.megakernel` (see
+[Tools](#tools) for how it launches on an allocation). `preshard k3` and
+`preshard prefill` use the host CPUs only, not the TPUs.
 
 ```bash
-python -m tools.megakernel --jobid JOB --kv-cache-dtype fp8 \
-    bench decode --batches 1,8,32,64 --contexts 32768,131072
+python -m tools.megakernel --jobid JOB preshard k3 \
+    --checkpoint /path/to/Kimi-K3 --output /path/to/kimi-k3-tp32
+python -m tools.megakernel --jobid JOB preshard prefill \
+    --checkpoint /path/to/Kimi-K3 --output /path/to/kimi-k3-tp32
+# Only for DSpark speculative decoding:
+python -m tools.megakernel --jobid JOB preshard dspark \
+    --draft /path/to/dspark --output /path/to/kimi-k3-tp32
 ```
 
-The FP8 option changes arithmetic and may change generated tokens. It is
-opt-in; evaluate task quality before making it a deployment's default.
+Run `preshard prefill` after `preshard k3`, with the same output directory.
+It refuses to overwrite an existing cache. To check an existing pre-shard,
+`preshard verify --against DIR --checkpoint CKPT --draft CKPT` rebuilds a
+sample of one rank and compares it byte for byte.
 
-## How it works
+## 2. Start the servers
 
-### Runner and program
+Each role is one `vllm serve` across its slice's four hosts. Both roles
+take these flags:
 
-`MegakernelModelRunner` (`megakernel/runner.py`, chosen by the worker on the
-megakernel path) owns the vLLM contract: request lifecycle, the KV
-connector, async output. Every step it hands the program a `StepInput` --
-the batch's requests as host data (`RequestInput`), finished requests and
-block copies (`megakernel/program.py`, with `KVGroup` and `StepOutput`) --
-and returns the tokens the program chose in its ops; there is no input
-preparation, attention metadata, logits, sampler or drafter. The program
-for the role is `KimiPrefiller` (`megakernel/kimi_k3/prefill.py`) or
-`KimiDecoder` (`megakernel/kimi_k3/decode.py`), built by
-`megakernel/kimi_k3/program.py` from the `MegakernelEngineConfig`
-(`megakernel/config.py`), which it also checks; it states the capabilities.
-Programs have no vLLM dependencies; `python -m tools.megakernel` drives them
-directly. vLLM's compilation is off on this path (`CompilationMode.NONE`):
-the ops are compiled by JAX.
+```bash
+COMMON=(
+  --tensor-parallel-size 32 --enable-expert-parallel
+  --decode-context-parallel-size 32 --cp-kv-cache-interleave-size 256
+  --block-size 256
+  --enable-prefix-caching --mamba-cache-mode align
+  --trust-remote-code
+  --load-format megakernel
+)
+CONNECTOR='"kv_connector": "TPURaidenConnector", "kv_connector_module_path": "vllm_torchtpu.distributed.kv_transfer.tpu_connector"'
+```
 
-### Kernels as torch ops
+Prefill (the KV producer):
 
-The kernels are pure JAX/Pallas SPMD programs over the 32 devices. Each
-program op is a `shard_map` body registered as a torch custom op
-(`distributed/sharded_jax_op.py`, via `megakernel/bridge.py`) on one kernel
-mesh over all devices in ascending id; a kernel's rank is the worker's
-position in it, not its vLLM TP rank (KDA heads move between the two orders
-with a `ppermute`, `pools.tp_rank_permutation`).
-`bridge.spmd_safe_axis_index` makes the kernels' XLA-level `lax.axis_index`
-survive torch_tpu's SPMD export. Ops with an `export_key` persist their
-exported modules (`megakernel/export_cache.py`) under
-`<VLLM_XLA_CACHE_PATH>/k3_export`, so a warm restart skips tracing and
-lowering. The kernels live in `src/vllm_torchtpu/megakernel`: shared
-building blocks in `common/`, the K3 kernels in `kimi_k3/kernels/` (JAX only,
-no vLLM or torch), their settings in `kimi_k3/config.py` (`KernelConfig`,
-installed before the first kernel import; serving uses the defaults). Each
-role's kernel is one file: `decode_megakernel.py` (with `mla_dcp.py`,
-`paged.py` and `dspark.py`) and `prefill_megakernel.py` (its module
-docstring maps the ops); model math both evaluate is in `helpers.py` and
-weight loading in `rank_loader.py`.
+```bash
+vllm serve /path/to/Kimi-K3 "${COMMON[@]}" \
+  --model-loader-extra-config '{"presharded": "/path/to/kimi-k3-tp32", "draft": "/path/to/dspark"}' \
+  --kv-transfer-config "{${CONNECTOR}, \"kv_role\": \"kv_producer\"}" \
+  --max-num-seqs 16 --max-num-batched-tokens 8192
+```
 
-vLLM still builds `KimiLinearForCausalLM`, on the meta device
-(`megakernel/loader.py`): its attention and KDA layers declare the KV cache
-spec vLLM allocates from; no parameter takes memory.
+Decode (the KV consumer):
 
-### The unified pools
+```bash
+vllm serve /path/to/Kimi-K3 "${COMMON[@]}" \
+  --model-loader-extra-config '{"presharded": "/path/to/kimi-k3-tp32"}' \
+  --kv-transfer-config "{${CONNECTOR}, \"kv_role\": \"kv_consumer\"}" \
+  --max-num-seqs 8 \
+  --speculative-config '{"method": "dspark", "model": "/path/to/dspark", "num_speculative_tokens": 7, "num_speculative_tokens_per_batch_size": [[1, 4, 7], [5, 8, 3]]}'
+```
 
-Each `KVCacheTensor` is one pool `[blocks, 128, 2, 640]` bf16 shared by one
-MLA layer and three KDA layers: MLA latent pages (576 lanes: the normalized
-latent and the rope part; token `t` of a page at `[t // 2, t % 2]`) and, in
-a KDA group's state block, the layer's state (rows 0-76 recurrent f32, rows
-77-80 conv taps) and, with the draft ring, rows 81-95: a fifteenth of the
-request's ring. The Raiden connector moves each rank's pool bytes to the
-same rank on the other role (`lower_dcp_page_spans`; the state blocks'
-conv region extended over the ring rows, `pool_manifest`).
+To run without speculative decoding, drop `"draft"` from the prefill's
+loader config and `--speculative-config` from the decode. The two roles
+must agree on DSpark: the KV transfer rejects a pair where only one side
+uses it.
 
-### Prefill (`megakernel/kimi_k3/prefill.py`)
+Then put the P/D proxy in front of the pair. It sends each request to
+prefill, then to decode:
 
-Every live row of a step is computed. A row's tokens are cut into pieces of
-at most the largest window (512, 1024, 2048, 4096, 8192 tokens, up to
-`--max-num-batched-tokens`), and up to 16 sequences (`--max-num-seqs`, and
-at most one per page of the window) are packed into a window at page-aligned
-offsets. A window runs the stack's first (embedding +
-layers 0-3), group (8 layers, 11 times) and final (layer 92 + each
-sequence's last-token logits) ops; each rank writes the new pages it owns.
+```bash
+python examples/disagg/toy_proxy_server.py --port 8100 \
+  --prefiller-hosts PREFILL_HOST --prefiller-ports 8000 \
+  --decoder-hosts DECODE_HOST --decoder-ports 8000
+```
 
-- **Cached prefixes:** the pools hold each prefix context parallel (page
-  `p` on rank `p % 32`). Each MLA layer all-gathers every rank's valid
-  prefix pages, as stored (FP8 or BF16), over the six TP32 ring streams
-  (`gathered_prefix_pages`), expands them for the rank's 3 heads
-  (`expand_prefix_pages`) and attends the window and the prefixes in one
-  flash call, as vLLM's GPU DCP prefill gathers the context's latent KV.
-- **MLA flash tiling:** 1024 query rows share each key tile, reducing
-  repeated prefix reads while keeping each query's key reduction order.
-- **MoE expert weights:** the indexed layer passes the resident packed weight
-  families and a scalar layer index into the grouped matmuls; the Pallas
-  kernel selects an HBM view before loading each tile, so no full-layer
-  dynamic-slice copy is made per window.
-- **MoE latent exchange:** the TP32 Pallas ring gathers the BF16 latent rows
-  over physical routes in mesh-rank order. Routing IDs and probabilities
-  use int32 and FP32 gathers; the routed output uses the reduce-scatter
-  ring. Gather ownership stays separate from any routed-output token
-  permutation.
-- **KDA state** between a request's steps stays in memory; a prefix-cache
-  hit reads it from the block vLLM's `align` mode keeps at the hit.
-- **Align-mode splits:** vLLM splits a prompt at its last block boundary to
-  cache the KDA state there. A step that stops short of a prompt whose rest
-  fits one window is skipped (no token), and the computing window
-  checkpoints the state at that boundary into the block vLLM assigned.
-- **Prefix hits inside a logical block** (256-token granularity under DCP)
-  copy-on-write the block; the runner hands the copies to the program
-  (`step(..., copies)`). The decode program applies no copies (its
-  `Capabilities.block_copies` is off), so a scheduler patch in `__init__.py`
-  rounds its hits down to whole logical blocks; another keeps the prefill's
-  chunk ends on 256-token pages.
-- The first token is chosen in an op from the kernel's logits, with the
-  decoder's in-op sampling.
+The Raiden connector also needs its usual environment on both roles
+(controller address, ports, premapped host buffer). See
+[`raiden_pd_prefill.yaml`](../developers_guide/examples/raiden_pd_prefill.yaml)
+for an example. A `--kv-cache-memory-bytes` flag on either role sets its
+KV budget explicitly. The prefill's premapped host pool is twice that
+budget, with an 8 GiB minimum. A `TPU_PREMAPPED_BUFFER_SIZE` setting
+overrides it.
 
-### Decode (`megakernel/kimi_k3/{decode,decode_ops,draft}.py`)
+Setting `VLLM_XLA_CACHE_PATH` on both roles keeps the exported kernels
+across restarts, so a warm restart skips most of the startup compilation.
 
-The program runs every decode step: the runner hands it a `StepInput` and
-gets the step's tokens; no input uploads, logits or rejection sampler. The
-decoder reads each rank's latent pages from vLLM's pools in place and
-commits the new ones there; KDA state lives in private slots, imported from
-the pool on a request's first step.
+## Options
 
-Two layers, as on the prefill side:
+| Option | How |
+|---|---|
+| DSpark draft schedule | `num_speculative_tokens_per_batch_size` in the decode's `--speculative-config`: each `[low, high, drafts]` entry sets how many drafts batch sizes `low`..`high` verify. Supported: 3 or 7 drafts at batches 1-8, 3 at batches 9-16, 0 anywhere. The decoder rejects any other schedule at startup. |
+| FP8 KV cache | `--kv-cache-dtype fp8 --block-size 512 --cp-kv-cache-interleave-size 512` on both roles. It changes the arithmetic and may change generated tokens, so evaluate quality before using it by default. |
+| Attention DP2 | `"attention_dp": 2` in the decode's loader config. It runs attention as two 16-rank groups, which allows larger speculative batches (3 drafts up to 32 requests). |
+| BF16 prefill MoE reduction | `TPU_K3_MOE_REDUCE_DTYPE=bfloat16` on the prefill. It halves the MoE ring traffic but rounds at every hop. The default is `float32`. |
+| Synthetic acceptance (benchmarking) | With `"rejection_sample_method": "synthetic"` in `--speculative-config`, add e.g. `"synthetic_acceptance_lengths": {"3": 2.5, "7": 3.5}` to the decode's loader config. This sets a mean acceptance length per draft width. The 7-draft value must match `synthetic_acceptance_length`. |
 
-- **`KimiDecoder`** (`decode.py`) is the decode role's program: it binds
-  vLLM's KV caches, imports a request's KDA state and DSpark ring on its
-  first step, keeps every request's state between steps, and decides what
-  each step runs (below).
-- **`DecodeOps`** (`decode_ops.py`) holds the weights and KDA slots and
-  builds the step ops (plain steps, the single and batched verifies), with
-  the `Control` vector's layout. `kimi_k3.program.build` makes it; the
-  standalone tools share one between several decoders.
+## Limits
 
-- **Control state:** one replicated int32 vector every op reads and
-  returns: per slot the next token, its position and which verify row holds
-  its KDA state, and the host plan (per batch row its slot, a reset with the
-  host token and position, sampling parameters, block table), uploaded only
-  when it changes. Under async scheduling nothing else is uploaded per step.
-- **Plain steps:** one op per compiled batch size (powers of two up to
-  `--max-num-seqs`; a step pads to the next), choosing tokens in the op
-  (greedy, or temperature / top-p / top-k / seed on the sharded logits).
-- **DSpark with seven drafts** (one request decoding): the 8-row verify of the
-  anchor and 7 drafts, then the fused draft op, which accepts in the op
-  (greedy, or exact rejection sampling) and drafts the next 7. The verifier
-  reads the request's persistent KDA state and emits temporary post-states.
-  After acceptance, a separate op copies only the selected post-state into
-  the request's regular slot; control metadata keeps the logical verifier
-  entry for width transitions.
-- **Width-aware DSpark** (a three-draft singleton or several requests,
-  through compiled request buckets 1, 2, 4, 8, 16 up to `--max-num-seqs`):
-  the default schedule uses 8 rows per request through batch four and 4
-  through batch eight (one anchor plus 7 or 3 drafts). The corresponding
-  verifiers are 2×8, 4×8 and 8×4; an explicit schedule can select 8×8 and
-  16×4 too (`[[1, 8, 7], [9, 16, 3]]` with `--max-num-seqs 16`). Live counts
-  between buckets pad with null-slot groups. One fused draft kernel runs for
-  the whole batch: projection weights are read once while each request keeps
-  its own ring, positions, Markov chain and sampling state. Ring slices use
-  two VMEM buffers; the eight-request shape also streams output/down
-  projection columns to stay within the VMEM budget, and batches of eight or
-  more stage one request's auxiliary features at a time. The 16×4 shape
-  computes only four physical rows per request and packs replicated metadata
-  before the custom-op boundary to stay below Torch's 64-argument limit.
-  Batched floating-point reductions can change BF16 rounding and proposals;
-  target verification still decides acceptance. vLLM's per-batch-size
-  schedule (`num_speculative_tokens_per_batch_size`: default 7 through batch
-  four, 3 through batch eight, 0 above) decides how many drafts each step
-  verifies, and the decoder derives which batch sizes speculate from it; a
-  request's drafts are verified only when they were made for its current
-  next token and at least the scheduled verification width (otherwise its
-  rows are placeholders). Changing from three to seven drafts first runs a
-  placeholder step to generate a full proposal. Draft states are packed and
-  split inside the registered JAX operation, so each Torch request state
-  keeps canonical backing dimensions when batch sizes change. States are
-  materialized when made and when a draft op returns them: torch_tpu would
-  otherwise compile their pending work (fills, the outputs' view updates)
-  into the next op that takes them, one variant per mix of new and
-  continuing requests (`check spec`'s churn phase times every step after
-  warmup to catch this).
-- **Streamed KDA state:** above 16 rows with attention DP disabled, the
-  decoder reads each sequence's initial state directly from its slot bank;
-  later verifier rows use the preceding row's recurrence. A separate ordered
-  DMA commit writes the batch results back to the bank. It preserves
-  untouched slots and last-write ordering for duplicate slot indices,
-  including padded null-slot rows.
-- **Under attention DP2** (loader `"attention_dp": 2`, DCP over each 16-rank
-  group) the batched path speculates too. Each group's requests fill half of
-  a compiled request count (2, 4, 8, 16 or 32; a lone request runs with a
-  null partner). The verify op places each group's rows on the batch rows
-  that group attends, so every sequence stays inside its group's attention
-  and KDA, and returns the logits and auxiliary rows in request order; each
-  group's ranks commit their requests' accepted KDA rows. The draft stays
-  TP32 over all 32 ranks, drafting at most 16 requests per fused call (a
-  32-request verify drafts in two). The MLA draft (`Inferact/Kimi-K3-DSpark`)
-  drafts at most eight requests per call, as many of each group's; only its
-  attention follows the groups: each rank attends its group's requests with
-  its two held TP32 shards' heads over the group's pages and commits only
-  their context latents. A step whose fuller group exceeds every compiled
-  verify decodes plainly.
-- **Cold warmup:** `megakernel/compilation.py` submits at most eight large
-  decoder/draft compilations per worker, with larger row counts first. The
-  default maximum of four requests has six plain programs (B1/B2/B4, greedy
-  and sampled), three verifiers (1x8, 2x8 and 4x8), and six acceptance/draft
-  programs (single, 2x8 and 4x8, greedy and sampled). Fresh draft vectors
-  get a small owned copy after their indexed initialization writes, giving
-  them the same `[1, 128]` backing as continuing states, so the large draft
-  and entry programs compile once for every mix of backing shapes.
-  Rank-invariant native/draft builders distribute their exports across the
-  workers and share them through the export cache; other ops export per
-  worker. Each compile-only graph has independent placeholders; it cannot
-  donate live KV/KDA buffers or execute collectives. The complete ordered
-  warmup still runs afterward, including control, imports, sampling, ring
-  entry and producer transitions.
-- **Batch recipes** (`decode_options`): from B8, rows are token-scattered
-  over sequence-parallel owners with the routed reduce-scatter.
-
-### The DSpark draft ring (`megakernel/kimi_k3/draft_ring.py`)
-
-The draft attends a ring of the last 2048 positions' context rows: per draft
-layer, the key and value of the target's residual streams entering layers
-24, 48, 72, 88 and 92, projected. Started empty, it drafts poorly until it
-fills; the prefill computes it from the prompt instead, as vLLM's DSpark
-speculator fills its draft KV during prefill and its KV connector moves it.
-
-- **Prefill:** after a window's regular groups, one op takes the streams
-  (the residual `blocks` slots 2/4/6, the pair-10 middle output, the prefix
-  into the final op), projects every rank's own rows for all 16 KV heads
-  with replicated `fc` / K/V weights (gathered from the draft's kernel
-  shards at load, 0.64 GiB per rank), and an all-to-all hands each rank its
-  head's rows (`kernels.dspark.prefill_ring_update`). The ring is kept per
-  request between steps, like the KDA state, written with it (final and
-  checkpoint blocks) and read back on a prefix hit.
-- **Header:** the ring's length and first held position travel with it
-  (each byte an exact bf16 number); a reader that finds no ring for exactly
-  the tokens it holds starts cold.
-- **Decode:** the import beside the KDA state (`KdaImporter.import_ring`,
-  in `KimiDecoder`'s first step of the request) hands the ring to the
-  request's first speculation.
-
-`check handoff --dspark` checks each imported ring and compares speculation
-from it with speculation from a cold ring.
-
-The decode role rejects sampling parameters the ops do not implement
-(logprobs, penalties, min_p, logit bias, allowed/bad words, min_tokens;
-`platforms/tpu_platform.py`). Structured outputs (the grammar bitmask) the
-plain decoder applies in its step op: a step with a structured request is
-deferred to `sample_tokens` (the engine computes the bitmask from the
-previous step's tokens), which runs the program with the requests' masks
-(`StepInput.mask`) and loses that step's async overlap. With DSpark the
-verify ops do not mask: while a structured request decodes, the whole batch
-steps plain and masked (no drafts), and speculation resumes once no
-structured request is left in the batch.
-
-## Limits and known issues
-
-- TP32, DCP 32 and block size 256 only. Plain decode serves batch sizes up
-  to `--max-num-seqs` (kernel-checked to B64; P/D-validated to 8);
-  speculative verifies up to 64 rows (8 requests with seven drafts, or
-  16 with three). B32 and B64 stream selected weights to fit VMEM.
-- The speculation lengths are the compiled verify shapes: 3 or 7 drafts at
-  batches 1–8, and 3 at batches 9–16 (compiled request buckets 1, 2, 4, 8
-  and 16, up to `--max-num-seqs`), and 0 anywhere; the per-batch-size
-  schedule chooses among them and the decoder rejects any other at startup.
-  Under attention DP2, 3 drafts reach 32 requests (a 128-row verify, 64 per
-  group); 64 requests would need a 256-row verify, which no layout compiles.
-- Besides its pages, each decode request holds one KDA state block per KDA
-  group of the decode KV budget (two while it crosses a page), 7.5 MiB a
-  rank each. Under KV pressure a request can hang: its Stage-3 transfer
-  completes but the completion is dropped as unmapped.
+- TP32, DCP 32 and block size 256 only (512 with the FP8 KV cache).
+- Plain decode goes up to `--max-num-seqs` (kernel-checked to 64).
+  Speculative verifies go up to 64 rows: 8 requests with seven drafts, or 16
+  with three. Under attention DP2, three drafts reach 32 requests.
+- The decode role rejects sampling parameters that the kernels do not
+  implement: logprobs, penalties, `min_p`, logit bias, allowed and bad words,
+  and `min_tokens`.
+- Structured outputs work, but while a structured request is in the batch,
+  the whole batch decodes without speculation.
 
 ## Tools
 
 `python -m tools.megakernel` runs the serving programs without a vLLM
-server. It expects a Slurm allocation of four TPU hosts (2x2x4, 32 chips):
-run from a login node with `--jobid` (default `$JOBID`), it re-launches
-itself with `srun` as 32 processes, 8 per host, in the Python environment
-`--venv` (default `$K3_VENV_DIR`, else the current one). `bench`, `check` and
-`profile` take `--presharded DIR` (the pre-shard below); `check` also takes
-`--model`, the Kimi-K3 checkpoint, and `check spec` `--dspark`, the
-speculator checkpoint.
+server. Run it from a Slurm login node with `--jobid JOB` (default
+`$JOBID`), a four-host (32-chip) allocation. It relaunches itself with
+`srun` as 32 processes, using the Python environment `--venv` (default
+`$K3_VENV_DIR`, else the current one).
 
-- `bench decode --batches 1,8,16 --contexts 1152,32768 [--dspark CHECKPOINT]`:
-  kernel-only timing of the serving decode ops (mixed contexts with
-  `--mix`, sampled ops with `--temperature`);
-- `bench prefill --prompts 8192x1,2048x4,3000x1@32768`: the prefill stack on
-  fresh prompts and on prompts appended to a cached prefix (`@PREFIX`); each
-  line names the compiled windows the step packs into;
-- `check spec`: DSpark against plain greedy, batch transitions, seeded
-  sampling; `check handoff`: prefill -> pools -> decode against a
-  decode-only replay of each prompt;
-- `profile decode ... --llo DIR`: an xprof trace and the compiled LLO
-  (`*-vliw-packed-bundles.txt`) of every op.
-- `preshard k3 --checkpoint CKPT --output DIR` / `preshard dspark --draft
-  CKPT --output DIR`: the checkpoint and the speculator in the kernels'
-  per-rank layout (the directory `--model-loader-extra-config
-  '{"presharded": DIR}'` names); `k3` runs one process per host, no TPU.
-  `preshard verify --against DIR --checkpoint CKPT --draft CKPT` rebuilds a
-  sample of one rank and compares it with an existing pre-shard byte for
-  byte.
-- `preshard prefill --checkpoint CKPT --output DIR`: generate
-  `DIR/prefill-sp-cache` from the same full Kimi-K3 checkpoint. Run this after
-  `preshard k3`, using the same output root. It runs on the allocation's first
-  host without using a TPU and refuses to overwrite an existing cache.
+Every command except `preshard` takes `--presharded DIR`. Every `check`
+also takes `--model`, the Kimi-K3 checkpoint, for the tokenizer and the
+prompts. Other common flags:
 
-`--set FIELD=VALUE` overrides a `KernelConfig` field to compare
-configurations, and `--json FILE` appends a record per result (with the
-config digest and git revision). `--coverage FILE` merges the kernel lines a
-run executes into `FILE` (export cache off, so every op is traced);
-`python -m tools.megakernel.coverage FILE` then lists, per kernel file, the
-functions no run entered and the branches none took.
+- `--kv-cache-dtype fp8`: run with the FP8 KV cache.
+- `--set FIELD=VALUE`: override a kernel setting (`KernelConfig` in
+  `src/vllm_torchtpu/megakernel/kimi_k3/config.py`) to compare
+  configurations. It can be repeated.
+- `--json FILE`: append one record per result, with the config digest and
+  git revision.
 
-## Performance
+### Correctness checks
 
-Kernel-only decode step (`bench decode`, distinct token streams):
+| Command | What it checks |
+|---|---|
+| `check handoff [--dspark CKPT]` | Prefill, then the KV pools, then decode, against a decode-only replay of each prompt. With `--dspark`, it also checks the draft ring that prefill hands over. |
+| `check spec --dspark CKPT` | DSpark against plain greedy decode, batch-size transitions and seeded sampling. Add `--large-batches 16,32` for the larger three-draft batches (32 needs attention DP2). |
+| `check packing` | Prompts packed into one prefill window against each prompt alone. |
+| `check greedy --output FILE` | Real prompts replayed on the decoder, then greedy tokens saved to `FILE`. Compare two configurations' files. |
+| `check masked [--dspark CKPT]` | Grammar-masked (structured output) decode against unmasked decode. |
 
-| context | B8 | B16 | B32 | B64 |
-|---|---|---|---|---|
-| 1152 | 10.0 ms | 15.5 ms | 25.7 ms | |
-| 32768 | 10.6 ms | | 25.6 ms | 44.5 ms |
+For example:
 
-Kernel-only prefill step (`bench prefill`, median of 3):
+```bash
+python -m tools.megakernel --jobid JOB --presharded /path/to/kimi-k3-tp32 \
+    check handoff --model /path/to/Kimi-K3 --dspark /path/to/dspark
+```
 
-| prompts | window | step |
-|---|---|---|
-| 8192x1, fresh | 8192 | 705.6 ms |
-| 2048x4, fresh | 8192 | 696.5 ms |
-| 3000 new tokens on a 32k prefix | 4096 | 447.8 ms |
-| 3000 new tokens on a 131k prefix | 4096 | 542.2 ms |
-| 2048x4 on 8192-token prefixes | 8192 | 797.2 ms |
+To check attention DP2 with the tools, pass `--set attention_dp=2`.
 
-Batched DSpark (`check spec`, each request on its own prompt, at the
-check's greedy acceptance):
+### Benchmarks and profiles
 
-| requests | speculative step | plain step | tokens/ms, spec vs plain |
-|---|---|---|---|
-| 2 (8-row verify) | 11.7 ms | 6.3 ms | 0.47 vs 0.32 |
-| 4 (16 rows) | 18.0 ms | 9.2 ms | 0.62 vs 0.44 |
-| 8 (32 rows) | 28.7 ms | 11.9 ms | 0.75 vs 0.67 |
+```bash
+# Decode step time per batch size and context length
+python -m tools.megakernel --jobid JOB --presharded DIR \
+    bench decode --batches 1,8,16 --contexts 1152,32768
+# Speculative steps at a fixed synthetic acceptance
+python -m tools.megakernel --jobid JOB --presharded DIR \
+    bench decode --batches 1,4 --dspark /path/to/dspark --acceptance 0.9,0.8,0.7,0.6,0.5,0.4,0.3
+# Prefill step time: fresh prompts, and 3000 new tokens on a 32K cached prefix
+python -m tools.megakernel --jobid JOB --presharded DIR \
+    bench prefill --prompts 8192x1,2048x4,3000x1@32768
+```
 
-P/D serving, agentic workload (3000-token turns, 256 output tokens, to 40k
-context), median TPOT with DSpark / without: 2.3 / 4.8 ms at 2
-conversations, 2.4 / 5.8 ms at 8. That filler text accepts many drafts;
-real prose and code gain less.
+- `bench decode` options: `--mix 1152x4,131072x4` adds one batch of mixed
+  context lengths, and `--temperature` times the sampled ops.
+- `bench prefill` option: `--token-file` takes prompts from real text
+  instead of random token ids.
+- `bench ... --trace DIR` saves an xprof trace of each case.
+- `profile decode|prefill` runs the same cases with a trace. With
+  `--llo DIR`, it also dumps the compiled LLO of every op.
 
-Rows with distinct tokens touch more experts than a uniform fixture (one
-prompt for every row), so compare numbers only within one allocation and
-fixture.
+Step times vary between allocations. Compare numbers only within one
+allocation and with the same prompts.
+
+### Coverage
+
+`--coverage FILE` merges the kernel lines that a run executes into `FILE`.
+It turns the export cache off, so every op is traced.
+`python -m tools.megakernel.coverage FILE` then lists, for each kernel
+file, the functions that no run entered and the branches that none took.
+
+## Where the code is
+
+- `src/vllm_torchtpu/megakernel/backend.py`: the `megakernel` load format and
+  its loader keys.
+- `src/vllm_torchtpu/megakernel/runner.py`: the model runner that hands each
+  step to the program.
+- `src/vllm_torchtpu/megakernel/kimi_k3/`: the prefill (`prefill.py`) and
+  decode (`decode.py`, `decode_ops.py`) programs.
+- `src/vllm_torchtpu/megakernel/kimi_k3/kernels/`: the Pallas kernels
+  (`prefill_megakernel.py` and `decode_megakernel.py` are the entry points).
+- `tools/megakernel/`: the tools above.

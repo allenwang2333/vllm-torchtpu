@@ -280,11 +280,15 @@ def _cached_class(cls: type) -> type:
 def hook(export_key: str | None) -> Callable[[Any], None] | None:
     """The ``sharded_jax_op(configure_callable=...)`` hook that puts an op
     with ``export_key`` on the cache, or None when there is no key or no
-    cache path (only an explicitly set VLLM_XLA_CACHE_PATH: its default is a
-    home directory)."""
+    cache path (only an explicitly set, non-empty VLLM_XLA_CACHE_PATH: its
+    default is a home directory; empty turns the cache off)."""
     import vllm.envs as vllm_envs
 
-    if not export_key or not vllm_envs.is_set("VLLM_XLA_CACHE_PATH"):
+    if (
+        not export_key
+        or not vllm_envs.is_set("VLLM_XLA_CACHE_PATH")
+        or not vllm_envs.VLLM_XLA_CACHE_PATH
+    ):
         return None
     root = pathlib.Path(vllm_envs.VLLM_XLA_CACHE_PATH) / "k3_export"
 

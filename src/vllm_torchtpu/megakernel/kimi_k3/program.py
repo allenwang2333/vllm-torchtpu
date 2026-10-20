@@ -18,7 +18,6 @@ from vllm_torchtpu.megakernel.program import Capabilities
 
 TP_SIZE = 32
 DCP_SIZE = 32
-BLOCK_SIZE = 256
 HIDDEN_SIZE = 7168
 VOCAB = 163840  # tokens; vocabulary-sharded 5120 per TP rank
 DRAFT_TOKENS = 7  # DSpark: the verify is the anchor and 7 drafts

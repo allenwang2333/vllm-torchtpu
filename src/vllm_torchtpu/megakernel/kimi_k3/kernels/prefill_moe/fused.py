@@ -27,6 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .. import prefill_megakernel as k
+from .indexed_ragged_gmm import _PackedRows
 
 
 def _sort_route_steps(keys, probabilities, *, size):
@@ -964,15 +965,12 @@ def _routed_experts(
         jax.ShapeDtypeStruct((rows, x.shape[-1]), x.dtype),
         jax.ShapeDtypeStruct(rhs.shape[1:], rhs.dtype),
         jax.ShapeDtypeStruct(scales.shape[1:], scales.dtype),
-        None,
         counts,
         offset,
         tile_info=k.calculate_tiling,
         vmem_limit_bytes=limit,
         out_dtype=None,
         acc_dtype=None,
-        maybe_quantize_lhs=False,
-        zero_initialize=False,
         fuse_act=None,
         rhs_quant_dtype=jnp.float4_e2m1fn,
     )
@@ -988,15 +986,12 @@ def _routed_experts(
         jax.ShapeDtypeStruct((rows, 3584), latent.dtype),
         jax.ShapeDtypeStruct(gu_weights.shape[1:], gu_weights.dtype),
         jax.ShapeDtypeStruct(gu_scales.shape[1:], gu_scales.dtype),
-        None,
         counts,
         offset,
         tile_info=k.calculate_tiling,
         vmem_limit_bytes=limit,
         out_dtype=None,
         acc_dtype=None,
-        maybe_quantize_lhs=False,
-        zero_initialize=False,
         fuse_act="situ:4:25",
         rhs_quant_dtype=jnp.float4_e2m1fn,
     )
@@ -1006,7 +1001,6 @@ def _routed_experts(
     )
     assert gu_cfg.dims.size_lhs_sublane == sub
     for config in (cfg, gu_cfg):
-        assert not config.lhs_cfgs.should_quantize
         assert config.rhs_cfgs.should_dequantize_before_matmul
         assert not config.rhs_cfgs.should_dequantize_after_matmul
 
@@ -1378,8 +1372,8 @@ def _routed_experts(
             destinations,
             probabilities,
             latent,
-            k.WeightsRef(weight=gu_weights, scale=gu_scales, bias=None),
-            k.WeightsRef(weight=rhs, scale=scales, bias=None),
+            k.WeightsRef(weight=gu_weights, scale=gu_scales),
+            k.WeightsRef(weight=rhs, scale=scales),
             middle,
             out,
             **scratch,
@@ -1403,20 +1397,6 @@ def _routed_experts(
         state=pltpu.SMEM((1 + 2 * streams,), jnp.int32),
         ring_meta=pltpu.SMEM((6 * 34,), jnp.int32),
     )
-
-
-class _PackedRows:
-    """Load only the static row bucket selected by the production GMM."""
-
-    def __init__(self, ref):
-        self.ref = ref
-
-    def reshape(self, rows, width):
-        assert rows == -1 and width == 2 * self.ref.shape[-1]
-        return self
-
-    def __getitem__(self, rows):
-        return self.ref[rows].reshape(-1, 2 * self.ref.shape[-1])
 
 
 def _column_rhs(rhs, first, size):
@@ -1450,7 +1430,6 @@ def _expert_product(lhs, rhs, *, cfgs, bucket_rows, overlap_work):
     panels; it must not read this product's result.
     """
     assert cfgs.dims.size_k == cfgs.tiles.tile_k
-    assert not cfgs.rhs_cfgs.has_bias
     columns = pltpu.get_tpu_info().mxu_column_size
     activations = lhs.reshape(-1, cfgs.tiles.tile_k)[:bucket_rows]
     width = (
@@ -1572,127 +1551,6 @@ def _down_inner(lhs, rhs, output, metadata, *, cfgs, overlap_work):
         for i in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base)
     ]
     lax.switch(last // cfgs.tiles.bucket_base, branches)
-
-
-def _reduce_step(
-    tables_ref,
-    x_ref,
-    o_ref,
-    send_sems,
-    recv_sems,
-    credits,
-    store_sem,
-    payload,
-    received,
-    *,
-    streams,
-    buffers,
-    step,
-):
-    rank = lax.axis_index("k3_sp")
-    descriptors = []
-    positions = [tables_ref[f, 0, rank] for f in range(3)]
-
-    def ring_coords(pos, family):
-        peer = tables_ref[family, 1, pos]
-        return (peer,)
-
-    @pl.when(step == 0)
-    def enter():
-        peers = [
-            ring_coords((positions[f] + direction) % 32, jnp.int32(f))
-            for f in range(3)
-            for direction in (-1, 1)
-        ]
-        sem = pltpu.get_barrier_semaphore()
-        for peer in peers:
-            pl.semaphore_signal(
-                sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
-            )
-        pl.semaphore_wait(sem, len(peers))
-
-        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
-        def initialized(ready):
-            for peer in peers:
-                pl.semaphore_signal(
-                    ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
-                )
-            pl.semaphore_wait(ready, len(peers))
-
-    for stream, region in enumerate(streams):
-        begin, size = region[:2]
-        col_begin, width = region[2:] if len(region) == 4 else (0, o_ref.shape[1])
-        cols = pl.ds(col_begin, width)
-        family = stream // 2 % 3
-        direction = -1 if stream % 2 == 0 else 1
-        position = positions[family]
-        target = ring_coords((position + direction) % 32, jnp.int32(family))
-        source = ring_coords((position - direction) % 32, jnp.int32(family))
-        owner_mesh = ring_coords(
-            (position - direction * (step + 1)) % 32, jnp.int32(family)
-        )[0]
-        owner = tables_ref[family, 2, owner_mesh]
-        rows = pl.ds(begin, size)
-        source_rows = pl.ds(owner * o_ref.shape[0] + begin, size)
-        descriptors.append((target, source, rows, cols, source_rows))
-    for stream, (target, source, rows, cols, source_rows) in enumerate(descriptors):
-
-        def local_value(rows=rows, cols=cols, source_rows=source_rows):
-            return (
-                x_ref.reshape(x_ref.shape[0], o_ref.shape[1])
-                .at[source_rows, cols][...]
-                .astype(payload.dtype)
-            )
-
-        def remote(index, rows=rows, cols=cols, stream=stream, target=target):
-            return pltpu.make_async_remote_copy(
-                payload.at[rows, cols],
-                received.at[index % buffers, rows, cols],
-                send_sems.at[stream],
-                recv_sems.at[index % buffers, stream],
-                device_id=target,
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-
-        @pl.when(step > 0)
-        def wait(remote=remote):
-            remote(step - 1).wait()
-
-        @pl.when(step == 0)
-        def seed(rows=rows, cols=cols, local_value=local_value):
-            payload.at[rows, cols][...] = local_value()
-
-        @pl.when(step > 0)
-        def add(
-            rows=rows, cols=cols, stream=stream, source=source, local_value=local_value
-        ):
-            payload.at[rows, cols][...] = (
-                local_value() + received.at[(step - 1) % buffers, rows, cols][...]
-            )
-            pl.semaphore_signal(
-                credits.at[stream],
-                1,
-                device_id=source,
-                device_id_type=pl.DeviceIdType.MESH,
-            )
-
-        @pl.when(step < 31)
-        def forward(remote=remote, stream=stream):
-            @pl.when(step >= buffers)
-            def acquire():
-                pl.semaphore_wait(credits.at[stream], 1)
-
-            remote(step).start()
-
-        @pl.when(step == 31)
-        def finish(rows=rows, cols=cols, stream=stream):
-            pl.semaphore_wait(credits.at[stream], buffers)
-
-    @pl.when(step == 31)
-    def store_complete_shard():
-        output = pltpu.make_async_copy(payload, o_ref, store_sem)
-        output.start()
-        output.wait()
 
 
 def _ready_reduce(

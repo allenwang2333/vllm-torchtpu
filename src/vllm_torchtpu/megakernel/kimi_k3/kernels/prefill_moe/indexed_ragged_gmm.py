@@ -41,15 +41,12 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         jax.ShapeDtypeStruct((rows, width), latent.dtype),
         jax.ShapeDtypeStruct(rhs.shape[1:], rhs.dtype),
         jax.ShapeDtypeStruct(scales.shape[1:], scales.dtype),
-        None,
         sizes,
         offset,
         tile_info=k.calculate_tiling,
         vmem_limit_bytes=limit,
         out_dtype=None,
         acc_dtype=None,
-        maybe_quantize_lhs=False,
-        zero_initialize=False,
         fuse_act="situ:4:25",
         rhs_quant_dtype=jnp.float4_e2m1fn,
     )
@@ -132,7 +129,7 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         out_shape=jax.ShapeDtypeStruct((rows, cfg.out_size_n), cfg.out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4,
-            in_specs=(hbm, k.WeightsRef(weight=hbm, scale=hbm, bias=None)),
+            in_specs=(hbm, k.WeightsRef(weight=hbm, scale=hbm)),
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM((sub, tn), cfg.out_dtype),
@@ -156,5 +153,5 @@ def indexed_gate_up(latent, indices, rhs, sizes, scales, layer):
         layer,
         indices,
         latent,
-        k.WeightsRef(weight=rhs, scale=scales, bias=None),
+        k.WeightsRef(weight=rhs, scale=scales),
     )

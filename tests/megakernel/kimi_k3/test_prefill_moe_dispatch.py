@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Production dispatch and rank-uniform metadata capacity regression checks."""
+"""Prefill MoE dispatch and rank-uniform metadata capacity regression checks."""
 
 import jax.numpy as jnp
 import numpy as np
@@ -15,18 +15,10 @@ from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_moe.moe_down_valu import (
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 6144, 8192])
-@pytest.mark.parametrize("ep", [8, 16, 32])
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("window", [512, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("reduce_dtype", ["float32", "bfloat16"])
-def test_factory_preserves_unsupported_shapes(
-    monkeypatch, window, ep, enabled, reduce_dtype
-):
-    cfg = config.KernelConfig(
-        prefill_expert_parallel=ep,
-        prefill_fused_moe=enabled,
-        moe_reduce_dtype=reduce_dtype,
-    )
+def test_dispatch_by_window_and_reduce_dtype(monkeypatch, window, reduce_dtype):
+    cfg = config.KernelConfig(moe_reduce_dtype=reduce_dtype)
     monkeypatch.setattr(config, "active", lambda: cfg)
     monkeypatch.setattr(
         kernels,
@@ -44,19 +36,11 @@ def test_factory_preserves_unsupported_shapes(
         lambda mesh, *, seq_len: ("bf16", seq_len),
     )
     result = kernels.make_indexed_moe_sp_ring(None, seq_len=window)
-    expected = "reference"
-    if enabled and ep == 16:
-        if reduce_dtype == "float32" and window in (512, 1024, 2048, 4096, 8192):
-            expected = "fused"
-        elif reduce_dtype == "bfloat16" and window in (4096, 8192):
-            expected = "bf16"
+    if reduce_dtype == "float32":
+        expected = "fused"
+    else:
+        expected = "bf16" if window in (4096, 8192) else "reference"
     assert result == (expected, window)
-
-
-def test_rollback_has_distinct_compile_cache_key():
-    cfg = config.KernelConfig()
-    assert cfg.prefill_fused_moe
-    assert cfg.key() != cfg.replace(prefill_fused_moe=False).key()
 
 
 @pytest.mark.parametrize("peak", [0, 32768, 32769, 131072])

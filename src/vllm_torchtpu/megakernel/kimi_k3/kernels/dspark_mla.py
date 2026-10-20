@@ -22,8 +22,6 @@ the positions after it; every block row attends every context token before
 the anchor and every block row (non-causal), and predicts the token one
 position after itself. Drafts are sampled left to right with the Markov bias
 ``markov_w2 @ markov_w1[previous token]``.
-
-``reference_*`` are unsharded JAX references on checkpoint-named arrays.
 """
 
 from __future__ import annotations
@@ -210,13 +208,6 @@ def rope_mscale(c: MlaDraftConfig) -> float:
     return float(get(c.rope_factor, c.rope_mscale) / get(c.rope_factor, c.rope_mscale_all_dim))
 
 
-def rope_cos_sin(c: MlaDraftConfig, positions) -> tuple[Any, Any]:
-    """``[tokens, rope / 2]`` FP32 cos and sin (vLLM's cos_sin_cache rows)."""
-    freqs = jnp.asarray(positions).astype(jnp.float32)[:, None] * jnp.asarray(rope_inv_freq(c))[None, :]
-    scale = rope_mscale(c)
-    return jnp.cos(freqs) * scale, jnp.sin(freqs) * scale
-
-
 def apply_rope(x, cos, sin):
     """Interleaved-pair RoPE in FP32: ``x`` ``[tokens, ..., rope]``, cos/sin
     ``[tokens, rope / 2]``; returns ``x``'s dtype."""
@@ -228,106 +219,11 @@ def apply_rope(x, cos, sin):
     return rotated.reshape(x.shape).astype(x.dtype)
 
 
-# --------------------------------------------------------------------------
-# Unsharded reference (bf16 activations, FP32 accumulation, like vLLM)
-
-
 def rms_norm(x, weight, eps):
     """vLLM RMSNorm: FP32 statistics, cast back, then scale by the weight."""
     x32 = x.astype(jnp.float32)
     normed = x32 * jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + eps)
     return normed.astype(x.dtype) * weight.astype(x.dtype)
-
-
-def _f32(x):
-    """FP32 operands (BF16 products are exact in FP32; the XLA CPU backend
-    has no BF16 x BF16 = FP32 dot)."""
-    return x.astype(jnp.float32)
-
-
-def linear(x, weight_out_in):
-    return jnp.einsum("...i,oi->...o", _f32(x), _f32(weight_out_in)).astype(x.dtype)
-
-
-def silu_mul(gate, up):
-    g = gate.astype(jnp.float32)
-    return (g * jax.nn.sigmoid(g) * up.astype(jnp.float32)).astype(gate.dtype)
-
-
-def reference_context(w, c: MlaDraftConfig, aux):
-    """``aux`` ``[tokens, context_width]`` (aux layers concatenated in
-    order) -> the combined context ``[tokens, hidden]``."""
-    return rms_norm(linear(aux, w["context_proj.weight"]), w["context_norm.weight"], c.eps)
-
-
-def reference_latents(w, c: MlaDraftConfig, layer, states, positions):
-    """``[tokens, latent]`` cache rows of ``states`` (the context, or a
-    block's normed hidden rows) for draft layer ``layer``."""
-    kv = linear(states, w[f"layers.{layer}.self_attn.kv_a_proj_with_mqa.weight"])
-    c_kv = rms_norm(kv[:, : c.kv_lora], w[f"layers.{layer}.self_attn.kv_a_layernorm.weight"], c.eps)
-    cos, sin = rope_cos_sin(c, positions)
-    k_pe = apply_rope(kv[:, c.kv_lora:], cos, sin)
-    return jnp.concatenate((c_kv, k_pe), axis=-1)
-
-
-def reference_attention(w, c: MlaDraftConfig, layer, h, positions, context_latents, context_valid):
-    """MLA over context latents (``[tokens, latent]``, ``context_valid``
-    ``[tokens]`` bool) and the block's own rows (non-causal) for block rows
-    ``h`` ``[rows, hidden]`` at ``positions``. Returns ``[rows, hidden]``
-    (o_proj applied). Absorbed form, as the kernels compute it."""
-    p = f"layers.{layer}.self_attn."
-    rows = h.shape[0]
-    q_c = rms_norm(linear(h, w[p + "q_a_proj.weight"]), w[p + "q_a_layernorm.weight"], c.eps)
-    q = linear(q_c, w[p + "q_b_proj.weight"]).reshape(rows, c.heads, c.qk_head)
-    cos, sin = rope_cos_sin(c, positions)
-    q_nope, q_pe = q[..., : c.nope], apply_rope(q[..., c.nope:], cos, sin)
-    kv_b = w[p + "kv_b_proj.weight"].reshape(c.heads, c.nope + c.v_head, c.kv_lora)
-    w_uk, w_uv = kv_b[:, : c.nope], kv_b[:, c.nope:]  # [H, nope, 512], [H, v, 512]
-    q_abs = jnp.einsum("rhn,hnl->rhl", _f32(q_nope), _f32(w_uk))
-    block_latents = reference_latents(w, c, layer, h, positions)
-    keys = jnp.concatenate((context_latents, block_latents), axis=0)  # [K, latent]
-    valid = jnp.concatenate((context_valid, jnp.ones((rows,), bool)))
-    scores = (jnp.einsum("rhl,kl->rhk", q_abs, keys[:, : c.kv_lora].astype(jnp.float32))
-              + jnp.einsum("rhd,kd->rhk", q_pe.astype(jnp.float32), keys[:, c.kv_lora:].astype(jnp.float32)))
-    scores = jnp.where(valid[None, None, :], scores * c.softmax_scale, -jnp.inf)
-    probabilities = jax.nn.softmax(scores, axis=-1)
-    out_latent = jnp.einsum("rhk,kl->rhl", probabilities, keys[:, : c.kv_lora].astype(jnp.float32))
-    out = jnp.einsum("rhl,hvl->rhv", out_latent, _f32(w_uv)).astype(h.dtype)
-    return linear(out.reshape(rows, c.heads * c.v_head), w[p + "o_proj.weight"])
-
-
-def reference_block_hidden(w, c: MlaDraftConfig, anchor_embedding, mask_embedding, context_latents,
-                           context_valid, anchor_position, block=None):
-    """The block of the anchor and ``block - 1`` mask tokens at positions
-    ``anchor_position ..``: final-normed hidden rows ``[block, hidden]``.
-    ``*_embedding`` are the target's ``[hidden]`` rows of the anchor and the
-    mask token; ``context_latents[layer]`` ``[tokens, latent]``."""
-    block = block or c.block
-    x = jnp.concatenate((jnp.asarray(anchor_embedding)[None],
-                         jnp.broadcast_to(jnp.asarray(mask_embedding)[None], (block - 1, c.hidden))))
-    positions = anchor_position + jnp.arange(block, dtype=jnp.int32)
-    for layer in range(c.layers):
-        p = f"layers.{layer}."
-        h = rms_norm(x, w[p + "input_layernorm.weight"], c.eps)
-        x = x + reference_attention(w, c, layer, h, positions, context_latents[layer], context_valid)
-        h = rms_norm(x, w[p + "post_attention_layernorm.weight"], c.eps)
-        x = x + linear(silu_mul(linear(h, w[p + "mlp.gate_proj.weight"]), linear(h, w[p + "mlp.up_proj.weight"])),
-                       w[p + "mlp.down_proj.weight"])
-    return rms_norm(x, w["final_norm.weight"], c.eps)
-
-
-def reference_markov_greedy(w, c: MlaDraftConfig, lm_head, hidden, anchor_token):
-    """Greedy left-to-right Markov sampling: ``lm_head`` the target's
-    ``[vocab, hidden]``; slot ``k`` predicts position ``anchor + k + 1``."""
-    base = jnp.einsum("rh,vh->rv", _f32(hidden), _f32(lm_head))
-    base = base.astype(jnp.bfloat16).astype(jnp.float32)
-    drafts, previous = [], anchor_token
-    for slot in range(hidden.shape[0]):
-        bias = jnp.einsum("r,vr->v", w["markov_head.markov_w1.weight"][previous].astype(jnp.float32),
-                          w["markov_head.markov_w2.weight"].astype(jnp.float32))
-        previous = jnp.argmax(base[slot] + bias).astype(jnp.int32)
-        drafts.append(previous)
-    return jnp.stack(drafts)
 
 
 # --------------------------------------------------------------------------
@@ -523,7 +419,7 @@ HELD_AXES = {"q_b": 2, "w_uk": 1, "w_uv": 1, "o": 1}
 def held_shards(directory, rank: int, dp: int, own: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Attention DP: ``rank``'s head-sharded arrays (``HELD_AXES``) holding
     its TP32 shards ``rank % (32 / dp) + k (32 / dp)`` in order ``k``, as the
-    decoder's attention holds them (``decode_megakernel.to_attention_dp``);
+    decoder's attention holds them (``rank_loader.attention_dp_families``);
     ``own`` is ``rank``'s shard. The shards share the rank's host lane, so
     their ``o`` chunk permutations agree."""
     group = RANKS // dp

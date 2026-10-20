@@ -23,8 +23,6 @@ from vllm_torchtpu.megakernel.kimi_k3.config import active as _config
 from vllm_torchtpu.megakernel.kimi_k3.kernels import mla_dcp
 from vllm_torchtpu.megakernel.kimi_k3.layout import CONV_HEAD_ROWS
 
-_COMMUNICATION_SCRATCH_SPEC_COUNT = 10
-
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -453,48 +451,12 @@ def _quantized_expert_dot(
     block_major=False,
     dot_tile=None,
 ):
-    """Multiply by one resident MXFP4 matrix or reblocked FP8 matrix.
-
-    Reblocked FP8 stores one BF16 power-of-two scale for each contiguous
-    contraction block. The scale-row count determines the static block width.
-    This trades a larger HBM representation for removing MXFP4 unpack and its
-    per-32-element scaled partial reduction.
-    """
+    """Multiply by one resident packed MXFP4 matrix."""
     dot_tile = (MXFP4_DOT_TILE or 0) if dot_tile is None else dot_tile
     accumulator[...] = jnp.zeros(accumulator.shape, jnp.float32)
 
-    if packed.dtype == jnp.float8_e4m3fn:
-        scale_block_count = scales.shape[0]
-        if contraction_size % scale_block_count:
-            raise ValueError("FP8 scale blocks must divide the contraction")
-        scale_block_size = contraction_size // scale_block_count
-        if scale_block_size % 128:
-            raise ValueError("FP8 scale blocks must be MXU aligned")
-
-        # Pallas traces and unrolls this fixed-size loop. Each FP8 tile is
-        # consumed directly by MXU and scaled only after the dot product.
-        for scale_block in range(scale_block_count):
-            start = scale_block * scale_block_size
-            activation = source[
-                :, pl.ds(pl.multiple_of(start, 128), scale_block_size)
-            ].astype(jnp.bfloat16)
-            values = packed[start : start + scale_block_size, :]
-            partial = jax.lax.dot_general(
-                jnp.pad(
-                    activation,
-                    ((0, -activation.shape[0] % 16), (0, 0)),
-                ),
-                values,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )[: activation.shape[0]]
-            accumulator[...] += (
-                partial * scales[scale_block : scale_block + 1].astype(jnp.float32)
-            )
-        return
-
     if packed.dtype != jnp.uint32:
-        raise ValueError("Expert weights must use packed MXFP4 or reblocked FP8")
+        raise ValueError("Expert weights must use packed MXFP4")
 
     split_small_contraction = contraction_size == 768 and block_major
     block_size = 256 if split_small_contraction else min(MXFP4_BLOCK, contraction_size)
@@ -647,69 +609,6 @@ def _paired_expert_gate_up(
     """
     accumulator[...] = jnp.zeros(accumulator.shape, jnp.float32)
 
-    if gate_up_vmem.dtype == jnp.float8_e4m3fn:
-        scale_block_count = gate_up_scale_vmem.shape[1]
-        if contraction_size % scale_block_count:
-            raise ValueError("FP8 gate/up scales must divide the contraction")
-        scale_block_size = contraction_size // scale_block_count
-        if scale_block_size % 128:
-            raise ValueError("FP8 gate/up scale blocks must be MXU aligned")
-        for scale_block in range(scale_block_count):
-            start = scale_block * scale_block_size
-            values = jnp.concatenate(
-                (
-                    gate_up_vmem[
-                        first_slot,
-                        pl.ds(pl.multiple_of(start, 128), scale_block_size),
-                        :,
-                    ],
-                    gate_up_vmem[
-                        second_slot,
-                        pl.ds(pl.multiple_of(start, 128), scale_block_size),
-                        :,
-                    ],
-                ),
-                axis=1,
-            )
-            scales = jnp.concatenate(
-                (
-                    gate_up_scale_vmem[
-                        first_slot, scale_block : scale_block + 1, :
-                    ],
-                    gate_up_scale_vmem[
-                        second_slot, scale_block : scale_block + 1, :
-                    ],
-                ),
-                axis=1,
-            ).astype(jnp.float32)
-            activation = source[
-                :, pl.ds(pl.multiple_of(start, 128), scale_block_size)
-            ].astype(jnp.bfloat16)
-            if second_source is not None:
-                activation = jnp.concatenate(
-                    (
-                        activation,
-                        second_source[
-                            :,
-                            pl.ds(
-                                pl.multiple_of(start, 128), scale_block_size
-                            ),
-                        ].astype(jnp.bfloat16),
-                    ),
-                    axis=0,
-                )
-            partial = jax.lax.dot_general(
-                jnp.pad(
-                    activation,
-                    ((0, -activation.shape[0] % 16), (0, 0)),
-                ),
-                values,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )[: activation.shape[0]]
-            accumulator[...] += partial * scales
-        return
-
     def tile(start, size):
         packed = jnp.concatenate(
             (
@@ -820,10 +719,7 @@ def _dot_scoped(function, name_of):
 
 if PHASE_SCOPES:
     _quantized_expert_dot = _dot_scoped(
-        _quantized_expert_dot,
-        lambda source, packed, *args, **kwargs: (
-            "e_dot_fp8" if packed.dtype == jnp.float8_e4m3fn else "e_dot_mxfp4"
-        ),
+        _quantized_expert_dot, lambda *args, **kwargs: "e_dot_mxfp4"
     )
     _paired_expert_gate_up = _dot_scoped(_paired_expert_gate_up, lambda *args, **kwargs: "e_dot_pair")
 
@@ -880,8 +776,7 @@ def _run_routed_expert_stream(
         else batch_size in (16, 32, 64, 96, 128)
     )
     def expert_dot(source, packed, scales, accumulator, contraction_size, output_size, **options):
-        if (batch_size > 1 and contraction_size == expert_input_size
-                and packed.dtype == jnp.uint32):
+        if batch_size > 1 and contraction_size == expert_input_size:
             # A live expert may switch between a pair and the unpaired tail
             # as other rows enter or leave. Match the paired gate's scale
             # reduction tree, including its final partial tile.
@@ -1291,7 +1186,7 @@ def _run_routed_expert_stream(
 
 
     compact_overflow = _use_compact_overflow(
-        batch_size, expert_gate_up_vmem.dtype, group_pending_routes=group_pending_routes
+        batch_size, group_pending_routes=group_pending_routes
     )
     # At B16, two compact gate tiles fill 16 rows but the down tile has 8.
     # Only compact overflow tests the down tile (not KernelConfig.compact_only
@@ -1302,7 +1197,6 @@ def _run_routed_expert_stream(
     share_compact_finish = (
         SHARED_EXPERT_FINISHERS and batch_size in (16, 32, 64, 96, 128) and compact_capacity == 8
         and (not compact_only or compact_overflow)
-        and expert_gate_up_vmem.dtype == jnp.uint32
     )
     share_full_finish = share_compact_finish and not compact_only
 
@@ -2031,13 +1925,11 @@ class MixtureOfExpertsWeights:
     shared_gate_up_projection: TensorLike  # [hidden_size, 2 * shared_width]
     shared_down_projection: TensorLike  # [shared_width, hidden_size]
     # Packed MXFP4: [local_experts, expert_input_size / 8, 2 * expert_width].
-    # Reblocked FP8: [local_experts, expert_input_size, 2 * expert_width].
     expert_gate_up_projection: TensorLike
     expert_gate_up_projection_vmem: Any  # [4, ...]
     expert_gate_up_scales: TensorLike
     expert_gate_up_scales_vmem: Any  # [4, ...]
     # Packed MXFP4: [local_experts, expert_width / 8, expert_output_size].
-    # Reblocked FP8: [local_experts, expert_width, expert_output_size].
     expert_down_projection: TensorLike
     expert_down_projection_vmem: Any  # [4, ...]
     expert_down_scales: TensorLike
@@ -2170,29 +2062,6 @@ class MixtureOfExpertsWorkspace:
     selections_vmem: Any = None  # [batch_size, 128] FP32
 
 
-def _consume_completed_routed_chunks(
-    *, batch_size, tokens_per_lane, lane, wait_for_peer, consume
-):
-    """Consume native 16-row tiles after all of their source lanes arrive.
-
-    All seven peer copies must already be in flight. Each wait drains both
-    the send to and receive from that peer. No transport source is changed
-    until every chunk has been consumed, so later chunks can remain in flight
-    while the caller computes on an earlier tile's complete latent vectors.
-    """
-    if batch_size not in (32, 64) or tokens_per_lane != batch_size // 8:
-        raise ValueError("Routed token pipeline needs B32/B64 over eight lanes")
-    chunk_rows = 16
-    lanes_per_chunk = chunk_rows // tokens_per_lane
-    for first in range(0, batch_size, chunk_rows):
-        first_lane = first // tokens_per_lane
-        for source_lane in range(first_lane, first_lane + lanes_per_chunk):
-            @pl.when(lane != source_lane)
-            def wait(source_lane=source_lane):
-                wait_for_peer(lane ^ source_lane)
-        consume(first, chunk_rows, first_lane, lanes_per_chunk)
-
-
 def moe(
     hidden_ref: TensorLike,  # [batch_size, hidden_size]
     output_ref: TensorLike,  # [batch_size, hidden_size] or owned token rows
@@ -2208,7 +2077,6 @@ def moe(
     group_pending_expert_routes: bool = False,
     token_scatter_output: bool = False,
     routed_reduce_scatter: bool = False,
-    token_pipeline: bool = False,
     after_experts=None,
     after_routing_scores=None,
     overlap_router_latent: bool = False,
@@ -2239,19 +2107,8 @@ def moe(
     expert_output_size = weights.expert_down_projection.shape[-1]
     local_expert_count = weights.expert_gate_up_projection.shape[0]
     expert_tensor_parallel = 32 * local_expert_count // expert_count
-    down_is_reblocked_fp8 = (
-        weights.expert_down_projection.dtype == jnp.float8_e4m3fn
-    )
-    expert_width = (
-        weights.expert_down_projection.shape[1]
-        if down_is_reblocked_fp8
-        else weights.expert_down_projection.shape[1] * 8
-    )
-    expert_input_size = (
-        weights.expert_gate_up_projection.shape[1] * 8
-        if weights.expert_gate_up_projection.dtype == jnp.uint32
-        else weights.expert_gate_up_projection.shape[1]
-    )
+    expert_width = weights.expert_down_projection.shape[1] * 8
+    expert_input_size = weights.expert_gate_up_projection.shape[1] * 8
     shared_width = weights.shared_down_projection.shape[0]
     expert_prefetch_slot_count = 4
 
@@ -2263,22 +2120,11 @@ def moe(
         raise ValueError("MoE token-scattered output requires batch size 8 or 16, or B2/B4 to one owner")
     if routed_reduce_scatter and batch_size not in (6, *SCATTER_BATCHES):
         raise ValueError("MoE routed reduce-scatter requires batch size 6, 8 or 16")
-    if token_pipeline and (
-        batch_size not in (32, 64)
-        or not routed_reduce_scatter
-        or not token_scatter_output
-        or token_scatter_owners != 4
-        or expert_tensor_parallel != 4
+    if (
+        weights.expert_gate_up_projection.dtype != jnp.uint32
+        or weights.expert_down_projection.dtype != jnp.uint32
     ):
-        raise ValueError("MoE token pipeline needs B32/B64, EP8/TP4 and pair-owned routed reduce-scatter")
-    if weights.expert_gate_up_projection.dtype not in (
-        jnp.uint32,
-        jnp.float8_e4m3fn,
-    ) or weights.expert_down_projection.dtype not in (
-        jnp.uint32,
-        jnp.float8_e4m3fn,
-    ):
-        raise ValueError("Unsupported routed-expert weight storage")
+        raise ValueError("Routed-expert weights must be packed MXFP4")
     if expert_tensor_parallel not in (1, 2, 4):
         raise ValueError("Expert tensor parallelism must be 1, 2, or 4")
     if (
@@ -2305,35 +2151,15 @@ def moe(
     if expert_input_size % 512 or expert_output_size % 128:
         raise ValueError("Expert dimensions must satisfy MXFP4 alignment")
 
-    if weights.expert_gate_up_projection.dtype == jnp.uint32:
-        if (
-            weights.expert_gate_up_projection.shape[1:]
-            != (expert_input_size // 8, 2 * expert_width)
-            or weights.expert_gate_up_scales.shape[1:]
-            != (expert_input_size // 32, 2 * expert_width)
-            or weights.expert_gate_up_scales.dtype != jnp.uint8
-        ):
-            raise ValueError("MXFP4 gate/up weights have inconsistent shapes")
-    elif (
+    if (
         weights.expert_gate_up_projection.shape[1:]
-        != (expert_input_size, 2 * expert_width)
-        or weights.expert_gate_up_scales.dtype != jnp.bfloat16
-        or not weights.expert_gate_up_scales.shape[1]
-        or expert_input_size % weights.expert_gate_up_scales.shape[1]
+        != (expert_input_size // 8, 2 * expert_width)
+        or weights.expert_gate_up_scales.shape[1:]
+        != (expert_input_size // 32, 2 * expert_width)
+        or weights.expert_gate_up_scales.dtype != jnp.uint8
     ):
-        raise ValueError("FP8 gate/up weights have inconsistent shapes")
-
-    if down_is_reblocked_fp8:
-        if weights.expert_down_projection.shape[1] != expert_width:
-            raise ValueError("Reblocked FP8 down weights have the wrong width")
-        if weights.expert_down_scales.dtype != jnp.bfloat16:
-            raise ValueError("Reblocked FP8 down scales must be BF16")
-        if (
-            not weights.expert_down_scales.shape[1]
-            or expert_width % weights.expert_down_scales.shape[1]
-        ):
-            raise ValueError("FP8 down scales must partition the contraction")
-    elif (
+        raise ValueError("MXFP4 gate/up weights have inconsistent shapes")
+    if (
         weights.expert_down_projection.shape[1] * 8 != expert_width
         or weights.expert_down_scales.dtype != jnp.uint8
     ):
@@ -2348,8 +2174,7 @@ def moe(
         raise ValueError("MoE output has the wrong shape for its communication mode")
 
     accumulator_rows = _expert_accumulator_rows(
-        batch_size, weights.expert_gate_up_projection.dtype,
-        group_pending_routes=group_pending_expert_routes,
+        batch_size, group_pending_routes=group_pending_expert_routes,
     )
     expected_workspace_shapes = (
         (workspace.selected_experts_vmem.shape, (batch_size, 128)),
@@ -3083,64 +2908,27 @@ def moe(
             pl.semaphore_wait(routed_consumed, 7)
             for offset in range(7, 0, -1):
                 expert_copy(lane_payload, offset).start()
-            if overlap_shared_reduction and not token_pipeline:
+            if overlap_shared_reduction:
                 # Shared-output conversion/reduction is independent of the
                 # routed gather and uses a separate transport buffer.
                 with _phase("t6_shared_during_routed_gather"):
                     finish_shared_host_reduction(
                         shared_transport_payload, reduced_shared_outputs
                     )
-            if token_pipeline:
-                # The shared contribution must be ready before a completed
-                # routed tile can finish its latent-up/add. Its local sends
-                # were drained above, before expert_host_reduction_vmem was
-                # reused for the routed host reduction.
+            for offset in range(7, 0, -1):
+                expert_copy(lane_payload, offset).wait()
+            reduced_expert_outputs[:, :expert_output_size] = (
+                decode_gathered_experts(
+                    expert_local_reduction_vmem[:, :lane_payload, :]
+                )
+            )
+            _phase_end(t5)
+            if not overlap_shared_reduction:
                 t6 = _phase_start("t6_shared_host")
                 finish_shared_host_reduction(
                     shared_transport_payload, reduced_shared_outputs
                 )
                 _phase_end(t6)
-                latent_output_copy.wait()
-
-                def consume(first, rows, first_lane, lane_count):
-                    # Each gathered lane contains fully reduced latent
-                    # vectors, not feature fragments. Same BF16 rounding point
-                    # and token order as the unpipelined gather.
-                    packed = expert_local_reduction_vmem[
-                        first_lane:first_lane + lane_count, :lane_payload, :
-                    ]
-                    values = tpu.bitcast(
-                        jax.lax.bitcast_convert_type(packed, jnp.uint32),
-                        jnp.bfloat16,
-                    ).astype(jnp.float32).reshape(rows, expert_output_size)
-                    reduced_expert_outputs[
-                        pl.ds(first, rows), :expert_output_size
-                    ] = values
-                    consume_routed_chunk(first, rows)
-
-                _consume_completed_routed_chunks(
-                    batch_size=batch_size,
-                    tokens_per_lane=tokens_per_lane,
-                    lane=lane,
-                    wait_for_peer=lambda offset: expert_copy(lane_payload, offset).wait(),
-                    consume=consume,
-                )
-                _phase_end(t5)
-            else:
-                for offset in range(7, 0, -1):
-                    expert_copy(lane_payload, offset).wait()
-                reduced_expert_outputs[:, :expert_output_size] = (
-                    decode_gathered_experts(
-                        expert_local_reduction_vmem[:, :lane_payload, :]
-                    )
-                )
-                _phase_end(t5)
-                if not overlap_shared_reduction:
-                    t6 = _phase_start("t6_shared_host")
-                    finish_shared_host_reduction(
-                        shared_transport_payload, reduced_shared_outputs
-                    )
-                    _phase_end(t6)
             reduction_phase[0] += 2
             return
         for offset in range(7, 0, -1):
@@ -3257,72 +3045,38 @@ def moe(
             progress=None,
             )
 
-    def consume_routed_chunk(first, rows):
-        with _phase("t7_pipeline_latent_up"):
-            row_slice = pl.ds(first, rows)
-            routed = routed_outputs_vmem[row_slice].astype(jnp.bfloat16).astype(jnp.float32)
-            normalized = (
-                routed
-                * jax.lax.rsqrt(
-                    jnp.sum(routed * routed, axis=1, keepdims=True)
-                    / latent_feature_count
-                    + epsilon
-                )
-                * weights.latent_normalization[...]
-            ).astype(jnp.bfloat16)
-            up = _dot(
-                normalized[:, :expert_output_size],
-                weights.latent_output_projection_vmem[...],
-            )
-            local_output = (
-                up
-                + (
-                    shared_outputs_vmem[row_slice]
-                    if shared_sharded
-                    else shared_outputs_vmem[
-                        row_slice, pl.ds((rank % 8) * 1024, 1024)
-                    ]
-                )
-            ).astype(jnp.bfloat16)
-            # Expert input latents are dead after the expert stream. This
-            # storage is disjoint from the still-live routed gather packets.
-            latent_vmem[row_slice, :1024] = local_output
-
     finish_reductions(
         routed_outputs_vmem[...],
         routed_outputs_vmem,
         shared_outputs_vmem,
     )
     t7 = _phase_start("t7_latent_up")
-    if token_pipeline:
-        local_output = latent_vmem[:, :1024]
-    else:
-        routed = routed_outputs_vmem[...].astype(jnp.bfloat16).astype(jnp.float32)
-        normalized = (
-            routed
-            * jax.lax.rsqrt(
-                jnp.sum(routed * routed, axis=1, keepdims=True)
-                / latent_feature_count
-                + epsilon
-            )
-            * weights.latent_normalization[...]
-        ).astype(jnp.bfloat16)
-        latent_output_copy.wait()
-        # The contraction is independent across batch rows. Let Mosaic lower
-        # it as one native row tile so the resident weight is consumed once.
-        up = _dot(
-            normalized[:, :expert_output_size],
-            weights.latent_output_projection_vmem[...],
+    routed = routed_outputs_vmem[...].astype(jnp.bfloat16).astype(jnp.float32)
+    normalized = (
+        routed
+        * jax.lax.rsqrt(
+            jnp.sum(routed * routed, axis=1, keepdims=True)
+            / latent_feature_count
+            + epsilon
         )
+        * weights.latent_normalization[...]
+    ).astype(jnp.bfloat16)
+    latent_output_copy.wait()
+    # The contraction is independent across batch rows. Let Mosaic lower
+    # it as one native row tile so the resident weight is consumed once.
+    up = _dot(
+        normalized[:, :expert_output_size],
+        weights.latent_output_projection_vmem[...],
+    )
 
-        local_output = (
-            up
-            + (
-                shared_outputs_vmem[...]
-                if shared_sharded
-                else shared_outputs_vmem[:, pl.ds((rank % 8) * 1024, 1024)]
-            )
-        ).astype(jnp.bfloat16)
+    local_output = (
+        up
+        + (
+            shared_outputs_vmem[...]
+            if shared_sharded
+            else shared_outputs_vmem[:, pl.ds((rank % 8) * 1024, 1024)]
+        )
+    ).astype(jnp.bfloat16)
     _phase_end(t7)
     t8 = _phase_start("t8_output_transport")
     if token_scatter_output:
@@ -3427,9 +3181,6 @@ def _stream_semaphore_count(streams) -> int:
         ]
     )
 
-
-STREAM_SEMAPHORES = _stream_semaphore_count(WEIGHT_STREAMS)
-
 # B32/B64 paged DCP needs these chunks to leave room for communication scratch.
 # These do not alter arithmetic or the resident weight representation.
 DCP_B32_WEIGHT_STREAMS = {
@@ -3519,74 +3270,6 @@ def _attention_projection_streams(dp: int, schedule: str) -> dict[str, tuple[int
     if dp not in (2, 4):
         raise ValueError("Projection schedule experiments require attention DP2/DP4")
     return {name: (dp, 2) for name in ("m_qb", "m_kb")}
-
-def attention_dp_shape(name, shape, dp):
-    """The per-rank ``[layers, ...]`` shape of ``name`` under attention DP."""
-    if dp == 1 or name not in ATTENTION_DP_WEIGHTS:
-        return tuple(shape)
-    kind, axis = ATTENTION_DP_WEIGHTS[name]
-    shape = list(shape)
-    if kind == "stack":
-        return (shape[0], dp, *shape[1:])
-    shape[1 + axis] *= dp
-    return tuple(shape)
-
-
-def to_attention_dp(weights, mesh, dp):
-    """Rearrange TP32 weights (``[32, layers, ...]`` per family) for attention
-    DP: rank r gathers the shards of ranks r % (32 / dp) + k * (32 / dp)."""
-    if dp == 1:
-        return weights
-    from jax.sharding import PartitionSpec as P
-
-    if dp not in (2, 4):
-        raise ValueError("Attention DP supports dp=1, dp=2 or dp=4")
-    group = 32 // dp
-
-    def rearrange(name):
-        kind, axis = ATTENTION_DP_WEIGHTS[name]
-
-        def local(value):
-            value = value[0]
-            # XOR partners collect every held TP32 shard. Canonical shard
-            # order is independent of the physical DP group owning this rank.
-            parts = (value,) + tuple(
-                jax.lax.ppermute(
-                    value, "tp", perm=[(rank, rank ^ (offset * group)) for rank in range(32)]
-                )
-                for offset in range(1, dp)
-            )
-            data_group = jax.lax.axis_index("tp") // group
-            ordered = []
-            for shard in range(dp):
-                part = parts[0]
-                for offset in range(1, dp):
-                    part = jnp.where((data_group ^ offset) == shard, parts[offset], part)
-                ordered.append(part)
-            if kind == "stack":
-                return jnp.stack(ordered, axis=1)[None]
-            return jnp.concatenate(ordered, axis=1 + axis)[None]
-
-        return jax.jit(
-            jax.shard_map(local, mesh=mesh, in_specs=P("tp"), out_specs=P("tp"), check_vma=False)
-        )
-
-    return {
-        name: rearrange(name)(value) if name in ATTENTION_DP_WEIGHTS else value
-        for name, value in weights.items()
-    }
-
-
-def attention_dp_abstract(weights, dp):
-    """``to_attention_dp`` applied to a ShapeDtypeStruct tree."""
-    return {
-        name: jax.ShapeDtypeStruct(
-            (value.shape[0], *attention_dp_shape(name, value.shape[1:], dp)),
-            value.dtype,
-            sharding=getattr(value, "sharding", None),
-        )
-        for name, value in weights.items()
-    }
 
 
 def _chunk_sizes(extent: int, chunks: int, unit: int) -> tuple[int, ...]:
@@ -5190,16 +4873,15 @@ def _project_attention_2d(
 
 def _project_attention_dp(
     attended, weight, out, comm, local, host_reduction, feature_backing,
-    sends, recvs, phase, dot, *, weight_stream=None, staging=None,
-    keep_dp_rows=False, owners=4,
+    sends, recvs, phase, dot, *, weight_stream=None, staging=None, owners=4,
 ):
-    """Project DP2/TP16 or DP4/TP8 attention back to MoE row ownership.
+    """Project DP2/TP16 or DP4/TP8 attention back to DP row ownership.
 
     ``attended`` [dp, 4r, 384] holds each logical TP32 head shard for the
     DP group's rows. The projection first reduces over four local rank
     pairs; DP2 also reduces over its second host. Rank pairs assemble the
-    hidden dimension, then DP groups gather their disjoint row subsets so
-    ``out`` [dp*r, 7168] has the pair-owned rows in sequence order.
+    hidden dimension, so ``out`` [r, 7168] holds this rank pair's r rows of
+    its DP group.
     With one row owner (DP2 B2/B4, ``attended`` [2, r, 384]) each pair's
     partial of its group's r rows goes to the 15 same-lane ranks of both
     groups in one hop, so ``out`` [2r, 7168] is the whole batch on every rank.
@@ -5348,57 +5030,13 @@ def _project_attention_dp(
         axis=1,
     )
 
-    if keep_dp_rows:
-        assert out.shape == (rows_per_pair, hidden)
-        out[...] = row
-    else:
-        _gather_attention_dp_rows(row, out, local, sends, recvs, shards)
+    assert out.shape == (rows_per_pair, hidden)
+    out[...] = row
     phase[0] += 1
 
 
-def _gather_attention_dp_rows(row, out, local, sends, recvs, shards):
-    """Restore a pair's DP subsets in canonical order, without arithmetic.
-
-    Each rank has only [batch / (4 * DP), hidden]. EP8/TP4 routing still
-    needs every pair's rows on every host. Keeping this exchange separate
-    lets residual mixing and normalization execute before replication.
-    """
-    rank = jax.lax.axis_index("tp")
-    group_size = 32 // shards
-    group = rank // group_size
-    rows_per_pair, hidden = row.shape
-    assert out.shape == (shards * rows_per_pair, hidden)
-    # Pack into flat wires so a one-row subset (DP4 B16) is DMA aligned.
-    group_payload = rows_per_pair * hidden // 128
-    group_send = local.at[4].bitcast(jnp.bfloat16).at[pl.ds(0, group_payload), :]
-    group_send[...] = row.reshape(group_payload, 128)
-    group_receives, group_copies = [], []
-    for offset in range(1, shards):
-        received_group = local.at[4 + offset].bitcast(jnp.bfloat16).at[
-            pl.ds(0, group_payload), :
-        ]
-        copy = tpu.make_async_remote_copy(
-            group_send, received_group, sends.at[6 + offset], recvs.at[6 + offset],
-            device_id=(rank ^ (group_size * offset),), device_id_type=pl.DeviceIdType.MESH,
-        )
-        copy.start()
-        group_receives.append(received_group)
-        group_copies.append(copy)
-    for copy in group_copies:
-        copy.wait()
-    for target_group in range(shards):
-        group_row = row
-        for offset, received_group in enumerate(group_receives, start=1):
-            group_row = jnp.where(
-                (group ^ offset) == target_group,
-                received_group[...].reshape(rows_per_pair, hidden),
-                group_row,
-            )
-        out[target_group * rows_per_pair : (target_group + 1) * rows_per_pair, :] = group_row
-
-
 def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards, pair_semaphores=None):
-    """``_gather_attention_dp_rows`` and the local pair gather, overlapped.
+    """Gather the DP groups' rows and the local pairs' rows, overlapped.
 
     Each rank holds [batch / (4 * DP), hidden] for its (DP group, local pair)
     and ends with the whole batch in ``out`` and its pair's rows of all groups
@@ -5483,16 +5121,6 @@ def _gather_dp_moe_rows(row, owned_out, out, local, sends, recvs, shards, pair_s
         owned_out[d * rows : (d + 1) * rows, :] = (
             wires[base + 4 * (group ^ d), pl.ds(0, payload)].reshape(rows, hidden)
         )
-
-
-def _gather_latent_host(x,sends,recvs):
-    rank=jax.lax.axis_index('tp')
-    view=x.at[:,pl.ds((rank%8)*512,512)]
-    copies=[]
-    for offset in range(7,0,-1):
-        cp=tpu.make_async_remote_copy(view,view,sends.at[offset-1],recvs.at[offset-1],device_id=(rank^offset,),device_id_type=pl.DeviceIdType.MESH)
-        cp.start();copies.append(cp)
-    for cp in copies:cp.wait()
 
 
 def _router_copy(weight, buffer, sems, wait, *, initialize_padding=True):
@@ -5821,73 +5449,6 @@ DENSE = ("dense_gu", "dense_down")  # layer 0's MLP, used when the stack include
 NAMES = MOE + KDA + MLA + NORMS
 
 
-def local_shapes(
-    layers=93,
-    hidden=7168,
-    *,
-    full_model=False,
-    vocab=163840,
-    expert_storage="mxfp4",
-    split_kda_gate_projection: bool = True,
-):
-    """Per-rank weight shapes. Layer and expert indices are never replicated/tied."""
-    if not split_kda_gate_projection:
-        raise ValueError("The clean decoder always uses the split KDA gate projection")
-    if not 2 <= layers <= 93:
-        raise ValueError("Kimi stack supports a prefix of 2..93 layers")
-    m = max(1, layers // 4 + (layers == 93))
-    k = layers - (layers // 4 + (layers == 93))
-    h = hidden
-    shapes = (
-        (layers - 1, h, 896),
-        (layers - 1, 1, 896),
-        (layers - 1, h, 128),
-        (layers - 1, 128, h),
-        (layers - 1, 1, 4096),
-        (layers - 1, h, 512),
-        (layers - 1, 256, h),
-        (layers - 1, 112, 448, 1536),
-        (layers - 1, 112, 112, 1536),
-        (layers - 1, 112, 96, 3584),
-        (layers - 1, 112, 24, 3584),
-        (k, h, 128),
-        (k, h, 1664 if split_kda_gate_projection else 1792),
-        (k, 128, 384),
-        (k, 384, h),
-        (k, 4, 3, 3, 128),
-        (k, 3, 1),
-        (k, 3, 128),
-        (k, 8, 128),
-        (m, h, 1536),
-        (m, h, 640),
-        (m, 1536, 768),
-        (m, 512, 768),
-        (m, h, 384),
-        (m, 384, h),
-        (m, 1, 1536),
-        (m, 1, 512),
-        *((layers, 1, h) for _ in range(4)),
-    )
-    result = dict(zip(NAMES, shapes, strict=True))
-    if expert_storage != "mxfp4":
-        raise ValueError("Routed experts require resident packed FP4")
-    if full_model:
-        if vocab % 32:
-            raise ValueError("Vocabulary must divide into 32 shards")
-        result.update(
-            embedding=(vocab // 32, h),
-            lm_head=(h, vocab // 32),
-            dense_gu=(h, 2304),
-            dense_down=(1152, h),
-            output_res=(1, h),
-            final_norm=(1, h),
-        )
-    return result
-
-
-
-
-
 def _residual_mixture_row(
     block_values,
     prefix_value,
@@ -5997,11 +5558,8 @@ MXFP4_PAIR_TILE = _config().mxfp4_pair_tile
 MXFP4_STATIC_TILE = _config().mxfp4_static_tile
 
 
-# B16 runs routed experts on compact 8-row tiles (MXFP4 only).
-B16_COMPACT_EXPERTS = (
-    _config().b16_compact_experts
-    and _config().expert_gate_up == "mxfp4"
-)
+# B16 runs routed experts on compact 8-row tiles.
+B16_COMPACT_EXPERTS = _config().b16_compact_experts
 
 
 def _compact_rows(batch_size):
@@ -6047,20 +5605,20 @@ def _shared_shards(batch_size):
     return SHARED_SHARDS and batch_size > 32
 
 
-def _use_compact_overflow(batch_size, gate_up_dtype, *, group_pending_routes):
+def _use_compact_overflow(batch_size, *, group_pending_routes):
     return (
         COMPACT_OVERFLOW and not COMPACT_ONLY and SHARED_EXPERT_FINISHERS
         and (batch_size in (32, 64, 96, 128) or (batch_size == 16 and B16_COMPACT_EXPERTS))
         and COMPACT_ROWS == 8
-        and gate_up_dtype == jnp.uint32 and group_pending_routes
+        and group_pending_routes
     )
 
 
-def _expert_accumulator_rows(batch_size, gate_up_dtype=None, *, group_pending_routes=False):
+def _expert_accumulator_rows(batch_size, *, group_pending_routes=False):
     """(gate/up, down) accumulator rows: the batch, or only the compact tiles."""
     capacity = _compact_rows(batch_size)
     if capacity and (COMPACT_ONLY or _use_compact_overflow(
-        batch_size, gate_up_dtype, group_pending_routes=group_pending_routes
+        batch_size, group_pending_routes=group_pending_routes
     )):
         return 2 * capacity, capacity
     return batch_size, batch_size
@@ -6247,13 +5805,11 @@ def _moe_scoped_scratch(
     gate_up = local_weights["expert_gu"]
     down = local_weights["expert_down"]
     latent_size = local_weights["latent_norm"].shape[-1]
-    expert_input_size = (
-        gate_up.shape[1] * 8 if gate_up.dtype == jnp.uint32 else gate_up.shape[1]
-    )
-    expert_width = down.shape[1] * 8 if down.dtype == jnp.uint32 else down.shape[1]
+    expert_input_size = gate_up.shape[1] * 8
+    expert_width = down.shape[1] * 8
     expert_output_size = down.shape[-1]
     accumulator_rows = _expert_accumulator_rows(
-        batch_size, gate_up.dtype, group_pending_routes=group_pending_routes
+        batch_size, group_pending_routes=group_pending_routes
     )
     scale_scratch = () if alias_expert_scales else (
         tpu.VMEM((4, *local_weights["expert_gus"].shape[1:]), local_weights["expert_gus"].dtype),
@@ -6336,12 +5892,7 @@ def stack(
     include_layer_zero: bool = False,
     state_row=None,
     attention_dp: int = 1,
-    attention_schedule: Literal["auto", "pooled", "legacy", "overlap"] = "auto",
-    attention_state_pipeline: bool = False,
-    attention_dp_ownership: bool = False,
     attention_projection_schedule: Literal["default", "mla_up_double"] = "default",
-    moe_token_pipeline: bool = False,
-    dp_moe_gather: Literal["staged", "split"] = "staged",
     mla_commit_tile_size: int | None = None,
     sequence_parallel_size: int = 4,
     shard_routing: bool | None = None,
@@ -6401,11 +5952,13 @@ def stack(
         raise ValueError(f"unified pools must match {layout.block_shape} {layout.dtype}")
     if block_tables.shape[0] != batch_size or block_tables.ndim != 2:
         raise ValueError("block_tables must be [batch_size, pages]")
-    if attention_dp != 1 and not (mla_dcp.GROUP * attention_dp == 32 and attention_dp_ownership):
+    if attention_dp != 1 and mla_dcp.GROUP * attention_dp != 32:
         raise ValueError(
-            "Attention DP needs DCP over each DP group (KernelConfig.dcp_group = 32 / dp) "
-            "and DP row ownership"
+            "Attention DP needs DCP over each DP group (KernelConfig.dcp_group = 32 / dp)"
         )
+    # Attention DP always runs with DP row ownership: a rank's residual stream
+    # holds only its own rows of its DP group.
+    attention_dp_ownership = attention_dp > 1
     paged_pages = int(block_tables.shape[1])
     if select_state_row and sequence_rows != batch_size:
         raise ValueError("state_row selection needs one sequence per tile")
@@ -6465,7 +6018,7 @@ def stack(
     )
     if sp_owners not in (1, 4, 8):
         raise ValueError("sequence_parallel_size must be 1 (attention DP2 B2/B4), 4 (rank pairs) or 8 (ranks)")
-    if sp_owners == 1 and not (attention_dp == 2 and attention_dp_ownership and batch_size in (2, 4)):
+    if sp_owners == 1 and not (attention_dp == 2 and batch_size in (2, 4)):
         raise ValueError("One row owner is attention DP2's B2/B4 layout")
     if sp_owners == 8 and not (
         attention_token_scatter and batch_size % 8 == 0 and attention_dp == 1
@@ -6479,8 +6032,6 @@ def stack(
     # The router splits its columns over each rank pair, so the top-k shards
     # over pairs: four row owners.
     shard_routing = shard_routing and moe_token_scatter_output and sp_owners == 4
-    if attention_schedule not in ("auto", "pooled", "legacy", "overlap"):
-        raise ValueError("attention_schedule must be auto, pooled, legacy, or overlap")
     if attention_dp not in (1, 2, 4):
         raise ValueError("Attention DP supports dp=1, dp=2 or dp=4")
     if attention_dp > 1 and not (
@@ -6496,24 +6047,11 @@ def stack(
             "sequence-parallel token-scatter layout, whole sequences in each "
             "group's rows and pooled weights"
         )
-    if attention_dp_ownership and (
-        attention_dp == 1
-        or batch_size not in (32, 64, 96, 128)
+    if attention_dp > 1 and (
+        batch_size not in (32, 64, 96, 128)
         and not (attention_dp == 2 and batch_size in (2, 4, 8, 16))
     ):
-        raise ValueError("DP row ownership requires attention DP2 at B2..B128 or DP4 at B32..B128")
-    if moe_token_pipeline and (
-        attention_dp not in (2, 4)
-        or batch_size not in (32, 64)
-        or not moe_routed_reduce_scatter
-        or not moe_token_scatter_output
-        or sp_owners != 4
-    ):
-        raise ValueError("MoE token pipeline requires attention DP2/DP4 at B32/B64 with pair-owned routed reduce-scatter")
-    if dp_moe_gather not in ("staged", "split"):
-        raise ValueError("dp_moe_gather must be staged or split")
-    if dp_moe_gather == "split" and not attention_dp_ownership:
-        raise ValueError("The split DP MoE-input gather requires DP row ownership")
+        raise ValueError("Attention DP supports DP2 at B2..B128 or DP4 at B32..B128")
     # The new-row hand-out's padded head count (cache_handoff_head_count)
     # follows these tile sizes.
     commit_rows = mla_commit_tile_size or mla_cache_batch_tile_size
@@ -6529,7 +6067,7 @@ def stack(
                     and batch_size == 128 and sequence_rows == 1)
     # Plain decode above two rows per rank pair: its two ranks split the
     # MoE-input gather (DP2 B128's eight residual owners gather their own).
-    pair_split_gather = (attention_dp_ownership and dp_moe_gather == "split" and not sp8_residual
+    pair_split_gather = (attention_dp_ownership and not sp8_residual
                          and sp_owners != 1 and dp_held_rows > 2 and sequence_rows == 1)
     default_streams = (
         {**DCP_B32_WEIGHT_STREAMS, **(DCP_B32_DECODE_RINGS if sequence_rows == 1 else {})}
@@ -6581,11 +6119,8 @@ def stack(
     owner_generic = blocks_owned and owned_rows % 16 == 0
     # The trace-time arena manager (``VmemPool``) places the router, attention
     # input projections, routed-expert slots and layer 0's dense slabs; under
-    # DP the router reuses the drained stream slots. "legacy" keeps the fixed
-    # DP layout.
-    pool_managed = POOLED_WEIGHTS and (
-        attention_dp == 1 or attention_schedule != "legacy"
-    )
+    # DP the router reuses the drained stream slots.
+    pool_managed = POOLED_WEIGHTS
     if blocks_block_major and not sequence_parallel_pre_attention:
         raise ValueError("Above eight rows the decoder needs sequence-parallel pre-attention")
     persist_kda_state = batch_size <= 4 and attention_dp == 1
@@ -7180,32 +6715,14 @@ def stack(
             if sp_owners == 1:
                 destination[...] = dp_owned_vmem[...]
                 return
-            if dp_moe_gather == "split":
-                _gather_dp_moe_rows(
-                    dp_owned_vmem[...], owned_rows_vmem, destination,
-                    communication_workspace.shared_local_reduction_vmem,
-                    communication_workspace.send_semaphores,
-                    communication_workspace.receive_semaphores,
-                    attention_dp,
-                    pair_semaphores=communication_workspace.pair_semaphores,
-                )
-                return
-            with _phase("t10a_dp_normalized_gather"):
-                _gather_attention_dp_rows(
-                    dp_owned_vmem[...], owned_rows_vmem,
-                    communication_workspace.shared_local_reduction_vmem,
-                    communication_workspace.send_semaphores,
-                    communication_workspace.receive_semaphores,
-                    attention_dp,
-                )
-            with _phase("t10b_moe_local_gather"):
-                _gather_local_pair_rows(
-                    owned_rows_vmem, destination,
-                    communication_workspace.send_semaphores,
-                    communication_workspace.receive_semaphores,
-                    communication_workspace.shared_local_reduction_vmem,
-                    owners=sp_owners,
-                )
+            _gather_dp_moe_rows(
+                dp_owned_vmem[...], owned_rows_vmem, destination,
+                communication_workspace.shared_local_reduction_vmem,
+                communication_workspace.send_semaphores,
+                communication_workspace.receive_semaphores,
+                attention_dp,
+                pair_semaphores=communication_workspace.pair_semaphores,
+            )
 
         def prefetch_norms(index):
             destinations = (
@@ -7268,7 +6785,7 @@ def stack(
             rank's owned rows (the token-scatter attention output)."""
             owned = _bf16_rows_view(
                 communication_workspace.attention_output_vmem,
-                dp_held_rows if attention_dp_ownership else tokens_per_pair,
+                dp_held_rows,
                 hidden_size,
             )
             pl.run_scoped(
@@ -7286,7 +6803,6 @@ def stack(
                     _dot,
                     weight_stream=stream,
                     staging=communication_workspace.projection_staging_vmem,
-                    keep_dp_rows=attention_dp_ownership,
                     owners=sp_owners,
                 ),
                 tpu.VMEM((group_rows, 8192), jnp.float32),
@@ -7617,43 +7133,6 @@ def stack(
                             communication_workspace.receive_semaphores,
                             communication_workspace.shared_local_reduction_vmem,
                             packed=True)
-            elif sequence_parallel_pre_attention and attention_dp > 1:
-                # The group's attention input: each local pair contributes its
-                # owned row 2p + d.
-                normalize(owned_rows_vmem, attention_norm_vmem)
-                t0 = _phase_start("t0_dp_group_gather")
-                data_group = jax.lax.axis_index("tp") // (32 // attention_dp)
-                if group_rows_per_pair == 1:
-                    owned = owned_rows_vmem[...]
-                    selected = owned[0:1]
-                    for group in range(1, attention_dp):
-                        selected = jnp.where(data_group == group, owned[group : group + 1], selected)
-                    group_input_vmem[0:1] = selected
-                    _gather_local_pair_rows(
-                        group_input_vmem.at[pl.ds(0, 1)],
-                        group_input_vmem,
-                        communication_workspace.send_semaphores,
-                        communication_workspace.receive_semaphores,
-                        communication_workspace.shared_local_reduction_vmem,
-                    )
-                elif "gather" not in DEBUG_SKIP:
-                    for group in range(attention_dp):
-                        @pl.when(data_group == group)
-                        def gather_group_rows(group=group):
-                            _gather_local_pair_rows(
-                                owned_rows_vmem.at[
-                                    group * group_rows_per_pair : (group + 1) * group_rows_per_pair
-                                ],
-                                group_input_vmem,
-                                communication_workspace.send_semaphores,
-                                communication_workspace.receive_semaphores,
-                                communication_workspace.shared_local_reduction_vmem,
-                                # B64 DP2 selects eight rows from a native
-                                # 16-row BF16 owner buffer. Pack this half-tile
-                                # view so its DMA byte count/layout is explicit.
-                                packed=group_rows_per_pair == 8,
-                            )
-                _phase_end(t0)
             elif sequence_parallel_pre_attention:
                 normalize(owned_rows_vmem, attention_norm_vmem)
                 _gather_local_pair_rows(
@@ -7668,17 +7147,6 @@ def stack(
                 normalize(normalized_vmem, attention_norm_vmem)
 
             _phase_end(layer_scope.pop())
-
-            def release_kda_inputs():
-                if attention_schedule == "overlap":
-                    assert pool is not None
-                    # Every head shard has consumed the gate/input/feature-gate
-                    # weights. The output ring still occupies the suffix, so
-                    # retain it while the queued router DMA reuses the prefix.
-                    pool.release_prefix(
-                        "attention",
-                        storage("k_gate") + storage("k_projection") + storage("k_fb"),
-                    )
 
             def run_delta_attention():
                 state_index = layer_index - layer_index // 4
@@ -7772,11 +7240,10 @@ def stack(
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
                                 gate_features_vmem=dp_compressed_vmem,
-                                stage_projections=attention_schedule in ("auto", "overlap"),
+                                stage_projections=True,
                                 projected_rows=None if swapped is None else swapped(order),
                                 first_call=order == 0,
                             )
-                        release_kda_inputs()
                         project_attention_dp(kda_projection_vmem[3], streams.get("output"))
                     else:
                         kda(
@@ -7851,35 +7318,32 @@ def stack(
                     def execute_streamed_dp(history_buffers, state_buffers, read_semaphores, write_semaphores):
                         streams = kda_streams(state_index, attention_base)
                         chunks_per_shard = group_rows // kda_row_chunk
-                        shared_state_stream = None
-                        if attention_state_pipeline:
-                            # to_attention_dp orders state rows as head shard,
-                            # then the group's sequences. One flattened stream
-                            # keeps its two-chunk lookahead across those shards
-                            # without allocating another state buffer.
-                            shared_state_stream = KdaStateStream(
-                                convolution_ref.at[:, state_index],
-                                recurrent_ref.at[:, state_index],
-                                convolution_output_ref.at[:, state_index],
-                                recurrent_output_ref.at[:, state_index],
-                                history_buffers,
-                                state_buffers,
-                                read_semaphores,
-                                write_semaphores,
-                                chunk=kda_row_chunk,
-                                chunks=attention_dp * chunks_per_shard,
-                                slots=slots_ref if slot_reads else None,
-                                sequence_rows=sequence_rows,
-                            )
-                            shared_state_stream.prime()
+                        # State rows are head-shard-major, then the group's
+                        # sequences (shard k of group row p at k * G + p). One
+                        # flattened stream keeps its two-chunk lookahead across
+                        # those shards without allocating another state buffer.
+                        shared_state_stream = KdaStateStream(
+                            convolution_ref.at[:, state_index],
+                            recurrent_ref.at[:, state_index],
+                            convolution_output_ref.at[:, state_index],
+                            recurrent_output_ref.at[:, state_index],
+                            history_buffers,
+                            state_buffers,
+                            read_semaphores,
+                            write_semaphores,
+                            chunk=kda_row_chunk,
+                            chunks=attention_dp * chunks_per_shard,
+                            slots=slots_ref if slot_reads else None,
+                            sequence_rows=sequence_rows,
+                        )
+                        shared_state_stream.prime()
                         input_stream = streams.get("input")
                         # DP4 runs its 24- and 32-row groups through one traced-shard
                         # body: four unrolled copies stall on instruction overlays.
                         rolled_shards = (
                             attention_dp == 4 and group_rows in (24, 32)
-                            and attention_schedule in ("auto", "overlap")
                             and input_stream is not None and input_stream.slots is not None
-                            and shared_state_stream is not None and slot_reads
+                            and slot_reads
                             and "kda" not in DEBUG_SKIP
                         )
                         per_shard = chunk_columns = 0
@@ -7963,28 +7427,11 @@ def stack(
                             if not slot_reads:
                                 history_rows = history_rows.at[rows]
                                 state_rows = state_rows.at[rows]
-                            if shared_state_stream is None:
-                                state_stream = KdaStateStream(
-                                    history_rows,
-                                    state_rows,
-                                    convolution_output_ref.at[:, state_index].at[rows],
-                                    recurrent_output_ref.at[:, state_index].at[rows],
-                                    history_buffers,
-                                    state_buffers,
-                                    read_semaphores,
-                                    write_semaphores,
-                                    chunk=kda_row_chunk,
-                                    chunks=chunks_per_shard,
-                                    slots=slots_ref.at[rows] if slot_reads else None,
-                                    sequence_rows=sequence_rows,
-                                )
-                                state_stream.prime()
-                            else:
-                                state_stream = KdaStateStreamSlice(
-                                    shared_state_stream,
-                                    first_chunk=shard * chunks_per_shard,
-                                    chunks=chunks_per_shard,
-                                )
+                            state_stream = KdaStateStreamSlice(
+                                shared_state_stream,
+                                first_chunk=shard * chunks_per_shard,
+                                chunks=chunks_per_shard,
+                            )
                             if "kda" in DEBUG_SKIP:
                                 for index in range(state_stream.chunks):
                                     state_stream.acquire(index)
@@ -8020,20 +7467,17 @@ def stack(
                                 shard_index=shard,
                                 attended_out=dp_attended_vmem.at[shard],
                                 gate_features_vmem=dp_compressed_vmem,
-                                stage_projections=attention_schedule in ("auto", "overlap"),
+                                stage_projections=True,
                                 state_stream=state_stream,
                             )
-                        if shared_state_stream is not None:
-                            # All KDA consumers have finished. The final three
-                            # writes are the only outstanding DMAs: every read
-                            # was acquired and earlier writes drained at reuse.
-                            if (attention_schedule in ("auto", "overlap")
-                                    and group_rows > 8 and "kda" not in DEBUG_SKIP):
-                                shared_state_stream.finish_rolled()
-                            else:
-                                shared_state_stream.finish()
+                        # All KDA consumers have finished. The final three
+                        # writes are the only outstanding DMAs: every read
+                        # was acquired and earlier writes drained at reuse.
+                        if group_rows > 8 and "kda" not in DEBUG_SKIP:
+                            shared_state_stream.finish_rolled()
+                        else:
+                            shared_state_stream.finish()
                         if "project" not in DEBUG_SKIP:
-                            release_kda_inputs()
                             project_attention_dp(kda_projection_vmem[3], streams.get("output"))
 
                     def execute_streamed(history_buffers, state_buffers, read_semaphores, write_semaphores):
@@ -8294,31 +7738,12 @@ def stack(
             if pool is not None:
                 pool.acquire("attention")  # the attention code waits for its copies
             with _phase("p1_attention"):
-                if attention_dp > 1 and attention_schedule == "overlap":
-                    assert pool is not None
-
-                    def consume_attention(run):
-                        def consume():
-                            run()
-                            pool.release("attention")
-                        return consume
-
-                    # KDA frees its consumed prefix before the output projection;
-                    # MLA reuses its q-down region for m_o and retains it until
-                    # the whole attention operation completes. Both branches
-                    # must restore the same arena state for the layer loop.
-                    pool.cond(
-                        (layer_index % 4 == 3) | (layer_index == 92),
-                        consume_attention(run_latent_attention),
-                        consume_attention(run_delta_attention),
-                    )
-                else:
-                    jax.lax.cond(
-                        (layer_index % 4 == 3) | (layer_index == 92),
-                        run_latent_attention,
-                        run_delta_attention,
-                    )
-            if pool is not None and not (attention_dp > 1 and attention_schedule == "overlap"):
+                jax.lax.cond(
+                    (layer_index % 4 == 3) | (layer_index == 92),
+                    run_latent_attention,
+                    run_delta_attention,
+                )
+            if pool is not None:
                 pool.release("attention")
             post_scope = _phase_start("q9_post_mix")
             with _phase("q9a_post_norm_wait"):
@@ -8569,7 +7994,6 @@ def stack(
                     overlap_shared_reduction=(attention_dp == 2 and batch_size in (64, 128) and sequence_rows == 1),
                     token_scatter_output=moe_token_scatter_output,
                     routed_reduce_scatter=moe_routed_reduce_scatter,
-                    token_pipeline=moe_token_pipeline,
                     prepare_weights_vmem=(
                         tuple(pool_view(name) for name in MOE_PREPARE_WEIGHTS)
                         if POOLED_WEIGHTS
@@ -9198,7 +8622,7 @@ def stack(
                         ("DP staged recurrence gate", tpu.VMEM((group_rows // kda_row_chunk, kda_row_chunk, 384), jnp.bfloat16)),
                         ("DP staged output gate", tpu.VMEM((group_rows, 384), jnp.bfloat16)),
                     )
-                    if attention_dp > 1 and attention_schedule in ("auto", "overlap") and group_rows > 8
+                    if attention_dp > 1 and group_rows > 8
                     else ()
                 ),
                 *(
@@ -9344,12 +8768,7 @@ def decode_local(
     aux_capture: Literal["layer", "attention", "mixture_input"] = "layer",
     state_row=None,
     attention_dp: int = 1,
-    attention_schedule: Literal["auto", "pooled", "legacy", "overlap"] = "auto",
-    attention_state_pipeline: bool = False,
-    attention_dp_ownership: bool = False,
     attention_projection_schedule: Literal["default", "mla_up_double"] = "default",
-    moe_token_pipeline: bool = False,
-    dp_moe_gather: Literal["staged", "split"] = "staged",
     mla_commit_tile_size: int | None = None,
     sequence_parallel_size: int = 4,
     block_tables=None,
@@ -9470,12 +8889,7 @@ def decode_local(
             include_layer_zero=True,
             state_row=state_row,
             attention_dp=attention_dp,
-            attention_schedule=attention_schedule,
-            attention_state_pipeline=attention_state_pipeline,
-            attention_dp_ownership=attention_dp_ownership,
             attention_projection_schedule=attention_projection_schedule,
-            moe_token_pipeline=moe_token_pipeline,
-            dp_moe_gather=dp_moe_gather,
             mla_commit_tile_size=mla_commit_tile_size,
             sequence_parallel_size=sequence_parallel_size,
             block_tables=block_tables,

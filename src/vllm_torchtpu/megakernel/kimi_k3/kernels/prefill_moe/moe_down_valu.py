@@ -13,7 +13,6 @@ Products and local subtotals round to BF16; token weighting uses FP32 and
 the ring uses ``ring_dtype``.
 """
 
-import contextlib
 import dataclasses
 import functools
 
@@ -30,12 +29,10 @@ def ring_step(
     tables_ref,
     x_ref,
     o_ref,
-    local_sems,
     send_sems,
     recv_sems,
     credits,
     store_sem,
-    local_buf,
     payload,
     received,
     *,
@@ -43,37 +40,15 @@ def ring_step(
     buffers,
     step,
 ):
-    tile = 0
     rank = lax.axis_index("k3_sp")
     descriptors = []
-    reads = []
     positions = [tables_ref[f, 0, rank] for f in range(3)]
 
     def ring_coords(pos, family):
         peer = tables_ref[family, 1, pos]
         return (peer,)
 
-    @pl.when(step == 0)
-    def enter():
-        peers = [
-            ring_coords((positions[f] + direction) % 32, jnp.int32(f))
-            for f in range(3)
-            for direction in (-1, 1)
-        ]
-        sem = pltpu.get_barrier_semaphore()
-        for peer in peers:
-            pl.semaphore_signal(
-                sem, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
-            )
-        pl.semaphore_wait(sem, len(peers))
-
-        @functools.partial(pl.run_scoped, ready=pltpu.SemaphoreType.REGULAR)
-        def initialized(ready):
-            for peer in peers:
-                pl.semaphore_signal(
-                    ready, 1, device_id=peer, device_id_type=pl.DeviceIdType.MESH
-                )
-            pl.semaphore_wait(ready, len(peers))
+    pl.when(step == 0)(lambda: k._ring_enter(tables_ref, rank))
 
     for stream, region in enumerate(streams):
         begin, size = region[:2]
@@ -89,10 +64,7 @@ def ring_step(
         )[0]
         owner = tables_ref[family, 2, owner_mesh]
         rows = pl.ds(begin, size)
-        source_rows = pl.ds(
-            owner * o_ref.shape[0] + tile * payload.shape[0] + begin, size
-        )
-        reads.append(None)
+        source_rows = pl.ds(owner * o_ref.shape[0] + begin, size)
         descriptors.append((target, source, rows, cols, source_rows))
     for stream, (target, source, rows, cols, source_rows) in enumerate(descriptors):
 
@@ -102,7 +74,6 @@ def ring_step(
                 .at[source_rows, cols][...]
                 .astype(payload.dtype)
             )
-            return local_buf.at[rows, cols][...].astype(payload.dtype)
 
         def remote(index, rows=rows, cols=cols, stream=stream, target=target):
             return pltpu.make_async_remote_copy(
@@ -200,15 +171,12 @@ def down_valu(
         jax.ShapeDtypeStruct(
             scales.shape[1:] if family else scales.shape, scales.dtype
         ),
-        None,
         counts,
         offset,
         tile_info=k.calculate_tiling,
         vmem_limit_bytes=limit,
         out_dtype=None,
         acc_dtype=None,
-        maybe_quantize_lhs=False,
-        zero_initialize=False,
         fuse_act=None,
         rhs_quant_dtype=jnp.float4_e2m1fn,
     )
@@ -226,10 +194,6 @@ def down_valu(
     route_chunk = min(rows, metadata_cache_rows or 8192)
     route_span = route_chunk + tm
 
-    def scope(name):
-        enabled = False
-        return jax.named_scope(name) if enabled else contextlib.nullcontext()
-
     def kernel(
         counts,
         offset,
@@ -240,21 +204,16 @@ def down_valu(
         x,
         w,
         out,
-        subtotals,
         partial,
         acc,
         metadata,
-        y,
         packed,
         sums,
         cast,
-        sum_sem,
-        loads,
         sends,
         receives,
         credits,
         stores,
-        localbuf,
         payload,
         rx,
         state,
@@ -287,40 +246,34 @@ def down_valu(
             route_tags[1] = -1
 
         def advance(stop, block):
-            with scope("ring_progress"):
-
-                @pl.loop(state[0], stop)
-                def hop(step):
-                    ring_step(
-                        tables,
-                        subtotal_vmem,
-                        out.at[:, pl.ds(block * tn, tn)],
-                        loads,
-                        sends,
-                        receives,
-                        credits,
-                        stores,
-                        localbuf,
-                        payload,
-                        rx,
-                        streams=regions,
-                        buffers=2,
-                        step=step,
-                    )
+            @pl.loop(state[0], stop)
+            def hop(step):
+                ring_step(
+                    tables,
+                    subtotal_vmem,
+                    out.at[:, pl.ds(block * tn, tn)],
+                    sends,
+                    receives,
+                    credits,
+                    stores,
+                    payload,
+                    rx,
+                    streams=regions,
+                    buffers=2,
+                    step=step,
+                )
 
             state[0] = stop
 
         def emit_subtotals(n):
-            with scope("subtotal_cast_store"):
-
-                @pl.loop(0, tokens // store_tile)
-                def block(b):
-                    cast[...] = (
-                        sums[pl.ds(b * store_tile, store_tile)]
-                        .reshape(store_tile, tn)
-                        .astype(jnp.bfloat16)
-                    )
-                    subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
+            @pl.loop(0, tokens // store_tile)
+            def block(b):
+                cast[...] = (
+                    sums[pl.ds(b * store_tile, store_tile)]
+                    .reshape(store_tile, tn)
+                    .astype(jnp.bfloat16)
+                )
+                subtotal_vmem.at[pl.ds(b * store_tile, store_tile)][...] = cast[...]
 
         def route(tile_g, i):
             if stream_metadata:
@@ -344,17 +297,16 @@ def down_valu(
                 target = sums.at[pl.ds(dest, 1)]
                 target[...] = target[...] + value * weight
 
-            with scope("valu_accumulate"):
-                full = (end - start) // unroll
+            full = (end - start) // unroll
 
-                @pl.loop(0, full)
-                def chunk(b):
-                    for u in range(unroll):
-                        update(start + b * unroll + u)
+            @pl.loop(0, full)
+            def chunk(b):
+                for u in range(unroll):
+                    update(start + b * unroll + u)
 
-                @pl.loop(start + full * unroll, end)
-                def tail(i):
-                    update(i)
+            @pl.loop(start + full * unroll, end)
+            def tail(i):
+                update(i)
 
         def inner(x, w, partial, acc, metadata):
             g, n = (pl.program_id(1), pl.program_id(0))
@@ -393,8 +345,7 @@ def down_valu(
 
             @pl.when(g == 0)
             def clear():
-                with scope("accumulator_clear"):
-                    sums[...] = jnp.zeros(sums.shape, jnp.float32)
+                sums[...] = jnp.zeros(sums.shape, jnp.float32)
 
             @pl.when(n > 0)
             def progress():
@@ -411,17 +362,16 @@ def down_valu(
                 start = metadata.gm_id_to_m_offset[previous_g]
                 end = metadata.gm_id_to_m_offset[previous_g + 1]
                 begin = start // sub * sub
-                with scope("previous_valu_chunk"):
-                    for row in range(unroll):
-                        offset = panel * unroll + row
-                        i = jnp.minimum(start + offset, end - 1)
-                        dest, prob = route(previous_g, i)
-                        weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
-                        value = previous.at[pl.ds(i - begin, 1)][...].astype(
-                            jnp.float32
-                        )
-                        target = sums.at[pl.ds(dest, 1)]
-                        target[...] = target[...] + value * weight
+                for row in range(unroll):
+                    offset = panel * unroll + row
+                    i = jnp.minimum(start + offset, end - 1)
+                    dest, prob = route(previous_g, i)
+                    weight = jnp.where((g > 0) & (start + offset < end), prob, 0)
+                    value = previous.at[pl.ds(i - begin, 1)][...].astype(
+                        jnp.float32
+                    )
+                    target = sums.at[pl.ds(dest, 1)]
+                    target[...] = target[...] + value * weight
 
             @pl.when(g == 0)
             def initialize_previous():
@@ -429,17 +379,16 @@ def down_valu(
 
             @pl.when(active_ng > 0)
             def product():
-                with scope("down_compute"):
-                    packed_inner_kernel(
-                        x,
-                        w,
-                        current,
-                        partial,
-                        acc,
-                        metadata,
-                        cfgs=cfg,
-                        overlap_work=overlap_work,
-                    )
+                packed_inner_kernel(
+                    x,
+                    w,
+                    current,
+                    partial,
+                    acc,
+                    metadata,
+                    cfgs=cfg,
+                    overlap_work=overlap_work,
+                )
 
             @pl.when(g > 0)
             def previous_tail():
@@ -451,16 +400,14 @@ def down_valu(
 
                 @pl.when(n > 0)
                 def previous():
-                    with scope("ring_previous_drain"):
-                        advance(jnp.int32(32), n - 1)
+                    advance(jnp.int32(32), n - 1)
 
                 emit_subtotals(n)
                 state[0] = 0
 
                 @pl.when(n == width // tn - 1)
                 def last():
-                    with scope("ring_final_drain"):
-                        advance(jnp.int32(32), n)
+                    advance(jnp.int32(32), n)
 
         pltpu.emit_pipeline(
             inner, grid=(width // tn, ng, 1), in_specs=(xs, ws), out_specs=()
@@ -469,33 +416,26 @@ def down_valu(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     call = pl.pallas_call(
         kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((localrows, width), ring_dtype),
-            jax.ShapeDtypeStruct((tokens, tn), jnp.bfloat16),
-        ),
+        out_shape=jax.ShapeDtypeStruct((localrows, width), ring_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=4 if stream_metadata else 6,
             in_specs=((hbm, hbm) if stream_metadata else ())
-            + (hbm, k.WeightsRef(weight=hbm, scale=hbm, bias=None)),
-            out_specs=(hbm, hbm),
+            + (hbm, k.WeightsRef(weight=hbm, scale=hbm)),
+            out_specs=hbm,
             scratch_shapes=(
-                None,
+                None,  # partial: packed_inner_kernel stores rows directly
                 pltpu.VMEM((tm, tn), jnp.float32),
                 k.MetadataRef(
                     gm_id_to_group_id=pltpu.SMEM((max_gm,), jnp.int32),
                     gm_id_to_m_offset=pltpu.SMEM((max_gm + 1,), jnp.int32),
                 ),
-                None,
                 pltpu.VMEM((2,) + (tm, 2, tn // 2), x.dtype),
                 pltpu.VMEM((tokens, 2, tn // 2), jnp.float32),
                 pltpu.VMEM((store_tile, tn), x.dtype),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA((streams,)),
                 pltpu.SemaphoreType.DMA((streams,)),
                 pltpu.SemaphoreType.DMA((2, streams)),
                 pltpu.SemaphoreType.REGULAR((streams,)),
                 pltpu.SemaphoreType.DMA,
-                None,
                 pltpu.VMEM((localrows, tn), ring_dtype),
                 pltpu.VMEM((2, localrows, tn), ring_dtype),
                 pltpu.SMEM((1,), jnp.int32),
@@ -507,7 +447,7 @@ def down_valu(
             ),
         ),
         compiler_params=pltpu.CompilerParams(collective_id=77, vmem_limit_bytes=limit),
-        name=f"down_valu_{'spread'}_m{tm}_n{tn}_u{unroll}_v{int(True)}_b{int(False)}_p{int(True)}_f{int(False)}_h{int(False)}_g{1}_c{int(False)}_x{int(True)}_z{int(True)}_r{int(False)}_d{int(True)}_o{int(True)}_mc{metadata_cache_rows}",
+        name=f"down_valu_m{tm}_n{tn}_u{unroll}_mc{metadata_cache_rows}",
     )
     return call(
         counts,
@@ -517,8 +457,8 @@ def down_valu(
         jnp.pad(destinations, (0, route_span)) if stream_metadata else destinations,
         jnp.pad(probabilities, (0, route_span)) if stream_metadata else probabilities,
         x,
-        k.WeightsRef(weight=rhs, scale=scales, bias=None),
-    )[0]
+        k.WeightsRef(weight=rhs, scale=scales),
+    )
 
 
 def packed_inner_kernel(
@@ -530,18 +470,20 @@ def packed_inner_kernel(
     metadata_ref: k.MetadataRef,
     *,
     cfgs: k.GmmConfigs,
-    overlap_work=None,
+    overlap_work,
 ):
     """Variant of ``prefill_megakernel.inner_kernel`` with a direct packed final store.
 
-    Arithmetic and row bucketing follow k.inner_kernel. Each valid expert row
-    is consumed immediately, so no adjacent-group sublane carry is needed.
-    Output is [tile_m, 2, tile_n // 2]; partial_out_ref is deliberately unused.
-    Products round to BF16 before the caller's FP32 routing weighting.
+    Arithmetic and row bucketing follow k.inner_kernel, over the complete
+    reduction dimension in one tile. Each valid expert row is consumed
+    immediately, so no adjacent-group sublane carry is needed. Output is
+    [tile_m, 2, tile_n // 2]; partial_out_ref is deliberately unused and
+    acc_ref only sets the accumulation dtype. Products round to BF16 before
+    the caller's FP32 routing weighting. ``overlap_work(panel)`` runs after
+    each MXU column panel is issued.
     """
-    if overlap_work is not None:
-        assert cfgs.dims.size_k == cfgs.tiles.tile_k
-        assert cfgs.fuse_act is None and (not cfgs.rhs_cfgs.has_bias)
+    assert cfgs.dims.size_k == cfgs.tiles.tile_k
+    assert cfgs.fuse_act is None
     gm_id = pl.program_id(1)
     m_start = metadata_ref.gm_id_to_m_offset[gm_id]
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -549,9 +491,8 @@ def packed_inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
-        tpu_info = pltpu.get_tpu_info()
-        mxu_size = tpu_info.mxu_column_size
+    def _matmul(bucket_m: int):
+        mxu_size = pltpu.get_tpu_info().mxu_column_size
         tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[:bucket_m]
         tiled_rhs = tiled_rhs_ref.get_weight()
         rhs_tile_n = tiled_rhs.shape[1]
@@ -568,132 +509,41 @@ def packed_inner_kernel(
             tiled_rhs_dequant = tiled_rhs_dequant * tiled_rhs_scale
             tiled_rhs = tiled_rhs_dequant.reshape(cfgs.tiles.tile_k, rhs_tile_n)
             rhs_qbs = cfgs.tiles.tile_k
-        valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-        if is_last_k_step and valid_k != 0:
-            mask_rhs = lax.broadcasted_iota(jnp.int32, tiled_rhs.shape, 0) < valid_k
-            tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
         acc_list = []
-        column_order = list(range(0, rhs_tile_n, mxu_size))
-
-        def accept_fragment(acc_n, start_n, end_n):
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
+            acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+            for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
+                end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+                block_acc = jnp.matmul(
+                    tiled_lhs[:, start_k:end_k],
+                    tiled_rhs[start_k:end_k, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(acc_ref.dtype)
+                if end_k == cfgs.tiles.tile_k:
+                    overlap_work(start_n // mxu_size)
+                if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    b_id = start_k // rhs_qbs
+                    rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                        replicate_size=bucket_m
+                    )[b_id, :, start_n : start_n + col_size]
+                    block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                acc_n += block_acc
             acc_list.append(acc_n)
-
-        if not cfgs.lhs_cfgs.should_quantize:
-            for start_n in column_order:
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
-                    if overlap_work is not None and end_k == cfgs.tiles.tile_k:
-                        overlap_work(start_n // mxu_size)
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-                    acc_n += block_acc
-                accept_fragment(acc_n, start_n, end_n)
-        else:
-            lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
-            q_block_size = cfgs.lhs_cfgs.quant_block_size
-            assert q_block_size is not None
-            if jnp.issubdtype(lhs_q_dtype, jnp.floating):
-                dtype_max = float(jnp.finfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.float32
-            else:
-                dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.int32
-            for start_n in column_order:
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-                    block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
-                    if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
-                        block_rhs = block_rhs.astype(lhs_q_dtype)
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
-                    if overlap_work is not None and end_k == cfgs.tiles.tile_k:
-                        overlap_work(start_n // mxu_size)
-                    block_acc *= block_scale.astype(acc_ref.dtype)
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-                    acc_n += block_acc
-                accept_fragment(acc_n, start_n, end_n)
         acc = jnp.concatenate(acc_list, axis=1)
-        if not is_first_k_step:
-            acc = jnp.pad(acc, ((cfgs.tiles.tile_m - bucket_m, 0), (0, 0)))
-            acc += acc_ref[...]
         acc_m = acc.shape[0]
-        if is_last_k_step:
-            if cfgs.rhs_cfgs.has_bias:
-                tiled_rhs_bias = tiled_rhs_ref.get_bias()
-                acc += tiled_rhs_bias.astype(acc.dtype)
-            acc = k.apply_act_fn(acc, cfgs.fuse_act)
-            iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
-            mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
-            acc_masked = jnp.where(mask, acc, 0)
-            tiled_out_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype).reshape(
-                acc_m, 2, cfgs.tiles.tile_n // 2
-            )
-        else:
-            acc_ref[:acc_m] = acc
+        iota = lax.broadcasted_iota(jnp.int32, acc.shape, 0)
+        mask = jnp.logical_and(m_start_local <= iota, iota < m_end_local)
+        acc_masked = jnp.where(mask, acc, 0)
+        tiled_out_ref[:acc_m] = acc_masked.astype(tiled_out_ref.dtype).reshape(
+            acc_m, 2, cfgs.tiles.tile_n // 2
+        )
 
     def run_matmul_step(bucket_idx: int):
         bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
-        if overlap_work is not None:
-            with jax.named_scope(f"bm{bucket_m}_fragment"):
-                _matmul(is_first_k_step=True, is_last_k_step=True, bucket_m=bucket_m)
-            return
-
-        @jax.named_scope(f"bm{bucket_m}_first_last")
-        def matmul_first_last():
-            _matmul(is_first_k_step=True, is_last_k_step=True, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_first")
-        def matmul_first():
-            _matmul(is_first_k_step=True, is_last_k_step=False, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_mid")
-        def matmul_mid():
-            _matmul(is_first_k_step=False, is_last_k_step=False, bucket_m=bucket_m)
-
-        @jax.named_scope(f"bm{bucket_m}_last")
-        def matmul_last():
-            _matmul(is_first_k_step=False, is_last_k_step=True, bucket_m=bucket_m)
-
-        num_k = pl.num_programs(2)
-        k_id = pl.program_id(2)
-        is_first_k_step = k_id == 0
-        is_last_k_step = k_id == num_k - 1
-        if bucket_m == cfgs.tiles.tile_m:
-            lax.cond(
-                is_first_k_step,
-                lambda: lax.cond(is_last_k_step, matmul_first_last, matmul_first),
-                lambda: lax.cond(is_last_k_step, matmul_last, matmul_mid),
-            )
-        else:
-            lax.cond(is_first_k_step, matmul_first_last, matmul_last)
+        with jax.named_scope(f"bm{bucket_m}_fragment"):
+            _matmul(bucket_m=bucket_m)
 
     branches = []
     for bucket_idx in range(cfgs.tiles.tile_m // cfgs.tiles.bucket_base):

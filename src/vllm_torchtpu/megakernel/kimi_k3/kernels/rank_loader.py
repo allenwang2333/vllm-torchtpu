@@ -8,19 +8,17 @@ additionally reads the SP projection cache
 (``latent_down.bin``, ``latent_up.bin``, ``shared_{gu,down}_{0,1}.bin``).
 Seeks and mmap page faults are slow on network storage, so reads are mostly
 large sequential ``readinto`` calls on separate handles, straight into the
-numpy array the caller keeps (the regrouped EP16/EP32 expert parts slice
+numpy array the caller keeps (the regrouped EP16 expert parts slice
 memory-mapped shards instead).
 
 The iterators yield ``(group, name, array)`` host arrays for one rank, in
 the per-rank layout the kernels consume (no leading rank axis). They are
-independent of JAX so a vLLM worker can upload them through torch, and
-:func:`to_device` builds the kernels' rank-leading global arrays from them.
+independent of JAX so a vLLM worker can upload them through torch.
 """
 
 from __future__ import annotations
 
 import json
-import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -133,9 +131,9 @@ class RankDir:
     def regrouped_expert_parts(self, name, quarter_dirs, part, parts):
         """An expert family regrouped from EP8/TP4 shards, per file like
         ``expert_parts``: experts ``part`` of ``parts`` equal slices of the EP8
-        group's 112, over the TP4 quarters in ``quarter_dirs`` (all four:
-        whole experts, EP32; two: half the intermediate, EP16/TP2) -- gate
-        quarters then up quarters along N, down and its scales along K."""
+        group's 112, over the TP4 quarters in ``quarter_dirs`` (two: half the
+        intermediate, EP16/TP2) -- gate quarters then up quarters along N,
+        down and its scales along K."""
         spec = self.families[name]
         shape = tuple(spec["shape"])  # [layers, 112, ...] per quarter
         dtype = _dtype(spec["dtype"])
@@ -154,17 +152,6 @@ class RankDir:
                                           + [q[..., half:] for q in quarters], axis=-1)
                 return np.concatenate(quarters, axis=2)
             yield f"{name}@{index}/{count}", (hi - lo) * nbytes, reader
-
-    def read_expert_family(self, name) -> np.ndarray:
-        """One expert family ``[92, ...]`` from its files, one reader per file."""
-        spec = self.families[name]
-        shape = tuple(spec["shape"])
-        dtype = _dtype(spec["dtype"])
-        out = np.empty(shape, dtype)
-        with ThreadPoolExecutor(len(spec["files"])) as pool:
-            list(pool.map(lambda item: read_into(self.path / item[0], 0, out[item[1][0]:item[1][1]]),
-                          zip(spec["files"], spec["layer_ranges"])))
-        return out
 
 
 def split_kda_projection(families: dict) -> dict:
@@ -222,30 +209,27 @@ def _family_bytes(spec) -> int:
     return int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize
 
 
-def _expert_jobs(rank_dir: RankDir, split: bool):
-    """Expert families largest first, whole or (``split``) one job per file."""
+def _expert_jobs(rank_dir: RankDir):
+    """Expert families largest first, one job per file."""
     experts = sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
     for name in experts:
-        if split:
-            yield from rank_dir.expert_parts(name)
-        else:
-            yield name, _family_bytes(rank_dir.spec(name)), lambda n=name: rank_dir.read_expert_family(n)
+        yield from rank_dir.expert_parts(name)
 
 
-def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: bool = False,
+def iter_decode_rank(presharded, rank: int, *, layers: int = 93,
                      attention_dp: int = 1) -> Iterator[tuple[str, str, np.ndarray]]:
     """The decode megakernel's weights for ``rank`` (MXFP4 experts as stored).
 
     Yields ``("decode", name, array)``: the four packed expert families
-    (largest first; with ``split_experts`` one array per file, named
-    ``family@index/count``, layer ranges in order -- the caller joins them),
+    (largest first, one array per file, named ``family@index/count``, layer
+    ranges in order -- the caller joins them),
     then every dense family (``k_projection`` split into ``k_gate`` and the
     rest), with at most ``KernelConfig.load_inflight_gb`` of host buffers in flight.
     With ``attention_dp`` > 1 the head-sharded attention families hold the
     rank's held TP32 shards (see :func:`attention_dp_families`).
     """
     rank_dir = RankDir(presharded, rank, layers)
-    jobs = list(_expert_jobs(rank_dir, split_experts))
+    jobs: list[tuple] = list(_expert_jobs(rank_dir))
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for key, value in _budgeted(jobs):
         if key == "dense":
@@ -261,8 +245,8 @@ def iter_decode_rank(presharded, rank: int, *, layers: int = 93, split_experts: 
 def attention_dp_families(families: dict, presharded, rank: int, layers: int, dp: int) -> dict:
     """Attention DP's head-sharded families for ``rank``: its TP32 shards
     ``rank % (32 / dp) + k * (32 / dp)`` in order ``k``, concatenated or
-    stacked as ``decode_megakernel.to_attention_dp`` lays them out, the other
-    shards read from their ranks' pre-shards."""
+    stacked per ``decode_megakernel.ATTENTION_DP_WEIGHTS``, the other shards
+    read from their ranks' pre-shards."""
     from vllm_torchtpu.megakernel.kimi_k3.kernels.decode_megakernel import (
         ATTENTION_DP_WEIGHTS,
     )
@@ -296,13 +280,13 @@ def _sequence_parallel_output(own: np.ndarray, peer_dir: RankDir, name: str, ran
     return np.ascontiguousarray(np.concatenate([h[:, rows] for h in halves], axis=-1))
 
 
-def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 93,
-                      split_experts: bool = False) -> Iterator[tuple[str, str, np.ndarray]]:
+def iter_prefill_rank(presharded, projection_cache, rank: int, *,
+                      layers: int = 93) -> Iterator[tuple[str, str, np.ndarray]]:
     """The prefill stack's weights for ``rank``.
 
     Yields ``(group, name, array)`` with ``group`` in io/common/kda/mla/moe
-    (per-rank arrays, without the rank axis); expert families first
-    (``split_experts``: per file, as in :func:`iter_decode_rank`).
+    (per-rank arrays, without the rank axis); expert families first, per
+    file, as EP16/TP2 parts regrouped from the EP8 group's shards.
     """
     rank_dir = RankDir(presharded, rank, layers)
     peer_dir = RankDir(presharded, rank ^ 1, layers)
@@ -322,19 +306,14 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         return (int(np.prod(spec["shape"])) * _dtype(spec["dtype"]).itemsize,
                 lambda: projection(name))
 
-    ep = _config().prefill_expert_parallel
-    jobs: list[tuple] = []
-    if ep in (16, 32):  # regrouped from the EP8 group's quarters (same host)
-        group = 4 * (rank // 4)
-        if ep == 32:  # 28 whole experts
-            quarters, part, parts = range(4), rank % 4, 4
-        else:  # 56 experts, half the intermediate (TP2 within the chip)
-            quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
-        quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
-        jobs += [job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
-                 for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
-    else:
-        jobs += list(_expert_jobs(rank_dir, split_experts))
+    # EP16/TP2: 56 experts, half the intermediate (TP2 within the chip),
+    # regrouped from the EP8 group's quarters (same host).
+    group = 4 * (rank // 4)
+    quarters, part, parts = (2 * (rank % 2), 2 * (rank % 2) + 1), (rank // 2) % 2, 2
+    quarter_dirs = [RankDir(presharded, group + q, layers) for q in quarters]
+    jobs: list[tuple] = [
+        job for name in sorted(EXPERT_FAMILIES, key=lambda n: -_family_bytes(rank_dir.spec(n)))
+        for job in rank_dir.regrouped_expert_parts(name, quarter_dirs, part, parts)]
     jobs.append(("dense", _dense_bytes(rank_dir), rank_dir.read_dense_all))
     for name, source in (("latent_down", "latent_down"), ("latent_up", "latent_up"),
                          ("shared_gu", f"shared_gu_{parity}"), ("shared_down", f"shared_down_{parity}")):
@@ -363,41 +342,3 @@ def iter_prefill_rank(presharded, projection_cache, rank: int, *, layers: int = 
         for name in PREFILL_MOE_DENSE:
             yield "moe", name, families[name]
         del families
-
-
-def to_device(mesh, iterator_for_rank, *, axis=None, ranks_in_flight: int = 8):
-    """Global rank-leading JAX arrays ``{group: {name: [32, ...]}}`` from a
-    per-rank iterator, for this process's devices of ``mesh``."""
-    import jax
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    axis = axis or mesh.axis_names[0]
-    devices = list(mesh.devices.flat)
-    local = [rank for rank, device in enumerate(devices) if device.process_index == jax.process_index()]
-    per_rank: dict[int, dict] = {}
-    lock = threading.Lock()
-
-    def load(rank):
-        result: dict = {}
-        for group, name, value in iterator_for_rank(rank):
-            array = jax.device_put(value[None], devices[rank])
-            array.block_until_ready()
-            result.setdefault(group, {})[name] = array
-            del value
-        with lock:
-            per_rank[rank] = result
-
-    with ThreadPoolExecutor(min(ranks_in_flight, len(local))) as pool:
-        list(pool.map(load, local))
-    sharding = NamedSharding(mesh, P(axis))
-    sample = per_rank[local[0]]
-    return {
-        group: {
-            name: jax.make_array_from_single_device_arrays(
-                (len(devices), *sample[group][name].shape[1:]), sharding,
-                [per_rank[rank][group][name] for rank in local])
-            for name in names
-        }
-        for group, names in sample.items()
-    }

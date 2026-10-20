@@ -36,10 +36,12 @@ Per layer:
   the projections, packed flash attention over the window, context-parallel
   attention over every rank's cached prefix pages (``CpPrefix``), the
   projection ring;
-* MoE, ``make_indexed_moe_sp_ring``: sequence-parallel routing; EP16 4K/8K
-  uses packed latent/shared overlap, indexed gate/up and fused weighted
-  down/reduce-scatter (``prefill_moe``). Other shapes use SparseCore row
-  movement and the grouped matmuls and ring below.
+* MoE, ``make_indexed_moe_sp_ring``: sequence-parallel routing, then by
+  ``moe_reduce_dtype``. FP32 (the default): ``prefill_moe.fused``, one
+  EP16/TP2 Pallas schedule for every window (512..8192). BF16:
+  ``prefill_moe.layer`` (packed latent/shared overlap, indexed gate/up,
+  weighted down fused with the reduce-scatter) for 4K/8K windows; 512..2048
+  use SparseCore row movement and the grouped matmuls and ring below.
 
 The sections run bottom-up: the TPU kernel library (SparseCore gathers,
 TP32 rings, the grouped matmul), the K3 building blocks, the layers, then
@@ -1479,28 +1481,6 @@ def project_reduce_scatter(x, w, mesh, tables, *, collective_id):
 # experts' gate/up (fused SiTU) and down projections, MXFP4 weights.
 
 
-def swigluoai(
-    gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
-) -> jax.Array:
-    """Activation used in some models such as GPT-OSS."""
-
-    gate = jnp.clip(gate, max=limit)
-    up = jnp.clip(up, min=-limit, max=limit)
-    glu = gate * jax.nn.sigmoid(alpha * gate)
-    return (up + 1.0) * glu
-
-
-def silu_and_mul_with_clamp(
-    gate: jax.Array, up: jax.Array, limit: float = 10.0
-) -> jax.Array:
-    """Activation used by DeepSeek V4."""
-    # The limit value is from DSV4's config.
-    # TODO: pass limit from model config, instead of hardcoding here.
-    gate = jnp.clip(gate, max=limit)
-    up = jnp.clip(up, min=-limit, max=limit)
-    return jax.nn.silu(gate) * up
-
-
 def situ_and_mul(
     gate: jax.Array, up: jax.Array, beta: float, linear_beta: float | None
 ) -> jax.Array:
@@ -1542,7 +1522,8 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
     Args:
         acc: The accumulator array, with the last dimension being 2 * tile_n.
-        fuse_act: The name of the activation function to apply.
+        fuse_act: None, or ``"situ:<beta>:<linear_beta>"`` (``linear_beta``
+            may be ``none``) for the SiTU gated activation.
 
     Returns:
         The result of applying the activation function.
@@ -1556,16 +1537,6 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
 
     acc_gate, acc_up = deinterleave_lane(acc)
     match fuse_act:
-        case "silu":
-            return jax.nn.silu(acc_gate) * acc_up
-        case "gelu":
-            return jax.nn.gelu(acc_gate) * acc_up
-        case "gelu_tanh":
-            return jax.nn.gelu(acc_gate, approximate=True) * acc_up
-        case "swigluoai":
-            return swigluoai(acc_gate, acc_up)
-        case "silu_and_mul_with_clamp":
-            return silu_and_mul_with_clamp(acc_gate, acc_up)
         case str() if fuse_act.startswith("situ:"):
             _, beta, linear_beta = fuse_act.split(":")
             linear_beta = None if linear_beta == "none" else float(linear_beta)
@@ -1610,9 +1581,6 @@ class RhsRef(ABC):
         """Returns scale array, optionally replicated across sublanes."""
         ...
 
-    @abstractmethod
-    def get_bias(self) -> jax.Array: ...
-
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -1621,7 +1589,6 @@ class WeightsRef(RhsRef):
 
     weight: Any
     scale: Any | None
-    bias: Any | None
 
     def get_weight(self) -> jax.Array:
         return self.weight[...]
@@ -1636,10 +1603,6 @@ class WeightsRef(RhsRef):
             # Perform zero-stride load for efficient broadcasting across sublanes.
             return self.scale[:, pl.ds(0, replicate_size, 0), :]
         return self.scale[...]
-
-    def get_bias(self) -> jax.Array:
-        assert self.bias is not None
-        return self.bias[...]
 
 
 @jax.tree_util.register_dataclass
@@ -1659,11 +1622,6 @@ class FusedWeightsRef(RhsRef):
         s_gate = self.gate.get_scale(replicate_size)
         s_up = self.up.get_scale(replicate_size)
         return interleave_lane(s_gate, s_up)
-
-    def get_bias(self) -> jax.Array:
-        b_gate = self.gate.get_bias()
-        b_up = self.up.get_bias()
-        return interleave_lane(b_gate, b_up)
 
 
 @jax.tree_util.register_dataclass
@@ -1696,7 +1654,6 @@ class InputConfigs:
     quant_dtype: jnp.dtype | None
     quant_block_size: int | None
     dtype: jnp.dtype
-    has_bias: bool = False
     has_scale: bool = False
     # Scales as raw MXFP4 E8M0 exponent bytes ([group, blocks, n] uint8),
     # converted per tile in VMEM, instead of [group, blocks, 1, n] FP32.
@@ -1720,12 +1677,6 @@ class InputConfigs:
     def should_dequantize_after_matmul(self) -> bool:
         return self.has_scale and not self.should_dequantize_before_matmul
 
-    @property
-    def should_quantize(self) -> bool:
-        if self.quant_dtype is None:
-            return False
-        return self.quant_dtype != self.dtype
-
 
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
@@ -1735,7 +1686,6 @@ class GmmConfigs:
     rhs_cfgs: InputConfigs
     out_dtype: jnp.dtype
     acc_dtype: jnp.dtype
-    zero_init: bool
     fuse_act: str | None
 
     @property
@@ -1773,10 +1723,6 @@ class IndexMaps:
     def rhs_weight_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, n_id)
-
-    def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
-        group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
-        return (group_id, 0, n_id)
 
     def rhs_scale_index_map(self, n_id: jax.Array, gm_id: jax.Array, k_id: jax.Array):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
@@ -1821,12 +1767,7 @@ def generate_block_specs(
         index_map.rhs_weight_index_map,
         pipeline_mode=pl.Buffered(buffer_count=3),
     )
-    rhs_scale_block_spec = rhs_bias_block_spec = None
-    if cfgs.rhs_cfgs.has_bias:
-        rhs_bias_block_spec = pl.BlockSpec(
-            (None, 1, cfgs.tiles.tile_n),
-            index_map.rhs_bias_index_map,
-        )
+    rhs_scale_block_spec = None
     if cfgs.rhs_cfgs.has_scale:
         rhs_scale_block_spec = pl.BlockSpec(
             (None, cfgs.num_quant_blocks_per_tile_k, cfgs.tiles.tile_n) if cfgs.rhs_cfgs.scale_e8m0
@@ -1837,7 +1778,6 @@ def generate_block_specs(
     rhs_block_spec = WeightsRef(
         weight=rhs_weight_spec,
         scale=rhs_scale_block_spec,
-        bias=rhs_bias_block_spec,
     )
 
     out_block_spec = pl.BlockSpec(
@@ -1923,97 +1863,29 @@ def inner_kernel(
 
         # Step 2: Matmul.
         acc_list = []
-        if not cfgs.lhs_cfgs.should_quantize:
-            # Unquantized matmul path.
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
+        for start_n in range(0, rhs_tile_n, mxu_size):
+            end_n = min(rhs_tile_n, start_n + mxu_size)
+            col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
-                    end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
+            acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+            for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
+                end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
 
-                    block_acc = jnp.matmul(
-                        tiled_lhs[:, start_k:end_k],
-                        tiled_rhs[start_k:end_k, start_n:end_n],
-                        preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                block_acc = jnp.matmul(
+                    tiled_lhs[:, start_k:end_k],
+                    tiled_rhs[start_k:end_k, start_n:end_n],
+                    preferred_element_type=jnp.float32,
+                ).astype(acc_ref.dtype)
 
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                if cfgs.rhs_cfgs.should_dequantize_after_matmul:
+                    b_id = start_k // rhs_qbs
+                    rhs_scale_replicated = tiled_rhs_ref.get_scale(
+                        replicate_size=bucket_m
+                    )[b_id, :, start_n : start_n + col_size]
+                    block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
 
-                    acc_n += block_acc
-                acc_list.append(acc_n)
-        else:
-            # Quantized matmul path.
-            lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
-            q_block_size = cfgs.lhs_cfgs.quant_block_size
-
-            if jnp.issubdtype(lhs_q_dtype, jnp.floating):
-                dtype_max = float(jnp.finfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.float32
-            else:
-                dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
-                preferred_element_type = jnp.int32
-
-            # Without n outer loop, result of quantized matmul becomes available only
-            # at the last iteration of the loop. This means [tile_m, tile_n] value
-            # needs to be stored until the last iteration. By adding n outer loop,
-            # result of [tile_m, mxu_size] becomes available at the end of every k
-            # inner loop which can be used to pipeline subsequent VPU or VST ops with
-            # MXU ops for the next [tile_m, mxu_size].
-            for start_n in range(0, rhs_tile_n, mxu_size):
-                end_n = min(rhs_tile_n, start_n + mxu_size)
-                col_size = end_n - start_n
-
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
-                for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
-                    end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
-
-                    block_lhs = tiled_lhs[:, start_k:end_k]
-                    block_rhs = tiled_rhs[start_k:end_k, start_n:end_n]
-
-                    # Perform lhs quantization. Note that for every block_lhs,
-                    # same computation will be performed tiles_n//mxu_size times.
-                    # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
-
-                    # Unlike unquantized path, compiler may not perform implicit type
-                    # conversion due to numeric concerns. As this can cause unsupported
-                    # matmul error, explicit type conversion is performed.
-                    if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
-                        block_rhs = block_rhs.astype(lhs_q_dtype)
-
-                    block_acc = jnp.matmul(
-                        block_lhs_q,
-                        block_rhs,
-                        preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
-
-                    block_acc *= block_scale.astype(acc_ref.dtype)
-
-                    # Apply rhs subchannel scale per quant block.
-                    if cfgs.rhs_cfgs.should_dequantize_after_matmul:
-                        b_id = start_k // rhs_qbs
-                        rhs_scale_replicated = tiled_rhs_ref.get_scale(
-                            replicate_size=bucket_m
-                        )[b_id, :, start_n : start_n + col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
-
-                    acc_n += block_acc
-                acc_list.append(acc_n)
+                acc_n += block_acc
+            acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 
         # Step 3: Output post-processing.
@@ -2023,10 +1895,6 @@ def inner_kernel(
         acc_m = acc.shape[0]
 
         if is_last_k_step:
-            if cfgs.rhs_cfgs.has_bias:
-                tiled_rhs_bias = tiled_rhs_ref.get_bias()
-                acc += tiled_rhs_bias.astype(acc.dtype)
-
             acc = apply_act_fn(acc, cfgs.fuse_act)
 
             # Mask out rows that do not belong to the current group.
@@ -2198,82 +2066,6 @@ def fill_metadata(
     return num_gm
 
 
-def zero_out_start(
-    out_ref: jax.Array,  # [size_m, size_n]
-    zero_ref: jax.Array,  # [tile_zero_m, num_lanes]
-    semaphore_ref: jax.Array,  # [1]
-    metadata_ref: MetadataRef,
-    num_gm: jax.Array,
-    *,
-    dims: Dimensions,
-):
-    """Zero out output rows that are not used in the computation."""
-
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    assert num_lanes == zero_ref.shape[-1]
-    zero_ref[...] = jnp.zeros_like(zero_ref)
-
-    zero_dma = zero_ref.reshape(-1, dims.size_lhs_sublane, num_lanes)
-    out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-    row_size = zero_dma.shape[0]
-
-    compute_start = metadata_ref.gm_id_to_m_offset[0]
-    compute_end = metadata_ref.gm_id_to_m_offset[num_gm]
-
-    left_zero_start = 0
-    left_zero_end = compute_start // dims.size_lhs_sublane
-    left_zero_size = left_zero_end - left_zero_start
-    left_num_loops = pl.cdiv(left_zero_size, row_size)
-
-    right_zero_start = pl.cdiv(compute_end, dims.size_lhs_sublane)
-    right_zero_end = out_dma.shape[0]
-    right_zero_size = right_zero_end - right_zero_start
-    right_num_loops = pl.cdiv(right_zero_size, row_size)
-
-    def fill_zero(i, zero_size, *, start, end):
-        dma_start = start + i * row_size
-        dma_end = jnp.minimum(dma_start + row_size, end)
-        dma_size = dma_end - dma_start
-
-        # Static loop. Will be unrolled during compile time.
-        for n_start in range(0, out_dma.shape[-1], num_lanes):
-            n_end = n_start + num_lanes
-            pltpu.make_async_copy(
-                src_ref=zero_dma.at[pl.ds(0, dma_size)],
-                dst_ref=out_dma.at[pl.ds(dma_start, dma_size), :, n_start:n_end],
-                sem=semaphore_ref.at[0],
-            ).start(priority=1)
-
-        return zero_size + dma_size
-
-    @jax.named_scope("left_fill_zero")
-    def left_fill_zero(i, zero_size):
-        return fill_zero(i, zero_size, start=left_zero_start, end=left_zero_end)
-
-    @jax.named_scope("right_fill_zero")
-    def right_fill_zero(i, zero_size):
-        return fill_zero(i, zero_size, start=right_zero_start, end=right_zero_end)
-
-    zero_size = lax.fori_loop(0, left_num_loops, left_fill_zero, 0)
-    zero_size = lax.fori_loop(0, right_num_loops, right_fill_zero, zero_size)
-    return zero_size
-
-
-def zero_out_end(
-    out_ref: jax.Array,  # [size_m, size_n]
-    semaphore_ref: jax.Array,  # [1]
-    zero_size: jax.Array,
-    *,
-    dims: Dimensions,
-):
-    out_dma = out_ref.reshape(-1, dims.size_lhs_sublane, out_ref.shape[-1])
-    pltpu.make_async_copy(
-        src_ref=out_dma.at[pl.ds(0, zero_size)],
-        dst_ref=out_dma.at[pl.ds(0, zero_size)],
-        sem=semaphore_ref.at[0],
-    ).wait()
-
-
 def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
@@ -2288,8 +2080,6 @@ def kernel_main(
     partial_out_ref: jax.Array,  # [size_lhs_sublane, tile_n]
     acc_ref: jax.Array,  # [tile_m, tile_n]
     metadata_ref: MetadataRef,
-    zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
-    semaphore_ref: jax.Array | None,  # [1]
     *,
     cfgs: GmmConfigs,
 ):
@@ -2315,8 +2105,6 @@ def kernel_main(
         partial_out_ref: Reference to the partial output.
         acc_ref: Reference to the accumulator.
         metadata_ref: Reference to the metadata.
-        zero_ref: Scratch memory for storing zero values used in initialization.
-        semaphore_ref: Semaphore for zero initialization DMAs.
         cfgs: GmmConfigs.
     """
 
@@ -2344,16 +2132,6 @@ def kernel_main(
         cfgs=cfgs,
     )
 
-    if cfgs.zero_init:
-        zero_size = zero_out_start(
-            out_ref,
-            zero_ref,
-            semaphore_ref,
-            metadata_ref,
-            num_gm,
-            dims=cfgs.dims,
-        )
-
     (lhs_spec, rhs_spec), out_spec = generate_block_specs(metadata_ref, cfgs)
 
     if cfgs.fuse_act is not None:
@@ -2380,9 +2158,6 @@ def kernel_main(
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     pipeline_fn(lhs_in, rhs_ref, out_in, scratches=scratches)
 
-    if cfgs.zero_init:
-        zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
-
 
 def calculate_tiling(
     dims: Dimensions,
@@ -2406,8 +2181,6 @@ def calculate_tiling(
     bf16_bf16_tile_m = 128
     rhs_mod = min(pl.cdiv(16, rhs_bits), 2)
     tile_m = bf16_bf16_tile_m // rhs_mod
-    if lhs_cfgs.should_quantize:
-        tile_m *= 2
     tile_m = min(tile_m, dims.size_m)
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
@@ -2438,13 +2211,8 @@ def calculate_tiling(
         # 1. LHS tile (double-buffered HBM load)
         lhs_tile_bytes = lhs_bits // 8
         lhs_vmem = 2 * tm * tk * lhs_tile_bytes
-        # If LHS is quantized on-the-fly, we need an extra single-buffered cast
-        # buffer in VMEM.
-        if lhs_cfgs.should_quantize:
-            lhs_quant_bits = jax.dtypes.itemsize_bits(lhs_cfgs.quant_dtype)
-            lhs_vmem += tm * tk * (lhs_quant_bits // 8)
 
-        # 2. RHS tile (triple-buffered, includes scale and bias if present)
+        # 2. RHS tile (triple-buffered, includes scale if present)
         # If fuse_act is enabled, we have both gate and up weights,
         # so RHS memory is doubled.
         rhs_weight_vmem = tk * tn * rhs_bits // 8
@@ -2452,17 +2220,11 @@ def calculate_tiling(
         if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
             num_quant_blocks_per_tile_k = pl.cdiv(tk, rhs_cfgs.quant_block_size)
             rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * 4
-        rhs_bias_vmem = 0
-        if rhs_cfgs.has_bias:
-            rhs_bias_vmem = tn * 4
-        rhs_vmem = fuse_act_factor * (
-            3 * rhs_weight_vmem + 2 * rhs_scale_vmem + 2 * rhs_bias_vmem
-        )
+        rhs_vmem = fuse_act_factor * (3 * rhs_weight_vmem + 2 * rhs_scale_vmem)
 
         # 3. Accumulator
         acc_cols = fuse_act_factor * tn
-        acc_dtype_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4
-        acc_vmem = tm * acc_cols * acc_dtype_bytes
+        acc_vmem = tm * acc_cols * 4  # FP32
 
         # 4. Output tile (double-buffered)
         out_dtype_bytes = jax.dtypes.itemsize_bits(lhs_cfgs.dtype) // 8
@@ -2522,7 +2284,6 @@ def validate_inputs(
     lhs: jax.Array,
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
-    rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
@@ -2538,8 +2299,6 @@ def validate_inputs(
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
     assert rhs.shape == (size_group, size_k // packing_factor, size_n)
-    if rhs_bias is not None:
-        assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
         if rhs_scale.dtype == jnp.uint8:  # E8M0 exponents
@@ -2573,14 +2332,14 @@ def get_cost_estimate(cfgs: GmmConfigs):
     """Returns the cost estimate for the GMM kernel."""
 
     dims = cfgs.dims
-    lhs_dtype = cfgs.lhs_cfgs.quant_dtype or cfgs.lhs_cfgs.dtype
+    lhs_dtype = cfgs.lhs_cfgs.dtype
     rhs_dtype = cfgs.rhs_cfgs.quant_dtype or cfgs.rhs_cfgs.dtype
 
     # We use bits for rhs since it could be a sub-byte dtype like int4.
     rhs_bits = jax.dtypes.itemsize_bits(rhs_dtype)
     fp32_bytes = jnp.dtype(jnp.float32).itemsize
 
-    # TODO(kyuyeunk): Add compute flops for quant, dequant, and bias.
+    # TODO(kyuyeunk): Add compute flops for dequant.
     flops = 2 * dims.size_m * dims.size_k * dims.size_n
 
     lhs_bytes = dims.size_m * dims.size_k * lhs_dtype.itemsize
@@ -2590,8 +2349,6 @@ def get_cost_estimate(cfgs: GmmConfigs):
     if cfgs.rhs_cfgs.has_scale:
         num_quant_blocks = pl.cdiv(dims.size_k, cfgs.rhs_cfgs.quant_block_size)
         rhs_bytes += dims.size_group * num_quant_blocks * dims.size_n * fp32_bytes
-    if cfgs.rhs_cfgs.has_bias:
-        rhs_bytes += dims.size_group * dims.size_n * fp32_bytes
 
     out_bytes = dims.size_m * cfgs.out_size_n * cfgs.out_dtype.itemsize
 
@@ -2617,7 +2374,6 @@ def make_gmm_configs(
     lhs: jax.Array,
     rhs: jax.Array,
     rhs_scale: jax.Array | None,
-    rhs_bias: jax.Array | None,
     group_sizes: jax.Array,
     group_offset: jax.Array,
     *,
@@ -2625,8 +2381,6 @@ def make_gmm_configs(
     vmem_limit_bytes: int | None,
     out_dtype: jnp.dtype | None,
     acc_dtype: jnp.dtype | None,
-    maybe_quantize_lhs: bool,
-    zero_initialize: bool,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
 ):
@@ -2638,7 +2392,6 @@ def make_gmm_configs(
         lhs,
         rhs,
         rhs_scale,
-        rhs_bias,
         group_sizes,
         group_offset,
         fuse_act,
@@ -2658,48 +2411,18 @@ def make_gmm_configs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
         dtype=rhs.dtype,
-        has_bias=rhs_bias is not None,
         has_scale=has_scale,
         scale_e8m0=rhs_scale is not None and rhs_scale.dtype == jnp.uint8,
     )
 
-    lhs_q_dtype = None
-    if maybe_quantize_lhs and rhs_cfgs.should_dequantize_after_matmul:
-        # Choose lhs quantization dtype based on TPU hardware support.
-        is_rhs_float = jnp.issubdtype(rhs_quant_dtype, jnp.floating)
-        tpu_info = pltpu.get_tpu_info()
-        # Check if there is hardware compute support for rhs dtype group.
-        if tpu_info.fp8_ops_per_second > 0:
-            # Special handling for 4-bit integer rhs as it can be converted to fp8
-            # without numeric issues. Note that this is not the case for 4-bit
-            # floating rhs as conversion to int8 will cause numeric issues.
-            is_rhs_4bits = jax.dtypes.itemsize_bits(rhs_quant_dtype) == 4
-            if is_rhs_float or is_rhs_4bits:
-                lhs_q_dtype = jnp.float8_e4m3fn.dtype
-        if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
-            lhs_q_dtype = jnp.int8.dtype
-
-    lhs_cfgs = InputConfigs(
-        quant_dtype=lhs_q_dtype,
-        # Input quantization involves reading all elements in a block to compute
-        # scale value. Since this operation is very memory intensive, we use a
-        # block size that is small enough to minimize memory overhead but large
-        # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
-        dtype=lhs.dtype,
-    )
+    # The lhs is never quantized: the matmul runs in its own dtype.
+    lhs_cfgs = InputConfigs(quant_dtype=None, quant_block_size=None, dtype=lhs.dtype)
 
     if out_dtype is None:
         out_dtype = lhs.dtype
 
     if acc_dtype is None:
-        if lhs_cfgs.quant_dtype is None:
-            acc_dtype = jnp.float32.dtype
-        else:
-            # Input quantization requires elementwise ops which can put pressure on
-            # VPUs. Using faster bf16 hardware during accumulation can help offset the
-            # pressure.
-            acc_dtype = jnp.bfloat16.dtype
+        acc_dtype = jnp.float32.dtype
 
     if isinstance(tile_info, TileSizes):
         tiles = tile_info
@@ -2713,7 +2436,6 @@ def make_gmm_configs(
         rhs_cfgs=rhs_cfgs,
         out_dtype=jnp.dtype(out_dtype),
         acc_dtype=jnp.dtype(acc_dtype),
-        zero_init=zero_initialize,
         fuse_act=fuse_act,
     )
 
@@ -2736,8 +2458,6 @@ def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
         "precision",
         "preferred_element_type",
         "acc_dtype",
-        "maybe_quantize_lhs",
-        "zero_initialize",
         "fuse_act",
         "rhs_quant_dtype",
     ]
@@ -2747,7 +2467,6 @@ def gmm_v2(
     rhs: jax.Array,  # [size_group, size_k, size_n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
     rhs_scale: jax.Array | None = None,  # [size_group, num_blocks, 1, out_size], or E8M0 uint8 [size_group, num_blocks, out_size]
-    rhs_bias: jax.Array | None = None,  # [size_group, 1, out_size]
     group_offset: jax.Array | None = None,  # int32[1]
     *,
     rhs_layer: jax.Array | None = None,
@@ -2756,8 +2475,6 @@ def gmm_v2(
     precision: jax.lax.Precision = jax.lax.Precision.DEFAULT,
     preferred_element_type: jnp.dtype | None = None,
     acc_dtype: jnp.dtype | None = None,
-    maybe_quantize_lhs: bool = True,
-    zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
 ) -> jax.Array:
@@ -2773,20 +2490,18 @@ def gmm_v2(
             [size_group, size_k/8, size_n]. A leading layer axis is allowed
             when rhs_layer is supplied; the kernel selects it without copying.
         rhs_layer: Optional int32[1] index into a resident RHS weight family.
-            Scales and bias still describe the selected layer.
+            Scales still describe the selected layer.
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
         rhs_scale: The rhs scale of shape [size_group, num_blocks, 1, out_size],
             or E8M0 uint8 [size_group, num_blocks, out_size].
-        rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
         vmem_limit_bytes: Optional vmem limit in bytes.
         precision: Unused. Exists for compatibility reasons.
         preferred_element_type: Optional jnp.dtype for the output matrix.
         acc_dtype: Optional jnp.dtype for the accumulator.
-        maybe_quantize_lhs: Quantize lhs if set to True and rhs is quantized.
-        zero_initialize: Whether to initialize unvisited output elements to zero.
-        fuse_act: Activation function to fuse with GMM, None if no fusion.
+        fuse_act: Activation function to fuse with GMM (``"situ:..."``), None
+            if no fusion. Output rows outside every group are not written.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier, packed along k.
 
     Returns:
@@ -2826,29 +2541,23 @@ def gmm_v2(
         lhs,
         jax.ShapeDtypeStruct(rhs.shape[1:], rhs.dtype) if family else rhs,
         jax.ShapeDtypeStruct(rhs_scale.shape[1:], rhs_scale.dtype) if scale_family else rhs_scale,
-        rhs_bias,
         group_sizes,
         group_offset,
         tile_info=tile_info,
         vmem_limit_bytes=vmem_limit_bytes,
         out_dtype=preferred_element_type,
         acc_dtype=acc_dtype,
-        maybe_quantize_lhs=maybe_quantize_lhs,
-        zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
 
-    rhs_scale_spec = rhs_bias_spec = None
+    rhs_scale_spec = None
     if rhs_scale is not None:
         if rhs_scale.dtype != jnp.uint8:  # E8M0 exponents stay bytes
             rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
-    if rhs_bias is not None:
-        rhs_bias = rhs_bias.astype(jnp.float32)
-        rhs_bias_spec = pl.BlockSpec(memory_space=pltpu.HBM)
 
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
@@ -2865,34 +2574,9 @@ def gmm_v2(
     ]
 
     num_lanes = pltpu.get_tpu_info().num_lanes
-    if cfgs.zero_init:
-        # TODO(kyuyeunk): Create better heuristics for determining this value.
-        target_zero_ref_bytes = 2 * 1024 * 1024
-
-        # Zero initialization is done by tiling size_m dim where each tile invokes
-        # zero initializing DMA for up-to tile_zero_m rows. This means larger
-        # tile_zero_m will result in fewer number of tiles and lead to smaller
-        # overhead. However, in order to invoke DMA call up-to tile_zero_m rows, we
-        # need to store equivalent sized memory in VMEM buffer for the duration of
-        # DMA. Storing [tile_zero_m, size_n] in buffer will trigger OOM if
-        # tile_zero_m is too large. Instead, if we set column size as num_lanes
-        # (which is smallest allowed column size for DMA) and reuse the buffer by
-        # size_n//num_lanes times in a single tile, we can significantly increase
-        # tile_zero_m without triggering OOM.
-        out_bytes = jnp.dtype(cfgs.out_dtype).itemsize
-        tile_zero_m = target_zero_ref_bytes // num_lanes // out_bytes
-        tile_zero_m = min(tile_zero_m, dims.size_m)
-
-        scratch_shapes += [
-            pltpu.VMEM((tile_zero_m, num_lanes), cfgs.out_dtype),
-            pltpu.SemaphoreType.DMA((1,)),
-        ]
-    else:
-        scratch_shapes += [None, None]
-
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
-    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale)
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
@@ -2904,7 +2588,6 @@ def gmm_v2(
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
-                    bias=rhs_bias_spec,
                 ),
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2950,13 +2633,6 @@ def _dot3(x, y, contracting=2):
         y,
         (((contracting,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
-    )
-
-
-def _mv_k(x, y):
-    """Batched matvec contracting the channel axis: [H, BC, K] @ [H, K] -> [H, BC]."""
-    return jax.lax.dot_general(
-        x, y, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32
     )
 
 
@@ -3422,7 +3098,6 @@ def make_mixture_norm_sp(mesh, *, seq_len, eps=1e-5):
 
 
 def kda_prefill_tiled_body(
-    length_ref,  # [1] INT32 scalar prefetch
     hidden_ref,  # [T, hidden] BF16 HBM
     gate_w_ref,  # [hidden, 128] BF16
     fb_w_ref,  # [128, 384] BF16
@@ -3455,24 +3130,23 @@ def kda_prefill_tiled_body(
     tile,
     decay_lower_bound,
     epsilon,
-    checkpoint=None,
-    segments=None,
-    tiles=None,
-    block_tiles=None,
-    projection=None,
+    checkpoint,
+    segments,
+    tiles,
+    block_tiles,
+    projection,
 ):
-    """Run one KDA layer, reading and writing tiled activations in HBM.
+    """Run one KDA layer over a packed window, reading and writing tiled
+    activations in HBM.
 
-    ``checkpoint``: ``(position, rec_out_ref, conv_out_ref)``; also store the
-    state after ``position`` tokens (a multiple of ``tile``, at most
-    ``length``; 0: the incoming state).
-    ``segments``: ``(ref, count)``; a packed window, ``ref`` the SMEM int32
-    ``[3 * count]`` offsets (ascending multiples of ``tile``), lengths (0: an
-    unused slot, whose output is its input) and checkpoint positions (from
-    the sequence start). State refs then lead with the sequence, each loaded
-    at its first tile and stored after its last; ``checkpoint[0]`` is
-    ignored, rows outside every sequence change nothing and ``length`` must
-    cover the last sequence.
+    ``segments``: ``(ref, count)``; ``ref`` the SMEM int32 ``[3 * count]``
+    offsets (ascending multiples of ``tile``), lengths (0: an unused slot,
+    whose output is its input) and checkpoint positions (from the sequence
+    start). State refs lead with the sequence, each loaded at its first tile
+    and stored after its last; rows outside every sequence change nothing.
+    ``checkpoint``: ``(rec_out_ref, conv_out_ref)``; also store each
+    sequence's state after its checkpoint position (a multiple of ``tile``;
+    0: the incoming state).
     ``tiles``: ``(first_tile, end_tile, first, last)``; run only those tiles,
     loading the weights when ``first`` and finishing when ``last``.
     ``block_tiles``: hidden rows arrive in blocks of this many tiles; no load
@@ -3482,19 +3156,15 @@ def kda_prefill_tiled_body(
     ``partial_ref`` ``[T, hidden]``, the reduce-scatter's partial sums.
     Scratch refs follow ``kda_prefill_tiled_scratch_shapes``.
     """
-    tokens, hidden = hidden_ref.shape
     head_count, channels = _HEADS, _CHANNELS
     width = head_count * channels  # 384
-    n_tiles = tokens // tile
-    length = length_ref[0]
-    packed = segments is not None
-    if packed:
-        segment_ref, count = segments
+    segment_ref, count = segments
 
-        def field(index, s):  # descriptor field ``index`` of sequence ``s``
-            return segment_ref[index * count + s]
+    def field(index, s):  # descriptor field ``index`` of sequence ``s``
+        return segment_ref[index * count + s]
 
-    # ---- load the layer weights (+ the carried state, unpacked) into VMEM once ----
+    # ---- load the layer weights into VMEM once ----
+    weight_ref, weight_vmem, partial_ref, partial_bufs, partial_sems = projection
     weight_copies = (
         pltpu.make_async_copy(gate_w_ref, gate_w_vmem, weight_sems.at[0]),
         pltpu.make_async_copy(fb_w_ref, fb_w_vmem, weight_sems.at[1]),
@@ -3503,25 +3173,11 @@ def kda_prefill_tiled_body(
         pltpu.make_async_copy(alog_ref, alog_vmem, weight_sems.at[4]),
         pltpu.make_async_copy(dt_ref, dt_vmem, weight_sems.at[5]),
         pltpu.make_async_copy(norm_ref, norm_vmem, weight_sems.at[6]),
+        pltpu.make_async_copy(weight_ref, weight_vmem, weight_sems.at[13]),
     )
-    if not packed:
-        weight_copies += (
-            pltpu.make_async_copy(rec_state_in_ref, rec_state_vmem, weight_sems.at[7]),
-            pltpu.make_async_copy(conv_hist_in_ref, conv_hist_vmem, weight_sems.at[8]),
-        )
-    first_tile, end_tile, first, last = tiles or (0, n_tiles, True, True)
-    block_tiles = block_tiles or n_tiles
+    first_tile, end_tile, first, last = tiles
 
-    def when(condition):  # pl.when that also takes a static bool
-        if isinstance(condition, bool):
-            return (lambda body: body()) if condition else (lambda body: None)
-        return pl.when(condition)
-
-    if projection is not None:
-        weight_ref, weight_vmem, partial_ref, partial_bufs, partial_sems = projection
-        weight_copies += (pltpu.make_async_copy(weight_ref, weight_vmem, weight_sems.at[13]),)
-
-    @when(first)
+    @pl.when(first)
     def load_weights():
         for c in weight_copies:
             c.start()
@@ -3536,40 +3192,32 @@ def kda_prefill_tiled_body(
         for copy in copies:
             copy.wait()
 
-    def write_checkpoint(segment=None):
-        rec_target, hist_target = checkpoint[1], checkpoint[2]
-        if segment is not None:
-            rec_target, hist_target = rec_target.at[segment], hist_target.at[segment]
-        copy_now(((rec_state_vmem, rec_target), (conv_hist_vmem, hist_target)), 11)
+    rec_checkpoint_ref, hist_checkpoint_ref = checkpoint
 
-    if checkpoint is not None and not packed:
-        write_checkpoint()  # position 0, overwritten when a tile ends there
-    if packed:
-        # An unused slot: its outputs are its inputs. The copies start with
-        # the first tiles and are waited for after the last: one blocking
-        # round trip per slot would hold up the tiles (~0.15 ms a layer at
-        # 16 slots).
-        def unused_copies(s):
-            pairs = [(rec_state_in_ref.at[s], rec_state_out_ref.at[s]),
-                     (conv_hist_in_ref.at[s], conv_hist_out_ref.at[s])]
-            if checkpoint is not None:
-                pairs += [(rec_state_in_ref.at[s], checkpoint[1].at[s]),
-                          (conv_hist_in_ref.at[s], checkpoint[2].at[s])]
-            return [pltpu.make_async_copy(source, target, weight_sems.at[14 + i % 2])
-                    for i, (source, target) in enumerate(pairs)]
+    def write_checkpoint(segment):
+        copy_now(((rec_state_vmem, rec_checkpoint_ref.at[segment]),
+                  (conv_hist_vmem, hist_checkpoint_ref.at[segment])), 11)
 
-        def each_unused(action):
-            @pl.loop(0, count)
-            def visit(s):
-                @pl.when(field(1, s) == 0)
-                def unused():
-                    for copy in unused_copies(s):
-                        action(copy)
+    # An unused slot: its outputs are its inputs. The copies start with the
+    # first tiles and are waited for after the last: one blocking round trip
+    # per slot would hold up the tiles (~0.15 ms a layer at 16 slots).
+    def unused_copies(s):
+        pairs = [(rec_state_in_ref.at[s], rec_state_out_ref.at[s]),
+                 (conv_hist_in_ref.at[s], conv_hist_out_ref.at[s]),
+                 (rec_state_in_ref.at[s], rec_checkpoint_ref.at[s]),
+                 (conv_hist_in_ref.at[s], hist_checkpoint_ref.at[s])]
+        return [pltpu.make_async_copy(source, target, weight_sems.at[14 + i % 2])
+                for i, (source, target) in enumerate(pairs)]
 
-        when(first)(lambda: each_unused(lambda copy: copy.start()))
-        finish_unused = lambda: each_unused(lambda copy: copy.wait())  # noqa: E731
-    else:
-        finish_unused = None
+    def each_unused(action):
+        @pl.loop(0, count)
+        def visit(s):
+            @pl.when(field(1, s) == 0)
+            def unused():
+                for copy in unused_copies(s):
+                    action(copy)
+
+    pl.when(first)(lambda: each_unused(lambda copy: copy.start()))
 
     def load_tile(t, buf):
         return pltpu.make_async_copy(
@@ -3579,15 +3227,13 @@ def kda_prefill_tiled_body(
         )
 
     def store_tile(t, buf):
-        copies = [pltpu.make_async_copy(
-            out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]
-        )]
-        if projection is not None:
-            copies.append(pltpu.make_async_copy(
+        return _Copies([
+            pltpu.make_async_copy(
+                out_bufs.at[buf], out_ref.at[pl.ds(t * tile, tile), :], out_sems.at[buf]),
+            pltpu.make_async_copy(
                 partial_bufs.at[buf], partial_ref.at[pl.ds(t * tile, tile), :],
-                partial_sems.at[buf],
-            ))
-        return _Copies(copies)
+                partial_sems.at[buf]),
+        ])
 
     def tile_body(t):
         buf = t % 2
@@ -3598,32 +3244,27 @@ def kda_prefill_tiled_body(
             load_tile(t, buf).start()
 
         load_tile(t, buf).wait()
-        if packed:
-            # The tile's sequence (-1: padding only; offsets are page-aligned,
-            # so no tile holds two) and where its rows end. The state copies
-            # index that one sequence: unrolled per slot, they would not fit
-            # the fused layer's instruction memory at 16 slots.
-            first_row = t * tile
-            segment, segment_end = -1, 0
-            for s in range(count):
-                start = field(0, s)
-                end = start + field(1, s)
-                inside = (first_row >= start) & (first_row < end)
-                segment = jnp.where(inside, s, segment)
-                segment_end = jnp.where(inside, end, segment_end)
-            current = jnp.maximum(segment, 0)
-            offset, position = field(0, current), field(2, current)
+        # The tile's sequence (-1: padding only; offsets are page-aligned, so
+        # no tile holds two) and where its rows end. The state copies index
+        # that one sequence: unrolled per slot, they would not fit the fused
+        # layer's instruction memory at 16 slots.
+        first_row = t * tile
+        segment, segment_end = -1, 0
+        for s in range(count):
+            start = field(0, s)
+            end = start + field(1, s)
+            inside = (first_row >= start) & (first_row < end)
+            segment = jnp.where(inside, s, segment)
+            segment_end = jnp.where(inside, end, segment_end)
+        current = jnp.maximum(segment, 0)
+        offset, position = field(0, current), field(2, current)
 
-            @pl.when((segment >= 0) & (first_row == offset))
-            def load_segment_state():
-                copy_now(((rec_state_in_ref.at[current], rec_state_vmem),
-                          (conv_hist_in_ref.at[current], conv_hist_vmem)), 7)
-                if checkpoint is not None:
-                    pl.when(position == 0)(lambda: write_checkpoint(current))
-            row_end = segment_end
-            tile_segment = (segment, segment_end, current, offset, position)
-        else:
-            row_end, tile_segment = length, None
+        @pl.when((segment >= 0) & (first_row == offset))
+        def load_segment_state():
+            copy_now(((rec_state_in_ref.at[current], rec_state_vmem),
+                      (conv_hist_in_ref.at[current], conv_hist_vmem)), 7)
+            pl.when(position == 0)(lambda: write_checkpoint(current))
+        row_end = segment_end
 
         @pl.when(in_block >= 2)
         def wait_previous_store():
@@ -3716,26 +3357,20 @@ def kda_prefill_tiled_body(
         ).astype(jnp.bfloat16)
         attended = attended.reshape(tile, width)
         out_bufs.at[buf][...] = attended
-        if projection is not None:
-            columns = weight_vmem.shape[1] // 4
-            for c in range(4):  # in column quarters: bounded temporaries
-                partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
-                    attended, weight_vmem[:, pl.ds(c * columns, columns)]
-                ).astype(jnp.bfloat16)
+        columns = weight_vmem.shape[1] // 4
+        for c in range(4):  # in column quarters: bounded temporaries
+            partial_bufs.at[buf, :, pl.ds(c * columns, columns)][...] = _dot(
+                attended, weight_vmem[:, pl.ds(c * columns, columns)]
+            ).astype(jnp.bfloat16)
 
-        if tile_segment is not None:
-            segment, segment_end, current, offset, position = tile_segment
-            if checkpoint is not None:
-                pl.when((segment >= 0) & (position > 0)
-                        & ((t + 1) * tile == offset + position))(
-                    lambda: write_checkpoint(current))
+        pl.when((segment >= 0) & (position > 0)
+                & ((t + 1) * tile == offset + position))(
+            lambda: write_checkpoint(current))
 
-            @pl.when((segment >= 0) & (t == (segment_end - 1) // tile))
-            def store_segment_state():
-                copy_now(((rec_state_vmem, rec_state_out_ref.at[current]),
-                          (conv_hist_vmem, conv_hist_out_ref.at[current])), 9)
-        elif checkpoint is not None:
-            pl.when((t + 1) * tile == checkpoint[0])(write_checkpoint)
+        @pl.when((segment >= 0) & (t == (segment_end - 1) // tile))
+        def store_segment_state():
+            copy_now(((rec_state_vmem, rec_state_out_ref.at[current]),
+                      (conv_hist_vmem, conv_hist_out_ref.at[current])), 9)
 
         # Write this tile back (overlaps with the next tile's compute).
         store_tile(t, buf).start()
@@ -3747,20 +3382,9 @@ def kda_prefill_tiled_body(
                 store_tile(t - 1, 1 - buf).wait()
 
     pl.loop(first_tile, end_tile)(tile_body)
-    if finish_unused is not None:
-        when(last)(finish_unused)
-        return  # each sequence's state was stored after its last tile
-
-    @when(last)
-    def store_state():
-        state_copies = (
-            pltpu.make_async_copy(rec_state_vmem, rec_state_out_ref, weight_sems.at[9]),
-            pltpu.make_async_copy(conv_hist_vmem, conv_hist_out_ref, weight_sems.at[10]),
-        )
-        for copy in state_copies:
-            copy.start()
-        for copy in state_copies:
-            copy.wait()
+    # Each sequence's state was stored after its last tile; wait for the
+    # unused slots' copies.
+    pl.when(last)(lambda: each_unused(lambda copy: copy.wait()))
 
 
 class _Copies:
@@ -3799,78 +3423,6 @@ def kda_prefill_tiled_scratch_shapes(
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((16,)),
     )
-
-
-def make_kda_tiled(
-    *,
-    seq_len,
-    tile=128,
-    decay_lower_bound=-5.0,
-    epsilon=1e-5,
-    interpret=False,
-):
-    """Build the sequence-tiled KDA prefill kernel.
-
-    Returns a callable ``(hidden, gate_w, fb_w, proj_w, conv_w, alog, dt,
-    norm, rec_state, conv_hist, length) -> (attended, rec_state, conv_hist)``.
-    ``length`` is an int32 array of shape ``[1]`` with 0 <= length <= seq_len.
-    Rows at or beyond length have zero output and do not change either state.
-    ``seq_len`` must be a multiple of ``tile`` and ``tile`` a multiple of the
-    64-token KDA chunk.
-    """
-    if seq_len <= 0 or tile <= 0:
-        raise ValueError("seq_len and tile must be positive")
-    if tile % _KDA_CHUNK:
-        raise ValueError("tile must be a multiple of the KDA chunk (64)")
-    if seq_len % tile:
-        raise ValueError("seq_len must be a multiple of tile")
-
-    head_count, channels = _HEADS, _CHANNELS
-    width = head_count * channels
-
-    def run(
-        hidden, gate_w, fb_w, proj_w, conv_w, alog, dt, norm,
-        rec_state, conv_hist, length,
-    ):
-        T, H = hidden.shape
-        if seq_len != T:
-            raise ValueError(f"hidden has {T} rows; expected {seq_len}")
-        if H % 128 or hidden.dtype != jnp.bfloat16:
-            raise ValueError("hidden must be BF16 with a 128-aligned width")
-        if length.shape != (1,) or length.dtype != jnp.int32:
-            raise ValueError("length must be an int32 array of shape (1,)")
-        if norm.shape != (8, channels):
-            raise ValueError("norm must have shape (8, 128), as in the K3 checkpoint")
-        kernel = pl.pallas_call(
-            functools.partial(
-                kda_prefill_tiled_body,
-                tile=tile,
-                decay_lower_bound=decay_lower_bound,
-                epsilon=epsilon,
-            ),
-            out_shape=(
-                jax.ShapeDtypeStruct((T, width), jnp.bfloat16),  # attended out
-                jax.ShapeDtypeStruct(rec_state.shape, jnp.float32),
-                jax.ShapeDtypeStruct(conv_hist.shape, jnp.bfloat16),
-            ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=1,
-                in_specs=[pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(10)],
-                out_specs=[pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(3)],
-                scratch_shapes=kda_prefill_tiled_scratch_shapes(
-                    H, tile, gate_w, fb_w, proj_w, conv_w, alog, dt, norm
-                ),
-            ),
-            interpret=interpret,
-            name="kda_prefill_tiled",
-            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024**2),
-        )
-        return kernel(
-            length, hidden, gate_w, fb_w, proj_w, conv_w, alog, dt, norm,
-            rec_state, conv_hist,
-        )
-
-    return run
 
 
 # ============================================================================
@@ -4743,35 +4295,6 @@ def _half_reduce_step(
 
 
 # ============================================================================
-# Attention output projection layout
-# ============================================================================
-#
-# The paired [768,3584] shards as the [384,7168] per-rank ring weights.
-
-
-def repack_attention_output_weights_for_rank(weights_by_rank, rank):
-    """Convert paired [2F,H/2] shards to per-head [F,H] projection weights.
-
-    ``weights_by_rank`` holds all 32 per-rank shards. The result lets each
-    rank project only its own attention features, then reduce-scatter the
-    full hidden width: the ``project_reduce_scatter`` layout, as in
-    ``kernels/kimi_k3/collectives.py``.
-    """
-    if not 0 <= rank < 32 or len(weights_by_rank) != 32:
-        raise ValueError("repacking requires rank 0..31 and all 32 shards")
-    own = np.asarray(weights_by_rank[rank])
-    partner = np.asarray(weights_by_rank[rank ^ 1])
-    if own.ndim != 2 or own.shape != partner.shape or own.shape[0] % 2:
-        raise ValueError("paired output weights must share [2F,H/2] shape")
-    features = own.shape[0] // 2
-    if rank % 2 == 0:
-        left, right = own[:features], partner[:features]
-    else:
-        left, right = partner[features:], own[features:]
-    return np.concatenate((left, right), axis=1)
-
-
-# ============================================================================
 # MLA attention layer (sequence-parallel)
 # ============================================================================
 #
@@ -4798,7 +4321,9 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
     ``CpPrefix`` (at most ``prefix_capacity`` prefix tokens). Returns the
     new residual rows and the rank-leading ``[32, T, 576]`` compressed KV
     (identical on every rank). ``output_projection_repacked`` is [384,7168]
-    per rank (``repack_attention_output_weights_for_rank``).
+    per rank: the rank's attention features over the full hidden width, built
+    from the chip pair's decode shards at load time
+    (``rank_loader._sequence_parallel_output``).
     """
     if not segments:
         raise ValueError("the MLA layer runs packed windows")
@@ -4958,10 +4483,13 @@ def _counting_sort_positions(keys, buckets):
 
 
 def expert_family_slot(family_count, slot):
-    """Map a global MoE slot to the resident first/group/final expert bank.
+    """Map a global MoE slot (0..91) to its index in a resident expert bank.
 
-    Dense families keep their global slots. Only the expert weights are split
-    into banks; the legacy complete family and replay-only shapes stay global.
+    Expert weights are banked by execution group (``_EXPERT_BANK_SIZES`` in
+    ``kimi_k3/prefill.py``): eight layers per regular group (slot ``3 + 8 i +
+    j`` -> ``j``) and one for the final layer (-> 0). Any other count, the
+    first bank (slots 0..2) or a complete 92-layer family, takes the global
+    slot. Dense (non-expert) families are not banked.
     """
     if family_count == 8:
         return (slot - 3) % 8
@@ -5036,13 +4564,11 @@ def routed_experts(
     middle = gmm_v2(
         x, expert_gate_up, counts, rhs_scale=gu_scale, rhs_layer=expert_layer,
         rhs_quant_dtype=jnp.float4_e2m1fn,
-        maybe_quantize_lhs=False, zero_initialize=False,
         fuse_act="situ:4:25",
     )
     down = gmm_v2(
         middle, expert_down, counts, rhs_scale=down_scale, rhs_layer=expert_layer,
         rhs_quant_dtype=jnp.float4_e2m1fn,
-        maybe_quantize_lhs=False, zero_initialize=False,
     )
 
     # Restore the token-major pair order, mask the unwritten nonlocal GMM rows,
@@ -5097,7 +4623,7 @@ def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables)
     the latent, ids and probabilities are then gathered so that each EP
     shard runs its experts over all tokens (``routed_experts``). The caller's
     reduce-scatter ring sums the partials. ``latent_down`` is [7168,4096] on
-    every rank; 112 local experts (EP8/TP4), 56 (EP16/TP2) or 28 (EP32).
+    every rank; 56 local experts (EP16/TP2).
     """
     rank = jax.lax.axis_index(axis_name)
     local_tokens, hidden_width = hidden_local.shape
@@ -5106,8 +4632,8 @@ def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables)
     if weights["latent_down"].shape[-2:] != (7168, 4096):
         raise ValueError("latent projection weights must use replicated SP layout")
     local_experts = weights["expert_gu"].shape[-3]
-    if local_experts not in (28, 56, 112):
-        raise ValueError("K3 SP MoE requires EP32, EP16/TP2 or EP8/TP4 expert weights")
+    if local_experts != 56:
+        raise ValueError("K3 SP MoE requires EP16/TP2 expert weights")
     expert_tp = 32 * local_experts // 896
     tokens = local_tokens * 32
 
@@ -5126,7 +4652,7 @@ def moe_local_routed(hidden_local, length, weights, *, axis_name, gather_tables)
     if weights["latent_down"].ndim == 3:  # the resident family: select the layer in the kernel
         latent_local = gmm_v2(
             hidden_local, weights["latent_down"][:, None], jnp.full((1,), local_tokens, jnp.int32),
-            rhs_layer=weights["expert_layer"], maybe_quantize_lhs=False, zero_initialize=False)
+            rhs_layer=weights["expert_layer"])
     else:
         latent_local = hidden_local @ weights["latent_down"]
     latent_all = _moe_latent_all_gather(latent_local[:, :3584], gather_tables)
@@ -5173,10 +4699,10 @@ def _moe_sp_shared_partial(chip_rows, weights):
     def one_group(w):
         return w[:, None] if family else w[None]
 
-    shared_mid = gmm_v2(chip_rows, one_group(weights["shared_gu"]), rows, maybe_quantize_lhs=False,
-                        zero_initialize=False, fuse_act="situ:4:25", **layer)
-    return gmm_v2(shared_mid, one_group(weights["shared_down"]), rows, maybe_quantize_lhs=False,
-                  zero_initialize=False, preferred_element_type=jnp.float32, **layer)
+    shared_mid = gmm_v2(chip_rows, one_group(weights["shared_gu"]), rows,
+                        fuse_act="situ:4:25", **layer)
+    return gmm_v2(shared_mid, one_group(weights["shared_down"]), rows,
+                  preferred_element_type=jnp.float32, **layer)
 
 
 def _moe_sp_shared_reduce(partial, axis_name):
@@ -5259,38 +4785,6 @@ def make_moe_fused_sp_repacked(mesh, *, seq_len, eps=1e-5, collective_id=42,
     return jax.jit(run_ring)
 
 
-def repack_moe_projection_weights_for_rank(weights_by_rank, rank):
-    """Convert the TP32 checkpoint projection shards to SP layout for one rank.
-
-    The input is a host mapping of 32-rank NumPy arrays. Expert and router
-    weights stay on their checkpoint shards; only the four dense projection
-    families are returned here. A checkpoint loader can construct the same
-    four arrays directly without materializing all 32 output copies.
-    """
-    if rank not in range(32):
-        raise ValueError("rank must be 0..31")
-    down = np.asarray(weights_by_rank["latent_down"])
-    up = np.asarray(weights_by_rank["latent_up"])
-    shared_gu = np.asarray(weights_by_rank["shared_gu"])
-    shared_down = np.asarray(weights_by_rank["shared_down"])
-    if any(value.shape[0] != 32 for value in (down, up, shared_gu, shared_down)):
-        raise ValueError("projection weight inputs must have a leading TP32 axis")
-    if shared_gu.shape[-1] % 2:
-        raise ValueError("shared gate/up columns must split evenly")
-    half = shared_gu.shape[-1] // 2
-    parity = rank % 2
-    gate = np.concatenate([shared_gu[i, :, :half] for i in range(parity, 32, 2)], axis=1)
-    value = np.concatenate([shared_gu[i, :, half:] for i in range(parity, 32, 2)], axis=1)
-    return {
-        "latent_down": np.ascontiguousarray(np.concatenate(list(down), axis=1)),
-        "latent_up": np.ascontiguousarray(np.concatenate([up[i] for i in range(7)], axis=1)),
-        "shared_gu": np.ascontiguousarray(np.concatenate((gate, value), axis=1)),
-        "shared_down": np.ascontiguousarray(np.concatenate(
-            [shared_down[i] for i in range(parity, 32, 2)], axis=0
-        )),
-    }
-
-
 # ============================================================================
 # MLA weight families
 # ============================================================================
@@ -5350,27 +4844,22 @@ def make_indexed_moe_sp_ring(mesh, *, seq_len=8192):
     """Select a MoE layer, keeping packed expert families resident for tile DMA."""
     from ..config import active
 
-    cfg = active()
-    if (
-        cfg.prefill_fused_moe
-        and cfg.prefill_expert_parallel == 16
-        and (
-            seq_len in (4096, 8192)
-            or (cfg.moe_reduce_dtype == "float32" and seq_len in (512, 1024, 2048))
-        )
-    ):
-        if cfg.moe_reduce_dtype == "float32":
-            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_packed_moe
-        else:
-            # Preserve the supported per-hop BF16 reduction implementation.
-            from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
+    if active().moe_reduce_dtype == "float32":
+        if seq_len in (512, 1024, 2048, 4096, 8192):
+            from .prefill_moe.fused import make_indexed_moe_sp_ring as make_fused_moe
+
+            return make_fused_moe(mesh, seq_len=seq_len)
+    elif seq_len in (4096, 8192):
+        # The per-hop BF16 reduction.
+        from .prefill_moe.layer import make_indexed_moe_sp_ring as make_packed_moe
+
         return make_packed_moe(mesh, seq_len=seq_len)
     return _make_indexed_moe_sp_ring_reference(mesh, seq_len=seq_len)
 
 
 def _make_indexed_moe_sp_ring_reference(mesh, *, seq_len=8192):
-    """SparseCore gather/combine path, for shapes the fused MoE does not cover
-    or with ``prefill_fused_moe`` off."""
+    """SparseCore gather/combine path, for the windows the fused and packed
+    MoEs do not cover (BF16 reduction below 4K)."""
     base = make_moe_fused_sp_repacked(mesh, seq_len=seq_len)
 
     def run(hidden, prefix, families, length, slot):
@@ -5549,13 +5038,13 @@ def _kda_layer_body(
     end_tile = jnp.where(
         attending, (phase - 1) * block_tiles + (ring_step + 1) * block_tiles // HALF_STEPS, 0)
     kda_prefill_tiled_body(
-        length_ref, gathered_ref, gate_family_ref.at[slot], fb_family_ref.at[slot],
+        gathered_ref, gate_family_ref.at[slot], fb_family_ref.at[slot],
         proj_family_ref.at[slot], conv_family_ref.at[slot],
         alog_family_ref.at[slot], dt_family_ref.at[slot],
         kda_norm_family_ref.at[slot], rec_in_ref, hist_in_ref,
         attended_ref, rec_out_ref, hist_out_ref, *kda_scratch,
         tile=128, decay_lower_bound=-5.0, epsilon=eps,
-        checkpoint=(None, rec_checkpoint_ref, hist_checkpoint_ref),
+        checkpoint=(rec_checkpoint_ref, hist_checkpoint_ref),
         segments=(segment_ref, count),
         tiles=(first_tile, end_tile, step == HALF_STEPS,
                step == HALF_STEPS * (blocks + 1) - 1),

@@ -18,12 +18,10 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 
-from . import Config, unpack_mxfp4
+from . import Config
 
 BF16 = np.dtype(ml_dtypes.bfloat16)
 PREFIX = "language_model.model."
@@ -99,10 +97,6 @@ class Checkpoint:
 
         self._layouts = {}
 
-    def close(self):
-        """Kept for callers that pair open/close; handles are per read."""
-        return None
-
     # Coalesced streaming reads: a rank's expert tensors are grouped into
     # contiguous ranges (merging gaps up to COALESCE_GAP) and each range is
     # streamed on its own handle, ranges in parallel: seeks and handles shared
@@ -123,11 +117,8 @@ class Checkpoint:
         """Whole tensors for ``keys`` as uint8-viewable numpy arrays, via coalesced reads.
 
         Returns ``{key: array}`` with the header dtype/shape applied. Used for
-        the expert families; a checkpoint object without ``path`` falls back
-        to ``read`` per key.
+        the expert families.
         """
-        if not hasattr(self, "path"):
-            return {key: self.read(key) for key in keys}
         by_file = {}
         for key in keys:
             by_file.setdefault(self.index[key], []).append(key)
@@ -182,7 +173,8 @@ class Checkpoint:
     def experts(self, layer, first, count, *, part=None, parts=4):
         """``(gate_up, gate_up_scales, down, down_scales)`` for ``count`` consecutive experts.
 
-        Each element is a list over experts in kernel layout (see :meth:`expert`);
+        Each element is a list over experts in kernel layout (gate/up packed
+        ``[K/8, N]`` with E8M0 scales ``[K/32, N]``, see :func:`pack_expert_bytes`);
         all tensors of the layer's experts are fetched with :meth:`read_many`.
         """
         base = f"{PREFIX}layers.{layer}.block_sparse_moe.experts."
@@ -258,46 +250,6 @@ class Checkpoint:
             os.close(fd)
         value = np.frombuffer(b"".join(pieces), dtype).reshape([r1 - r0, *shape[1:]] if shape else [])
         return value[rest] if rest else value
-
-    def expert(self, layer, expert, down=False, part=None, parts=2):
-        """One expert's packed FP4 weights and E8M0 scales, optionally one TP part.
-
-        ``part`` selects the rank's slice of an expert split ``parts`` ways over
-        its gate/up output channels (``down=False``) or its down contraction
-        channels (``down=True``).
-        """
-        base = f"{PREFIX}layers.{layer}.block_sparse_moe.experts.{expert}."
-        names = ("w2",) if down else ("w1", "w3")
-        weights, scales = [], []
-        for name in names:
-            packed_slice = scale_slice = None
-            if part is not None:
-                if part not in range(parts) or 3072 % parts:
-                    raise ValueError(f"Expert TP part must be in 0..{parts - 1}")
-                width = 3072 // parts  # channels of one part
-                packed_slice = (
-                    (slice(None), slice(part * width // 2, (part + 1) * width // 2))
-                    if down
-                    else (slice(part * width, (part + 1) * width), slice(None))
-                )
-                scale_slice = (
-                    (slice(None), slice(part * width // 32, (part + 1) * width // 32))
-                    if down
-                    else (slice(part * width, (part + 1) * width), slice(None))
-                )
-            # Read whole tensors and slice in memory: column slices are strided
-            # reads on network storage, and an expert's TP parts share a host,
-            # so the page cache serves the other parts.
-            packed = self.read(base + name + ".weight_packed")
-            scale = self.read(base + name + ".weight_scale")
-            if packed_slice is not None:
-                packed = packed[packed_slice]
-                scale = scale[scale_slice]
-            weights.append(pack_expert_bytes(packed))
-            if scale.dtype != np.uint8 or np.any((scale == 0) | (scale == 255)):
-                raise ValueError(f"{base}{name}: expected normal, finite E8M0 scales")
-            scales.append(scale.T.copy())
-        return np.concatenate(weights, axis=1), np.concatenate(scales, axis=1)
 
     def dense(self, name, layer, rank):
         """One layer of a parameter family, with its exact global-rank slice."""
@@ -554,26 +506,3 @@ def _family_layers(config, name, layers):
     if name in norms:
         return list(range(layers))
     return None
-
-
-def _reblock_one(packed, scales, block_size):
-    """Losslessly encode one MXFP4 matrix as FP8 plus coarse BF16 scales."""
-    values = unpack_mxfp4(packed, scales)
-    contraction_size, output_size = values.shape
-    exponents = scales.reshape(
-        contraction_size // block_size,
-        block_size // 32,
-        output_size,
-    ).astype(jnp.int32)
-    common_exponents = jnp.max(exponents, axis=1) - 6
-    coarse_scales = jnp.exp2(common_exponents.astype(jnp.float32) - 127).astype(jnp.bfloat16)
-    encoded = (
-        values.reshape(contraction_size // block_size, block_size, output_size).astype(jnp.float32)
-        / coarse_scales.astype(jnp.float32)[:, None, :]
-    ).astype(jnp.float8_e4m3fn)
-    restored = (
-        encoded.astype(jnp.bfloat16) * coarse_scales[:, None, :]
-    ).reshape(contraction_size, output_size)
-    restored_bits = jax.lax.bitcast_convert_type(restored, jnp.uint16)
-    value_bits = jax.lax.bitcast_convert_type(values, jnp.uint16)
-    return encoded.reshape(values.shape), coarse_scales, jnp.all(restored_bits == value_bits)

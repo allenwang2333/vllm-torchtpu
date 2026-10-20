@@ -4,8 +4,6 @@
 
 
 def make_shared_ring(local_rows, *, budget=1):
-    import contextlib
-
     import jax
     import jax.numpy as jnp
     from jax.experimental import pallas as pl
@@ -24,9 +22,6 @@ def make_shared_ring(local_rows, *, budget=1):
     view = _PackedView
     regions = row_regions(local_rows, width // 2)
     streams = len(regions)
-
-    def scope(n):
-        return contextlib.nullcontext()
 
     def body(
         tables,
@@ -84,8 +79,7 @@ def make_shared_ring(local_rows, *, budget=1):
 
             @pl.when(completed)
             def ring_completed():
-                with scope("shared_ring_complete"):
-                    state[1] = stop
+                state[1] = stop
 
         def gu_load(n, slot):
             for ref, offset in ((wg, 0), (wu, middle)):
@@ -135,8 +129,7 @@ def make_shared_ring(local_rows, *, budget=1):
 
             @pl.when(t == gu_steps - 1)
             def begin_down():
-                with scope("shared_mid_ready"):
-                    down_load(jnp.int32(0), jnp.int32(0))
+                down_load(jnp.int32(0), jnp.int32(0))
 
         @pl.when(t >= gu_steps)
         def output():
@@ -163,15 +156,12 @@ def make_shared_ring(local_rows, *, budget=1):
 
             @pl.when(t == gu_steps)
             def first_output():
-                with scope("shared_first_output_ready"):
-                    state[1] = t
+                state[1] = t
 
         @pl.when(t == total - 1)
         def finish():
-            with scope("shared_ring_drain"):
-                advance(jnp.int32(32))
-            with scope("shared_all_done"):
-                state[1] = t
+            advance(jnp.int32(32))
+            state[1] = t
 
     return pl.pallas_call(
         body,
@@ -210,5 +200,5 @@ def make_shared_ring(local_rows, *, budget=1):
             disable_bounds_checks=True,
             vmem_limit_bytes=96 * 1024**2,
         ),
-        name=f"shared_ring_{'all'}_{'stream'}_b{budget}_m{256}_n{512}",
+        name=f"shared_ring_b{budget}_m256_n512",
     )

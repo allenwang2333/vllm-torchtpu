@@ -10,17 +10,25 @@ predicts the token one position after itself. DSpark adds a low-rank Markov
 bias, ``markov_w2 @ markov_w1[previous token]``, applied while sampling the
 block left to right.
 
-Two implementations share one weight naming scheme (the checkpoint's):
+This module holds:
 
-* ``reference_*``: unsharded JAX reference implementations on a plain dict;
-* ``make_context_update`` / ``make_draft_step``: TP32 ``shard_map`` programs
-  on the megakernel mesh. Weights lead with the rank, like the megakernel's.
+* the checkpoint config and reader (``DraftConfig``,
+  ``load_checkpoint_weights``) and the conversion to the fused kernel's
+  per-rank layout (``kernel_weight_shards``, ``save_kernel_shards``);
+* ``make_fused_draft``: one TP32 Pallas kernel per step that reads the verify
+  logits, accepts drafts, extends each request's context ring and drafts the
+  next block (output lanes ``OUT_*``);
+* the ring from a prompt on the prefill side (``prefill_ring_update``,
+  ``pack_ring`` / ``unpack_ring``);
+* sampling helpers used outside the kernel (``nucleus_accept``,
+  ``synthetic_count``).
 
-The draft context cache is a ring over ``window`` positions per layer; slot
-``position % window`` stores that position's key/value and ``cache_positions``
-records which position a slot holds (``-1`` when empty). Rows written for
-positions that later turn out to be rejected drafts are hidden by the
-``position < anchor_position`` mask until the real token overwrites them.
+Each request's draft context is a ring over ``window`` positions per layer:
+slot ``position % window`` stores that position's packed key | value row and
+a positions array records which position a slot holds (``-1`` when empty).
+Rows written for positions that later turn out to be rejected drafts are
+hidden by the ``position < anchor_position`` mask until the real token
+overwrites them.
 """
 
 from __future__ import annotations
@@ -56,11 +64,6 @@ class DraftConfig:
     rope_theta: float = 10000.0
     eps: float = 1e-5
     markov_rank: int = 256
-    # Candidates per vocabulary shard kept for the sequential Markov step. The
-    # biased argmax is searched among the top ``markov_top_m`` base logits of
-    # every shard (all-gathered once) instead of the full vocabulary. Zero
-    # means exact full-vocabulary sampling with a collective per slot.
-    markov_top_m: int = 16
 
     @property
     def q_width(self) -> int:
@@ -126,22 +129,6 @@ def weight_shapes(c: DraftConfig) -> dict[str, tuple[int, ...]]:
     return shapes
 
 
-def random_weights(c: DraftConfig, seed: int = 0) -> dict[str, np.ndarray]:
-    """Deterministic bf16 weights with the checkpoint's names and shapes."""
-    rng = np.random.default_rng(seed)
-    weights = {}
-    for name, shape in weight_shapes(c).items():
-        if name.endswith("norm.weight"):
-            value = 1 + 0.05 * rng.standard_normal(shape)
-        elif "markov" in name:
-            value = 0.01 * rng.standard_normal(shape)
-        else:
-            fan_in = shape[-1] if len(shape) == 2 else shape[0]
-            value = rng.standard_normal(shape) / np.sqrt(fan_in)
-        weights[name] = jnp.asarray(value, jnp.float32).astype(jnp.bfloat16)
-    return weights
-
-
 # --------------------------------------------------------------------------
 # Shared arithmetic (mirrors transformers' Qwen3 bf16 modules)
 
@@ -152,452 +139,6 @@ def rms_norm(x, weight, eps):
     x32 = x.astype(jnp.float32)
     normed = x32 * jax.lax.rsqrt(jnp.mean(x32 * x32, axis=-1, keepdims=True) + eps)
     return weight * normed.astype(dtype)
-
-
-def linear(x, weight_out_in):
-    """``x @ W^T`` with FP32 accumulation, rounded to the activation dtype."""
-    return jnp.einsum(
-        "...i,oi->...o", x, weight_out_in, preferred_element_type=jnp.float32
-    ).astype(x.dtype)
-
-
-def rope_cos_sin(positions, head_dim, theta, dtype):
-    inv_freq = 1.0 / theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
-    freqs = positions.astype(jnp.float32)[:, None] * jnp.asarray(inv_freq)[None, :]
-    emb = jnp.concatenate((freqs, freqs), axis=-1)
-    return jnp.cos(emb).astype(dtype), jnp.sin(emb).astype(dtype)
-
-
-def apply_rope(x, cos, sin):
-    """``x`` is ``[tokens, heads, head_dim]``; cos/sin are ``[tokens, head_dim]``."""
-    half = x.shape[-1] // 2
-    rotated = jnp.concatenate((-x[..., half:], x[..., :half]), axis=-1)
-    return x * cos[:, None, :] + rotated * sin[:, None, :]
-
-
-def silu(x):
-    x32 = x.astype(jnp.float32)
-    return (x32 * jax.nn.sigmoid(x32)).astype(x.dtype)
-
-
-# --------------------------------------------------------------------------
-# Unsharded reference
-
-
-def reference_context_features(w, c: DraftConfig, aux):
-    """``aux`` is ``[tokens, len(aux_layers) * hidden]`` bf16 -> ``[tokens, hidden]``."""
-    return rms_norm(linear(aux, w["fc.weight"]), w["hidden_norm.weight"], c.eps)
-
-
-def reference_context_kv(w, c: DraftConfig, context, positions):
-    """Per-layer normalized, rotated keys and values of context rows.
-
-    Returns ``keys, values`` shaped ``[layers, tokens, kv_heads, head_dim]``.
-    """
-    cos, sin = rope_cos_sin(positions, c.head_dim, c.rope_theta, context.dtype)
-    keys, values = [], []
-    for layer in range(c.layers):
-        prefix = f"layers.{layer}.self_attn."
-        k = linear(context, w[prefix + "k_proj.weight"]).reshape(-1, c.kv_heads, c.head_dim)
-        k = rms_norm(k, w[prefix + "k_norm.weight"], c.eps)
-        keys.append(apply_rope(k, cos, sin))
-        values.append(linear(context, w[prefix + "v_proj.weight"]).reshape(-1, c.kv_heads, c.head_dim))
-    return jnp.stack(keys), jnp.stack(values)
-
-
-def _attend(q, k, v, allowed, groups):
-    """Eager GQA attention: ``q [Q, H, d]``, ``k/v [K, Hkv, d]``, ``allowed [Q, K]``."""
-    k = jnp.repeat(k, groups, axis=1)
-    v = jnp.repeat(v, groups, axis=1)
-    scores = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
-    scores = scores * q.shape[-1] ** -0.5
-    scores = jnp.where(allowed[None], scores, -jnp.inf)
-    probabilities = jax.nn.softmax(scores, axis=-1).astype(q.dtype)
-    return jnp.einsum("hqk,khd->qhd", probabilities, v, preferred_element_type=jnp.float32).astype(q.dtype)
-
-
-def reference_block_hidden(
-    w,
-    c: DraftConfig,
-    context_keys,  # [layers, tokens, kv_heads, head_dim]
-    context_values,
-    context_positions,  # [tokens] int32, -1 for empty slots
-    anchor_token,  # scalar int32
-    anchor_position,  # scalar int32
-    block_size: int,
-):
-    """Run the block of ``anchor + (block_size - 1)`` mask tokens; return the
-    final-normed hidden rows ``[block_size, hidden]``."""
-    tokens = jnp.concatenate(
-        (jnp.asarray([anchor_token], jnp.int32), jnp.full((block_size - 1,), c.mask_token, jnp.int32))
-    )
-    x = w["embed_tokens.weight"][tokens]
-    block_positions = anchor_position + jnp.arange(block_size, dtype=jnp.int32)
-    cos, sin = rope_cos_sin(block_positions, c.head_dim, c.rope_theta, x.dtype)
-    context_allowed = (
-        (context_positions >= 0)
-        & (context_positions < anchor_position)
-        & (context_positions >= anchor_position - c.window)
-    )
-    block_allowed = jnp.arange(block_size)[None, :] <= jnp.arange(block_size)[:, None]
-    allowed = jnp.concatenate(
-        (jnp.broadcast_to(context_allowed[None], (block_size, context_positions.shape[0])), block_allowed),
-        axis=1,
-    )
-    groups = c.heads // c.kv_heads
-    for layer in range(c.layers):
-        prefix = f"layers.{layer}."
-        h = rms_norm(x, w[prefix + "input_layernorm.weight"], c.eps)
-        q = linear(h, w[prefix + "self_attn.q_proj.weight"]).reshape(block_size, c.heads, c.head_dim)
-        q = apply_rope(rms_norm(q, w[prefix + "self_attn.q_norm.weight"], c.eps), cos, sin)
-        k = linear(h, w[prefix + "self_attn.k_proj.weight"]).reshape(block_size, c.kv_heads, c.head_dim)
-        k = apply_rope(rms_norm(k, w[prefix + "self_attn.k_norm.weight"], c.eps), cos, sin)
-        v = linear(h, w[prefix + "self_attn.v_proj.weight"]).reshape(block_size, c.kv_heads, c.head_dim)
-        keys = jnp.concatenate((context_keys[layer], k), axis=0)
-        values = jnp.concatenate((context_values[layer], v), axis=0)
-        attended = _attend(q, keys, values, allowed, groups).reshape(block_size, c.q_width)
-        x = x + linear(attended, w[prefix + "self_attn.o_proj.weight"])
-        h = rms_norm(x, w[prefix + "post_attention_layernorm.weight"], c.eps)
-        gate = linear(h, w[prefix + "mlp.gate_proj.weight"])
-        up = linear(h, w[prefix + "mlp.up_proj.weight"])
-        x = x + linear(silu(gate) * up, w[prefix + "mlp.down_proj.weight"])
-    return rms_norm(x, w["norm.weight"], c.eps)
-
-
-def reference_markov_greedy(w, c: DraftConfig, hidden, anchor_token):
-    """Left-to-right greedy sampling with the Markov bias. Returns
-    ``[block_size]`` draft tokens where slot ``k`` predicts position ``p+k+1``."""
-    base = linear(hidden, w["lm_head.weight"]).astype(jnp.float32)
-    drafts = []
-    previous = anchor_token
-    for slot in range(hidden.shape[0]):
-        embedding = w["markov_head.markov_w1.weight"][previous]
-        bias = linear(embedding[None], w["markov_head.markov_w2.weight"])[0].astype(jnp.float32)
-        previous = jnp.argmax(base[slot] + bias).astype(jnp.int32)
-        drafts.append(previous)
-    return jnp.stack(drafts)
-
-
-# --------------------------------------------------------------------------
-# TP32 sharded programs
-
-
-def _shard_weights(c: DraftConfig, weights, ranks=32):
-    """Split checkpoint-named arrays into ``[ranks, ...]`` per-rank shards (host side).
-
-    Layout: q heads and the matching kv head by rank (``heads // ranks`` q
-    heads per rank; kv head ``rank // (ranks // kv_heads)``), MLP channels
-    and ``fc`` input features by rank, vocabulary rows by rank for the
-    embedding, LM head and both Markov matrices, small norms replicated.
-    """
-    if c.heads % ranks or ranks % c.kv_heads or c.intermediate % ranks:
-        raise ValueError("Draft dimensions must divide across the ranks")
-    if c.context_width % ranks or c.vocab % ranks:
-        raise ValueError("Context width and vocabulary must divide across the ranks")
-    q_per_rank = c.heads // ranks
-    kv_share = ranks // c.kv_heads
-    shards: dict[str, Any] = {}
-
-    def by_rows(value, rows_per_rank):
-        return value.reshape(ranks, rows_per_rank, *value.shape[1:])
-
-    def replicate(value):
-        return np.broadcast_to(value[None], (ranks, *value.shape))
-
-    for name, value in weights.items():
-        value = np.asarray(value)
-        if name == "markov_head.markov_w1.weight":
-            shards[name] = replicate(value)  # local previous-token lookup
-        elif name in ("embed_tokens.weight", "lm_head.weight") or "markov" in name:
-            shards[name] = by_rows(value, c.vocab // ranks)
-        elif name == "fc.weight":
-            shards[name] = value.reshape(c.hidden, ranks, c.context_width // ranks).transpose(1, 0, 2)
-        elif name.endswith("q_proj.weight"):
-            shards[name] = by_rows(value, q_per_rank * c.head_dim)
-        elif name.endswith("k_proj.weight") or name.endswith("v_proj.weight"):
-            per_head = value.reshape(c.kv_heads, c.head_dim, c.hidden)
-            shards[name] = np.repeat(per_head, kv_share, axis=0)
-        elif name.endswith("o_proj.weight"):
-            shards[name] = value.reshape(c.hidden, ranks, q_per_rank * c.head_dim).transpose(1, 0, 2)
-        elif name.endswith("gate_proj.weight") or name.endswith("up_proj.weight"):
-            shards[name] = by_rows(value, c.intermediate // ranks)
-        elif name.endswith("down_proj.weight"):
-            shards[name] = value.reshape(c.hidden, ranks, c.intermediate // ranks).transpose(1, 0, 2)
-        else:
-            shards[name] = replicate(value)
-    return shards
-
-
-def shard_weights_to_mesh(c: DraftConfig, weights, mesh):
-    """Place ``[32, ...]`` shards on the mesh with the rank on ``tp``.
-
-    Shards are cut on the host; each process uploads only the slices that
-    live on its own devices.
-    """
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    sharding = NamedSharding(mesh, P("tp"))
-    placed = {}
-    for name, value in _shard_weights(c, weights, mesh.size).items():
-        placed[name] = jax.make_array_from_callback(
-            value.shape, sharding, lambda index, value=value: np.ascontiguousarray(value[index])
-        )
-    return placed
-
-
-def empty_cache(c: DraftConfig, mesh):
-    """Per-rank context key/value ring buffers and the replicated slot positions."""
-    from jax.sharding import NamedSharding
-    from jax.sharding import PartitionSpec as P
-
-    ranks = mesh.size
-    keys = jnp.zeros((ranks, c.layers, c.window, c.head_dim), jnp.bfloat16)
-    values = jnp.zeros((ranks, c.layers, c.window, c.head_dim), jnp.bfloat16)
-    positions = jnp.full((c.window,), -1, jnp.int32)
-    sharded = NamedSharding(mesh, P("tp"))
-    return (
-        jax.device_put(keys, sharded),
-        jax.device_put(values, sharded),
-        jax.device_put(positions, NamedSharding(mesh, P())),
-    )
-
-
-def _vocab_gather(table, token_ids, rank, rows_per_rank):
-    """Replicated lookup of vocabulary-sharded rows via a masked TP32 sum."""
-    local = token_ids - rank * rows_per_rank
-    valid = (local >= 0) & (local < rows_per_rank)
-    rows = table[jnp.clip(local, 0, rows_per_rank - 1)]
-    return jax.lax.psum(
-        jnp.where(valid[:, None], rows.astype(jnp.float32), 0), "tp"
-    ).astype(table.dtype)
-
-
-def make_context_update(c: DraftConfig, mesh, rows: int):
-    """Project ``rows`` aux rows into the context cache at their positions.
-
-    ``aux`` is ``[len(aux_layers), rows, hidden]`` (the megakernel's aux
-    output), ``positions`` is ``[rows]``. Every row is written; the draft step
-    masks slots whose position is not below the anchor position.
-    """
-    from jax.sharding import PartitionSpec as P
-
-    ranks = mesh.size
-    aux_width = c.context_width // ranks
-
-    def local(weights, cache, cache_positions, aux, positions):
-        weights = jax.tree.map(lambda x: x[0], weights)
-        keys, values = (x[0] for x in cache[:2])
-        rank = jax.lax.axis_index("tp")
-        # fc contracts over the concatenated aux features; each rank holds a
-        # slice of the input features and the partial products are summed.
-        aux_rows = aux.transpose(1, 0, 2).reshape(rows, c.context_width)
-        aux_slice = jax.lax.dynamic_slice_in_dim(aux_rows, rank * aux_width, aux_width, axis=1)
-        partial = jnp.einsum(
-            "ri,oi->ro", aux_slice, weights["fc.weight"], preferred_element_type=jnp.float32
-        )
-        context = jax.lax.psum(partial, "tp").astype(jnp.bfloat16)
-        context = rms_norm(context, weights["hidden_norm.weight"], c.eps)
-        cos, sin = rope_cos_sin(positions, c.head_dim, c.rope_theta, jnp.bfloat16)
-        slots = positions % c.window
-        for layer in range(c.layers):
-            prefix = f"layers.{layer}.self_attn."
-            k = linear(context, weights[prefix + "k_proj.weight"])[:, None, :]
-            k = apply_rope(rms_norm(k, weights[prefix + "k_norm.weight"], c.eps), cos, sin)[:, 0]
-            v = linear(context, weights[prefix + "v_proj.weight"])
-            keys = keys.at[layer, slots].set(k)
-            values = values.at[layer, slots].set(v)
-        cache_positions = cache_positions.at[slots].set(positions)
-        return keys[None], values[None], cache_positions
-
-    return jax.jit(
-        jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=(P("tp"), (P("tp"), P("tp"), P()), P(), P(), P()),
-            out_specs=(P("tp"), P("tp"), P()),
-            check_vma=False,
-        ),
-        donate_argnums=(1,),
-    )
-
-
-def _draft_backbone(c, weights, context_keys, context_values, cache_positions,
-                    anchor_token, anchor_position, block_size, rank):
-    """Per-rank DFlash backbone: returns the final-normed block hidden rows."""
-    ranks_q = weights["layers.0.self_attn.q_proj.weight"].shape[0] // c.head_dim
-    vocab_per_rank = weights["embed_tokens.weight"].shape[0]
-    tokens = jnp.concatenate(
-        (anchor_token[None], jnp.full((block_size - 1,), c.mask_token, jnp.int32))
-    )
-    x = _vocab_gather(weights["embed_tokens.weight"], tokens, rank, vocab_per_rank)
-    block_positions = anchor_position + jnp.arange(block_size, dtype=jnp.int32)
-    cos, sin = rope_cos_sin(block_positions, c.head_dim, c.rope_theta, x.dtype)
-    context_allowed = (
-        (cache_positions >= 0)
-        & (cache_positions < anchor_position)
-        & (cache_positions >= anchor_position - c.window)
-    )
-    block_allowed = jnp.arange(block_size)[None, :] <= jnp.arange(block_size)[:, None]
-    allowed = jnp.concatenate(
-        (jnp.broadcast_to(context_allowed[None], (block_size, c.window)), block_allowed),
-        axis=1,
-    )
-    for layer in range(c.layers):
-        prefix = f"layers.{layer}."
-        h = rms_norm(x, weights[prefix + "input_layernorm.weight"], c.eps)
-        q = linear(h, weights[prefix + "self_attn.q_proj.weight"]).reshape(
-            block_size, ranks_q, c.head_dim
-        )
-        q = apply_rope(rms_norm(q, weights[prefix + "self_attn.q_norm.weight"], c.eps), cos, sin)
-        k = linear(h, weights[prefix + "self_attn.k_proj.weight"])[:, None, :]
-        k = apply_rope(rms_norm(k, weights[prefix + "self_attn.k_norm.weight"], c.eps), cos, sin)
-        v = linear(h, weights[prefix + "self_attn.v_proj.weight"])[:, None, :]
-        keys = jnp.concatenate((context_keys[layer][:, None, :], k), axis=0)
-        values = jnp.concatenate((context_values[layer][:, None, :], v), axis=0)
-        attended = _attend(q, keys, values, allowed, ranks_q).reshape(
-            block_size, ranks_q * c.head_dim
-        )
-        partial = jnp.einsum(
-            "ri,oi->ro",
-            attended,
-            weights[prefix + "self_attn.o_proj.weight"],
-            preferred_element_type=jnp.float32,
-        )
-        x = x + jax.lax.psum(partial, "tp").astype(x.dtype)
-        h = rms_norm(x, weights[prefix + "post_attention_layernorm.weight"], c.eps)
-        gate = linear(h, weights[prefix + "mlp.gate_proj.weight"])
-        up = linear(h, weights[prefix + "mlp.up_proj.weight"])
-        partial = jnp.einsum(
-            "ri,oi->ro",
-            silu(gate) * up,
-            weights[prefix + "mlp.down_proj.weight"],
-            preferred_element_type=jnp.float32,
-        )
-        x = x + jax.lax.psum(partial, "tp").astype(x.dtype)
-    return rms_norm(x, weights["norm.weight"], c.eps)
-
-
-def _pack_candidates(values, ids, w2_rows):
-    """``[block, M]`` FP32 values, int32 ids and ``[block, M, r]`` bf16 rows -> int32 ``[block, M, r/2 + 2]``."""
-    block, count, width = w2_rows.shape
-    return jnp.concatenate(
-        (
-            jax.lax.bitcast_convert_type(w2_rows.reshape(block, count, width // 2, 2), jnp.int32),
-            jax.lax.bitcast_convert_type(values, jnp.int32)[..., None],
-            ids[..., None],
-        ),
-        axis=2,
-    )
-
-
-def _unpack_candidates(packed):
-    half = packed.shape[-1] - 2
-    block = packed.shape[0]
-    w2_rows = jax.lax.bitcast_convert_type(packed[..., :half], jnp.bfloat16).reshape(block, -1, 2 * half)
-    values = jax.lax.bitcast_convert_type(packed[..., half], jnp.float32)
-    return values, packed[..., half + 1], w2_rows
-
-
-def _markov_sample(c, weights, hidden, anchor_token, rank):
-    """Greedy sampling with the Markov bias, left to right.
-
-    With ``markov_top_m > 0`` every shard keeps its top-M base logits per slot
-    together with their ``markov_w2`` rows; one all-gather then lets each
-    rank run the whole sequential chain locally (``markov_w1`` is replicated).
-    Otherwise the exact chain runs with a lookup and a global argmax per slot.
-    """
-    vocab_per_rank = weights["lm_head.weight"].shape[0]
-    base = linear(hidden, weights["lm_head.weight"]).astype(jnp.float32)
-    block_size = hidden.shape[0]
-    if c.markov_top_m:
-        top_m = min(c.markov_top_m, vocab_per_rank)
-        values, local_ids = jax.lax.top_k(base, top_m)  # [block, M]
-        global_ids = local_ids + rank * vocab_per_rank
-        w2_rows = weights["markov_head.markov_w2.weight"][local_ids]  # [block, M, rank]
-        # One all-gather of an int32 payload. Ints are never flushed: token ids
-        # reinterpreted as FP32 are denormals and TPUs flush those to zero.
-        packed = jax.lax.all_gather(
-            _pack_candidates(values, global_ids, w2_rows), "tp", axis=1, tiled=True
-        )  # [block, ranks*M, half + 2]
-        values, global_ids, w2_rows = _unpack_candidates(packed)
-        previous = anchor_token
-        drafts = []
-        for slot in range(block_size):
-            embedding = weights["markov_head.markov_w1.weight"][previous]  # [rank]
-            bias = jnp.einsum(
-                "mr,r->m", w2_rows[slot], embedding, preferred_element_type=jnp.float32
-            )
-            pick = jnp.argmax(values[slot] + bias)
-            previous = global_ids[slot, pick].astype(jnp.int32)
-            drafts.append(previous)
-        return jnp.stack(drafts)
-    # Exact path: the bias is computed for the whole local vocabulary shard
-    # (markov_w1 is replicated), then one all-gather of (max, id) per slot.
-    previous = anchor_token
-    drafts = []
-    for slot in range(block_size):
-        embedding = weights["markov_head.markov_w1.weight"][previous]  # [rank]
-        bias = jnp.einsum(
-            "vr,r->v", weights["markov_head.markov_w2.weight"], embedding,
-            preferred_element_type=jnp.float32,
-        )
-        logits = base[slot] + bias
-        local_id = jnp.argmax(logits).astype(jnp.int32)
-        local_max = logits[local_id]
-        maxima, ids = jax.lax.all_gather(
-            (local_max, local_id + rank * vocab_per_rank), "tp", axis=0
-        )
-        previous = ids[jnp.argmax(maxima)].astype(jnp.int32)
-        drafts.append(previous)
-    return jnp.stack(drafts)
-
-
-def make_draft_step(c: DraftConfig, mesh, block_size: int, phase: str = "full"):
-    """Draft ``block_size`` tokens for one sequence: returns ``[block_size]``
-    ids where slot ``k`` predicts position ``anchor_position + k + 1``.
-
-    ``phase`` selects the program for profiling: ``"full"`` (default),
-    ``"backbone"`` (returns the replicated block hidden rows instead of ids)
-    or ``"sampling"`` (takes those hidden rows and the anchor, returns ids).
-    """
-    from jax.sharding import PartitionSpec as P
-
-    if phase not in ("full", "backbone", "sampling"):
-        raise ValueError("phase must be 'full', 'backbone' or 'sampling'")
-
-    def local(weights, cache, cache_positions, anchor_token, anchor_position):
-        weights = jax.tree.map(lambda x: x[0], weights)
-        context_keys, context_values = (x[0] for x in cache[:2])
-        rank = jax.lax.axis_index("tp")
-        hidden = _draft_backbone(
-            c, weights, context_keys, context_values, cache_positions,
-            anchor_token, anchor_position, block_size, rank,
-        )
-        if phase == "backbone":
-            return hidden
-        return _markov_sample(c, weights, hidden, anchor_token, rank)
-
-    def local_sampling(weights, hidden, anchor_token):
-        weights = jax.tree.map(lambda x: x[0], weights)
-        return _markov_sample(c, weights, hidden, anchor_token, jax.lax.axis_index("tp"))
-
-    if phase == "sampling":
-        return jax.jit(
-            jax.shard_map(
-                local_sampling, mesh=mesh, in_specs=(P("tp"), P(), P()), out_specs=P(),
-                check_vma=False,
-            )
-        )
-    return jax.jit(
-        jax.shard_map(
-            local,
-            mesh=mesh,
-            in_specs=(P("tp"), (P("tp"), P("tp"), P()), P(), P(), P()),
-            out_specs=P(),
-            check_vma=False,
-        )
-    )
 
 
 def synthetic_count(rates, seed, position):
@@ -654,40 +195,6 @@ def nucleus_accept(values, ids, lse, drafts, forced_count, top_p, uniforms):
     return count, bonus.astype(jnp.int32)
 
 
-def make_row_sampler(mesh, rows: int, vocab: int, candidates: int = 128):
-    """``(logits [32, rows, vocab / 32], drafts [rows], forced_count, temperature, top_p, uniforms [rows, 2])``
-    -> ``(count, bonus)``: :func:`nucleus_accept` on the verify's vocabulary-sharded logits.
-
-    Every rank contributes its ``candidates`` largest logits (and the exact
-    log-normalizer partials) through one all-gather, so the nucleus is exact
-    unless the top-p mass needs more than ``candidates`` tokens of one rank.
-    The gathered part runs replicated on every rank; all ranks (and hosts)
-    reach the same ``count`` and ``bonus``. ``temperature`` must be > 0.
-    """
-    from jax.sharding import PartitionSpec as P
-
-    ranks = mesh.size
-    width = vocab // ranks
-
-    def local(logits, drafts, forced_count, temperature, top_p, uniforms):
-        local_logits = logits[0].astype(jnp.float32) / temperature  # [rows, vocab / 32]
-        rank = jax.lax.axis_index("tp")
-        local_max = jnp.max(local_logits, axis=1)
-        local_lse = jnp.log(jnp.sum(jnp.exp(local_logits - local_max[:, None]), axis=1))  # relative to local_max
-        values, ids = jax.lax.top_k(local_logits, candidates)  # [rows, candidates]
-        ids = ids.astype(jnp.int32) + rank * width
-        maxima, lses, values, ids = jax.lax.all_gather((local_max, local_lse, values, ids), "tp", axis=0)
-        best = jnp.max(maxima, axis=0)  # [rows]
-        lse = best + jnp.log(jnp.sum(jnp.exp(maxima - best[None] + lses), axis=0))
-        values = jnp.transpose(values, (1, 0, 2)).reshape(rows, ranks * candidates)
-        ids = jnp.transpose(ids, (1, 0, 2)).reshape(rows, ranks * candidates)
-        return nucleus_accept(values, ids, lse, drafts, forced_count, top_p, uniforms)
-
-    return jax.jit(jax.shard_map(
-        local, mesh=mesh, in_specs=(P("tp"), P(), P(), P(), P(), P()), out_specs=(P(), P()), check_vma=False,
-    ))
-
-
 def load_checkpoint_weights(directory: Path, c: DraftConfig | None = None):
     """Read the safetensors file into checkpoint-named bf16 arrays."""
     from safetensors.numpy import load_file
@@ -714,7 +221,6 @@ MLP_PADDED = 512  # 448 MLP channels per rank padded to whole lane tiles
 LM_CHUNKS = 10  # 10 * 512 = 5120 vocabulary rows per rank
 FC_IN = 35840 // 4  # aux features contracted per host (8960)
 CHUNK = 7168 // 8  # 896-column chunk of the hidden vector per host lane
-PACKED = ROWS * CHUNK // 256  # 28 FP32 rows hold one BF16 [8, 896] chunk
 ROW_PACKED = 7168 // 256  # 28 FP32 rows hold one BF16 [1, 7168] row
 NEG = -3.0e38
 
@@ -875,8 +381,6 @@ KERNEL_SHARD_FORMAT = 1
 
 def save_kernel_shards(shards: dict[str, np.ndarray], directory, *, ranks: int = RANKS) -> None:
     """Write ``kernel_weight_shards`` output as one raw file per rank plus a shared index."""
-    import json
-
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     names = list(shards)
@@ -956,8 +460,6 @@ def _select_rows(block32, offset, rows):
 # The kernel
 
 
-STOP_POINTS = ("barrier", "fc_wait", "fc_matmul", "fc", "layers:1", "layers:2", "layers:3", "layers:4", "layers:5",
-               "lm_head", "full")
 SMALL_NAMES = ("aux", "positions", "previous") + VMEM_NAMES  # HBM operands copied into VMEM at entry (the logits land in logits_vmem)
 
 
@@ -974,21 +476,14 @@ def _fused_rows(requests: int, block: int) -> int:
     return ROWS if requests <= 8 else 4
 
 
-def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full", host_bf16: bool = True,
-               requests: int = 1):
-    """``stop_after`` (profiling): end the kernel after a phase (``STOP_POINTS``);
-    outputs are incomplete, timing only. ``host_bf16`` sends the cross-host
-    partial sums as BF16 pairs instead of FP32.
-
-    One call covers ``requests`` sequences: their block rows fold into the row
+def _make_body(c: DraftConfig, block: int, eps: float, requests: int = 1):
+    """One call covers ``requests`` sequences: their block rows fold into the row
     axis of every projection, so the weights cross HBM to VMEM once per call,
     while each request keeps its own ring, positions, anchor and sampling chain.
     The rings stay in HBM (the per-request rings do not fit in VMEM): (layer,
     request) slices stream through two buffers, each updated, attended and
-    written back. From eight requests the FC stages one request's aux features."""
-    if stop_after not in STOP_POINTS:
-        raise ValueError(f"stop_after must be one of {STOP_POINTS}")
-    stop_layers = int(stop_after.split(":")[1]) if stop_after.startswith("layers:") else None
+    written back. From eight requests the FC stages one request's aux features.
+    The cross-host partial sums travel as BF16 pairs."""
     layers = c.layers
     window = c.window
     R = requests
@@ -1017,7 +512,7 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
         (
             a_buf, q_buf, kv_buf, o_buf, gate_buf, up_buf, down_buf, w2t_buf, w1_blk, embed_blk, bcast_buf,
             rope_q_blk, rope_kv_blk, ring_vmem, logits_vmem, fc_part, tokens_v, stage, local_recv,
-            host_buf, host_packed, gather_recv, tiny_recv, argmax_recv, newkv_buf, dma_sems, small_sems, sends, recvs,
+            host_packed, gather_recv, tiny_recv, argmax_recv, newkv_buf, dma_sems, small_sems, sends, recvs,
         ) = scratch[len(SMALL_NAMES):]
 
         rank = jax.lax.axis_index("tp")
@@ -1058,14 +553,9 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
         def host_reduce_gather(chunk32, slot):
             """FP32 [T, 896] chunk partial of this host lane -> full [T, 7168] sum over hosts,
             BF16-rounded (the reference casts the reduced value to BF16)."""
-            if host_bf16:
-                host_packed[slot, host] = pack(_bf16(chunk32))
-                exchange(lambda o: host_packed.at[slot, host], lambda o: host_packed.at[slot, host], (8, 16, 24), SEM_HOST, slot)
-                reduced = sum(unpack(host_packed[slot, h], T, CHUNK) for h in range(4))
-            else:
-                host_buf[slot, host] = chunk32
-                exchange(lambda o: host_buf.at[slot, host], lambda o: host_buf.at[slot, host], (8, 16, 24), SEM_HOST, slot)
-                reduced = jnp.sum(host_buf[slot], axis=0)
+            host_packed[slot, host] = pack(_bf16(chunk32))
+            exchange(lambda o: host_packed.at[slot, host], lambda o: host_packed.at[slot, host], (8, 16, 24), SEM_HOST, slot)
+            reduced = sum(unpack(host_packed[slot, h], T, CHUNK) for h in range(4))
             gather_recv[slot, lane] = pack(_bf16(reduced))
             exchange(lambda o: gather_recv.at[slot, lane], lambda o: gather_recv.at[slot, lane], range(1, 8), SEM_GATHER, slot)
             return jnp.concatenate([unpack(gather_recv[slot, j], T, CHUNK) for j in range(8)], axis=1)
@@ -1303,31 +793,8 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
         def w1_drain(slot):
             return [item for item in w1_copies[slot] if item is not None]
 
-        def early_exit(drain):
-            """Exit before the ring slices cycle: drain, then write outputs and copy the rings through."""
-            for item in drain:
-                item.wait()
-            for item in rope_copies:
-                item.wait()
-            copies = [
-                tpu.make_async_copy(tokens_v, tokens_out, small_sems.at[0]),
-                tpu.make_async_copy(small["positions"], positions_out, small_sems.at[1]),
-            ]
-            for item in copies:
-                item.start()
-            ring_drain()
-            for item in copies:
-                item.wait()
-            receive_anchor_rows()
-
         # ---------------- fc: context features for the new rows ----------------
-        if stop_after == "barrier":
-            early_exit([fc_copy] + w1_drain(0))
-            return
         fc_copy.wait()
-        if stop_after == "fc_wait":
-            early_exit(w1_drain(0))
-            return
         # Layer-0 weights and the Markov pieces stream in behind the fc phase.
         pending = {name: layer_copy(name, 0) for name in layer_buffers}
         for name in ("kv", "q", "o", "gate", "up", "down"):
@@ -1375,9 +842,6 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
                         fc_part.at[pl.ds(j * rows, rows), pl.ds(col_start, cols)][...] = total
 
         fc_round(0, CHUNK, a_buf.at[:, pl.ds(0, CHUNK)])
-        if stop_after == "fc_matmul":
-            early_exit(list(pending.values()) + w1_drain(0) + [w2t_copy])
-            return
         context = _rms_norm(_bf16(host_reduce_gather(fc_part[...], 0)), small["hidden_norm"][...], eps)  # [T, 7168]
 
         # ---------------- positions, masks, RoPE ----------------
@@ -1419,21 +883,6 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
         x_row = jax.lax.broadcasted_iota(jnp.int32, (R, rows, hidden), 1)
         x = _bf16(jnp.where(x_row == 0, anchor_rows[:, None, :], mask_row[:, None, :]))  # [R, 8, 7168]
         x = x.reshape(T, hidden)
-
-        def finish(drain):
-            """Write outputs (early exits drain their outstanding DMAs first)."""
-            for item in drain:
-                if item is not None:
-                    item.wait()
-            tokens_copy = tpu.make_async_copy(tokens_v, tokens_out, small_sems.at[0])
-            tokens_copy.start()
-            ring_drain()
-            tokens_copy.wait()
-            positions_copy.wait()
-
-        if stop_after == "fc":
-            finish(list(pending.values()) + w1_drain(0) + [w2t_copy])
-            return
 
         def kv_rows(features_bf16, layer, cos32, sin32):
             """Packed [T, 128] K (normed, RoPE) | V rows for all requests' feature rows."""
@@ -1564,10 +1013,6 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
                 pending["kv"] = None  # consumed; the next layer's block rows reuse the buffer
                 newkv_buf[...] = kv_rows(context, layer + 1, cos_new, sin_new)
             x = _bf16(_f32(x) + all_reduce_finish(handles, 0))
-            if stop_layers == layer + 1:
-                # w1/w2t were already waited on by compute_slot0_bias in layer 0.
-                finish(list(pending.values()) if layer + 1 < layers else [])
-                return
 
         # ---------------- LM head ----------------
         hidden_rows = _rms_norm(x, small["final_norm"][...], eps)  # [T, 7168]
@@ -1592,9 +1037,6 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
                 chunk_copies[chunk % 3] = chunk_copy(chunk + 3)
                 chunk_copies[chunk % 3].start()
             logits_vmem[:, :, pl.ds(chunk * LM_CHUNK, LM_CHUNK)] = logits.reshape(R, rows, LM_CHUNK)
-        if stop_after == "lm_head":
-            finish([])
-            return
 
         # ---------------- exact Markov sampling ----------------
         tokens = tokens_v[...]  # [R, 128]
@@ -1627,13 +1069,18 @@ def _make_body(c: DraftConfig, block: int, eps: float, stop_after: str = "full",
             if slot + 1 < block:
                 start_w1(previous, (slot + 1) % 2)
         tokens_v[...] = tokens
-        finish([])
+
+        # ---------------- outputs ----------------
+        tokens_copy = tpu.make_async_copy(tokens_v, tokens_out, small_sems.at[0])
+        tokens_copy.start()
+        ring_drain()
+        tokens_copy.wait()
+        positions_copy.wait()
 
     return body
 
 
-def make_fused_draft(c: DraftConfig, mesh, block: int, *, eps: float | None = None, stop_after: str = "full",
-                     host_bf16: bool = True, requests: int = 1):
+def make_fused_draft(c: DraftConfig, mesh, block: int, *, eps: float | None = None, requests: int = 1):
     """``(weights, cache, positions, aux, logits, previous, positions0, forced_counts[, forced_anchors])`` ->
     ``(vectors [R, 128] int32, cache, positions)``.
 
@@ -1660,7 +1107,7 @@ def make_fused_draft(c: DraftConfig, mesh, block: int, *, eps: float | None = No
     window, hidden = c.window, c.hidden
     R, T = requests, requests * rows
     packed = T * CHUNK // 256  # FP32 rows holding one BF16 [T, 896] chunk
-    body = _make_body(c, block, eps, stop_after, host_bf16, requests)
+    body = _make_body(c, block, eps, requests)
 
     def local(weights, cache, positions, aux, logits, previous, position, forced_count, forced_anchor):
         weights = {name: weights[name][0] for name in WEIGHT_NAMES}
@@ -1707,7 +1154,6 @@ def make_fused_draft(c: DraftConfig, mesh, block: int, *, eps: float | None = No
             tpu.VMEM((R, 128), jnp.int32),  # tokens_v
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # stage
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # local_recv
-            tpu.VMEM((1, 1, 1, 1) if host_bf16 else (2, 4, T, CHUNK), jnp.float32),  # host_buf
             tpu.VMEM((2, 4, packed, 128), jnp.float32),  # host_packed
             tpu.VMEM((2, 8, packed, 128), jnp.float32),  # gather_recv
             tpu.VMEM((2, RANKS, R, 128), jnp.int32),  # tiny_recv

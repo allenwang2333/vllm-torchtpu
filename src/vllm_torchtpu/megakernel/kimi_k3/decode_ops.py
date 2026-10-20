@@ -111,9 +111,6 @@ def decode_options(batch_size: int) -> dict:
     attention_dp = (
         {
             "attention_dp": dp,
-            "attention_dp_ownership": True,
-            "attention_state_pipeline": True,
-            "dp_moe_gather": "split",
             **({"sequence_parallel_size": owners} if owners != 4 else {}),
         }
         if dp > 1
@@ -204,7 +201,6 @@ class DecodeOps:
             self.rank_loader.iter_decode_rank(
                 presharded,
                 self.rank,
-                split_experts=True,
                 attention_dp=self.attention_dp,
             ),
             lambda _group, name, tensor: self.weights.__setitem__(name, tensor),
@@ -922,29 +918,6 @@ class Control:
         self.plan_start = 3 * self.slots
         self.tables_start = self.plan_start + self.rows * self.FIELDS
         self.size = self.tables_start + self.rows * self.pages
-
-    def accepted_state_rows(self, ids, state, requests, rows_per, *, single=False):
-        """Native source rows and bank destinations after DP1 acceptance.
-
-        The batched entry permutes bank entries so its first row reads the
-        previous accepted state. Control records the selected bank entry, not
-        its row in this verifier. Padding commits the final verifier row,
-        independent of its accepted count.
-        """
-        total = requests * rows_per
-        plan, _ = self.fields(state, requests)
-        slots = plan[:, self.SLOT]
-        accepted_entry = state[2 * self.slots + slots]
-        entries = (
-            jnp.arange(rows_per, dtype=jnp.int32)[None, :]
-            if single
-            else ids[3 * total : 4 * total].reshape(requests, rows_per)
-        )
-        selected = jnp.argmax(entries == accepted_entry[:, None], axis=1)
-        source = jnp.arange(requests, dtype=jnp.int32) * rows_per + jnp.where(
-            slots == 0, rows_per - 1, selected
-        )
-        return source, ids[2 * total + source]
 
     def key(self) -> tuple[int, int, int]:
         return self.slots, self.rows, self.pages

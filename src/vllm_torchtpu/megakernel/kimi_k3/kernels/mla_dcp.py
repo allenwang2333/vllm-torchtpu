@@ -60,7 +60,6 @@ PAGE_TOKENS = 256
 LANES = 640  # latent 512 | rope 64 | zero 64
 LATENT = 512
 HEADS_PER_RANK = 3
-HEAD_SLOTS = 4  # most rows per rank and batch row in a packet (see packet_layout)
 NEG = -1e30  # finite "no tokens" log-sum-exp
 MAX_ROWS = 8  # batch rows of an unchunked call; a larger batch runs in chunks (see _attend_chunked)
 HOST_LANES = 8  # DCP ranks per host (rank = host * 8 + lane)
@@ -396,7 +395,7 @@ class DcpAttention:
     """One DCP attention invocation for ``batch`` rows at ``position_ref``."""
 
     def __init__(self, cache: DcpCache, workspace: DcpWorkspace, position_ref, batch, *,
-                 probability_hilo=False, skip=(), sequence_rows=1, heads=HEADS_PER_RANK,
+                 skip=(), sequence_rows=1, heads=HEADS_PER_RANK,
                  chunk_rows=None, cache_verify_rows=False):
         if batch > MAX_ROWS:
             chunk = chunk_layout(batch, heads, chunk_rows=chunk_rows)[0]  # validates
@@ -429,7 +428,7 @@ class DcpAttention:
         self.span = workspace.pages.shape[1] // (self.page_tokens if self.native else self.page_rows)
         self.folds = staged_folds(batch, heads, sequence_rows, cache.dtype)
         self.fold_tokens = self.span * self.page_tokens // self.folds
-        self.probability_hilo, self.skip = probability_hilo, set(skip)
+        self.skip = set(skip)
         rank = jax.lax.axis_index("tp")
         self.member = rank % self.group
         self.base = rank - self.member
@@ -865,10 +864,6 @@ class DcpAttention:
                                        preferred_element_type=jnp.float32)
         if self.fp8:
             weighted = weighted * (1.0 / 256)
-        elif self.probability_hilo:
-            low = (probabilities - high.astype(jnp.float32)).astype(jnp.bfloat16)
-            weighted += jax.lax.dot_general(low, values, (((1, ), (0, )), ((), ())),
-                                            preferred_element_type=jnp.float32)
         ws.accumulator[held] = ws.accumulator[held] * scale + weighted
 
     def _clean_step(self, slot, row, local_step, tokens=None, end=None):
@@ -914,14 +909,12 @@ class DcpAttention:
 
         return words
 
-    def _pack_partials(self, first, end, base=0):
+    def _pack_partials(self, first, end):
         """Rows ``first..end``: normalized outputs and log-sum-exps into each
-        peer's send packet (BF16; the lse as a high and a low part); state
-        and packet rows are relative to ``base``."""
+        peer's send packet (BF16; the lse as a high and a low part)."""
         ws, group = self.ws, self.group
         lses = {}
-        for b in range(first, end):
-            held = b - base
+        for held in range(first, end):
             total_weight = ws.denominator[held]  # [head_rows, 1]
             row_maximum = ws.maximum[held]
             has = total_weight > 0
@@ -937,7 +930,7 @@ class DcpAttention:
                 ws.send[self._send_index(peer), target, :] = jnp.concatenate(
                     (normalized[heads_of_peer], lse_lanes[heads_of_peer]), axis=1).astype(jnp.bfloat16)
         if self.lse_in_padding:
-            self._pack_lse_rows(lses, first - base, end - base)
+            self._pack_lse_rows(lses, first, end)
 
     def _pack_lse_rows(self, lses, first, end):
         """``lse_in_padding``: each whole sequence's log-sum-exps (rows but its
@@ -1246,13 +1239,12 @@ def _lse_packet(normalized, lse, lse_rows):
     return packet.astype(jnp.bfloat16)
 
 
-def _merge_received_keys(received, own_rows, keys, key_valid, group, *, unroll=1, lse_rows=0):
+def _merge_received_keys(received, own_rows, keys, key_valid, group, *, lse_rows=0):
     """``_merge_received`` with explicit new keys: every row (head slot)
     attends the valid ones of ``keys`` [K, 640] (``key_valid`` [1, K] nonzero;
     at least one), and the peers' partials. Two passes rather than online:
     every peer's log-sum-exp (lanes 512:514) in one load, one maximum, then a
     weighted sum of the partials (no rescaling or exp per peer)."""
-    del unroll
     keys = keys.astype(jnp.float32)
     scores = jax.lax.dot_general(own_rows, keys, (((1, ), (1, )), ((), ())),
                                  precision=jax.lax.Precision.HIGHEST,

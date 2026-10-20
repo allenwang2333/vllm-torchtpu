@@ -303,15 +303,9 @@ class PrefillProgram:
     # ------------------------------------------------------------ weights
     def load_weights(self, presharded) -> None:
         cache = presharded / "prefill-sp-cache"
-        from .config import active
-
-        iterator = self._rank_loader.iter_prefill_rank(
-            presharded, cache, self.rank, split_experts=True
-        )
-        self._expert_banks = []
-        if active().prefill_fused_moe and active().prefill_expert_parallel == 16:
-            self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
-            iterator = _bank_expert_weights(iterator)
+        iterator = self._rank_loader.iter_prefill_rank(presharded, cache, self.rank)
+        self._expert_banks = [{} for _ in _EXPERT_BANK_SIZES]
+        iterator = _bank_expert_weights(iterator)
 
         def store(group, name, tensor):
             family, marker, index = name.partition("#bank")
@@ -1192,7 +1186,6 @@ class KimiPrefiller:
         self._mla_group = 0
         self._kda_groups: list[tuple[int, int]] = []
         self._zero_logits: torch.Tensor | None = None
-        self._sampler: Any = None
         self._loaded = False
         # With the DSpark speculator: each request's draft ring, computed from
         # the windows' residual streams and written with its KDA state.

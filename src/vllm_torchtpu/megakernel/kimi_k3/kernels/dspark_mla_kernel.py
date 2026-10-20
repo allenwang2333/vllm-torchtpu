@@ -32,6 +32,7 @@ pools (``paged.commit_latent_rows``).
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import jax
@@ -565,7 +566,7 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
             _phase_end(scope)
             scope = _phase_start("d_attend")
             attention = mla_dcp.DcpAttention(
-                dataclasses_replace(cache, layer=jnp.int32(layer)), workspace,
+                dataclasses.replace(cache, layer=jnp.int32(layer)), workspace,
                 _Scalars(scalars, first_request, rows), group_rows, sequence_rows=rows, heads=heads, chunk_rows=rows,
             )
             # The block's padding row carries the partials' lse: the combine
@@ -676,11 +677,6 @@ def _make_body(c: MlaDraftConfig, block: int, requests: int, rows: int, pages: i
         _phase_end(scope)
 
     return body
-
-
-def dataclasses_replace(value, **fields):
-    import dataclasses
-    return dataclasses.replace(value, **fields)
 
 
 def fused_draft_local(c: MlaDraftConfig, *, requests: int, pages: int, block: int | None = None,

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimi K3 checkpoint configuration and component reference helpers.
+"""Kimi K3 checkpoint configuration and shared whole-array math helpers.
 
-Equations follow the Kimi K3 model and KDA reference. All matrix weights use
-[input, output] layout. This reference does not call fused kernels.
+``Config`` reads the checkpoint's ``config.json``. The functions below are
+plain JAX on whole arrays (no fused kernels): RMS norm, the attention
+residual and the tensor-parallel sum that the decode megakernel evaluates
+outside its Pallas calls.
+All matrix weights use [input, output] layout.
 """
 
 import json
@@ -91,56 +94,12 @@ def rms(x, weight, eps=1e-5):
     return (value * weight.astype(jnp.float32)).astype(x.dtype)
 
 
-def sigmoid(x):
-    """Match a BF16 sigmoid operator: compute in FP32, then round once."""
-    return jax.nn.sigmoid(x.astype(jnp.float32)).astype(x.dtype)
-
-
-def route(logits, bias, top_k):
-    """Correction bias selects IDs; uncorrected sigmoid scores set their weights."""
-    scores = jax.nn.sigmoid(logits.astype(jnp.float32))
-    _, ids = jax.lax.top_k(scores + bias, top_k)
-    weights = scores[ids]
-    return ids, weights / jnp.sum(weights)
-
-
 def attention_residual(prefix, blocks, folded_weight, eps=1e-5):
     values = jnp.concatenate((blocks, prefix[None]), axis=0).astype(jnp.float32)
     scores = jnp.sum(values * folded_weight, axis=-1)
     scores *= jax.lax.rsqrt(jnp.mean(values * values, axis=-1) + eps)
     mixed = jnp.sum(jax.nn.softmax(scores)[:, None] * values, axis=0)
     return jax.lax.optimization_barrier(mixed).astype(prefix.dtype)
-
-
-def kda_step(qkv, raw_gate, beta, output_gate, conv, state, w, c):
-    """One token, [3, heads, D] QKV; recurrent state uses [heads, K, V]."""
-    history = jnp.concatenate((conv, qkv[None]), axis=0)
-    filtered = jax.nn.silu(
-        jnp.sum(history.astype(jnp.float32) * w["conv"].astype(jnp.float32), axis=0)
-    ).astype(qkv.dtype)
-    q, k, v = filtered.astype(jnp.float32)
-    q *= jax.lax.rsqrt(jnp.sum(q * q, -1, keepdims=True) + 1e-6) * c.head_dim**-0.5
-    k *= jax.lax.rsqrt(jnp.sum(k * k, -1, keepdims=True) + 1e-6)
-    gate = c.gate_lower_bound * jax.nn.sigmoid(
-        jnp.exp(w["a_log"])[:, None] * (raw_gate.astype(jnp.float32) + w["dt_bias"])
-    )
-    state = state.astype(jnp.float32) * jnp.exp(gate)[..., None]
-    prediction = jnp.einsum("hk,hkv->hv", k, state, precision=jax.lax.Precision.HIGHEST)
-    delta = jax.nn.sigmoid(beta.astype(jnp.float32))[:, None] * (v - prediction)
-    state += k[..., None] * delta[:, None, :]
-    out = jnp.einsum("hk,hkv->hv", q, state, precision=jax.lax.Precision.HIGHEST).astype(qkv.dtype)
-    out = rms(out, w["out_norm"], c.eps) * sigmoid(output_gate)
-    return out, history[1:], state
-
-
-def unpack_mxfp4(packed, scales):
-    """[K/8,N] u32 low-nibble-first storage, [K/32,N] E8M0 scales."""
-    shifts = jnp.arange(8, dtype=jnp.uint32) * 4
-    codes = ((packed[:, None, :] >> shifts[None, :, None]) & 15).reshape(-1, packed.shape[-1])
-    magnitudes = jnp.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], jnp.float32)
-    values = magnitudes[codes & 7] * jnp.where(codes & 8, -1, 1)
-    scale = jax.lax.bitcast_convert_type(scales.astype(jnp.uint32) << 23, jnp.float32)
-    return (values * jnp.repeat(scale, 32, axis=0)).astype(jnp.bfloat16)
 
 
 def tp_sum(value, axis_name="tp"):

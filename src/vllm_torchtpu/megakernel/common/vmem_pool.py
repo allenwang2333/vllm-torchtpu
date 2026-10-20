@@ -20,10 +20,9 @@ its first write (the router, consumed before the first expert copy).
 
 Everything here runs while the kernel is traced: offsets, issue points and
 semaphores are Python constants, and the emitted code is the same DMA starts
-and waits as hand-placed calls. Traced control flow goes through ``cond``,
-``when`` and ``loop``, which check that every path leaves the arena in the
-same state (and a loop body in the state it started in), so a static offset
-is valid on every path.
+and waits as hand-placed calls. The layer loop goes through ``loop``, which
+checks that its body ends in the arena state it started in, so a static
+offset is valid on every iteration.
 
 ``start(offset, index)`` gets the loop index the load was requested for, which a
 closure would misread for a load issued after the loop back-edge.
@@ -31,7 +30,6 @@ closure would misread for a load issued after the loop back-edge.
 
 import dataclasses
 
-import jax
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.megakernel.common import pool_alias
@@ -172,28 +170,6 @@ class VmemPool:
         self._log("release", entry)
         self._issue_queued()
 
-    def release_prefix(self, name, nbytes):
-        """Release an acquired load's consumed prefix; retain its live suffix.
-
-        ``nbytes`` must be a positive multiple of the arena alignment and
-        smaller than the remaining load. The caller must finish every read
-        and DMA touching the released bytes before this call. Existing views
-        into the retained suffix remain valid; ``offset(name)`` now points
-        to the suffix. Queued loads can immediately reuse the freed prefix.
-        Use ``release`` once the suffix has also been consumed.
-        """
-        entry = self._live(name)
-        if entry.state != "acquired":
-            raise PoolError(f"release_prefix({name}) requires an acquired load")
-        if nbytes <= 0 or nbytes % ALIGN or nbytes >= entry.nbytes:
-            raise PoolError(
-                f"release_prefix({name}) needs an aligned, nonempty proper prefix"
-            )
-        entry.offset += nbytes
-        entry.nbytes -= nbytes
-        self._log("release_prefix", entry)
-        self._issue_queued()
-
     def view(self, offset, shape, dtype):
         """A [shape] dtype view of the arena from byte ``offset``."""
         nbytes = pool_alias.storage_size(shape, dtype)
@@ -208,57 +184,6 @@ class VmemPool:
             tuple(entry.signature() for entry in self.entries.values()),
             tuple(self.queue),
         )
-
-    def _snapshot(self):
-        return (
-            {name: dataclasses.replace(entry) for name, entry in self.entries.items()},
-            list(self.queue),
-        )
-
-    def _restore(self, snapshot):
-        entries, queue = snapshot
-        self.entries = {name: dataclasses.replace(entry) for name, entry in entries.items()}
-        self.queue = list(queue)
-
-    def cond(self, predicate, true_function, false_function):
-        """``jax.lax.cond`` whose branches must leave the arena in one state."""
-        before = self._snapshot()
-        ends = []
-
-        def branch(function, label):
-            def traced():
-                self._restore(before)
-                self.phase_push(label)
-                function()
-                self.phase_pop()
-                ends.append((label, self.signature(), self._snapshot()))
-
-            return traced
-
-        jax.lax.cond(predicate, branch(true_function, "true"), branch(false_function, "false"))
-        (_, first, snapshot), (_, second, _) = ends
-        if first != second:
-            raise PoolError(
-                "The branches of a cond leave the arena in different states:\n"
-                f"  true:  {first}\n  false: {second}"
-            )
-        self._restore(snapshot)
-
-    def when(self, predicate):
-        """``pl.when`` decorator; the guarded code must not change the arena."""
-        def decorator(function):
-            before = self.signature()
-
-            def traced():
-                function()
-                if self.signature() != before:
-                    raise PoolError(
-                        f"pl.when body changed the arena: {before} -> {self.signature()}"
-                    )
-
-            pl.when(predicate)(traced)
-
-        return decorator
 
     def loop(self, lower, upper):
         """``pl.loop`` decorator; the body must end in the state it began in.

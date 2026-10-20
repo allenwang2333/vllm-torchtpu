@@ -30,8 +30,7 @@ class KernelConfig:
     # only to FP8 plain decode at attention_dp=2, dcp_group=16 with 32 rows per
     # DP group (B64); everything else uses 1024.
     mla_decode_ktile: int = 1024
-    # Routed experts and weight layout (the pre-shard format).
-    expert_gate_up: str = "mxfp4"  # "mxfp4" or "fp8" (reblocked)
+    # Routed experts (MXFP4, the pre-shard format).
     mxfp4_block: int = 2048
     mxfp4_pair_tile: int = 512
     mxfp4_static_tile: int = 0
@@ -60,15 +59,9 @@ class KernelConfig:
     # Prefill MLA flash tiles (queries x keys per step).
     mla_flash_qtile: int = 1024
     mla_flash_ktile: int = 2048
-    # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
-    # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
-    # 16 and 32 regroup the EP8 group's shards at load.
-    prefill_expert_parallel: int = 16
-    # Packed dispatch/shared overlap and fused down/combine/reduce-scatter.
-    # EP16: FP32 at all serving windows, BF16 at 4K/8K only.
-    # False: the unfused SparseCore gather/combine.
-    prefill_fused_moe: bool = True
     # Both prefill MoE rings: BF16 halves transfer bytes, rounding every hop.
+    # FP32 runs the fused MoE at every window; BF16 the packed MoE at 4K/8K
+    # and the SparseCore gather/combine below 4K.
     moe_reduce_dtype: str = "float32"
     # Weight loading.
     read_streams: int = 4
@@ -84,8 +77,6 @@ class KernelConfig:
     vmem_pad_kb: int = 0
 
     def __post_init__(self) -> None:
-        if self.prefill_expert_parallel not in (8, 16, 32):
-            raise ValueError("prefill_expert_parallel is 8, 16 or 32")
         if self.moe_reduce_dtype not in ("float32", "bfloat16"):
             raise ValueError("moe_reduce_dtype is float32 or bfloat16")
         if self.mla_decode_ktile not in (1024, 2048):

@@ -91,9 +91,6 @@ def add_arguments(parser) -> None:
         default=None,
         help="the DSpark speculator checkpoint: compare the prefill's rings too",
     )
-    from tools.megakernel.check_mla import add_arguments as add_mla_arguments
-
-    add_mla_arguments(sub)
     greedy = sub.add_parser(
         "greedy", help="real prompts replayed on the decoder, then greedy tokens"
     )
@@ -121,10 +118,6 @@ def add_arguments(parser) -> None:
 
 
 def run(args, records: harness.Records) -> None:
-    if args.check == "mladraft":
-        from tools.megakernel.check_mla import run_mladraft
-
-        return run_mladraft(args, records)
     {
         "spec": run_spec,
         "handoff": run_handoff,
@@ -466,7 +459,7 @@ def run_spec(args, records: harness.Records) -> None:
     # C and F retain their 2000-token fixtures even when --prompt-tokens
     # shortens A. All fixtures must fit both the pool and the draft's RoPE.
     longest_prompt = max(map(len, prompts.values()))
-    pages = -(-(longest_prompt + 4 * generate + 64) // k3.LOGICAL) + 1
+    pages = -(-(longest_prompt + 4 * generate + 64) // k3.logical()) + 1
     # One copy of the weights for the decoders below (max_num_seqs 8, or the
     # largest --large-batches count).
     ops = DecodeOps(
@@ -488,7 +481,7 @@ def run_spec(args, records: harness.Records) -> None:
             ops,
             pools,
             max_num_seqs=most,
-            max_model_len=pages * k3.LOGICAL,
+            max_model_len=pages * k3.logical(),
             draft=draft,
             schedule=schedule,
         )

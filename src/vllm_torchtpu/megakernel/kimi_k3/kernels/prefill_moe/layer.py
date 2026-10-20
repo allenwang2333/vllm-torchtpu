@@ -209,8 +209,6 @@ def moe_local_routed(
             weights["latent_down"][:, None],
             jnp.full((1,), local_tokens, jnp.int32),
             rhs_layer=weights["expert_layer"],
-            maybe_quantize_lhs=False,
-            zero_initialize=False,
         )
     else:
         latent_local = hidden_local @ weights["latent_down"]

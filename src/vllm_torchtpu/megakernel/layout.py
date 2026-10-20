@@ -29,8 +29,8 @@ class StateRegion:
 @dataclasses.dataclass(frozen=True)
 class KVLayout:
     """Unified pools: one tensor per attention layer, ``[num_blocks,
-    *block_shape]`` of ``dtype``, pool ``p`` shared with recurrent layers
-    ``[p * states_per_pool, (p + 1) * states_per_pool)``. An attention
+    *block_shape]`` of ``dtype``, each shared with recurrent layers (pool
+    ``p`` holds the ``p``-th equal run of ``state_layers``). An attention
     block holds ``tokens_per_block`` token entries of ``entry_lanes`` used
     lanes (row ``t // tokens_per_row``, slot ``t % tokens_per_row``); a
     recurrent layer's state block holds its ``state_regions``."""
@@ -47,12 +47,6 @@ class KVLayout:
     @property
     def pools(self) -> int:
         return len(self.attention_layers)
-
-    @property
-    def states_per_pool(self) -> int:
-        """The most recurrent layers one pool holds (pool ``p`` holds state
-        layers ``[p * states_per_pool, (p + 1) * states_per_pool)``)."""
-        return -(-len(self.state_layers) // self.pools)
 
     def region(self, name: str) -> StateRegion:
         return next(r for r in self.state_regions if r.name == name)

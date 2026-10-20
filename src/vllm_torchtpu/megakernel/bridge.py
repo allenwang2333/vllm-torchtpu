@@ -242,7 +242,7 @@ def stream_to_device(iterator, store) -> dict[str, float]:
 
     Uploads run concurrently on ``UPLOAD_THREADS`` threads with at most that
     many arrays and ``UPLOAD_INFLIGHT_BYTES`` of host buffers pending. Arrays
-    named ``family@index/count`` (``rank_loader.iter_*_rank(split_experts=)``)
+    named ``family@index/count`` (``rank_loader.iter_*_rank``'s expert files)
     are joined on the device along the layer axis once all parts are up.
     Returns wall time, time blocked on the reader, time blocked on uploads
     and the GiB moved.

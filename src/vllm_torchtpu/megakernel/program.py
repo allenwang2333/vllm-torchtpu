@@ -78,10 +78,6 @@ class RequestInput:
         return self.computed + self.scheduled
 
     @property
-    def completes_prompt(self) -> bool:
-        return self.end >= self.num_prompt_tokens
-
-    @property
     def partial(self) -> bool:
         """A prefill chunk that leaves known tokens unscheduled: no token this step."""
         return self.end < self.num_tokens
