@@ -78,8 +78,14 @@ The host-placement choice does not change the checkpoint's numeric format.
 - `scripts/vllm/benchmarking/configs/deepseek-v41-flash-dp8-ep.sh`: DP8 full
   forward smoke and GSM8K. The accuracy floor is inherited from the previous
   TP8 quality gate; it is not a newly measured DP8 baseline.
-- `.buildkite/pipeline_dsv41.yml`: CPU policy/route checks, TPU scorer/route
-  correctness, DP8 quality and the two DP8 performance scenarios.
+- `.buildkite/pipeline_dsv41.yml`: DP8 full-forward smoke + GSM8K, C384 steady
+  DSpark decode at 96K context, and C8 cached 96K + 16K prefill extend.
+  All three jobs depend on the CI Docker image build.
+
+The `epic/dsv41` lane no longer schedules the benchmark-script CPU regressions
+or index/model/kernel CPU contract tests on every build. The test files remain
+available for targeted manual pytest runs; the retained TPU jobs keep their
+existing configurations and pass/fail thresholds.
 
 The six TP8 serving configs and the old `bench_100k_prefill.sh` /
 `integrated_prefill_suite.sh` launchers have been retired. Standalone kernel

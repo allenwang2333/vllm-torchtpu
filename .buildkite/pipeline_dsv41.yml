@@ -12,57 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The only lane on epic/dsv41 (see ALL_LANES in scripts/bootstrap.sh). The
-# branch targets DeepSeek-V4.1-Flash alone, so the other models' suites are
-# not run here.
+# The only lane on epic/dsv41 (see ALL_LANES in scripts/bootstrap.sh).
+# Keep the DP8 quality gate and production long-context prefill/decode only.
+# CPU regression and contract tests remain available for manual runs.
 
 steps:
-  - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
-    key: "dsv41_benchmark_scripts_cpu"
-    depends_on: "build_docker"
-    timeout_in_minutes: 10
-    agents:
-      queue: "cpu_64_core"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest --confcutdir=tests/scripts
-        tests/scripts/test_dsv41_server_session.py
-        tests/scripts/test_dsv41_check_summary.py
-        tests/scripts/test_dsv41_decode_worker_capture.py
-        tests/scripts/test_dsv41_decode_accounting.py
-        tests/scripts/test_dsv41_serve_recipe.py
-        -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
-
-  - label: "DeepSeek-V4.1 index configuration: CPU contracts"
-    key: "dsv41_kernel_config_cpu"
-    depends_on: "build_docker"
-    timeout_in_minutes: 15
-    agents:
-      queue: "cpu_64_core"
-    env:
-      CPU_ONLY: "1"
-    commands:
-      - >-
-        bash .buildkite/scripts/run_in_docker.sh
-        python -m pytest
-        tests/models/vllm/test_dsv41_config.py
-        tests/models/vllm/test_dsv41_v2_model_full.py
-        tests/models/vllm/test_dsv41_v2_model_sp.py
-        tests/models/vllm/test_dsv41_v2_local_q.py
-        tests/models/vllm/test_dsv41_v2_prefix_replay.py
-        tests/layers/adapter/test_fused_moe_ep.py
-        tests/kernels/test_dsv41_decode_tuning.py
-        tests/kernels/test_dsv41_decode_index_scores.py
-        tests/models/vllm/test_dsv41_decode_indexer_route.py
-        -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml
-    artifact_paths:
-      - "perf_eval_results/**/*"
-
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
