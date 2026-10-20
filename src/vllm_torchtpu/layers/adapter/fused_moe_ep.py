@@ -185,12 +185,14 @@ def _build_op(
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    oneshot_routing_gather = envs.TPU_MOE_ONESHOT_ROUTING_GATHER
     key = (
         topk,
         renormalize,
         activation,
         mesh_expert_order,
         sharded_plan,
+        oneshot_routing_gather,
         weight_format,
         rhs_qb,
         scoring_fn,
@@ -239,6 +241,7 @@ def _build_op(
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
+            oneshot_routing_gather=oneshot_routing_gather,
             token_replica_groups=token_replica_groups,
             scales_expert_second_minor=scales_expert_second_minor,
             **bias_kw,

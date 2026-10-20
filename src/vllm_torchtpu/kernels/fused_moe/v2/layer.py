@@ -56,6 +56,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.oneshot_gather import oneshot_all_gather
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
 
@@ -287,6 +288,7 @@ def fused_ep_moe_v2(
     scales_expert_second_minor=False,
     expert_slot=None,
     order_after=None,
+    oneshot_routing_gather=False,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -330,6 +332,10 @@ def fused_ep_moe_v2(
     routes and computes a disjoint slice, then gathers the combined outputs
     within its group to restore the input row order. Expert sharding stays
     unchanged. None means singleton groups with no token replication.
+
+    oneshot_routing_gather swaps the all-gather of the routing payload for
+    ``oneshot_all_gather`` (one barrier, then direct remote DMAs to every
+    shard). Same bits; only the collective's latency changes.
 
     mesh_ep_ranks names the EP rank at every device-mesh index. A non-identity
     order relabels only the selected expert ids after top-k, keeping the full
@@ -643,14 +649,15 @@ def fused_ep_moe_v2(
             )
         )
         layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
-        exchange = lax.all_gather(
-            _pack_routing_exchange(
-                local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
-            ),
-            ax,
-            axis=0,
-            tiled=True,
-        ).reshape(ep, layout[-1])
+        payload = _pack_routing_exchange(
+            local_blocks.reshape(-1), scale_bits_l, block_hist.sum(axis=0), layout
+        )
+        if oneshot_routing_gather:
+            exchange = oneshot_all_gather(payload, me, ep)
+        else:
+            exchange = lax.all_gather(payload, ax, axis=0, tiled=True).reshape(
+                ep, layout[-1]
+            )
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
         )
@@ -870,6 +877,7 @@ def fused_ep_moe_v2(
         has_order_after and order_after.shape[1:],
         float(routed_scaling_factor),
         bool(scales_expert_second_minor),
+        bool(oneshot_routing_gather),
     )
     sm = _LAYER_SM_CACHE.get(key)
     if sm is None:

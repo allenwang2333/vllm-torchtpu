@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
+    TPU_MOE_ONESHOT_ROUTING_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
@@ -798,6 +799,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
+    # Fused EP MoE: gather the per-shard routing payload with a one-shot
+    # remote-DMA all-gather (kernels/fused_moe/v2/oneshot_gather.py) instead
+    # of lax.all_gather. Same bits, lower collective latency.
+    "TPU_MOE_ONESHOT_ROUTING_GATHER": env_bool("TPU_MOE_ONESHOT_ROUTING_GATHER"),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py). Empty: the
