@@ -87,6 +87,8 @@ python scripts/dsv41_bench/server_steps/run.py \
 For native GCS weight streaming, also set `MODEL_URI=gs://bucket/model-prefix`.
 The target and DSpark models use that URI; `MODEL_PATH` remains the local
 checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`.
+`--target-buckets 128,256,2048` replaces the target compile sizes for bucket-ladder
+experiments (the largest must equal the 2048-token chunk); CI uses the defaults.
 
 `run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate

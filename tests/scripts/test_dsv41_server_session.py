@@ -134,6 +134,63 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert status["completed"] == (profile != "failed")
 
 
+def test_target_bucket_ladder_parses_and_rejects_bad_ladders():
+    assert launcher.bucket_ladder("128,256,2048") == [128, 256, 2048]
+    for text in ("256,128,2048", "128,128,2048", "0,2048", "128,x"):
+        with pytest.raises(launcher.argparse.ArgumentTypeError):
+            launcher.bucket_ladder(text)
+
+
+@pytest.mark.parametrize(
+    "scenario,ladder,error",
+    [
+        ("encoder_extend", "128,256,2048", None),
+        ("decode", "288,576,2048", None),
+        ("encoder_extend", "128,1024", "must end at the 2048-token chunk"),
+    ],
+)
+def test_target_bucket_override_reaches_the_server(
+    tmp_path, monkeypatch, capsys, scenario, ladder, error
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.json").write_text("{}")
+    monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(__file__=__file__))
+    argv = ["run.py", "--scenario", scenario, "--input", "inputs.json"]
+    argv += ["--out", "results", "--target-buckets", ladder]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(launcher, "load_frozen_input", lambda _: {})
+    monkeypatch.setattr(launcher, "source_identity", lambda *a, **kw: {})
+    monkeypatch.setattr(launcher.importlib.metadata, "version", lambda _: "1")
+    monkeypatch.setattr(launcher, "bootstrap_ports", lambda *a: None)
+    monkeypatch.setattr(
+        launcher.requests, "get", lambda *a, **kw: SimpleNamespace(ok=False)
+    )
+    starts = []
+
+    def start(command, *, env, **kwargs):
+        starts.append(command)
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", start)
+    monkeypatch.setattr(launcher, "stop", lambda _: None)
+    if error is not None:
+        with pytest.raises(SystemExit):
+            launcher.main()
+        assert error in capsys.readouterr().err
+        assert not starts and not (tmp_path / "results").exists()
+        return
+    with pytest.raises(RuntimeError, match="stop after launch"):
+        launcher.main()
+    command = starts[0]
+    expected = [int(n) for n in ladder.split(",")]
+    assert json.loads(command[command.index("--compilation-config") + 1]) == {
+        "compile_sizes": expected
+    }
+    manifest = json.loads((tmp_path / "results/manifest.json").read_text())
+    assert manifest["compile_sizes"] == expected
+
+
 @pytest.mark.parametrize("profile_only,waves", [(False, 6), (True, 1)])
 def test_prefill_keeps_formal_warmup_but_skips_duplicate_profile_warmup(
     tmp_path, monkeypatch, profile_only, waves

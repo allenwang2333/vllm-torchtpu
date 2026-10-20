@@ -107,6 +107,19 @@ def bootstrap_ports(env: dict[str, str], out: Path) -> None:
     raise RuntimeError("No available ten-port bootstrap block")
 
 
+def bucket_ladder(text: str) -> list[int]:
+    """Parse a comma-separated, strictly increasing list of positive token buckets."""
+    try:
+        buckets = [int(item) for item in text.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"not a list of integers: {text}") from error
+    if not buckets or buckets[0] < 1 or buckets != sorted(set(buckets)):
+        raise argparse.ArgumentTypeError(
+            f"buckets must be positive and strictly increasing: {text}"
+        )
+    return buckets
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -121,6 +134,12 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--target-buckets",
+        type=bucket_ladder,
+        help="Comma-separated target compile sizes, e.g. 128,256,2048; the largest "
+        "must equal the scenario's chunk. Default: the CI ladder of the scenario.",
+    )
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -128,6 +147,9 @@ def main() -> None:
         parser.error("The integrated launcher requires at least one formal window")
     if args.scenario == "encoder_extend":
         load_frozen_input(args.input)
+    chunk = DECODE_SCENARIO.chunk_tokens if args.scenario == "decode" else 2048
+    if args.target_buckets is not None and args.target_buckets[-1] != chunk:
+        parser.error(f"--target-buckets must end at the {chunk}-token chunk")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
@@ -174,11 +196,13 @@ def main() -> None:
     )
     # Target and context-KV buckets; draft queries derive their own ladder
     # from request buckets and the draft block size.
-    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 2048]
+    buckets = [verify_rows, chunk] if decode else [128, chunk]
+    if args.target_buckets is not None:
+        buckets = args.target_buckets
     env.update(
         TP="1",
         DP="8",
-        CHUNK=str(DECODE_SCENARIO.chunk_tokens) if decode else "2048",
+        CHUNK=str(chunk),
         MAX_SEQS=str(DECODE_SCENARIO.local_concurrency) if decode else "1",
     )
     if decode:
