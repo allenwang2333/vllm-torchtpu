@@ -62,6 +62,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     rowquant_fp8,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
+from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
     replica_wire_rows,
@@ -710,8 +711,8 @@ def fused_ep_moe_v2(
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
         slab_row = local_slab_rows(routing, me, shard_stride=ragged_stride)
-        # The two slab scatters and the activation all-gather are offloaded to
-        # the SAME SparseCore. Ordering the scatters behind the collective
+        # Without explicit affinity, the two slab scatters and activation
+        # all-gather can share a SparseCore. Ordering scatters behind the collective
         # enqueues it 129 us earlier and costs them the cover they had; that
         # trade measures +2.80% at 2048 local tokens and negative at every
         # smaller shape, so it is taken only where the routing plan in front
@@ -719,9 +720,27 @@ def fused_ep_moe_v2(
         # either way; only the queue moves.
         if t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
+        # Restrict the new scratch allocation and scheduling to the measured
+        # DSV4.1 shape until other token counts have TPU coverage.
+        merged_scatter = (
+            jax.devices()[0].device_kind.startswith("TPU7")
+            and form.quantized_activations
+            and (T, topk, e_total, ep, capacity, ragged_stride)
+            == (2304, 6, 384, 8, 128, 14336)
         )
+        scattered_scale_bits = None
+        if merged_scatter:
+            token_gather, scattered_scale_bits = scatter_pair(
+                slab_row,
+                jnp.repeat(cast(jax.Array, scale_bits_g), topk),
+                ragged_stride,
+                act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+                topk,
+            )
+        else:
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
             # token t -- row t % t_local of shard t // t_local -- sits in the
@@ -755,11 +774,14 @@ def fused_ep_moe_v2(
         if form.quantized_activations:
             scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
+            if scattered_scale_bits is None:
+                scattered_scale_bits = (
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop")
+                )
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
-                jnp.float32,
+                scattered_scale_bits, jnp.float32
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
