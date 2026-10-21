@@ -1059,6 +1059,7 @@ class TPUModelRunner(GPUModelRunner):
         # The step whose KV-connector progress an intermediate stage still
         # owes in sample_tokens.
         self._pp_pending_scheduler_output: SchedulerOutput | None = None
+        self._pp_pending_kv_save_nan_check: KVSaveNanCheck | None = None
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
@@ -3995,8 +3996,9 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
             if nan_check is not None:
-                assert isinstance(hidden_states, torch.Tensor), (
-                    "KV store NaN checking requires final hidden states"
+                assert isinstance(hidden_states, (torch.Tensor, IntermediateTensors)), (
+                    "KV store NaN checking requires forward hidden states or "
+                    "intermediate tensors"
                 )
                 plan = self._last_sequence_layout_plan
                 assert plan is not None, (
@@ -4118,6 +4120,7 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
+            self._pp_pending_kv_save_nan_check = nan_check
             return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,
@@ -4972,7 +4975,9 @@ class TPUModelRunner(GPUModelRunner):
         # clear past its drafter.) ngram drafts below from host tokens and
         # writes no KV. The wait above also proves the previous forward
         # finished, so a store deferred behind it can be handed to raiden in
-        # this step rather than the next.
+        # this step rather than the next. Note that state.kv_save_nan_check
+        # snapshots only the target forward chunks from execute_model(), not
+        # the drafter's KV writes above.
         self.maybe_wait_for_kv_save(state.kv_save_nan_check)
         (
             finished_sending,
@@ -7661,10 +7666,12 @@ class TPUModelRunner(GPUModelRunner):
         their KV-connector progress so the aggregated step output is
         complete."""
         scheduler_output = self._pp_pending_scheduler_output
+        nan_check = self._pp_pending_kv_save_nan_check
         self._pp_pending_scheduler_output = None
+        self._pp_pending_kv_save_nan_check = None
         if scheduler_output is None:
             return EMPTY_MODEL_RUNNER_OUTPUT
-        self.maybe_wait_for_kv_save()
+        self.maybe_wait_for_kv_save(nan_check)
         (
             finished_sending,
             finished_recving,
