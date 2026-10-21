@@ -324,6 +324,55 @@ The corrected three-slot, gate/up activation and G1024 experiments have a
 combined source/HLO/result archive at
 `exp-bazj9i3rq6` / `results/final-micro-evidence.tgz`.
 
+In `exp-c5bdngz3ad` (source `a04817ac`), explicit one- and two-block
+FP4-to-FP8 lookahead retained the original K-block dot shapes, scales and
+addition order. All complete EP8 output bits matched. At biased seed 1043,
+whole-layer device medians excluding entry barriers were 0.571214 ms for the
+reference, 0.571439 ms for one-block lookahead and 0.571498 ms for two blocks.
+At uniform seed 1044 they were 0.459195, 0.459625 and 0.459485 ms. Generated
+code sizes and compiled argument/output/temporary storage were unchanged.
+Moving those reads earlier did not establish a speedup and is not adopted.
+
+A separate small MXU operand probe on that job tested FP8 LHS with a native
+FP4 RHS at M64/K256/N256 and M128/K512/N256. The pinned compiler rejected
+both with `Unsupported element type for matmul push rhs: 'f4E2M1FN'`.
+Explicit FP4-to-FP8 conversion followed by asynchronous MXU operations was
+bit-exact against the ordinary dot reference. This is a compiler/API result
+for JAX/JAXLIB 0.11.2 and libtpu 0.0.50, not a claim about hardware capability;
+there is no native-FP4-RHS timing result.
+
+The same job tested putting CSA cache words and scale bits in a single
+SparseCore gather record. For two 524288-record banks and 288-by-512 indices,
+the 136- and 160-word formats were bit-exact but increased device module time
+excluding entry barriers from 0.174463 ms to 1.752655 and 1.724891 ms.
+Temporary storage grew from 1376064 bytes to 1360035360 and 1410367008 bytes.
+Compiled HLO contains full-bank layout copies for these candidates. Packing
+occurred outside timing; the copies are inside the measured executable.
+The 129-word format failed numerical checks and was excluded from timing.
+A flat-input variant failed compilation with `Reshape 1D ref is not supported.`
+These results reject these layouts, not every possible packed representation.
+The job completed successfully; its result/HLO/device-event files were retrieved
+through a read-only CPU helper. The verified local archive SHA-256 is
+`85ae39d7abf1685f2fe382cca6014a62e1d7463e37028adb7e6121417d210991`.
+
+The mHC VMEM-output candidate retains the normalized BF16 activation in VMEM
+for following consumers, without changing their interface or arithmetic.
+At seeds 1034 and 1036, all mHC outputs, FP8 activation/scale and projected
+values were bit-exact. Device medians for mHC plus the following 5120-by-1792
+projection fell from 27.747 to 26.634 us and from 27.646 to 26.607 us.
+The dispatch is limited to the kernel's TPU7x envelope with 288 tokens,
+four streams, width 5120, BF16 norm weights and HBM gate inputs.
+Other shapes retain the previous output placement. Serving validation is
+pending; these isolated timings do not establish a whole-model improvement.
+
+```bash
+git show a04817ac:src/vllm_torchtpu/kernels/deepseek_v41/mhc/shifted_post_pre_rms.py \
+  > /tmp/mhc-output-reference.py
+python scripts/dsv41_bench/bench_mhc_output.py \
+  --reference-source /tmp/mhc-output-reference.py \
+  --out /tmp/mhc-output --seed 1045 --profile
+```
+
 Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
 above ran in `exp-qg29pd6unq` after its serving process exited. The initial
 1024–1800-block tail test was faster, but that density was too low to represent
