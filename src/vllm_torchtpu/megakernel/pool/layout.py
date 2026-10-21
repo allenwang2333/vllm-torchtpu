@@ -59,17 +59,17 @@ if TYPE_CHECKING:
 # TPU lane width: the u32 / bf16 views of a pool page are `(rows, LANES)`.
 LANES = 128
 
-# Geometry the pool kernels (split gather / scatter, the GDN in-kernel GPR path,
-# and the experimental fused pool I/O) are validated for. They are written in
-# terms of `PoolLayout`, but these combinations are the only ones exercised on
-# TPU; `PoolLayout.validate` rejects anything else instead of guessing.
+# Geometry the pool I/O paths (split gather / scatter, the in-kernel GPR
+# path, and fused pool I/O) are validated for. They are written in terms of
+# `PoolLayout`, but these combinations are the only ones exercised on TPU;
+# `PoolLayout.validate` rejects anything else instead of guessing.
 # - `hd == 256`, `page_size == 128`, `kvh == 1`: KV page `(2, 64, 4, 128)` and
-#   one `(K, V)` head pair per rank and page (`GQABlock` paged reads).
+#   one `(K, V)` head pair per rank and page.
 # - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
-#   geometry the pool kernels have run with on TPU.
+#   geometry exercised on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
-#   and the GDN conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`) hard-code
-#   the 3-tap window.
+#   and the recurrent conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`)
+#   hard-code the 3-tap window.
 VALIDATED_HD = 256
 VALIDATED_PAGE_SIZE = 128
 VALIDATED_KVH = 1
@@ -83,7 +83,8 @@ class PoolLayout:
     """Unified raw-pool layout: KV page packing plus recurrent checkpoint slots.
 
     The defaults describe a single KV-only pool with the validated page geometry.
-    Models build their layout explicitly (e.g. `qwen35_pool_layout(g)`).
+    Callers build their layout explicitly for their attention and recurrent head
+    counts.
     """
 
     # Pool topology.
@@ -147,7 +148,7 @@ class PoolLayout:
         return slot * (pps * self.slots_per_pool) + sub * pps
 
     def min_num_pages(self, ex: ExecSpec) -> int:
-        """Pages needed by `allocate_test_layout(self, ex)` (reserved + KV + slots)."""
+        """Pages needed for a disjoint test layout (reserved + KV + slots)."""
         pps = self.pages_per_slot
         kv_pages_total = self.reserved_pages + ex.NS * (
             ex.ctx // cache_exec(ex).page_size
@@ -304,8 +305,8 @@ class PoolLayout:
             f"page ({self.conv_page_rows} rows)",
         )
         # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
-        # window: GPR in the K half of the conv page (as `can_pool_gather`
-        # checks), fused pool I/O (at least 16 rows) in the whole conv page.
+        # window: GPR in the K half of the conv page (`gpr_conv_fits`),
+        # fused pool I/O (at least 16 rows) in the whole conv page.
         qkv_rows = self.qkv_per_rank(R) // LANES
         hr = rup(self.conv_taps + ex.T, 8)
         _need(

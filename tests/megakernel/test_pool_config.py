@@ -17,27 +17,62 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import pool
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.pool import (
+    CacheExec,
+    PoolBackend,
+    PoolLayout,
+    cache_exec,
+    resolved_max_pages_per_seq,
+    with_cache,
+)
 
 
 def test_cache_exec_pool_gather_default_is_split():
+    assert pool.POOL_STATE_NAME == "raw"
     assert pool.POOL_IO_NUMERICS == {
         "fused_pool_io": "approx",
         "pool_gather": "exact",
         "pool_gather_eligible": "approx",
     }
-    assert mk.ExecSpec().cache is None
+    assert ExecSpec().cache is None
     # A `CacheExec` equal to its defaults is the same as no cache extension.
-    assert mk.ExecSpec(cache=mk.CacheExec()) == mk.ExecSpec()
-    assert hash(mk.ExecSpec(cache=mk.CacheExec())) == hash(mk.ExecSpec())
-    assert mk.with_cache(mk.ExecSpec(), paged_kv=False).cache is None
-    assert mk.ExecSpec(cache=mk.CacheExec(paged_kv=True)) != mk.ExecSpec()
-    assert mk.cache_exec(mk.ExecSpec()).pool_gather is False
-    assert not mk.CacheExec(paged_kv=True).GPR
+    assert ExecSpec(cache=CacheExec()) == ExecSpec()
+    assert hash(ExecSpec(cache=CacheExec())) == hash(ExecSpec())
+    assert with_cache(ExecSpec(), paged_kv=False).cache is None
+    assert ExecSpec(cache=CacheExec(paged_kv=True)) != ExecSpec()
+    assert cache_exec(ExecSpec()).pool_gather is False
+    assert not CacheExec(paged_kv=True).GPR
+    assert not CacheExec(paged_kv=True).FUSED
+    assert CacheExec(paged_kv=True, fused_pool_io=True).FUSED
     for val in pool.POOL_GATHER_VALUES:
-        assert mk.CacheExec(pool_gather=val).pool_gather == val
+        assert CacheExec(pool_gather=val).pool_gather == val
     with pytest.raises(ValueError, match="pool_gather must be one of"):
-        mk.CacheExec(pool_gather="sometimes")  # type: ignore[arg-type]
-    ex = mk.with_cache(mk.ExecSpec(B=24, T=4), paged_kv=True, pool_gather=True)
-    assert mk.cache_exec(ex).GPR and not mk.cache_exec(ex).FUSED
+        CacheExec(pool_gather="sometimes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="CacheExec"):
+        cache_exec(ExecSpec(cache="invalid"))
+    ex = with_cache(ExecSpec(B=24, T=4), paged_kv=True, pool_gather=True)
+    assert cache_exec(ex).GPR and not cache_exec(ex).FUSED
+
+
+def test_resolved_max_pages_per_seq_and_pool_backend_properties():
+    ex = ExecSpec(ctx=512)
+    assert resolved_max_pages_per_seq(ex) == 4
+    assert resolved_max_pages_per_seq(with_cache(ex, max_pages_per_seq=16)) == 16
+
+    for slots in (3, 1, 0):
+        lay = PoolLayout(
+            num_pools=2,
+            slots_per_pool=slots,
+            kh=2 if slots else 0,
+            vh=4 if slots else 0,
+        )
+        backend = PoolBackend(
+            layout=lay,
+            kernel_names=("gather_gdn_states", "scatter_pool_states"),
+        )
+        assert backend.layout is lay and backend.num_pools == 2
+        assert backend.has_recurrent_pool == (slots > 0)
+        assert backend.recurrent_slots_per_pool == max(1, slots)
+        assert backend.ckpt_pages_per_slot == 5

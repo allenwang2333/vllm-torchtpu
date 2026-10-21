@@ -16,9 +16,8 @@
 `CacheExec` holds the paged-pool execution settings (KV paging, the pool I/O
 mode, checkpoint-index formats). It rides on `ExecSpec.cache` (`None` means
 `CacheExec()`, i.e. plain non-paged states); read it with `cache_exec(ex)` and
-derive a variant with `with_cache(ex, **fields)`. `PoolBackend` is the
-model-injected pool layout plus gather / scatter callbacks
-(`ModelSpec.cache_backend`).
+derive a variant with `with_cache(ex, **fields)`. `PoolBackend` wraps a
+`PoolLayout` together with its gather / scatter callbacks.
 """
 
 from __future__ import annotations
@@ -33,21 +32,20 @@ if TYPE_CHECKING:
     from ..exec_spec import ExecSpec
     from .layout import PoolLayout
 
-# State name of the unified raw-pool tuple (`ST[...]` / `O[...]`). This is the
-# single definition: blocks, the kernel builder and the cache pipes use this
-# constant (or `KernelContext.raw_refs`).
+# State name of the unified raw-pool tuple (`ST[...]` / `O[...]`), defined
+# once here and shared across the pool and execution layers.
 POOL_STATE_NAME = "raw"
 
 # Valid `CacheExec.pool_gather` values (see the field comment).
 POOL_GATHER_VALUES: tuple[Any, ...] = (False, "split", None, "eligible", True)
 
-# Numerics class of the pool-I/O modes selected by profiles.
+# Numerics class of each pool-I/O mode.
 POOL_IO_NUMERICS: dict[str, NumericsClass] = {
-    "fused_pool_io": "approx",  # always runs the head-major GDN recurrence
-    # GPR, auto (`Profile.pool_gather=None`): WIDE verify buckets only, where
-    # GCH is already on (bitwise vs split at T=4 B=24).
+    "fused_pool_io": "approx",  # always runs the head-major recurrence
+    # GPR, auto (`pool_gather=None`): WIDE verify buckets only, where
+    # chunked recurrence is already on (bitwise vs split at T=4 B=24).
     "pool_gather": "exact",
-    # GPR on every eligible bucket (`Profile.pool_gather=True`): may reassociate
+    # GPR on every eligible bucket (`pool_gather="eligible"`): may reassociate
     # non-WIDE verify buckets under tuned tile schedules.
     "pool_gather_eligible": "approx",
 }
@@ -61,11 +59,11 @@ class CacheExec:
     page_size: int = 128  # Tokens per KV page
     num_pages: int = 4096  # Total pages per attention pool per rank
     max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
-    fused_pool_io: bool = False  # True: fuse KV RMW + GDN gather/scatter in-kernel
-    # In-kernel GDN gather (GPR): False (default) = split gather kernel, which
-    # a profile may override; "split" = split, explicitly (wins over a profile);
-    # None = auto (WIDE verify buckets where eligible); "eligible" = every bucket
-    # the pool backend can gather on; True = required (`MegakernelConfigError`
+    fused_pool_io: bool = False  # True: fuse KV RMW and recurrent I/O in-kernel
+    # In-kernel recurrent gather (GPR): False (default) = split gather
+    # (overridable by caller); "split" = split, explicitly; None = auto
+    # (WIDE verify buckets where eligible); "eligible" = every bucket the
+    # pool backend can gather on; True = required (`MegakernelConfigError`
     # if the bucket cannot).
     pool_gather: bool | None | Literal["eligible", "split"] = False
     act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
@@ -89,7 +87,7 @@ class CacheExec:
 
     @property
     def GPR(self) -> bool:
-        """In-kernel GDN gather on (only after `pool_gather` is resolved to `True`)."""
+        """In-kernel recurrent gather on (after `pool_gather` resolves to `True`)."""
         return bool(
             self.paged_kv and not self.fused_pool_io and self.pool_gather is True
         )
@@ -125,10 +123,10 @@ def resolved_max_pages_per_seq(ex: ExecSpec) -> int:
 
 @dataclass(frozen=True)
 class PoolBackend:
-    """Model-injected unified pool layout and gather/scatter callbacks.
+    """Unified pool layout and gather/scatter callbacks.
 
-    Built by `pool.make_pool_backend(layout, ...)`. Pool count, recurrent-slot
-    count and checkpoint slot stride are derived from `layout`.
+    Pool count, recurrent-slot count and checkpoint slot stride are derived
+    from `layout`.
     """
 
     layout: PoolLayout
