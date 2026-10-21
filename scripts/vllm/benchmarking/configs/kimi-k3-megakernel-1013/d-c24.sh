@@ -25,5 +25,7 @@ RECIPE_DECODE_MAX_NUM_SEQS=16
 RECIPE_DRAFTS=3
 RECIPE_ACCEPTANCE=2.87
 RECIPE_STORE_SERVERS=1
+# 384 GiB store servers, as build 601.
+RECIPE_STORE_NODE_BYTES=412316860416
 # shellcheck source=scripts/vllm/benchmarking/configs/kimi-k3-megakernel/recipe-base.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../kimi-k3-megakernel/recipe-base.sh"
