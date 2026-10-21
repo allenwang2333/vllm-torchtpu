@@ -21,9 +21,11 @@ import pathlib
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from conftest import FakeGeometry, FakeMixerBlock, MiniCtx
 from jax import lax
+from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
@@ -31,12 +33,13 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.megakernel import blocks, comm, planner, stream, vmem
 from vllm_torchtpu.megakernel.blocks import MoEBlock
-from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm, rnd
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, I32, rmsnorm
 from vllm_torchtpu.megakernel.spec import (
     TINY_TILES,
     ExecSpec,
     LayerType,
     ModelSpec,
+    Tiles,
 )
 
 BLOCKS_DIR = pathlib.Path(blocks.__file__).resolve().parent
@@ -423,11 +426,7 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
     partials = []
     for r in range(R):
         g13 = (xb_moe @ sh13[r].astype(F32)) * sh13_s[r]
-        mid_sh = (
-            rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
-            .astype(BF16)
-            .astype(F32)
-        )
+        mid_sh = (jax.nn.silu(g13[:, :ISR]) * g13[:, ISR:]).astype(BF16).astype(F32)
         part_r = (mid_sh @ sh2[r].astype(F32)) * sh2_s[r] * sg
         for b in range(ex.B):
             for k in range(TOPK):
@@ -439,11 +438,9 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
                     r, w_slot
                 ]
                 mid_e = (
-                    rnd(rnd(jax.nn.silu(rnd(h_e[:, :IR]))) * rnd(h_e[:, IR:]))
-                    .astype(BF16)
-                    .astype(F32)
+                    (jax.nn.silu(h_e[:, :IR]) * h_e[:, IR:]).astype(BF16).astype(F32)
                 )
-                y_e = rnd((mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot])
+                y_e = (mid_e @ e2[r, w_slot].astype(F32)) * e2_s[r, w_slot]
                 part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
         partials.append(part_r.astype(BF16).astype(F32))
 
@@ -452,3 +449,373 @@ def test_moe_block_numerical_parity(moe_tp: bool, R: int, pipe: bool):
         assert jnp.allclose(
             out_ranks[r].astype(F32), ref_out.astype(F32), atol=2e-2, rtol=2e-2
         )
+
+
+def test_moe_topk_packed_and_route_vec_compile_time_bounds():
+    """Verify compile-time assertions guard bit-packed top-k and BF16 MXU routing."""
+    moe = MoEBlock()
+    base_tiles = dataclasses.replace(TINY_TILES, bank=512 << 10)
+    g_ok = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=256,
+        I=256,
+        IS=1024,
+        E=512,
+        TOPK=8,
+        moe_tp=False,
+        e_slots=72,
+    )
+    ex_ok = ExecSpec(
+        R=8,
+        B=4,
+        T=1,
+        tiles=dataclasses.replace(base_tiles, topk=True, route_vec=True),
+    )
+    ms_ok = ModelSpec("moe_ok", config=g_ok, layer_type=LayerType("lt", slots=(moe,)))
+    plan_ok = planner.plan(ms_ok, ex_ok)
+    mp_ok = plan_ok.block_params["moe"]
+    assert mp_ok.topk_packed is True
+    assert mp_ok.route_vec is True
+
+    # E=1024 overflows the 9-bit lane index packed into float32 mantissa when topk=True.
+    g_e1024 = dataclasses.replace(g_ok, E=1024, e_slots=0)
+    ex_topk_bad = ExecSpec(
+        R=8,
+        B=4,
+        T=1,
+        tiles=dataclasses.replace(base_tiles, topk=True, route_vec=False),
+    )
+    ms_e1024 = ModelSpec(
+        "moe_e1024", config=g_e1024, layer_type=LayerType("lt", slots=(moe,))
+    )
+    with pytest.raises(AssertionError, match="topk_packed"):
+        planner.plan(ms_e1024, ex_topk_bad)
+
+    # E=2048 overflows the 10-bit expert index split (5-bit hi + 5-bit lo) in route_vec.
+    g_e2048 = dataclasses.replace(g_ok, E=2048, e_slots=260)
+    ex_rvec_bad = ExecSpec(
+        R=8,
+        B=4,
+        T=1,
+        tiles=dataclasses.replace(base_tiles, topk=False, route_vec=True),
+    )
+    ms_e2048 = ModelSpec(
+        "moe_e2048", config=g_e2048, layer_type=LayerType("lt", slots=(moe,))
+    )
+    with pytest.raises(AssertionError, match="route_vec"):
+        planner.plan(ms_e2048, ex_rvec_bad)
+
+    # Excessive redundant slots (`R * EXTRA + R + 1 > 128`) overflow BF16 exact range.
+    g_extra_bad = dataclasses.replace(g_ok, E=512, e_slots=96)
+    ms_extra = ModelSpec(
+        "moe_extra", config=g_extra_bad, layer_type=LayerType("lt", slots=(moe,))
+    )
+    with pytest.raises(AssertionError, match="route_vec"):
+        planner.plan(ms_extra, ex_rvec_bad)
+
+
+@pytest.mark.parametrize("T", [1, 4])
+@pytest.mark.parametrize("B", [1, 4, 8, 16, 24, 32, 48, 56, 64])
+@pytest.mark.parametrize(
+    "moe_tp,e_slots",
+    [
+        (False, 0),
+        (False, 72),
+        (True, 0),
+    ],
+)
+def test_moe_deployment_ring_invariants(
+    T: int,
+    B: int,
+    moe_tp: bool,
+    e_slots: int,
+):
+    """Verify MoE ring-buffer distance invariants across Qwen3.5 deployments."""
+    if B < T or B % T != 0:
+        pytest.skip(f"Invalid (B={B}, T={T}) combination")
+
+    moe = MoEBlock()
+    g = FakeGeometry(
+        L=4,
+        att_every=1,
+        H=2048,
+        I=1024 if moe_tp else 512,
+        IS=1024,
+        E=512,
+        TOPK=8,
+        NH=16,
+        NKV=2,
+        HD=256,
+        moe_tp=moe_tp,
+        e_slots=e_slots,
+    )
+    for tiles in (
+        Tiles(),
+        Tiles(
+            bank=2048 << 10,
+            nbd=12,
+            nbe=10,
+            ebank=256 << 10,
+            pipe_ep=True,
+            r2_direct_store=True,
+            route_vec=True,
+            topk_lanes=True,
+            moe_unroll=True,
+        ),
+    ):
+        ex = ExecSpec(R=8, B=B, T=T, tiles=tiles)
+        ms = ModelSpec(
+            "moe_ring_inv",
+            config=g,
+            layer_type=LayerType("lt", slots=(FakeMixerBlock(), moe)),
+        )
+        cp, _ = vmem.build_scratch(ms, ex)
+        mp = cp.block("moe")
+        resolved = ex.resolve_tiles(g)
+
+        assert mp.NSS >= 3 + (mp.NBE - 1) // mp.TE
+        assert mp.NBE >= 2
+        assert not (mp.PIPE and mp.PIPE_EP)
+        if mp.PIPE:
+            assert mp.T13 == 1 and mp.T2 == 1
+        if mp.PIPE_EP:
+            assert mp.T13 == 2 * mp.T2
+            assert mp.NBE >= mp.TE and mp.NBE % mp.TE == 0
+        if mp.LAZY_MOE:
+            assert resolved.nbd >= mp.N_MOE
+
+
+@pytest.mark.parametrize(
+    "case_name,pipe,pipe_ep,e_slots,route_vec",
+    [
+        ("pipe_single_tile", True, False, 0, False),
+        ("pipe_ep_group_rel", False, True, 0, False),
+        ("pipe_ep_eplb_route_vec", False, True, 70, True),
+    ],
+)
+def test_moe_dynamic_dma_race_invariants(
+    case_name: str,
+    pipe: bool,
+    pipe_ep: bool,
+    e_slots: int,
+    route_vec: bool,
+):
+    """Run MoEBlock under Pallas vector-clock race detection (`on_wait` vs `eager`)."""
+    del case_name
+    R = 2
+    devs = jax.devices("cpu")
+    assert len(devs) >= R
+
+    H, E, TOPK, IR, ISR = 256, 128, 2, 128, 128
+    ER = E // R
+    EW = e_slots if e_slots > 0 else ER
+    ebank = (32 << 10) if pipe_ep else (256 << 10)
+    tiles = dataclasses.replace(
+        TINY_TILES,
+        bank=512 << 10,
+        nbd=8,
+        nbe=6,
+        ebank=ebank,
+        pipe=pipe,
+        pipe_ep=pipe_ep,
+        moe_unroll=pipe_ep,
+        r2_direct_store=pipe_ep,
+        route_vec=route_vec,
+        topk_lanes=True,
+        war=1,
+        mb8=2,
+    )
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=H,
+        NH=2,
+        NKV=1,
+        HD=128,
+        E=E,
+        TOPK=TOPK,
+        I=IR,
+        IS=ISR * R,
+        moe_tp=False,
+        e_slots=e_slots,
+    )
+    moe = MoEBlock()
+    ms = ModelSpec("moe_race", config=g, layer_type=LayerType("lt", slots=(moe,)))
+
+    def _run_mode(dma_mode: str):
+        ex = ExecSpec(
+            B=4,
+            T=1,
+            R=R,
+            ctx=128,
+            stack_e=True,
+            tiles=tiles,
+            interpret=pltpu.InterpretParams(
+                detect_races=True,
+                dma_execution_mode=dma_mode,
+            ),
+        )
+        cp, scratch = vmem.build_scratch(ms, ex)
+        if pipe_ep:
+            assert cp.block("moe").PIPE_EP is True
+        p = cp.plan
+        wsh = planner.weight_shapes(ms, ex, p)
+        osh = planner.kernel_out_shapes(ms, ex, p)
+        s_names = list(scratch.keys())
+
+        keys = jax.random.split(jax.random.PRNGKey(202), 12)
+        hid = jax.random.normal(keys[0], (ex.M, H), dtype=BF16) * 0.5
+        post_norm = jax.random.uniform(
+            keys[1], (H,), dtype=F32, minval=-0.2, maxval=0.2
+        )
+        router = jax.random.normal(keys[2], (H, E), dtype=BF16) * 0.1
+        sh_gate = jax.random.normal(keys[3], (H,), dtype=F32) * 0.2
+        sh13 = (jax.random.normal(keys[4], (R, H, 2 * ISR), dtype=F32) * 0.4).astype(
+            FP8
+        )
+        sh13_s = jax.random.uniform(
+            keys[5], (R, 2 * ISR), dtype=F32, minval=0.05, maxval=0.15
+        )
+        sh2 = (jax.random.normal(keys[6], (R, ISR, H), dtype=F32) * 0.4).astype(FP8)
+        sh2_s = jax.random.uniform(keys[7], (R, H), dtype=F32, minval=0.05, maxval=0.15)
+        e13 = (jax.random.normal(keys[8], (R, EW, H, 2 * IR), dtype=F32) * 0.4).astype(
+            FP8
+        )
+        e13_s = jax.random.uniform(
+            keys[9], (R, EW, 2 * IR), dtype=F32, minval=0.05, maxval=0.15
+        )
+        e2 = (jax.random.normal(keys[10], (R, EW, IR, H), dtype=F32) * 0.4).astype(FP8)
+        e2_s = jax.random.uniform(
+            keys[11], (R, EW, H), dtype=F32, minval=0.05, maxval=0.15
+        )
+
+        lay = p.smalls_layout
+        sm = jnp.zeros((R, 1, 1, p.smalls_width), dtype=F32)
+        sm_items = [
+            ("post_norm", jnp.broadcast_to(post_norm[None, :], (R, H))),
+            ("sh13_s", sh13_s),
+            ("sh2_s", sh2_s),
+            ("sh_gate", jnp.broadcast_to(sh_gate[None, :], (R, H))),
+        ]
+        if e_slots > 0:
+            ecopy_tbl = jnp.zeros((R, E), dtype=F32)
+            # Place a replica of expert 0 on rank 1's extra slot 0 (code=1 + 1*extra)
+            extra = EW - ER
+            ecopy_tbl = ecopy_tbl.at[:, 0].set(float(1 + 1 * extra))
+            sm_items.append(("ecopy", ecopy_tbl))
+        for name, val in sm_items:
+            o, w = lay[name]
+            sm = sm.at[:, 0, 0, o : o + w].set(val)
+
+        w_by_name = {
+            "router": jnp.broadcast_to(router[None, ...], (R, 1, H, E)).reshape(
+                R, *wsh["router"][0]
+            ),
+            "sh13": sh13.reshape(R, *wsh["sh13"][0]),
+            "sh2": sh2.reshape(R, *wsh["sh2"][0]),
+            "e13": e13.reshape(R, *wsh["e13"][0]),
+            "e2": e2.reshape(R, *wsh["e2"][0]),
+            "es": jnp.concatenate([e13_s, e2_s], axis=-1).reshape(R, *wsh["es"][0]),
+            "smalls": sm,
+            "final_norm": jnp.zeros((R, *wsh["final_norm"][0]), dtype=F32),
+        }
+
+        def pallas_body(pos_ref, hid_ref, *rest):
+            n_w, n_o = len(p.w_names), len(p.o_names)
+            W = dict(zip(p.w_names, rest[:n_w]))
+            O = dict(zip(p.o_names, rest[n_w : n_w + n_o]))  # noqa: E741
+            scr = dict(zip(s_names, rest[n_w + n_o :]))
+            me = lax.axis_index("tp").astype(I32)
+            barrier = pltpu.get_barrier_semaphore()
+            for off in range(1, R):
+                pl.semaphore_signal(
+                    barrier,
+                    1,
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(barrier, R - 1)
+
+            ring = stream.TwoRing(cp.stream, W, scr, me, interpret=True)
+            ar = comm.AllReduceRing(cp.comm, scr, me)
+            ctx = MiniCtx(
+                g=g,
+                ex=ex,
+                core_plan=cp,
+                pos_ref=pos_ref,
+                W=W,
+                ST={},
+                O=O,
+                scr=scr,
+                me=me,
+                stream=ring,
+                comm=ar,
+            )
+
+            for i in range(cp.stream.NBD):
+                ring.fetch(jnp.int32(i))
+            pltpu.make_async_copy(
+                W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+            ).start()
+            moe.prologue(ctx)
+            scr["res"][...] = hid_ref[: ex.MB].astype(F32)
+            scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+            moe.init_buffers(ctx)
+
+            pltpu.make_async_copy(
+                W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+            ).wait()
+            ring.begin_layer(jnp.int32(0))
+            ctx.apply_input_norm(moe.input_norm, jnp.int32(0))
+            part_moe = moe.emit(ctx, jnp.int32(0), jnp.int32(0))
+            ar.add_residual(ar.allreduce(0, part_moe, jnp.bool_(True)))
+            ar.drain_sends()
+            O["hidden"][: ex.MB] = scr["res"][...].astype(BF16)
+            if ex.MB < ex.M:
+                O["hidden"][ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+
+        in_specs = [
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ] + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names]
+        out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM) for _ in p.o_names]
+        out_shape = [jax.ShapeDtypeStruct(*osh[k]) for k in p.o_names]
+
+        call = pl.pallas_call(
+            pallas_body,
+            out_shape=out_shape,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            scratch_shapes=[scratch[k] for k in s_names],
+            compiler_params=pltpu.CompilerParams(collective_id=0),
+            interpret=ex.interpret,
+        )
+        mesh = Mesh(devs[:R], ("tp",))
+        step = jax.jit(
+            jax.shard_map(
+                lambda pos_in, hid_in, *ws: call(
+                    pos_in, hid_in[0], *[w[0] for w in ws]
+                )[0][None],
+                mesh=mesh,
+                in_specs=(P(), P("tp"), *(P("tp") for _ in p.w_names)),
+                out_specs=P("tp"),
+                check_vma=False,
+            )
+        )
+        pos = jnp.array([1, 2, 3, 4], dtype=I32)
+        hid_rep = jnp.broadcast_to(hid[None, ...], (R, ex.M, H))
+        w_all = [w_by_name[k] for k in p.w_names]
+        out = jax.block_until_ready(step(pos, hid_rep, *w_all))
+        assert ipc.races is not None
+        assert not ipc.races.races_found, (
+            f"Data race detected in MoEBlock under dma_execution_mode={dma_mode!r}"
+        )
+        return np.asarray(out[:, : ex.B]).copy()
+
+    out_wait = _run_mode("on_wait")
+    out_eager = _run_mode("eager")
+    np.testing.assert_array_equal(
+        out_eager.view(np.uint8),
+        out_wait.view(np.uint8),
+    )

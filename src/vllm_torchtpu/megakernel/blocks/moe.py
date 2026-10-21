@@ -31,7 +31,6 @@ from ..ops import (
     FP8,
     I32,
     bswitch,
-    rnd,
     rup,
 )
 from ..spec import (
@@ -228,6 +227,18 @@ class MoEBlock(Block):
         lazy_moe = tiles.lazy and n_moe <= tiles.nbd
         ecopy = not g.moe_tp and g.e_slots > er
         assert not (ex.row_mask and ecopy), "row_mask: identity expert placement only"
+        if tiles.topk:
+            assert g.E > 0 and (g.E & (g.E - 1)) == 0 and g.E <= 512, (
+                "topk_packed requires power-of-2 E <= 512 "
+                f"(9-bit float32 mantissa pack), got E={g.E}"
+            )
+        if tiles.route_vec and ecopy:
+            max_rvec_score = ex.R * extra + ex.R + 1
+            assert g.E <= 1024 and max_rvec_score <= 128, (
+                "route_vec requires E <= 1024 and R*EXTRA+R+1 <= 128 "
+                f"for exact BF16 MXU routing, got E={g.E}, "
+                f"max_rvec_score={max_rvec_score}"
+            )
         return MoEParams(
             H=g.H,
             E=g.E,
@@ -558,7 +569,7 @@ class MoEBlock(Block):
 
         def gate_up(i, w13):
             h = stream.mm(scr["xb"][...], w13[...]) * scr["es"][i % NSS, :, : 2 * IR]
-            return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
+            return (jax.nn.silu(h[:, :IR]) * h[:, IR:]).astype(BF16)
 
         def down(i, mid, w2):
             e, s, part = scr["elist"][i], i % NSS, scr["part"]
@@ -568,7 +579,7 @@ class MoEBlock(Block):
             for j in range(H // CH):
                 lo = 2 * IR + j * CH
                 y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
-                y = rnd(y * scr["es"][s, :, lo : lo + CH])
+                y = y * scr["es"][s, :, lo : lo + CH]
                 part[0:MR, j * CH : (j + 1) * CH] += wcol * y
 
         def expert(l_idx, i, carry):
@@ -616,7 +627,7 @@ class MoEBlock(Block):
                 h = acc[:, : 2 * IR]
             es_wait(i)
             h = h * scr["es"][s, :, : 2 * IR]
-            mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+            mid_ = jax.nn.silu(h[:, :IR]) * h[:, IR:]
             xb2[:, :IR] = mid_.astype(BF16)
             wcol = jnp.sum(
                 jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
@@ -628,7 +639,7 @@ class MoEBlock(Block):
                 for j in range(H // CH):
                     lo = 2 * IR + j * CH
                     y = stream.mm(xm, w2[:, j * CH : (j + 1) * CH])[0:MR]
-                    y = rnd(y * scr["es"][s, :, lo : lo + CH])
+                    y = y * scr["es"][s, :, lo : lo + CH]
                     part[0:MR, j * CH : (j + 1) * CH] += wcol * y
                 egive(u2, l_idx)
             elif not mp.unroll:
@@ -643,7 +654,7 @@ class MoEBlock(Block):
                     return cc
 
                 lax.fori_loop(0, T2, b2, 0)
-                y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+                y = acc[0:MR, :H] * scr["es"][s, :, 2 * IR :]
                 part[0:MR, :] += wcol * y
             else:
                 TK2 = tk["e2"]
@@ -664,7 +675,7 @@ class MoEBlock(Block):
                             egive(u, l_idx, T13 + t)
                     else:
                         egive(u, l_idx, T13 + t)
-                y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+                y = acc[0:MR, :H] * scr["es"][s, :, 2 * IR :]
                 part[0:MR, :] += wcol * y
             return carry
 
@@ -725,7 +736,7 @@ class MoEBlock(Block):
                         egive(t, l_idx, t)
                 es_wait(0)
                 h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
-                mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+                mid0 = jax.nn.silu(h0[:, :IR]) * h0[:, IR:]
                 xb2[:, :IR] = mid0.astype(BF16)
 
                 def body_ep(i, _):
@@ -776,14 +787,12 @@ class MoEBlock(Block):
                         axis=1,
                         keepdims=True,
                     )
-                    y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+                    y = acc[0:MR, :H] * scr["es"][s_cur, :, BN:]
                     part[0:MR, :] += wcol * y
 
                     es_wait(i + 1)
                     h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
-                    mid_nxt = rnd(
-                        rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:])
-                    )
+                    mid_nxt = jax.nn.silu(h_nxt[:, :IR]) * h_nxt[:, IR:]
                     xb2[:, :IR] = mid_nxt.astype(BF16)
                     return 0
 
@@ -819,7 +828,7 @@ class MoEBlock(Block):
                     axis=1,
                     keepdims=True,
                 )
-                y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+                y_last = acc[0:MR, :H] * scr["es"][s_last, :, BN:]
                 part[0:MR, :] += wcol_last * y_last
 
         def route(l_idx, p8):
@@ -1209,7 +1218,7 @@ class MoEBlock(Block):
             with sc("moe_shared"):
                 g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
                 g13 = g13 * ctx.sm(slot, "sh13_s")
-                mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :ISR]))) * rnd(g13[:, ISR:]))
+                mid = jax.nn.silu(g13[:, :ISR]) * g13[:, ISR:]
                 scr["xb2"][:, :ISR] = mid.astype(BF16)
                 ysh = stream.dmatmul("sh2", scr["xb2"], H)
                 scr["part"][...] = ysh * ctx.sm(slot, "sh2_s") * scr["sg"][:, 0:1]
