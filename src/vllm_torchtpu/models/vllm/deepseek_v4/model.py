@@ -276,9 +276,9 @@ class _HostStagedParams:
             self._flush(name)
         # The staging is tens of GiB per worker, eight workers a host, and
         # dropping the last reference does not by itself shrink the process:
-        # glibc keeps the mid-sized chunks for reuse. The serving pod's host
-        # budget is tight enough that holding them OOM-killed a server at the
-        # end of startup, so hand them back now and log what came back.
+        # the allocator keeps the freed memory for reuse (see
+        # release_memory_to_os). Held, it is host DRAM the KV-offload store
+        # cannot have, so hand it back now and log what came back.
         rss_before = host_rss_gib()
         release_memory_to_os()
         logger.info(
