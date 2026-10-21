@@ -65,7 +65,12 @@ FAULTS = ("", "digit", "tierank", "nofix", "kscale", "page", "ropeseg", "shareds
           # composed-kernel oracle faults (glm_ref names where the semantics match)
           "causal_mask", "page_off_by_one", "kv_read_before_write", "scale_twice", "topk_swap",
           # delay-exposed race control: count-exchange payloads read before their receives are waited
-          "f_cx_earlyread")
+          "f_cx_earlyread",
+          # path-activation controls for the forced-path variants (WHITEBOARD.v1 §11.2 C-THR2 / C-WAVE / C-WRAP):
+          # each perturbs only its path, so n/a at a build that never takes it and RED where it does
+          "f_thr2",     # digit + 1, 2-bit threshold rounds only (Sigma np > thr_switch)
+          "f_wave",     # digit + 1, waves after the first only (rows of a wave starting at row > 0)
+          "f_wrap")     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
 ALIASED = ("b_keys", "b_memb", "b_pre", "b_xacc", "b_xcc", "g_nope", "g_rope", "kvb", "qb", "qrb", "b_sbuf",
            "att_acc")
@@ -633,8 +638,10 @@ def make(E):
                 Gs = Gs + crecv[s_]
             ge = (Gs >= KT) & (lane8 >= 1) & (lane8 <= NK)
             d = jnp.sum(ge.astype(I32), axis=1, keepdims=True)                     # (8, 1) digit
-            if fault == "digit":
+            if fault == "digit" or (fault == "f_thr2" and DW == 2):
                 d = jnp.minimum(d + 1, NK)
+            if fault == "f_wave":
+                d = jnp.where(rt0 > 0, jnp.minimum(d + 1, NK), d)
             r8 = pl.multiple_of(gi * 8, 8)
             pref = row[1, pl.ds(r8, 8), :]
             if not last:
@@ -1062,9 +1069,13 @@ def make(E):
         b = scr["b_greq"][r]
         j = r - req[b, 1]
         nu = req[b, 0]
-        base = pl.multiple_of((r % GR) * 128, 128)
+        slot = r % GR
+        if fault == "f_wrap":                            # FAULT: after the ring wraps, read the next slot
+            slot = jnp.where(r >= GR, (r + 1) % GR, slot)
+        base = pl.multiple_of(slot * 128, 128)
         w = lax.bitcast_convert_type(scr["g_nope"][pl.ds(base, 128), :], I32)
-        w = jnp.where(j * 128 + sub128 < nu, w, 0)        # stale tail rows -> fp8 0 (dec8); valid rows unchanged
+        if fault != "f_alias_poison_nan_noguard":         # FAULT (with the kernel's 0xFF poison): no tail zeroing
+            w = jnp.where(j * 128 + sub128 < nu, w, 0)    # stale tail rows -> fp8 0 (dec8); valid rows unchanged
         for b_ in range(4):
             scr["kvb"][buf, :, b_ * 128:(b_ + 1) * 128] = dec8(shr(w, 8 * b_) & 0xFF)
         s = jnp.zeros((QN, 128), F32)

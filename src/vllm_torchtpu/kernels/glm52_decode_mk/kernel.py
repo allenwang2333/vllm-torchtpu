@@ -72,7 +72,9 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "f_ichunk", "f_slotreuse", "f_hitcap", "f_xrace", "f_nope",
                        "f_alias_poison",      # alias layout only (Mosaic, or interpret via interp_alias)
                        "f_alias_poison_red", "f_stale_is_alias",   # own_uv placed in the alias (+ poison)
-                       "f_ar_earlyread")      # AR#1 sums its slots before waiting them (delay-exposed race)
+                       "f_ar_earlyread",      # AR#1 sums its slots before waiting them (delay-exposed race)
+                       "f_alias_poison_nan",  # F-ALIAS-POISON with 0xFF bytes (e4m3fn NaN): must stay identical
+                       "f_alias_poison_nan_noguard")   # ... and the DSA's tail-row zeroing off: must go RED
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -996,18 +998,22 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 def _moe():
                     moe(l, slot, g_ffn, mpos)
             stage_wait(l)
-            if fault in ("f_alias_poison", "f_alias_poison_red"):
+            if fault in ("f_alias_poison", "f_alias_poison_red", "f_alias_poison_nan", "f_alias_poison_nan_noguard"):
                 poison_alias()
             return carry
 
         def poison_alias():
             """F-ALIAS-POISON (alias layout only): after each layer's MoE, the whole alias window holds 0x7E bytes
             (finite fp8 448 / f32 8.4e37), so a buffer wrongly assumed persistent reads garbage. Must stay
-            bit-identical to clean; its pairing F-ALIAS-POISON-RED also places own_uv in the window -> RED."""
+            bit-identical to clean; its pairing F-ALIAS-POISON-RED also places own_uv in the window -> RED.
+            F-ALIAS-POISON-NAN writes 0xFF (the e4m3fn NaN code; f32 NaN) instead: a partial gather granule's tail
+            rows then hold NaN codes, which the DSA's tail-row zeroing must keep out of P.V (identical to clean);
+            its pairing ..._NOGUARD also drops that zeroing -> RED."""
             if typed:
                 return
             n_ = EPOOL["dsa_bytes"] // 128
-            scr["epool"][0:n_, :] = jnp.full((n_, 128), 0x7E, U8)
+            byte = 0xFF if fault.startswith("f_alias_poison_nan") else 0x7E
+            scr["epool"][0:n_, :] = jnp.full((n_, 128), byte, U8)
 
         def moe(l, slot, g_ffn, mpos):
             with sc("M_route"):
