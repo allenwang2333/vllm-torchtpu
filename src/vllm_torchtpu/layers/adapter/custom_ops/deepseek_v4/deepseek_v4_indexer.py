@@ -154,6 +154,7 @@ def _indexer_jax(
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS
             or (q.shape[0] // 4 if q.shape[0] >= _FOUR_PIECE_MIN_TOKENS else None),
             split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED,
+            strict_causal=envs.TPU_STREAMIDX_STRICT_CAUSAL,
         )
 
     return _indexer_local(
