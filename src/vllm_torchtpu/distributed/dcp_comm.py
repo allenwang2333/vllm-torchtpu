@@ -92,6 +92,27 @@ def cp_lse_ag_out_rs(
     lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     merged_lse = torch.logsumexp(lses, dim=0)
 
+    merged = lse_weighted_reduce_scatter(output, lse, merged_lse, group, rs_dtype)
+    if not return_lse:
+        return merged
+
+    heads = merged.shape[1]
+    start = int(group.rank_in_group) * heads
+    return merged, merged_lse[:, start : start + heads]
+
+
+def lse_weighted_reduce_scatter(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`cp_lse_ag_out_rs` after its logsumexp: weight `output` [T, H * group, D]
+    by `exp(lse - merged_lse)` (both f32 [T, H * group]) and reduce-scatter it
+    over heads in `rs_dtype` (None keeps f32). Returns [T, H, D] in
+    output.dtype. Callers that gather the lse themselves use this to stay bit
+    for bit with `cp_lse_ag_out_rs`."""
     if output.device.type == "tpu":
         # Head-major, so the reduce-scatter's leading axis is the heads and
         # it reads the weighted partial without a transposing copy.
@@ -106,10 +127,4 @@ def cp_lse_ag_out_rs(
         if rs_dtype is not None:
             weighted = weighted.to(rs_dtype)
         merged = group.reduce_scatter(weighted.contiguous(), dim=1)
-    merged = merged.to(output.dtype)
-    if not return_lse:
-        return merged
-
-    heads = merged.shape[1]
-    start = int(group.rank_in_group) * heads
-    return merged, merged_lse[:, start : start + heads]
+    return merged.to(output.dtype)

@@ -41,7 +41,10 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.dcp_comm import (
+    cp_lse_ag_out_rs,
+    lse_weighted_reduce_scatter,
+)
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -286,6 +289,10 @@ def _weighted_reduce_scatter(
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
     `[world, T, H]` for exactly `output`'s `T` rows."""
     merged_lse = torch.logsumexp(lses, dim=0)
+    if not envs.TPU_DCP_MERGE_RS_BF16:
+        # The same weighting kernel and reduce-scatter as `cp_lse_ag_out_rs`,
+        # so the result is bit for bit the unchunked/per-chunk-gather merge's.
+        return lse_weighted_reduce_scatter(output, lse_f32, merged_lse, group, rs_dtype)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
