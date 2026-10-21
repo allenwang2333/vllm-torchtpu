@@ -134,6 +134,48 @@ def exchange(R, me, src_fn, dst_fn, send_sem, recv_sem, wait=True, scope=None):
     finish()
 
 
+def start_all(R, me, src_fn, dst_fn, send_sem, recv_sem):
+    """Start src_fn(d) -> peer d's dst_fn(me) for every peer d != me (no wait). L4 C1 / C2: the chunked A2A and the
+    lse tiles start pieces of one exchange at different times on one (send, recv) semaphore pair."""
+    if R == 1:
+        return
+    for d in range(R):
+        @pl.when(me != d)
+        def _(d=d):
+            pltpu.make_async_remote_copy(src_ref=src_fn(d), dst_ref=dst_fn(me), send_sem=send_sem,
+                                         recv_sem=recv_sem, device_id=(jnp.int32(d),),
+                                         device_id_type=MESH).start()
+
+
+def wait_pieces(R, me, pieces, send_sem, recv_sem, scope=None):
+    """Wait every piece started by start_all on (send_sem, recv_sem): pieces = [(src_ref, dst_ref, n_starts)], each
+    started n_starts times towards every peer. Byte-counting semaphores: all receives are waited before any send, and
+    nothing is read before every wait returned, so the arrival order of pieces does not matter."""
+    if R == 1:
+        return
+
+    def waits():
+        descs = [(pltpu.make_async_remote_copy(src_ref=s_, dst_ref=d_, send_sem=send_sem, recv_sem=recv_sem,
+                                               device_id=(me,), device_id_type=MESH), n) for s_, d_, n in pieces]
+        for kind in ("recv", "send"):
+            for desc, n in descs:
+                tot = n * (R - 1)
+                fn = desc.wait_recv if kind == "recv" else desc.wait_send
+                if tot <= 16:
+                    for _ in range(tot):
+                        fn()
+                else:
+                    def body(i, c, fn=fn):
+                        fn()
+                        return c
+                    lax.fori_loop(0, tot, body, 0)
+    if scope is not None:
+        with scope("X_wait"):
+            waits()
+    else:
+        waits()
+
+
 def spin(n, ref):
     """F-DELAY: a data-dependent busy loop of n iterations on a (8, 128) f32 VMEM ref (csq_proto spin, :538)."""
     ref[...] = lax.fori_loop(0, n, lambda it, a: a * 0.9990234375 + 0.0009765625, ref[...])

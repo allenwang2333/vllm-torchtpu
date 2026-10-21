@@ -74,7 +74,8 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "f_alias_poison_red", "f_stale_is_alias",   # own_uv placed in the alias (+ poison)
                        "f_ar_earlyread",      # AR#1 sums its slots before waiting them (delay-exposed race)
                        "f_alias_poison_nan",  # F-ALIAS-POISON with 0xFF bytes (e4m3fn NaN): must stay identical
-                       "f_alias_poison_nan_noguard")   # ... and the DSA's tail-row zeroing off: must go RED
+                       "f_alias_poison_nan_noguard",   # ... and the DSA's tail-row zeroing off: must go RED
+                       "f_a2a_early")         # L4 C2: an A2A chunk is sent one request before its rows are emitted
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -108,6 +109,15 @@ class Tiles:
     scan_unroll: int = 4         # DSA scan inner unroll (was the MKD_SCAN_UNROLL env var: outside every cache key)
     interp_alias: bool = True    # interpret mode: run the Mosaic alias layout (dpool / epool views) through
                                  # interp_alias.install() instead of separate typed buffers (alias=False: typed)
+    # ---- stage B lane L4 (collectives); every default is the stage-A program ----
+    a2a_lse: str = "lanes"       # "lanes": 128 lse lanes in every A2A payload row (stage A) | "tile": one [8, 128] f32
+                                 # lse tile per peer (sublane = head within the owner, lane = row), payload = OH lanes
+    a2a_rw: int = 0              # > 0: the A2A goes in chunks of a2a_rw rows, each started inside the attention loop
+                                 # once the requests covering its rows have emitted (requires a2a_lse == "tile")
+    replay: str = ""             # TIMING-ONLY backing arms (need recorded operands, see build()):
+                                 # "a2a": the A2A + LSE merge are replaced by an HBM load of the recorded merged `oh`;
+                                 # "ar": both all-reduces are replaced by HBM loads of their recorded outputs
+    shadow_a2a: bool = False     # TIMING-ONLY addition arm: a second, unconsumed A2A of the same bytes after the real one
 
 
 def bf(x):
@@ -306,6 +316,20 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     QH = HR * QA // 2
     OH = HR * KL // 2
     OW = OH + 128
+    # ---- L4 (stage B) collectives variants; defaults = the stage-A program ----
+    assert tiles.a2a_lse in ("lanes", "tile"), tiles.a2a_lse
+    LSE_TILE = tiles.a2a_lse == "tile"
+    RW = int(tiles.a2a_rw)
+    if RW >= TMAX:                                   # one chunk = the unchunked exchange
+        RW = 0
+    assert RW == 0 or (LSE_TILE and RW % 8 == 0 and TMAX % RW == 0), ("a2a_rw needs a2a_lse='tile', 8 | rw | TMAX",
+                                                                      RW, TMAX)
+    NCH = TMAX // RW if RW else 1
+    if LSE_TILE:
+        assert R * 8 <= 128 and TMAX <= 128 and HR <= 8, ("lse tile: R * 8 rows, TMAX lanes", R, TMAX, HR)
+    OWX = OH if LSE_TILE else OW                     # A2A payload row (u32 lanes)
+    assert tiles.replay in ("", "a2a", "ar"), tiles.replay
+    n_r = {"": 0, "a2a": 1, "ar": 2}[tiles.replay]
     NQB = HR * DQ
     NBLK = H // QB
     QB8 = 8
@@ -363,7 +387,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         "rec_v": pltpu.VMEM((TMAX, 256), I32), "kvw_sem": pltpu.SemaphoreType.DMA((3,)),
         "qsend": pltpu.VMEM((TMAX, QH), U32), "qall": pltpu.VMEM((R, TMAX, QH), U32),
         "iqv": pltpu.VMEM((IH, M + QB8, 128), F32), "wts": pltpu.VMEM((M + QB8, 128), F32),
-        "osend": pltpu.VMEM((R, TMAX, OW), U32), "orecv": pltpu.VMEM((R, TMAX, OW), U32),
+        "osend": pltpu.VMEM((R, TMAX, OWX), U32), "orecv": pltpu.VMEM((R, TMAX, OWX), U32),
         "orow": pltpu.VMEM((M, KR), F32), "oh": pltpu.VMEM((HR, M, KL), F32), "mvalid": pltpu.VMEM((M, 128), F32),
         "part": pltpu.VMEM((M, H), F32), "attn": pltpu.VMEM((M, H), F32),
         # MoE (csq / moe_tp_decode)
@@ -383,6 +407,19 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     }
     for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
         scratch[f"ar1_{CO.AR_NAMES[i]}"] = sp
+    if LSE_TILE:                                 # rows d * 8 + hh (owner d, head hh), lanes = rows t
+        scratch["lsend"] = pltpu.VMEM((128, 128), F32)
+        scratch["lrecv"] = pltpu.VMEM((128, 128), F32)
+        scratch["lse_t"] = pltpu.VMEM((128, 128), F32)    # lrecv transposed: row t, lane s * 8 + hh
+    if RW:
+        scratch["a2a_n"] = pltpu.SMEM((1,), I32)          # chunks of this layer's A2A already started
+    if tiles.shadow_a2a:
+        scratch["a2_send"] = pltpu.SemaphoreType.DMA(())
+        scratch["a2_recv"] = pltpu.SemaphoreType.DMA(())
+    if n_r:
+        scratch["rep_sem"] = pltpu.SemaphoreType.DMA(())
+    if tiles.replay == "ar":
+        scratch["rbuf"] = pltpu.VMEM((M, H), F32)
     if fault != "f_xrace":                       # F-XRACE: one slot set shared by both all-reduces of a layer
         for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
             scratch[f"ar2_{CO.AR_NAMES[i]}"] = sp
@@ -432,7 +469,8 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         Wd = dict(zip(dkinds, refs[n_fixed:n_fixed + n_d]))
         e_in = refs[n_fixed + n_d:n_fixed + n_d + n_e]
         c_in = refs[n_fixed + n_d + n_e:n_fixed + n_d + n_e + n_c]
-        o0 = n_fixed + n_d + n_e + n_c
+        recs = refs[n_fixed + n_d + n_e + n_c:n_fixed + n_d + n_e + n_c + n_r]
+        o0 = n_fixed + n_d + n_e + n_c + n_r
         out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
         rest = refs[o0 + 4:]
         if debug:
@@ -581,6 +619,11 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         def all_reduce(partial_f32, which, drop_last=False, early_read=False):
             """bf16 partial [M, H] (rows >= T zeroed, moe_tp_decode all_reduce._masked) -> rank-order f32 sum ->
             bf16 values as f32."""
+            if tiles.replay == "ar":                 # TIMING-ONLY: the recorded all-reduce output of this layer
+                cp = pltpu.make_async_copy(recs[0 if which == 1 else 1].at[cur_layer[0]], scr["rbuf"], scr["rep_sem"])
+                cp.start()
+                cp.wait()
+                return scr["rbuf"][...]
             buf = scr["arbuf"]
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
             if "coll" not in skip:
@@ -593,6 +636,12 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 return None if wait else (lambda: None)
             return CO.exchange(R, me, src_fn, dst_fn, scr[ss], scr[rs], wait=wait,
                                scope=sc if tiles.trace else None)
+
+        def a2a_chunk(c_):
+            """L4 C2: rows [c_ * RW, (c_ + 1) * RW) of every owner's payload to that owner (static chunk index)."""
+            r0_ = c_ * RW
+            CO.start_all(R, me, lambda d: scr["osend"].at[d, pl.ds(r0_, RW)],
+                         lambda i: scr["orecv"].at[i, pl.ds(r0_, RW)], scr["a_send"], scr["a_recv"])
 
         cur_layer = [None]
 
@@ -722,11 +771,17 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         def merge():
             MCH = min(TMAX, 16)
             scr["mvalid"][...] = jnp.broadcast_to(rvalid, (M, 128))
+            if LSE_TILE:
+                scr["lse_t"][...] = jnp.transpose(scr["lrecv"][...])
 
             def body(c, cc):
                 r0 = pl.multiple_of(c * MCH, MCH)
 
                 def lse_of(s_):
+                    if LSE_TILE:                     # lanes hh < HR = source s_'s heads (lanes >= HR are unused)
+                        x_ = scr["lse_t"][pl.ds(r0, MCH), :]
+                        sh_ = (128 - 8 * s_) % 128
+                        return pltpu.roll(x_, sh_, 1) if sh_ else x_
                     return lax.bitcast_convert_type(scr["orecv"][s_, pl.ds(r0, MCH), OH:OH + 128], F32)
                 shift = jnp.full((MCH, 128), -jnp.inf, F32)
                 for s_ in range(R):
@@ -927,8 +982,21 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                     dput(d_ureq.at[fp], scr["b_req"])
 
             # ===== batched attention (IndexShare layers issue the gather ring before the q AG wait) =====
+            after_req = None
+            if RW and "coll" not in skip and tiles.replay != "a2a":
+                scr["a2a_n"][0] = jnp.int32(0)
+
+                def after_req(b):                    # L4 C2: start every chunk whose rows are all emitted
+                    done = qmeta[b, 0] + qmeta[b, 1]
+                    if fault == "f_a2a_early":       # FAULT: one request early (its rows not yet emitted)
+                        done = done + cfg.QMAX
+                    for c_ in range(NCH - 1):
+                        @pl.when(jnp.logical_and(scr["a2a_n"][0] == c_, done >= (c_ + 1) * RW))
+                        def _(c_=c_):
+                            a2a_chunk(c_)
+                            scr["a2a_n"][0] = jnp.int32(c_ + 1)
             with sc("L_attn"):
-                core["attention"](l, fresh, q_wait)
+                core["attention"](l, fresh, q_wait, after_req=after_req)
             if fault == "stale_indexshare":
                 @pl.when(jnp.logical_and(fresh, l > full_l[0]))
                 def _():
@@ -938,9 +1006,38 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
 
             # ===== A2A partials + lse to head owners, LSE merge =====
             with sc("L_merge"):
-                scr["orecv"][me] = scr["osend"][me]
-                exchange(lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i], "a_send", "a_recv")
-                merge()
+                if tiles.replay == "a2a":            # TIMING-ONLY: the recorded merged oh of this layer
+                    cp = pltpu.make_async_copy(recs[0].at[l], scr["oh"], scr["rep_sem"])
+                    cp.start()
+                    cp.wait()
+                else:
+                    scr["orecv"][me] = scr["osend"][me]
+                    if not LSE_TILE:                 # the stage-A exchange, verbatim
+                        exchange(lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i], "a_send", "a_recv")
+                    else:
+                        r8 = pl.multiple_of(me * 8, 8)
+                        scr["lrecv"][pl.ds(r8, 8), :] = scr["lsend"][pl.ds(r8, 8), :]
+                        if "coll" not in skip:
+                            if RW:
+                                for c_ in range(NCH):            # the chunks not started inside the attention loop
+                                    @pl.when(scr["a2a_n"][0] <= c_)
+                                    def _(c_=c_):
+                                        a2a_chunk(c_)
+                            else:
+                                CO.start_all(R, me, lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i],
+                                             scr["a_send"], scr["a_recv"])
+                            CO.start_all(R, me, lambda d: scr["lsend"].at[pl.ds(d * 8, 8)],
+                                         lambda i: scr["lrecv"].at[pl.ds(pl.multiple_of(i * 8, 8), 8)],
+                                         scr["a_send"], scr["a_recv"])
+                            rw_ = RW or TMAX
+                            CO.wait_pieces(R, me, [(scr["osend"].at[0, pl.ds(0, rw_)],
+                                                    scr["orecv"].at[0, pl.ds(0, rw_)], NCH),
+                                                   (scr["lsend"].at[pl.ds(0, 8)], scr["lrecv"].at[pl.ds(0, 8)], 1)],
+                                           scr["a_send"], scr["a_recv"], scope=sc if tiles.trace else None)
+                    if tiles.shadow_a2a and "coll" not in skip:   # TIMING-ONLY: the same bytes again, unconsumed
+                        CO.exchange(R, me, lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i],
+                                    scr["a2_send"], scr["a2_recv"], scope=sc if tiles.trace else None)
+                    merge()
                 if debug:
                     dput(d_oloc.at[l], scr["oh"])
 
@@ -1159,6 +1256,9 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             scr["hcur"][...] = h0[...]
             scr["res"][...] = jnp.zeros((M, H), F32)
             scr["osend"][...] = jnp.zeros(scr["osend"].shape, U32)
+            if LSE_TILE:                                      # lanes >= T and rows hh >= HR are never written
+                scr["lsend"][...] = jnp.zeros((128, 128), F32)
+                scr["lrecv"][...] = jnp.zeros((128, 128), F32)
             scr["spin"][...] = jnp.zeros((8, 128), F32)
             if fault == "stale_accumulator":
                 scr["owner"][...] = jnp.zeros((M, H), F32)
@@ -1178,7 +1278,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c)
+    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c + n_r)
     out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, TMAX, 128), U32),
                  jax.ShapeDtypeStruct((L, TMAX, 128), U32), jax.ShapeDtypeStruct((L, TMAX, 256), I32)]
     out_specs = [vmem, hbm, hbm, hbm]
@@ -1205,5 +1305,11 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     info = dict(s_names=s_names, dkinds=dkinds, e_names=e_names, c_names=c_names, plan=plan, BANK=BANK, S=S,
                 lay=lay, ltab=ltab_np, dtab=dtab_np, M=M, ck=ck, groups=G, OW=OW, OH=OH, QH=QH, QA=QA, MB_SH=MB_SH,
                 geometry=GEO, epool=EPOOL, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by,
-                moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed)
+                moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed,
+                # L4 drivers (M6) and the timing-only replay operands (appended after the caches)
+                a2a=dict(lse=tiles.a2a_lse, rw=RW, chunks=NCH, payload_lanes=OWX,
+                         bytes_per_peer=TMAX * OWX * 4 + (128 * 8 * 4 if LSE_TILE else 0),
+                         starts_per_peer=NCH + (1 if LSE_TILE else 0), shadow=bool(tiles.shadow_a2a)),
+                n_rec=n_r, rec_shapes=({"a2a": [((L, HR, M, KL), "float32")],
+                                        "ar": [((L, M, H), "float32"), ((L, M, H), "float32")]}.get(tiles.replay, [])))
     return call, info
