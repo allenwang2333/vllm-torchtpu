@@ -23,12 +23,13 @@ from jax.typing import DTypeLike
 
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
 
-# Matched1/2/4/8/16 tests on TPU7x: state wall latency plateaus at8,
-# while irregular main-row writes still benefit at16. These bound measured
-# concurrency/code expansion, not hardware semaphores or universal optima.
-# Unmeasured chips stay serial; resource admission is independently mandatory.
-_RING_TAG_DMA_BATCHES = (8, 4, 2, 1)
-_MAIN_KV_DMA_BATCHES = (16, 8, 4, 2, 1)
+# Conservative TPU7x performance default, not a hardware concurrency limit.
+# Matched1/2/4/8/16 wall measurements do not establish a material gain at16.
+# Unmeasured chips stay serial; resource admission remains mandatory.
+DEFAULT_DMA_CONCURRENCY = 8
+_DMA_BATCHES = tuple(
+    1 << power for power in reversed(range(DEFAULT_DMA_CONCURRENCY.bit_length()))
+)
 _COMPILER_SMEM_RESERVE = 32 * 1024
 _MAIN_TILE = 128
 _DmaArray = jax.Array | jax.ShapeDtypeStruct
@@ -194,9 +195,7 @@ def ring_tag_dma_batch(
     if rt + tt > pool.shape[1]:
         return 1
     batches = (
-        _RING_TAG_DMA_BATCHES
-        if hardware.chip_version == pltpu.ChipVersion.TPU_7X
-        else (1,)
+        _DMA_BATCHES if hardware.chip_version == pltpu.ChipVersion.TPU_7X else (1,)
     )
     for batch in batches:
         if requests % batch:
@@ -227,9 +226,7 @@ def main_kv_dma_batch(
         return 1
     assert hardware is not None
     batches = (
-        _MAIN_KV_DMA_BATCHES
-        if hardware.chip_version == pltpu.ChipVersion.TPU_7X
-        else (1,)
+        _DMA_BATCHES if hardware.chip_version == pltpu.ChipVersion.TPU_7X else (1,)
     )
     for batch in batches:
         memory = main_kv_dma_memory(pool, rows, batch, hardware)

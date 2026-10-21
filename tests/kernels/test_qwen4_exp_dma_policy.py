@@ -48,7 +48,7 @@ def test_same_payload_uses_batch_independently_of_page_stride(dtype, page, monke
     assert (
         policy.get_ring_tag_dma_batch(pool, 8, ring_elements=1024, tag_elements=16) == 8
     )
-    assert policy.get_main_kv_dma_batch(pool, rows) == 16
+    assert policy.get_main_kv_dma_batch(pool, rows) == 8
 
 
 @pytest.mark.parametrize(
@@ -174,7 +174,7 @@ def test_pure_planning_never_queries_backend(monkeypatch):
             == 8
         )
         rows = jax.ShapeDtypeStruct((128, *pool.shape[2:]), pool.dtype)
-        assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 16
+        assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 8
 
 
 def test_unmeasured_chip_keeps_serial_policy_with_known_resource_facts():
