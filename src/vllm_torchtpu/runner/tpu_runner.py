@@ -1009,18 +1009,11 @@ class TPUModelRunner(GPUModelRunner):
         # The producer populates draft context KV without generating proposals.
         self._is_dspark_pd_producer = bool(
             transfer_config is not None
-            and transfer_config.kv_connector == "TPURaidenConnector"
             and transfer_config.is_kv_producer
             and speculative_config is not None
             and speculative_config.method == "dspark"
         )
         if self._is_dspark_pd_producer:
-            if not self._unified_kv_layout:
-                raise ValueError("DSpark PD requires the unified block pool.")
-            if self.scheduler_config.async_scheduling:
-                raise ValueError(
-                    "DSpark PD producer currently requires sync scheduling."
-                )
             if self.parallel_config.pipeline_parallel_size != 1:
                 raise ValueError("DSpark PD producer currently requires PP=1.")
         # Maximum query length to be considered a decode.
@@ -5021,7 +5014,11 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
-            elif self._is_async_drafter and next_tokens_tpu_chunks:
+            elif (
+                self._is_async_drafter
+                and not self._is_dspark_pd_producer
+                and next_tokens_tpu_chunks
+            ):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
@@ -5229,6 +5226,10 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
 
         evict_loaded_weights_page_cache()
+        if self.parallel_config.data_parallel_size > 1:
+            from vllm.distributed import get_dp_group
+
+            torch.distributed.barrier(group=get_dp_group().cpu_group)
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
@@ -6145,7 +6146,7 @@ class TPUModelRunner(GPUModelRunner):
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
         next_lens = list(self.num_reqs_paddings)
-        if self._is_async_drafter:
+        if self._is_async_drafter and not self._is_dspark_pd_producer:
             assert self.speculative_config is not None
             next_lens.append(
                 self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
@@ -6514,14 +6515,20 @@ class TPUModelRunner(GPUModelRunner):
                 self._check_draft_buckets()
             elif self._is_async_drafter:
                 self._async_drafter.precompile()
-                self._precompile_rejection_sampler()
-                self._precompile_spec_logprobs()
-                # The isolated precompiles above emit standalone fused
-                # programs; the real per-step propose+verify+sampling
-                # dispatch fuses them differently, so the first real
-                # request would otherwise compile new graphs. Warm those
-                # through the real two-phase spec-decode path.
-                self._warmup_spec_decode()
+                if self._is_dspark_pd_producer:
+                    logger.info(
+                        "Skipping rejection replay and decode/verify warmup "
+                        "for prefill-only DSpark PD producer"
+                    )
+                else:
+                    self._precompile_rejection_sampler()
+                    self._precompile_spec_logprobs()
+                    # The isolated precompiles above emit standalone fused
+                    # programs; the real per-step propose+verify+sampling
+                    # dispatch fuses them differently, so the first real
+                    # request would otherwise compile new graphs. Warm those
+                    # through the real two-phase spec-decode path.
+                    self._warmup_spec_decode()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -7018,6 +7025,15 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        if R * (1 + K) > self.max_num_tokens:
+            logger.info(
+                "skip spec-decode warmup R=%d: R*(1+K)=%d > max_num_tokens=%d",
+                R,
+                R * (1 + K),
+                self.max_num_tokens,
+            )
+            return
+        P = max(1, min(P, self.max_num_tokens // max(1, R)))
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))

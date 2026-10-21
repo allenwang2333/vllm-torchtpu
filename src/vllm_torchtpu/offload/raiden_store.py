@@ -835,10 +835,14 @@ class RaidenOffloadingManager(OffloadingManager):
         # that bypasses the connector override cannot falsely report success
         # to POST /reset_prefix_cache?reset_external=true while the Raiden
         # store continues serving cached entries.
-        raise NotImplementedError(
-            "TPURaidenOffloadingConnector: external cache reset is not supported "
-            "by the Raiden offload store."
-        )
+        if self._admissions:
+            self.drain_jobs(set(self._admissions.keys()))
+        self._key_namespace = hashlib.sha256(self._key_namespace + b":reset").digest()[:16]
+        self._inflight_store_keys.clear()
+        self._remote_slices.clear()
+        self._pending_remote_slices.clear()
+        self._finished.clear()
+        logger.info("TPURaidenOffloadingConnector: rotated Raiden key_namespace=%s on reset_cache", self._key_namespace.hex())
 
     def has_pending_work(self) -> bool:
         return bool(self._admissions)
@@ -2430,7 +2434,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         if self._worker is None:
             from vllm.distributed import parallel_state
 
-            rank = parallel_state.get_world_group().rank_in_group
+            rank = parallel_state.get_tp_group().rank_in_group
             # Direct workers to dial the controller on store_server_ip when configured
             # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
             controller_address = (

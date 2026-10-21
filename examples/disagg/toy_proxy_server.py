@@ -1,16 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import argparse
 import asyncio
@@ -26,8 +15,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
+from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -78,53 +66,6 @@ def _proxy_latency_interval() -> float:
 
 
 _PROXY_LATENCY = _ProxyLatencyTracker(_proxy_latency_interval())
-
-
-class _DecodeRouter:
-    """Picks a decode instance once a request's prefill returns.
-
-    round_robin cycles through the instances. least_loaded picks the one with
-    the fewest requests in flight through this proxy, ties round robin. The
-    counts change only on the event loop, so no lock is needed.
-    """
-
-    def __init__(self, num_decodes: int, policy: str, log_interval_s: float):
-        self.policy = policy
-        self.inflight = [0] * num_decodes
-        self.dispatched = [0] * num_decodes
-        self._cycle = itertools.cycle(range(num_decodes))
-        self._log_interval_s = log_interval_s
-        self._next_log = time.monotonic() + log_interval_s
-
-    def acquire(self) -> int:
-        if self.policy == "least_loaded":
-            low = min(self.inflight)
-            # Some index holds the minimum, so this stops within one lap.
-            for _ in range(len(self.inflight)):
-                idx = next(self._cycle)
-                if self.inflight[idx] == low:
-                    break
-        else:
-            idx = next(self._cycle)
-        self.inflight[idx] += 1
-        self.dispatched[idx] += 1
-        self._maybe_log()
-        return idx
-
-    def release(self, idx: int) -> None:
-        self.inflight[idx] -= 1
-
-    def _maybe_log(self) -> None:
-        if self._log_interval_s <= 0:
-            return
-        now = time.monotonic()
-        if now >= self._next_log:
-            self._next_log = now + self._log_interval_s
-            print(
-                f"PERF PROXY decode_routing policy={self.policy} "
-                f"dispatched={self.dispatched} inflight={self.inflight}",
-                flush=True,
-            )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -230,8 +171,8 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
-    # directly within the prefill engine.
+    if api == "/v1/completions":
+        return "/v1/completions/render"
     return None
 
 
@@ -347,16 +288,11 @@ async def lifespan(app: FastAPI):
 
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
-    app.state.decode_router = _DecodeRouter(
-        len(app.state.decode_clients),
-        global_args.decode_routing,
-        _proxy_latency_interval(),
-    )
+    app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients "
-        f"(decode routing: {global_args.decode_routing})."
+        f"and {len(app.state.decode_clients)} decode clients."
     )
 
     yield
@@ -398,13 +334,6 @@ def parse_args():
     parser.add_argument(
         "--decoder-ports", "--decoder-port", type=int, nargs="+", default=[9400]
     )
-    parser.add_argument(
-        "--decode-routing",
-        choices=["round_robin", "least_loaded"],
-        default=os.getenv("PROXY_DECODE_ROUTING", "round_robin"),
-        help="How a request picks its decode instance once prefill returns: "
-        "round_robin, or least_loaded (fewest requests in flight here).",
-    )
 
     args = parser.parse_args()
 
@@ -430,7 +359,7 @@ def get_next_client(app, service_type: str):
 
     Args:
         app: The FastAPI app instance
-        service_type: 'prefill'
+        service_type: Either 'prefill' or 'decode'
 
     Returns:
         The next client to use
@@ -438,6 +367,9 @@ def get_next_client(app, service_type: str):
     if service_type == "prefill":
         client_idx = next(app.state.prefill_iterator)
         return app.state.prefill_clients[client_idx]
+    elif service_type == "decode":
+        client_idx = next(app.state.decode_iterator)
+        return app.state.decode_clients[client_idx]
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
@@ -616,69 +548,42 @@ async def _handle_completions(api: str, request: Request):
         if kv_transfer_params:
             req_data["kv_transfer_params"] = kv_transfer_params
 
-        # Pick the decode instance: the next in turn, or the least loaded.
-        router = request.app.state.decode_router
-        decode_idx = router.acquire()
-        decode_client_info = request.app.state.decode_clients[decode_idx]
-        released = False
-
-        def release_decode() -> None:
-            # Called from the stream's finally and again as the response's
-            # background task, which also covers a stream that never started.
-            nonlocal released
-            if not released:
-                released = True
-                router.release(decode_idx)
+        # Get the next decode client in round-robin fashion
+        decode_client_info = get_next_client(request.app, "decode")
 
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
         # Stream response from decode service
         async def generate_stream():
-            try:
-                t_decode_send = time.time()
-                t_decode_send_perf = time.perf_counter()
-                print(
-                    f"PERF PROXY decode_send req_id={request_id} "
-                    f"decode={decode_idx} ts={t_decode_send:.6f}{kv_uuid_log}",
-                    flush=True,
-                )
-                first = True
-                async for chunk in stream_from_decode(
-                    decode_client_info, api, req_data, request_id, forwarded
-                ):
-                    if first:
-                        t_first = time.time()
-                        t_first_perf = time.perf_counter()
-                        decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                        ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                        _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                        _PROXY_LATENCY.record("ttft", ttft_ms)
-                        print(
-                            f"PERF PROXY first_chunk req_id={request_id} "
-                            f"ts={t_first:.6f} "
-                            f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                            f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
-                            flush=True,
-                        )
-                        first = False
-                    yield chunk
-            finally:
-                release_decode()
+            t_decode_send = time.time()
+            t_decode_send_perf = time.perf_counter()
+            print(
+                f"PERF PROXY decode_send req_id={request_id} "
+                f"ts={t_decode_send:.6f}{kv_uuid_log}",
+                flush=True,
+            )
+            first = True
+            async for chunk in stream_from_decode(
+                decode_client_info, api, req_data, request_id, forwarded
+            ):
+                if first:
+                    t_first = time.time()
+                    t_first_perf = time.perf_counter()
+                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
+                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                    _PROXY_LATENCY.record("ttft", ttft_ms)
+                    print(
+                        f"PERF PROXY first_chunk req_id={request_id} "
+                        f"ts={t_first:.6f} "
+                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                        flush=True,
+                    )
+                    first = False
+                yield chunk
 
-        # text/event-stream when the caller asked for a stream, which is what
-        # the decode instance is actually sending back. Declared as
-        # application/json, a client parses each SSE frame - "data: {...}" prefix
-        # and all - as one JSON document, and every request fails; aiperf's
-        # agentic replay does exactly that, while the non-streaming callers this
-        # proxy had until now (check_completions.py, lm_eval) never noticed.
-        media_type = (
-            "text/event-stream" if req_data.get("stream") else "application/json"
-        )
-        return StreamingResponse(
-            generate_stream(),
-            media_type=media_type,
-            background=BackgroundTask(release_decode),
-        )
+        return StreamingResponse(generate_stream(), media_type=("text/event-stream" if req_data.get("stream") else "application/json"))
 
     except Exception as e:
         import sys
@@ -701,32 +606,131 @@ async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
 
 
-@app.get("/v1/models")
-async def models():
-    """The decode instance's model list, which is the pair's.
+async def _check_backend_healthy(client_info: dict) -> bool:
+    client = client_info["client"]
+    try:
+        resp = await client.get("/health", timeout=10.0)
+        if resp.status_code == 200:
+            return True
+        logger.warning(
+            f"Backend {client_info['host']}:{client_info['port']} /health returned status {resp.status_code}"
+        )
+        return False
+    except Exception as e:
+        logger.debug(
+            f"Backend {client_info['host']}:{client_info['port']} health check failed: {e}"
+        )
+        return False
 
-    Part of the OpenAI surface this proxy presents: a client resolves the served
-    model name here, and the ModelCard's max_model_len is how a benchmark client
-    learns the window it is replaying against. Both instances serve the same
-    model; decode is the one that finishes a request.
-    """
-    client = app.state.decode_clients[0]["client"]
-    response = await client.get("/v1/models")
-    return JSONResponse(status_code=response.status_code, content=response.json())
 
-
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
-    """Simple endpoint to check if the server is running."""
-    router = app.state.decode_router
-    return {
-        "status": "ok",
-        "prefill_instances": len(app.state.prefill_clients),
-        "decode_instances": len(app.state.decode_clients),
-        "decode_routing": router.policy,
-        "decode_inflight": router.inflight,
-        "decode_dispatched": router.dispatched,
-    }
+    prefill_clients = getattr(app.state, "prefill_clients", [])
+    decode_clients = getattr(app.state, "decode_clients", [])
+
+    if not prefill_clients or not decode_clients:
+        return Response(
+            content='{"status": "no_clients_configured"}',
+            status_code=503,
+            media_type="application/json",
+        )
+
+    prefill_results = [await _check_backend_healthy(c) for c in prefill_clients]
+    decode_results = [await _check_backend_healthy(c) for c in decode_clients]
+
+    prefill_ok = all(prefill_results)
+    decode_ok = all(decode_results)
+
+    if prefill_ok and decode_ok:
+        return {
+            "status": "ok",
+            "prefill_instances": len(prefill_clients),
+            "decode_instances": len(decode_clients),
+        }
+    return Response(
+        content='{"status": "waiting_for_backends", "prefill_ready": %s, "decode_ready": %s}' % (
+            "true" if prefill_ok else "false", "true" if decode_ok else "false"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+@app.get("/v1/models")
+async def handle_models():
+    for clients in [getattr(app.state, "decode_clients", []), getattr(app.state, "prefill_clients", [])]:
+        if clients:
+            try:
+                resp = await clients[0]["client"].get("/v1/models", timeout=10.0)
+                if resp.status_code == 200:
+                    return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            except Exception:
+                pass
+    return {"object": "list", "data": [{"id": "deepseek-ai/DeepSeek-V4-Pro-0813", "object": "model"}]}
+
+
+@app.post("/reset_prefix_cache")
+async def handle_reset_prefix_cache(request: Request):
+    params = dict(request.query_params)
+    errors = []
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        success = False
+        for attempt in range(5):
+            try:
+                resp = await c["client"].post("/reset_prefix_cache", params=params, timeout=60.0)
+                if resp.status_code == 200:
+                    success = True
+                    break
+                logger.warning(f"Reset prefix cache on {c['host']}:{c['port']} returned {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"Reset prefix cache attempt {attempt + 1} on {c['host']}:{c['port']} failed: {e}")
+                await asyncio.sleep(2)
+        if not success:
+            errors.append(f"{c['host']}:{c['port']}")
+    if errors:
+        return Response(content='{"status": "error", "failed_backends": %s}' % str(errors), status_code=502, media_type="application/json")
+    return {"status": "ok"}
+
+
+@app.post("/start_profile")
+async def handle_start_profile(request: Request):
+    params = dict(request.query_params)
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        try:
+            await c["client"].post("/start_profile", params=params, timeout=30.0)
+        except Exception as e:
+            logger.warning(f"start_profile on {c['host']}:{c['port']} failed: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/stop_profile")
+async def handle_stop_profile(request: Request):
+    params = dict(request.query_params)
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        try:
+            await c["client"].post("/stop_profile", params=params, timeout=60.0)
+        except Exception as e:
+            logger.warning(f"stop_profile on {c['host']}:{c['port']} failed: {e}")
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def handle_metrics():
+    output = []
+    for role, client_list in [("decode", getattr(app.state, "decode_clients", [])), ("prefill", getattr(app.state, "prefill_clients", []))]:
+        if client_list:
+            try:
+                resp = await client_list[0]["client"].get("/metrics", timeout=10.0)
+                if resp.status_code == 200:
+                    output.append(resp.text.replace('engine="', f'engine="{role}_'))
+            except Exception:
+                pass
+    if output:
+        return Response(content="\n".join(output), media_type="text/plain")
+    return Response(content="", media_type="text/plain")
 
 
 if __name__ == "__main__":

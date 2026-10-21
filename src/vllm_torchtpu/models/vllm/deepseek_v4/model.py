@@ -96,7 +96,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        _is_prefill_draft = (
+            __import__("os").environ.get("ROLE") == "prefill"
+            and self.layer_idx >= config.num_hidden_layers
+        )
+        if _is_prefill_draft:
+            self.attn.wq_b = nn.Identity()
+            self.attn.wo_a = nn.Identity()
+            self.attn.wo_b = nn.Identity()
+            self.attn.q_norm = nn.Identity()
+        self.ffn = (
+            nn.Identity()
+            if _is_prefill_draft
+            else DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -234,45 +247,120 @@ class _HostStagedParams:
     def __init__(self):
         # name -> (parameter, its real device tensor).
         self._staged: dict[str, tuple[torch.nn.Parameter, torch.nn.Parameter]] = {}
+        self._pool: dict[tuple, list[torch.Tensor]] = {}
+        self._pending_sync: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._pending_sync_bytes: int = 0
+        self._stacked_seen: dict[str, set[int]] = {}
+        self._expert_seen: dict[str, set[tuple[int, str]]] = {}
+        self._flushed_names: set[str] = set()
+        self._flushed_count: int = 0
+        self._flushed_bytes: int = 0
 
     def stage(self, name: str, param: torch.nn.Parameter) -> torch.nn.Parameter:
         """Return a host-backed stand-in for `param` for loaders to write."""
         if name not in self._staged:
-            # ``_make_subclass`` is how nn.Parameter builds itself from a
-            # tensor; using it keeps the stand-in the parameter's own class, so
-            # upstream's isinstance dispatch (BlockQuantScaleParameter in
-            # MergedColumnParallelLinear.weight_loader, say) still picks the
-            # right branch and class-level loader methods bind to the stand-in.
-            # ``param.data`` cannot simply be re-pointed at host storage:
-            # this backend's tensors carry their own TensorImpl and set_data
-            # rejects the dispatch-key change.
+            key = (tuple(param.shape), param.dtype)
+            free = self._pool.get(key)
+            if free:
+                buf = free.pop()
+                if name in self._flushed_names:
+                    buf.copy_(param.data)
+                else:
+                    buf.zero_()
+            else:
+                buf = (
+                    param.data.to("cpu")
+                    if name in self._flushed_names
+                    else torch.zeros(param.shape, dtype=param.dtype, device="cpu")
+                )
             host = typing.cast(
                 torch.nn.Parameter,
-                torch.Tensor._make_subclass(type(param), param.data.to("cpu"), False),
+                torch.Tensor._make_subclass(type(param), buf, False),
             )
             host.__dict__.update(param.__dict__)
             self._staged[name] = (param, host)
         return self._staged[name][1]
 
+    def _sync_pending(self) -> None:
+        if not self._pending_sync:
+            return
+        tpu_tensors = [p for p, _ in self._pending_sync if p.device.type == "tpu"]
+        if tpu_tensors:
+            from vllm_torchtpu.utils import synchronize_tensors
+            synchronize_tensors(tpu_tensors, wait=True)
+        for _, buf in self._pending_sync:
+            self._pool.setdefault((tuple(buf.shape), buf.dtype), []).append(buf)
+        self._pending_sync.clear()
+        self._pending_sync_bytes = 0
+
     def _flush(self, name: str) -> None:
-        param, host = self._staged.pop(name)
+        entry = self._staged.pop(name, None)
+        if entry is None:
+            return
+        param, host = entry
+        nbytes = host.numel() * host.element_size()
         param.data.copy_(host.data)
-        # `host` was the only reference to the staging buffer; dropping it
-        # here returns that host memory to the allocator.
+        buf = torch.Tensor._make_subclass(torch.Tensor, host.data, False)
+        host.__dict__.clear()
         del host
+        self._flushed_names.add(name)
+        self._flushed_count += 1
+        self._flushed_bytes += nbytes
+        self._pending_sync.append((param.data, buf))
+        self._pending_sync_bytes += nbytes
+        if self._pending_sync_bytes >= (256 << 20) or len(self._pending_sync) >= 16:
+            self._sync_pending()
+
+    def note_stacked(self, name: str, shard_id: int) -> None:
+        seen = self._stacked_seen.setdefault(name, set())
+        seen.add(shard_id)
+        if len(seen) >= 2:
+            del self._stacked_seen[name]
+            self._flush(name)
+
+    def note_expert(
+        self, name: str, param: torch.nn.Parameter, expert_id: int, shard_id: str
+    ) -> None:
+        shards = 2 if shard_id in ("w1", "w3") else (1 if shard_id == "w2" else 0)
+        if shards == 0:
+            return
+        seen = self._expert_seen.setdefault(name, set())
+        seen.add((expert_id, shard_id))
+        if len(seen) >= param.shape[0] * shards:
+            del self._expert_seen[name]
+            self._flush(name)
+
+    def note_plain(self, name: str) -> None:
+        self._flush(name)
 
     def flush_all(self) -> None:
-        """Flush every staged parameter and release all host buffers."""
-        staged_bytes = sum(
-            h.numel() * h.element_size() for _, h in self._staged.values()
-        )
-        logger.info(
-            "Writing %d staged parameters (%.1f GiB of host memory) to the device.",
-            len(self._staged),
-            staged_bytes / 2**30,
-        )
+        """Flush every remaining staged parameter and release all host buffers."""
+        rem_count = len(self._staged)
         for name in list(self._staged):
             self._flush(name)
+        self._sync_pending()
+        pooled_bytes = sum(
+            b.numel() * b.element_size()
+            for blist in self._pool.values()
+            for b in blist
+        )
+        self._pool.clear()
+        self._stacked_seen.clear()
+        self._expert_seen.clear()
+        import ctypes, gc
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+        logger.info(
+            "Flushed %d staged parameters (%.1f GiB total, %d at end, "
+            "released %.2f GiB pool + malloc_trim).",
+            self._flushed_count,
+            self._flushed_bytes / 2**30,
+            rem_count,
+            pooled_bytes / 2**30,
+        )
 
 
 @support_torch_compile(
@@ -544,6 +632,7 @@ class DeepseekV4Model(nn.Module):
                     param = staged.stage(name, params_dict[name])
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
+                    staged.note_stacked(name, shard_id)
                     loaded_params.add(name)
                     break
                 else:
@@ -581,6 +670,9 @@ class DeepseekV4Model(nn.Module):
                                 return_success=True,
                             )
                             if success:
+                                staged.note_expert(
+                                    name_mapped, param, expert_id, expert_shard_id
+                                )
                                 loaded_params.add(name_mapped)
                                 break
                         continue
@@ -593,6 +685,7 @@ class DeepseekV4Model(nn.Module):
                         n = narrow_weight.shape[0]
                         param = staged.stage(name, params_dict[name])
                         param.data[:n].copy_(narrow_weight)
+                        staged.note_plain(name)
                         loaded_params.add(name)
                         continue
                     else:
@@ -605,6 +698,7 @@ class DeepseekV4Model(nn.Module):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        staged.note_plain(name)
                         loaded_params.add(name)
                         continue
         finally:

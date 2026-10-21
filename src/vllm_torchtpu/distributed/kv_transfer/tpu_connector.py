@@ -3303,7 +3303,7 @@ class TPURaidenConnectorWorker:
 
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
-        summary = dict(engine.register_pools(manifest.pool_dicts()))
+        summary = self._register_raiden_pools(engine, manifest, kv_cache_groups)
 
         registration = self._register_raiden_stage3_work_unit(
             engine=engine,
@@ -6870,11 +6870,15 @@ class TPURaidenConnectorWorker:
             timeout_s=float(dist_utils.get_p2p_wait_pull_timeout()),
         )
         if stage3_enabled:
+            socket_parallelism_env = int(
+                os.environ.get("TPU_RAIDEN_SOCKET_PARALLELISM", "0") or 0
+            )
+            default_parallelism = (
+                self._raiden_transfer_parallelism() if self.is_producer else 1
+            )
             manager_kwargs.update(
                 listener_port=0,
-                parallelism=(
-                    self._raiden_transfer_parallelism() if self.is_producer else 1
-                ),
+                parallelism=max(default_parallelism, socket_parallelism_env),
             )
             if _reshard_store_mode():
                 # Register this worker with its engine store's dispatch
@@ -7009,6 +7013,22 @@ class TPURaidenConnectorWorker:
             for layer_name in getattr(group, "layer_names", ()):
                 group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
+        max_model_len = int(self.vllm_config.model_config.max_model_len)
+        dsv4_group_max_blocks: dict[int, int] = {}
+        for index, group in enumerate(kv_cache_groups or ()):
+            spec = getattr(group, "kv_cache_spec", None)
+            if spec is None or isinstance(spec, MambaSpec):
+                continue
+            page_tokens = max(1, int(spec.block_size))
+            window_tokens = _stage3_group_window_tokens(spec)
+            if window_tokens is not None and window_tokens > 0:
+                max_group_pages = min(
+                    (max_model_len + page_tokens - 1) // page_tokens,
+                    (window_tokens + page_tokens - 1) // page_tokens + 1,
+                )
+            else:
+                max_group_pages = (max_model_len + page_tokens - 1) // page_tokens
+            dsv4_group_max_blocks[index] = max(1, max_group_pages)
         # storage -> {block table: blocks one transfer touches from it}
         tables_by_storage: dict[int, dict[Any, int]] = {}
         full_mirror: set[int] = set()
@@ -7017,15 +7037,24 @@ class TPURaidenConnectorWorker:
             storage = int(pool.storage_index)
             if tag.startswith(rpm.TAG_FA):
                 blocks = fa_pages
+                layer_name = str(pool.layer_name)
+                table: Any = group_of_layer.get(layer_name, layer_name)
             elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(rpm.TAG_GDN_SSM):
                 blocks = 1
+                layer_name = str(pool.layer_name)
+                table = group_of_layer.get(layer_name, layer_name)
+            elif tag.startswith("dsv4.") and ".g" in tag:
+                group_index = int(tag.rsplit(".g", 1)[1])
+                blocks = dsv4_group_max_blocks.get(group_index, 0)
+                if blocks <= 0:
+                    full_mirror.add(storage)
+                    continue
+                table = group_index
             else:
                 full_mirror.add(storage)
                 continue
             # Layers of one kv-cache group share a block table; a layer
             # outside every group is its own table.
-            layer_name = str(pool.layer_name)
-            table = group_of_layer.get(layer_name, layer_name)
             tables = tables_by_storage.setdefault(storage, {})
             tables[table] = max(tables.get(table, 0), blocks)
         hints: list[int] = []

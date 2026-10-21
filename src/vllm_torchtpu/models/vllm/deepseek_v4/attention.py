@@ -771,6 +771,8 @@ class VllmDeepseekV4MLAAttention(
         return op
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        if not hasattr(self.wo_a, "weight"):
+            return
         """Store `wo_a` in the layout the fused o-projection kernel wants,
         which is (self.n_local_heads * self.head_dim // self.n_local_groups,
                   self.n_local_groups * self.o_lora_rank).
@@ -793,6 +795,8 @@ class VllmDeepseekV4MLAAttention(
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
 
     def _assert_o_proj_supported(self) -> None:
+        if not hasattr(self.wo_a, "weight"):
+            return
         """Check what the fused `wo_a` kernel requires.
 
         The kernel is the only `wo_a` path, so an unmet condition is a
