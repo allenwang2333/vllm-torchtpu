@@ -581,18 +581,34 @@ class Glm52DecodeMK:
         if os.environ.get("GLM52_DECODE_MK_STACK_E", "1") == "0":
             self.expert_stack = {"form": "per-layer (GLM52_DECODE_MK_STACK_E=0)"}
             return
+        import gc
+
         moe = LY.layers_of(self.cfg, "gate")
+        rts = [self._per_layer[l]["rt"] for l in moe]
+        # Drop this object's own references to the per-layer tensors first: stack_experts frees each kind's per-layer
+        # tensors right after stacking it, so the load-time transient is one kind's bytes, not a second full copy
+        # (j-b6b945d5 G1: with these references held, bytes_in_use rose by the whole stack during stacking).
+        for l in moe:
+            for k_ in ("ew13", "ew2", "es13", "es2"):
+                self._per_layer[l].pop(k_, None)
+        self.experts = []
+        gc.collect()
         try:
-            rep = _mtd().stack_experts([self._per_layer[l]["rt"] for l in moe])
+            rep = _mtd().stack_experts(rts)
         except ValueError as e:
+            # stack_experts left (or restored) the per-layer parameters: re-collect them
+            for l, rt in zip(moe, rts):
+                d = self._per_layer[l]
+                d["ew13"], d["ew2"] = rt.w13_weight, rt.w2_weight
+                d["es13"], d["es2"] = rt.w13_weight_scale_inv, rt.w2_weight_scale_inv
+                self.experts += [d["ew13"], d["ew2"], d["es13"], d["es2"]]
             logger.warning("GLM-5.2 decode megakernel: experts stay per layer (%s)", e)
             self.expert_stack = {"form": f"per-layer ({e})"}
             return
-        stk = [_mtd().expert_stacks(self._per_layer[l]["rt"]) for l in moe]
+        gc.collect()
+        rep["hbm_after_release"] = _mtd()._hbm_stats()
+        stk = [_mtd().expert_stacks(rt) for rt in rts]
         self._check_expert_stacks(stk[0][0])
-        for l in moe:                                                 # drop the per-layer references
-            for k_ in ("ew13", "ew2", "es13", "es2"):
-                self._per_layer[l].pop(k_, None)
         self.experts = list(stk[0][0])
         self.stack_e = True
         self.expert_stack = dict(rep, form="stacked")

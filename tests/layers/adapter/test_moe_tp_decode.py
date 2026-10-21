@@ -573,3 +573,21 @@ def test_gmm_custom_op_still_registers_with_the_stacked_variant():
         topk=TOPK, activation="silu", use_ep=False, skip_padded_tokens=True
     )
     assert "pallas::fused_moe_kernel_" in str(op)
+
+
+def test_stack_experts_releases_the_per_layer_tensors(harness):
+    """No second copy: once stacked, nothing in the module tree (or the stacking code) keeps
+    a per-layer routed parameter alive, so its storage is freed."""
+    import gc
+    import weakref
+
+    model = harness.model({}, {})
+    moe_tp_decode.arm(model)
+    layers = [r.routed_experts for r in model.layers]
+    refs = [weakref.ref(getattr(layer, n)) for layer in layers for n in moe_tp_decode._EXPERT_PARAMS]
+    stores = [weakref.ref(getattr(layer, n).untyped_storage()) for layer in layers
+              for n in moe_tp_decode._EXPERT_PARAMS]
+    moe_tp_decode.stack_experts(layers)
+    gc.collect()
+    assert all(r() is None for r in refs), "a per-layer routed parameter is still referenced"
+    del stores
