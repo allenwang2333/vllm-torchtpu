@@ -135,14 +135,18 @@ def _retain_buffers(out: torch.Tensor, *buffers: torch.Tensor | None) -> torch.T
     """`out` plus a zero read from each buffer, on the token-count branch that
     does not use them: the backbone warmup hands a bucket over only between
     traces that lift the same buffers (as `cp_mla_attention._retain_rank`). A
-    dead read would be eliminated, so the zero rides on `out`."""
+    dead read would be eliminated, so the zero rides on `out`. One element by
+    index, not `reshape(-1)[0]`: flattening a tiled weight makes XLA relayout
+    all of it (the 8 MiB W_UV_dcp_qrep: ~11 us per layer, ~0.9 ms per decode
+    step over 78 layers, j-911bd7a9). The warmup-compiled graph is the one that
+    serves, so the read runs every step."""
     from vllm_torchtpu.compilation import shape_variants
 
     if not shape_variants.in_warmup():
         return out
     for buf in buffers:
         if buf is not None:
-            value = buf.reshape(-1)[0].to(out.dtype)
+            value = buf[(0,) * buf.dim()].to(out.dtype)
             out = out + (value - value)
     return out
 

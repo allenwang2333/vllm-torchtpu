@@ -61,15 +61,21 @@ def test_retain_buffers_reads_each_buffer_in_warmup_only(monkeypatch):
     assert attention._retain_buffers(out, w, scale, None) is out
 
     reads = []
-    real_reshape = torch.Tensor.reshape
+    real_getitem = torch.Tensor.__getitem__
 
-    def reshape(self, *shape):
+    def getitem(self, idx):
         if self is w or self is scale:
+            # One element by index; no flattening (a relayout of the weight).
+            assert idx == (0,) * self.dim(), idx
             reads.append(self)
-        return real_reshape(self, *shape)
+        return real_getitem(self, idx)
+
+    def no_reshape(self, *shape):
+        raise AssertionError("a retained buffer must not be reshaped")
 
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
-    monkeypatch.setattr(torch.Tensor, "reshape", reshape)
+    monkeypatch.setattr(torch.Tensor, "__getitem__", getitem)
+    monkeypatch.setattr(torch.Tensor, "reshape", no_reshape)
     got = attention._retain_buffers(out, w, scale, None)
     assert torch.equal(got, out)
     assert reads == [w, scale]
