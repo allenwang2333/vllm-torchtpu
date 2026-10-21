@@ -938,6 +938,50 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
     assert drv3.verify_buckets == driver_mod._DEFAULT_VERIFY_BUCKETS
 
 
+def test_maybe_create_disables_on_unsupported_tpu_chip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`maybe_create` catches `MegakernelConfigError` on unsupported TPU chips."""
+    import vllm.distributed as vllm_dist
+
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+
+    class _UnsupportedTPUDevice:
+        id = 0
+        device_kind = "TPU v5 lite"
+
+    v5_mesh = SimpleNamespace(
+        devices=np.array([_UnsupportedTPUDevice() for _ in range(8)], dtype=object)
+    )
+    runner = SimpleNamespace(
+        model=model,
+        mesh=v5_mesh,
+        _unified_kv_layout=True,
+        supports_mm_inputs=False,
+        lora_config=None,
+        _pp_is_first=True,
+        _pp_is_last=True,
+        _pcp_enabled=False,
+        _dcp_enabled=False,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        _dp_lockstep_enabled=lambda: False,
+        vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
+    )
+    monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
+    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        driver_mod, "_build_tp_rank_mesh", lambda _r, fallback_mesh=None: fallback_mesh
+    )
+    assert MegakernelDriver.maybe_create(runner) is None
+
+
 def test_can_run_real_tpu_runner_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify `can_run` against real `TPUModelRunner` and `AttentionMetadata` fields."""
     mesh = _cpu_mesh(1)

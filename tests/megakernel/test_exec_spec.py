@@ -156,9 +156,13 @@ def test_default_tile_rule_is_model_agnostic():
     assert default_tiles(8, chip=small).vmem_mib == 16
 
 
-def test_chip_budget_follows_device_kind_with_v7x_fallback(monkeypatch):
+def test_chip_budget_follows_device_kind_and_rejects_unsupported_tpu(monkeypatch):
+    from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+
     assert chip_budget("TPU7x") is TPU_V7X
-    assert chip_budget("TPU v5 lite") is DEFAULT_CHIP is TPU_V7X
+    with pytest.raises(MegakernelConfigError, match="TPU v5 lite.*TPU7x"):
+        chip_budget("TPU v5 lite")
+    assert chip_budget("cpu") is DEFAULT_CHIP
     assert chip_budget() is DEFAULT_CHIP  # CPU interpret runs: the v7x fallback
     small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
     monkeypatch.setitem(

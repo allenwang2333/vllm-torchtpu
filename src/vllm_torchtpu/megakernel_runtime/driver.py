@@ -67,6 +67,7 @@ from vllm_torchtpu.megakernel.profile import (
     get_profile,
     model_default_profile,
 )
+from vllm_torchtpu.megakernel.profiles.default import chip_budget
 from vllm_torchtpu.megakernel_runtime.exported_bridge import (
     MegakernelConfigError,
     build_pooled_step_op,
@@ -1207,6 +1208,16 @@ class MegakernelDriver:
                 int(mesh.devices.size),
                 r_cnt,
             )
+            return None
+        dev_kind = getattr(mesh.devices.flat[0], "device_kind", None)
+        try:
+            chip_budget(
+                dev_kind
+                if isinstance(dev_kind, str) and dev_kind.startswith("TPU")
+                else None
+            )
+        except MegakernelConfigError as exc:
+            logger.warning("Megakernel disabled: %s; skipping.", exc)
             return None
         # Profile-owned settings the user didn't set stay None, so the driver
         # takes them from the effective profile.
