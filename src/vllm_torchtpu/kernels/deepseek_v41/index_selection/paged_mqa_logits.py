@@ -54,8 +54,7 @@ class MQAOps:
     read_sem: Ref
     write_sem: Ref
     q_sem: Ref
-    reduction_scales: Ref
-    accumulator_scales: Ref | None
+    staged_logits: Ref
     accumulators: tuple[Ref, ...]
     page_records: int
     next_tiles: jax.Array = field(init=False)
@@ -210,15 +209,11 @@ class MQAOps:
             load(0, 0)
         else:
             boundary = self.pool[0].shape[0]
-            in_first = address < boundary
-
-            @pl.when(in_first)
-            def low():
-                load(0, 0)
-
-            @pl.when(~in_first)
-            def high():
-                load(1, boundary)
+            jax.lax.cond(
+                address < boundary,
+                lambda: load(0, 0),
+                lambda: load(1, boundary),
+            )
 
     def fetch(self, tile, metadata_slot, slot):
         def body(i, _):
@@ -262,30 +257,33 @@ class MQAOps:
         query = self.lhs[group * group_heads : (group + 1) * group_heads]
         data_rows = self.page_records // self.plan.key_slots
         page_rows = data_rows + 1
-        key_parts, scale_parts = ([], [])
+        key_parts = []
         for page in range(
             fragment * self.plan.mxu_size // self.page_records,
             (fragment + 1) * self.plan.mxu_size // self.page_records,
         ):
             words = self.keys[self.key_slot(tile), pl.ds(page * page_rows, data_rows)]
             key_parts.append(pltpu.bitcast(words, self.q.dtype))
-            scale_words = self.keys[self.key_slot(tile), page * page_rows + data_rows]
-            scale_parts.append(jax.lax.bitcast_convert_type(scale_words, jnp.float32))
-        self.accumulator_scales[index] = jnp.concatenate(scale_parts)[None, :]
         keys = jnp.concatenate(key_parts, axis=0)
         rhs = jnp.concatenate((keys, jnp.zeros_like(keys)), axis=1)
         # Head reduction overwrites staged RHS, so every QK group reloads K.
         pltpu.matmul_push_rhs(rhs, 0, fragment % c.issue_depth % 2, transpose=True)
         pltpu.matmul_acc_lhs(acc, query, load_staged_rhs=0)
 
+    def transform(self, fragment: int, group: int) -> None:
+        c = self.plan.config
+        index = fragment % c.issue_depth * self.plan.groups + group
+        logits = pltpu.matmul_pop(self.accumulators[index])
+        self.staged_logits[index] = jnp.maximum(
+            logits.astype(jnp.bfloat16), jnp.bfloat16(0)
+        )
+
     def reduce(self, fragment: int, group: int) -> None:
         c = self.plan.config
         size = self.plan.mxu_size
         group_heads = c.query_group * self.plan.heads
         index = fragment % c.issue_depth * self.plan.groups + group
-        acc = self.accumulators[index]
-        logits = pltpu.matmul_pop(acc)
-        logits = jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
+        logits = self.staged_logits[index]
         matrix = self.weight_matrix.reshape(
             3, self.plan.groups * c.query_group, self.plan.groups * group_heads
         )[
@@ -294,7 +292,6 @@ class MQAOps:
             group * group_heads : (group + 1) * group_heads,
         ].reshape(3 * c.query_group, group_heads)
         reduction = self.accumulators[c.issue_depth * self.plan.groups + index]
-        self.reduction_scales[index] = self.accumulator_scales[index]
         mxu = fragment % c.issue_depth % 2
         rhs = jnp.pad(logits, ((0, size - group_heads), (0, 0)))
         lhs = jnp.pad(
@@ -303,7 +300,7 @@ class MQAOps:
         pltpu.matmul_push_rhs(rhs, 0, mxu)
         pltpu.matmul_acc_lhs(reduction, lhs, load_staged_rhs=0)
 
-    def consume(self, fragment: int, group: int) -> jax.Array:
+    def consume(self, tile, fragment: int, group: int) -> jax.Array:
         c = self.plan.config
         index = fragment % c.issue_depth * self.plan.groups + group
         acc = self.accumulators[c.issue_depth * self.plan.groups + index]
@@ -311,7 +308,19 @@ class MQAOps:
         products = products[: 3 * c.query_group].reshape(
             3, c.query_group, self.plan.mxu_size
         )
-        return (products[0] + products[1] + products[2]) * self.reduction_scales[index]
+        # K remains resident until this tile has finished consuming its results.
+        data_rows = self.page_records // self.plan.key_slots
+        scales = [
+            jax.lax.bitcast_convert_type(
+                self.keys[self.key_slot(tile), page * (data_rows + 1) + data_rows],
+                jnp.float32,
+            )
+            for page in range(
+                fragment * self.plan.mxu_size // self.page_records,
+                (fragment + 1) * self.plan.mxu_size // self.page_records,
+            )
+        ]
+        return (products[0] + products[1] + products[2]) * jnp.concatenate(scales)
 
     def store(self, tile, fragment: int, parts: list[jax.Array]) -> None:
         size = self.plan.compute_size
@@ -379,8 +388,7 @@ def _kernel(
     read_sem,
     write_sem,
     q_sem,
-    key_scales,
-    accumulator_scales,
+    staged_logits,
     accumulators,
     *,
     pipeline,
@@ -404,8 +412,7 @@ def _kernel(
             read_sem,
             write_sem,
             q_sem,
-            key_scales,
-            accumulator_scales,
+            staged_logits,
             accumulators,
             pipeline.page_records,
         )

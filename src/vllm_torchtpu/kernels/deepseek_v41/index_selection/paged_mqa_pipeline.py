@@ -76,8 +76,14 @@ class BufferPlan:
             pltpu.SemaphoreType.DMA((c.key_buffers,)),
             pltpu.SemaphoreType.DMA((2, c.query_tile)),
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.VMEM((c.issue_depth * self.groups, 1, self.mxu_size), jnp.float32),
-            pltpu.VMEM((c.issue_depth * self.groups, 1, self.mxu_size), jnp.float32),
+            pltpu.VMEM(
+                (
+                    c.issue_depth * self.groups,
+                    c.query_group * self.heads,
+                    self.mxu_size,
+                ),
+                jnp.bfloat16,
+            ),
         )
 
     def accumulator_shapes(self) -> tuple:
@@ -107,11 +113,10 @@ class BufferPlan:
             )
 
         scratch = self.scratch_shapes()
-        scale_bytes = size((tokens, self.heads), jnp.float32) + sum(
-            size(v.shape, v.dtype) for v in scratch[-2:]
-        )
+        scale_bytes = size((tokens, self.heads), jnp.float32)
         return (
             sum(size(s.shape, s.dtype) for s in scratch[:3])
+            + size(scratch[-1].shape, scratch[-1].dtype)
             + scale_bytes
             + (
                 size((tokens, self.heads), jnp.float32)
@@ -152,8 +157,9 @@ class BufferPlan:
 class Pipeline:
     """Trace-time producer/consumer schedule; no runtime Python dispatch.
 
-    K slots are released after their final RHS read. MRB slots are popped before
-    reuse. A score slot is published after its final MRB pop, and its DMA must
+    K slots stay resident through the final scale read. QK results pass through
+    a BF16 ring before head reduction; its slots are read before reuse. MRB
+    slots are popped before reuse. Output DMA starts after the last pop and must
     finish before the slot is overwritten. Q and page metadata each have two
     slots: the next Q is loaded while the current Q's K tiles are processed.
     A Q slot is reused only after its query block finishes.
@@ -187,7 +193,7 @@ class Pipeline:
         )
         depth = self.plan.config.issue_depth
         fragments = self.plan.fragments
-        for stage in range(fragments + 2 * depth):
+        for stage in range(fragments + 3 * depth):
             if stage < fragments and prefetch:
                 for page in range(
                     stage * size // self.page_records,
@@ -198,14 +204,16 @@ class Pipeline:
                     )
             parts = []
             for group in range(self.plan.groups):
-                if stage >= 2 * depth:
-                    parts.append(ops.consume(stage - 2 * depth, group))
+                if stage >= 3 * depth:
+                    parts.append(ops.consume(tile, stage - 3 * depth, group))
+                if 2 * depth <= stage < fragments + 2 * depth:
+                    ops.reduce(stage - 2 * depth, group)
                 if depth <= stage < fragments + depth:
-                    ops.reduce(stage - depth, group)
+                    ops.transform(stage - depth, group)
                 if stage < fragments:
                     ops.issue(tile, stage, group)
             if parts:
-                ops.store(tile, stage - 2 * depth, parts)
+                ops.store(tile, stage - 3 * depth, parts)
 
     def step(self, ops: "MQAOps", tile, *, initial: bool) -> None:
         ops.wait_keys(tile)
@@ -218,13 +226,11 @@ class Pipeline:
             tile + self.plan.config.key_buffers - 1 < ops.live_tiles + ops.next_tiles
         )
 
-        @pl.when(pending)
-        def overlap():
-            self.emit_tile(ops, tile, prefetch=True)
-
-        @pl.when(~pending)
-        def finish():
-            self.emit_tile(ops, tile, prefetch=False)
+        jax.lax.cond(
+            pending,
+            lambda: self.emit_tile(ops, tile, prefetch=True),
+            lambda: self.emit_tile(ops, tile, prefetch=False),
+        )
 
         ops.publish(tile)
 

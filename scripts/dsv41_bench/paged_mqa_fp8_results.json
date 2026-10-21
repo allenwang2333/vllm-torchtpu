@@ -147,5 +147,222 @@
   "checkpoint_validation": {
     "native_source_experiment_id": "exp-f4z6frgpyy",
     "comparison": "Native implementation AST matches staged8 after excluding imports, docstrings, and exception messages."
+  },
+  "shared_key_fp8_followup": {
+    "rollback_commit": "8dc381676",
+    "shape": {
+      "groups": 48,
+      "queries_per_group": 6,
+      "heads": 32,
+      "head_dim": 128,
+      "context": 98304,
+      "visible_tokens": 98287,
+      "page_records": 128
+    },
+    "versions": {
+      "jax": "0.11.2",
+      "jaxlib": "0.11.2",
+      "libtpu": "0.0.50"
+    },
+    "timing": "Mean of two seed medians; five XProf XLA Ops scorer samples per seed. XLA Modules include output conversion. Preparation outside timing.",
+    "selected": "BF16 logits staging with 32K K tiles, issue depth 8, query tile/group 6, four K buffers",
+    "scope": "Original shared-K input contract and arithmetic; no pair metadata or changed candidate workload. Standalone kernel, not serving validation.",
+    "validation": {
+      "iteration32_native": 24,
+      "iteration32_full_shape": 12,
+      "iteration33_native": 4,
+      "iteration33_full_shape_comparisons": 6,
+      "iteration34_native": 8,
+      "iteration34_full_shape_comparisons": 6,
+      "iteration35_native": 8,
+      "iteration35_full_shape_comparisons": 6,
+      "source_equivalence": "Maintained code AST matches iteration36 both variant after removing docstrings; formatting differs.",
+      "iteration36_native": 16,
+      "iteration36_full_shape_comparisons": 6
+    },
+    "limitations": [
+      "400us target not met.",
+      "Explicit query_tile=5 and key_tile=512 triggers pre-existing output DMA layout compilation failure in libtpu 0.0.50.",
+      "No serving or model-quality validation."
+    ],
+    "experiments": [
+      {
+        "experiment_id": "exp-74k0of0qyw",
+        "artifact_id": "art-n2zfbcw8tx",
+        "analysis_id": "an-7hpztvbo1u",
+        "summary": {
+          "control": {
+            "kernel_us": 888.7934425000001,
+            "module_us": 980.785639
+          },
+          "group3": {
+            "kernel_us": 1567.2436225000001,
+            "module_us": 1659.8085985
+          },
+          "group2": {
+            "kernel_us": 2221.4819925,
+            "module_us": 2313.661502
+          },
+          "reuse3": {
+            "kernel_us": 1366.9436150000001,
+            "module_us": 1458.8740619999999
+          },
+          "reuse2": {
+            "kernel_us": 1641.4345365,
+            "module_us": 1733.8319705
+          },
+          "rolled6": {
+            "kernel_us": 1031.2977190000001,
+            "module_us": 1123.559349
+          }
+        },
+        "source_sha256": {
+          "pipeline_control.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_control.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_group3.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_group3.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_group2.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_group2.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_reuse3.py": "dccf4beca321449ecc206fae76832ece8a1832b322d2041210b728fbb1d5fb83",
+          "logits_reuse3.py": "a0df8b1655ea4ffbf787777ae152f516e689b9d66538f25c22b80e00a185dae1",
+          "pipeline_reuse2.py": "dccf4beca321449ecc206fae76832ece8a1832b322d2041210b728fbb1d5fb83",
+          "logits_reuse2.py": "a0df8b1655ea4ffbf787777ae152f516e689b9d66538f25c22b80e00a185dae1",
+          "run_tpu.py": "dac89d34a1382286b1acd57100502050eec3b7d12f922e847b01c54462814d6b",
+          "pipeline_rolled6.py": "fb0bbeb7285aacfaee3b00c2e6716a3f1178f3f9dc091c2b7a829edee1615e2a",
+          "logits_rolled6.py": "dc5a2495c867feea829f28b4d7e891edb8715e14d0eac3765a466b5607ed6ec6"
+        }
+      },
+      {
+        "experiment_id": "exp-setevonqk1",
+        "artifact_id": "art-jurrm2caho",
+        "analysis_id": "an-z4egc4wivy",
+        "summary": {
+          "control": {
+            "kernel_us": 888.6051175,
+            "module_us": 980.3973965
+          },
+          "tile32k": {
+            "kernel_us": 861.4375749999999,
+            "module_us": 953.795318
+          },
+          "tile48k": {
+            "kernel_us": 1194.129652,
+            "module_us": 1285.828894
+          },
+          "tile96k": {
+            "kernel_us": 881.8781135,
+            "module_us": 973.4338984999999
+          }
+        },
+        "source_sha256": {
+          "pipeline_control.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_control.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_tile32k.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_tile32k.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_tile48k.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_tile48k.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_tile96k.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_tile96k.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "run_tpu.py": "37092dc0ef1a7ed7aaa2dbc8c8d8f4bf4ae2d5c2f3343a0b91f294f04d4483e3",
+          "run_fast.py": "6b8518d08627acdea37ee114e0e1793877dd740da74bf41aa9811d9e89a21230"
+        }
+      },
+      {
+        "experiment_id": "exp-4kt5wnjz05",
+        "artifact_id": "art-5upf5w7cu8",
+        "analysis_id": "an-3gqv8pu4sj",
+        "summary": {
+          "control": {
+            "kernel_us": 889.5785940000001,
+            "module_us": 981.092437
+          },
+          "control32": {
+            "kernel_us": 861.6771455,
+            "module_us": 953.6418065
+          },
+          "direct": {
+            "kernel_us": 926.424932,
+            "module_us": 1017.998162
+          },
+          "direct32": {
+            "kernel_us": 905.809086,
+            "module_us": 997.7850015
+          }
+        },
+        "source_sha256": {
+          "pipeline_control.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_control.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_direct.py": "ffa4e70899e403610817a854648348a6dc2f158904487dc57ee90caa9500e835",
+          "logits_direct.py": "ddfbdfe4f20d71b57c1cd05a2676613c93dc70e4d17d3492ce5233d7ce652c57",
+          "run_fast.py": "4d416829f00695823c454ca2eb4d0c58ce4cf2c01a5afe2c60b926d410f02c06"
+        }
+      },
+      {
+        "experiment_id": "exp-vb4z5v984g",
+        "artifact_id": "art-0xcwsbzip1",
+        "analysis_id": "an-ofm5gvzk7u",
+        "summary": {
+          "control": {
+            "kernel_us": 887.447854,
+            "module_us": 979.320453
+          },
+          "control32": {
+            "kernel_us": 861.8180150000001,
+            "module_us": 953.9615094999999
+          },
+          "staged": {
+            "kernel_us": 818.3918444999999,
+            "module_us": 910.0858714999999
+          },
+          "staged32": {
+            "kernel_us": 794.5064895,
+            "module_us": 886.426208
+          }
+        },
+        "source_sha256": {
+          "pipeline_control.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "logits_control.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "pipeline_staged.py": "3b185d732f33b803010f58fcc3d51c334a509f2f2dd96d9accbecba76f1995a0",
+          "logits_staged.py": "4c473487073d807db4699f9d30e5fb76ceec80f73354e72c2dcb925bca4c9774",
+          "run_fast.py": "803aecf1ff868a3ad2d6a054d7128d98378fbe97ac751b1f9bee004e72f5d311"
+        }
+      },
+      {
+        "experiment_id": "exp-o0ftn9bnzl",
+        "artifact_id": "art-j7t3dm8gd8",
+        "analysis_id": "an-3xlth3rce0",
+        "summary": {
+          "control": {
+            "kernel_us": 891.9736270000001,
+            "module_us": 983.496999
+          },
+          "staged": {
+            "kernel_us": 796.164541,
+            "module_us": 888.4789920000001
+          },
+          "dma": {
+            "kernel_us": 796.2293665,
+            "module_us": 888.1721565
+          },
+          "both": {
+            "kernel_us": 795.8637075,
+            "module_us": 887.426733
+          }
+        },
+        "source_sha256": {
+          "logits_both.py": "b157e32f2936e0658d6d2f2141166a467d33703bdf74aabb2c4be7f3bb0a328c",
+          "logits_control.py": "44a5f0e996059e55870631e92c596479328bf99ba3521bfbb8cc5ef71f907c87",
+          "logits_dma.py": "b157e32f2936e0658d6d2f2141166a467d33703bdf74aabb2c4be7f3bb0a328c",
+          "logits_staged.py": "4c473487073d807db4699f9d30e5fb76ceec80f73354e72c2dcb925bca4c9774",
+          "pipeline_both.py": "a21d866670fba94d1bf64e7e7a16a26df2569719478f08063c6f377eb209c3dc",
+          "pipeline_control.py": "63e8b89196323249f9188670eddf39480f5d11e51ad587205eb7fc3243e889db",
+          "pipeline_dma.py": "3b185d732f33b803010f58fcc3d51c334a509f2f2dd96d9accbecba76f1995a0",
+          "pipeline_staged.py": "3b185d732f33b803010f58fcc3d51c334a509f2f2dd96d9accbecba76f1995a0",
+          "run_fast.py": "90804b192c2d90ea73bd09e63da9f0bde1297a74faba690d23948af2a0a3dd95"
+        },
+        "note": "staged: BF16 ring at 32K; dma: one bank-select branch; both: also one prefetch/finish branch. Branch cleanup differences are within timing variation, not evidence of extra speedup. Maintained code uses both."
+      }
+    ],
+    "raw_samples_file": "paged_mqa_fp8_followup.jsonl"
   }
 }
