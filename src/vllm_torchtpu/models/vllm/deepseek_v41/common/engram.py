@@ -10,6 +10,7 @@ import tempfile
 from contextlib import ExitStack
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -25,6 +26,9 @@ from vllm_torchtpu.model_loader_patches import register_row_slice
 
 from ..config import engram_cpu_offload
 from .host_exchange import PendingRowExchange, start_exchange_rows
+
+if TYPE_CHECKING:
+    from .host_transfer import PreparedEngramUpload
 
 
 @dataclass
@@ -612,6 +616,7 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
+        self._prepared_uploads: dict[int, PreparedEngramUpload] | None = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -651,6 +656,17 @@ class Engram(upstream.Engram):
             self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[max_tokens] = self._staged_raw
             self._active_raw = self._staged_views(max_tokens)
+
+    def enable_prepared_upload(self) -> None:
+        """Opt into the isolated raw-DMA experiment before any consumer runs.
+
+        Serving keeps copy_ until consumer completion has a scoped event.
+        The prototype fences the whole device before each overwrite.
+        """
+        if self._staged_raw is None:
+            raise ValueError("Prepared upload requires host-offloaded Engram")
+        if self._prepared_uploads is None:
+            self._prepared_uploads = {}
 
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
@@ -732,20 +748,26 @@ class Engram(upstream.Engram):
         scale_words = num_tokens * (-(-(cols * blocks) // 4))
         if scale_words * 4 > scale_bytes:
             self._host_scale_buf[scale_bytes : scale_words * 4].fill_(_INVALID_SCALE)
-        # On TorchTPU, `copy_()` into a slice/view of a materialized device
-        # tensor allocates a fresh buffer per call instead of overwriting in
-        # place, whereas a whole-tensor `copy_()` overwrites in place (see
-        # `deepseek_v4/model.py:_HostStagedParams`). Allocate and reuse one
-        # exact-size whole 1-D packed device tensor per `num_tokens` bucket
-        # so each Engram layer issues a single fast 1-D H2D transfer, while
-        # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
-        # `torch.compile` (`create_concrete_args`).
+        # Cache exact-size Tensor objects and compiler views. CPU->TPU copy_
+        # can replace the underlying PJRT buffer even for a whole-tensor write.
         host_words = self._host_packed_buf.view(torch.int32)
         host_words[raw_words : raw_words + scale_words].copy_(
             self._host_scale_buf[: scale_words * 4].view(torch.int32)
         )
-        staged = self._staged_tensors(num_tokens)
-        staged.copy_(host_words[: raw_words + scale_words])
+        packed = host_words[: raw_words + scale_words]
+        if self._prepared_uploads is None:
+            self._staged_tensors(num_tokens).copy_(packed)
+        else:
+            from .host_transfer import PreparedEngramUpload
+
+            upload = self._prepared_uploads.get(num_tokens)
+            if upload is None:
+                assert self._staged_raw is not None
+                upload = PreparedEngramUpload(packed.numel(), self._staged_raw.device)
+                self._prepared_uploads[num_tokens] = upload
+                self._staged_by_tokens[num_tokens] = upload.device
+                self._staged_views_by_tokens.pop(num_tokens, None)
+            upload.copy_from(packed)
         self._active_raw = self._staged_views(num_tokens)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
