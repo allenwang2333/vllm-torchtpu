@@ -376,7 +376,7 @@ def test_parity_runs_stock_then_kernel_and_serves_the_kernel(make, monkeypatch, 
     assert all(syncs[n] is None for _, n in events)
     assert all(torch.equal(t, b + 5) for t, b in zip(mk.caches.arrays, before))
     err = capsys.readouterr().err
-    steps = re.findall(r"parity (\S+) #(\d) step \d+ mk_q3_t16 rows 6 stock_mk: "
+    steps = re.findall(r"parity (\S+) #(\d) step \d+ mk_q3_t16 ctx 0 rows 6 stock_mk: "
                        r"rel_l2 max (\S+) ", err)  # fmt: skip
     norm = np.sqrt(2**2 + 2**2 + 0.5**2)  # the stock row (id 2, position 2)
     assert [(p, n) for p, n, _ in steps] == [

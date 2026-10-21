@@ -1338,6 +1338,7 @@ class DSv4Megakernel:
         # False until the runner's warm-up is over (`mark_serving`)
         self.serving = False
         self._local_real_rows = 0  # this rank's scheduled rows (classify)
+        self._local_ctx = 0  # and its longest request context
         self._nonfinite = (
             SD.NonfiniteStats(rank, spec.q, self.device, stats_period_s, self._compile)
             if nonfinite_stats
@@ -1616,6 +1617,7 @@ class DSv4Megakernel:
         local = self._classify(runner, scheduler_output, num_reqs, num_decode,
                                num_windowed, num_chunks, scheduled)  # fmt: skip
         self._local_real_rows = scheduler_output.total_num_scheduled_tokens
+        self._local_ctx = local.ctx
         if self._trace_left > 0:
             self._trace_local = (
                 f"batch_reqs={num_reqs} scheduled_reqs={scheduled} "
@@ -1795,7 +1797,7 @@ class DSv4Megakernel:
         if not decision.idle:
             self._parity.compare(
                 self.phase,
-                f"step {self.trace.step} {decision.bucket.key}",
+                f"step {self.trace.step} {decision.bucket.key} ctx {self._local_ctx}",
                 outs[0],
                 outs[1],
                 self._local_real_rows,
