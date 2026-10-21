@@ -28,32 +28,6 @@ def gemma_norm(x, weight, norm_eps):
     )
 
 
-def _fma(a, b, c):
-    """Single BF16 rounding of BF16-valued a*b+c in the finite normal domain.
-
-    BF16 products have at most16 significant bits and are exact in FP32 when
-    they neither underflow nor overflow. TwoSum recovers the addition residual;
-    only an FP32 midpoint can double-round incorrectly to BF16. Preserve both
-    barriers so reassociation cannot erase that residual. This is not a general
-    FP32 FMA or an IEEE gradual-underflow emulation.
-    """
-    product = a.astype(jnp.float32) * b.astype(jnp.float32)
-    c = c.astype(jnp.float32)
-    high = jax.lax.optimization_barrier(product + c)
-    z = jax.lax.optimization_barrier(high - product)
-    residual = (product - (high - z)) + (c - z)
-    bits = jax.lax.bitcast_convert_type(high, jnp.uint32)
-    tie = (bits & jnp.uint32(0xFFFF)) == jnp.uint32(0x8000)
-    adjusted = jnp.where(
-        tie & (residual > 0),
-        jnp.nextafter(high, jnp.float32(jnp.inf)),
-        jnp.where(
-            tie & (residual < 0), jnp.nextafter(high, jnp.float32(-jnp.inf)), high
-        ),
-    )
-    return bf16(adjusted)
-
-
 def _rope_parts(x, positions, cache, rotary_dim):
     # Gather complete aligned rows before slicing the logical cos/sin values.
     # Folding the slice into the gather lowers to serial partial-row reads;
@@ -79,18 +53,12 @@ def main_rope(x, positions, cache, rotary_dim):
 
 
 def index_rope(x, positions, cache, rotary_dim):
-    """Indexer contract: B(a*c-B(b*s)), B(a*s+B(b*c)).
-
-    These observable BF16 inner products differ from promoted main RoPE.
-    Reassociation changes the intermediate rounding. The explicit formula
-    above specifies this implementation; do not infer a universal GPU fusion
-    order from the unfused source expression.
-    """
+    """FP32 outer arithmetic with BF16 inner products and BF16 outputs."""
     a, b, c, s = _rope_parts(x, positions, cache, rotary_dim)
     return jnp.concatenate(
         [
-            _fma(a, c, -bf16(b * s)),
-            _fma(a, s, bf16(b * c)),
+            bf16(a * c - bf16(b * s)),
+            bf16(a * s + bf16(b * c)),
             x[..., rotary_dim:],
         ],
         -1,

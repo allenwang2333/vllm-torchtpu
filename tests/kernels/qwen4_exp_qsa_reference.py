@@ -79,7 +79,7 @@ def main_rope(x, positions, cache):
 
 
 def index_rope(x, positions, cache):
-    """Frozen Triton3.8 contract B(a*c-B(b*s)), B(a*s+B(b*c))."""
+    """Historical compensated index-RoPE comparison reference."""
     a, b, c, s = _rope_parts(x, positions, cache)
     return jnp.concatenate(
         [

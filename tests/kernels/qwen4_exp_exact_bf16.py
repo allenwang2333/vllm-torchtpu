@@ -15,6 +15,8 @@
 
 import random
 
+import numpy as np
+
 
 def decode(bits):
     sign = -1 if bits & 0x8000 else 1
@@ -141,3 +143,46 @@ def rope_bits(row, *, target):
     else:
         raise ValueError(target)
     return first, second
+
+
+def fp32_value(bits):
+    """Decode BF16 as a NumPy FP32 value without production rounding code."""
+    return np.asarray(int(bits) << 16, dtype=np.uint32).view(np.float32)[()]
+
+
+def bf16_bits_from_fp32(value):
+    """Round a finite FP32 value via its integer significand, ties to even."""
+    bits = int(np.asarray(value, dtype=np.float32).view(np.uint32))
+    sign = -1 if bits >> 31 else 1
+    exponent, fraction = (bits >> 23) & 255, bits & ((1 << 23) - 1)
+    if exponent == 255:
+        raise ValueError("oracle expects finite FP32 intermediates")
+    if not exponent and not fraction:
+        return (bits >> 16) & 0x8000
+    return round_bits(
+        sign * (fraction if exponent == 0 else (1 << 23) + fraction),
+        -149 if exponent == 0 else exponent - 150,
+    )
+
+
+def fp32_multiply_add_bits(a, b, c):
+    """Separate NumPy FP32 multiply and add, followed by integer BF16 RNE."""
+    product = np.multiply(fp32_value(a), fp32_value(b), dtype=np.float32)
+    total = np.add(product, fp32_value(c), dtype=np.float32)
+    return bf16_bits_from_fp32(total)
+
+
+def fp32_rope_bits(row):
+    """Independent index-RoPE operation order; no fused single-round oracle."""
+    a, b, c, s = row
+    # Inner products round to BF16 before the separate outer FP32 operations.
+    bs = bf16_bits_from_fp32(
+        np.multiply(fp32_value(b), fp32_value(s), dtype=np.float32)
+    )
+    bc = bf16_bits_from_fp32(
+        np.multiply(fp32_value(b), fp32_value(c), dtype=np.float32)
+    )
+    return (
+        fp32_multiply_add_bits(a, c, bs ^ 0x8000),
+        fp32_multiply_add_bits(a, s, bc),
+    )
