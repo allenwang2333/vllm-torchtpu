@@ -652,7 +652,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
-        a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
+        hist_merge = envs.TPU_DCP_INDEXER_HIST_MERGE
+        a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE and not hist_merge
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
@@ -745,6 +746,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                hist_merge=hist_merge,
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
                 **overlap,
