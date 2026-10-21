@@ -29,6 +29,14 @@ def gemma_norm(x, weight, norm_eps):
 
 
 def _fma(a, b, c):
+    """Single BF16 rounding of BF16-valued a*b+c in the finite normal domain.
+
+    BF16 products have at most16 significant bits and are exact in FP32 when
+    they neither underflow nor overflow. TwoSum recovers the addition residual;
+    only an FP32 midpoint can double-round incorrectly to BF16. Preserve both
+    barriers so reassociation cannot erase that residual. This is not a general
+    FP32 FMA or an IEEE gradual-underflow emulation.
+    """
     product = a.astype(jnp.float32) * b.astype(jnp.float32)
     c = c.astype(jnp.float32)
     high = jax.lax.optimization_barrier(product + c)
@@ -71,7 +79,12 @@ def main_rope(x, positions, cache, rotary_dim):
 
 
 def index_rope(x, positions, cache, rotary_dim):
-    """Frozen Triton3.8 contract B(a*c-B(b*s)), B(a*s+B(b*c))."""
+    """Indexer contract: B(a*c-B(b*s)), B(a*s+B(b*c)).
+
+    These observable BF16 inner products differ from promoted main RoPE.
+    Triton fusion order is target-dependent; this matches the pinned sm80
+    indexer lowering, not every GPU target's reassociation of the same source.
+    """
     a, b, c, s = _rope_parts(x, positions, cache, rotary_dim)
     return jnp.concatenate(
         [
