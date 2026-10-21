@@ -187,6 +187,10 @@ entry barriers; operator-only measurements are explicitly identified.
 | One 49152-key DMA window with a larger VMEM budget | Full-union scorer/selection 0.436 to 0.450 ms, bit-exact | Retain 24576-key DMA windows |
 | MoE routing rank windows of 32, 16 or 8 pairs | Whole EP8 layer 0.5125 to 0.5129–0.5139 ms, bit-exact | Retain existing rule |
 | SparseCore gather writeback overlap and 1024 rows/subcore | Isolated gather 0.705 to 0.684 ms, bit-exact | Small synthetic gain; no serving validation or production change |
+| mHC 32-token tiles or compiler-managed gate windows | With RMSNorm: 18.845 to 23.241 us (32-token/HBM), or 21.184 us (96-token/compiler), bit-exact | Retain 96-token/HBM configuration |
+| mHC 288-token tile with the original 96-row projection chunks | With RMSNorm: 18.695 to 20.777 us, all five outputs bit-exact | Reject |
+| Compact MoE gate/up staging with three gate/up slots and two down slots | Biased whole EP8 layer: 0.50020 to 0.50150 ms; uniform: 0.45972 to 0.45887 ms, bit-exact | No meaningful gain |
+| Packed-word FP4-to-FP8 expansion | Biased whole EP8 layer: 0.50085 to 4.18015 ms; uniform: 0.45934 to 4.07370 ms, bit-exact | Reject |
 
 Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
 above ran in `exp-qg29pd6unq` after its serving process exited. The initial
@@ -198,6 +202,31 @@ Increasing SparseCore gather read concurrency from eight to sixteen did not
 complete within 300 seconds after the baseline variant. Only that benchmark
 process was terminated; this does not establish the cause of the stall.
 The subsequent writeback-overlap comparison retained eight reads.
+
+The mHC and asymmetric MoE experiments ran in `exp-1yxqyt6ap6`. A single
+288-row mHC projection initially changed only the FP32 gates by at most
+2.384e-7; retaining three 96-row projection chunks restored bit equality but
+did not improve performance. The asymmetric MoE kept capacity 128 and the
+automatic height ladder. Compact gate/up staging and accounting for the actual
+256-column widened blocks required 62,144,512 bytes against a 65,766,686-byte
+VMEM budget; compilation and both whole-layer output checks passed. The biased
+case used `sqrtsoftplus`, correction bias and routed scale 1.5 at seed 1030;
+the uniform softmax case used seed 1031. The packed-word FP4 expansion used the
+same two input distributions and preserved signed zero, but regressed both
+whole-layer device timings by more than eight times.
+
+A further FP8 candidate-score diagnostic in that experiment applied recovered
+query/key scales before the head reduction. It still changed the selected ID
+arrays at compute tiles 2048, 4096 and 8192. Those candidates were excluded from
+timing and remain outside the production path.
+
+A separate 192-by-8192 dot diagnostic confirmed bit-exact query/key
+round-trips through the FP8 cache and power-of-two scales. Both XLA and Pallas
+FP8 dots nevertheless differed from their BF16-input references, while XLA
+and Pallas agreed for each input type. `highest` precision did not remove the
+difference, and this pinned TPU runtime rejected `ANY_F8_ANY_F8_F32` as
+unsupported. This rules out cache loss as the cause in that diagnostic; it
+does not establish the backend's internal arithmetic.
 
 Dense FP8 GEMM fusion was measured in `exp-sh81ry5nm6` at commit `0e742279`,
 with the same pinned TPU runtime and seed 1028. All 57 baseline/candidate cases
