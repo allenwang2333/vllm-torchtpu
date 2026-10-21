@@ -1047,6 +1047,7 @@ def reference_step(
 
     half = g.ROT // 2
     inv = 1.0 / (g.theta ** (jnp.arange(half, dtype=F32)[None, :] * 2.0 / g.ROT))
+    rope_round = not ex.resolve_tiles(g).block(GQABlock.name).rope_fp32
     expand = vh // kh
 
     def branch_slice(arr: jax.Array, lyr: int, ord_idx: int) -> jax.Array:
@@ -1098,8 +1099,15 @@ def reference_step(
                         zero_centered=g.zero_centered_norm,
                     )
                     vb = y[b : b + 1, koff + HD : koff + 2 * HD]
-                    qb = rnd(rope_partial(qb, cos, sin, g.ROT) * (HD**-0.5))
-                    kb = rope_partial(kb, cos, sin, g.ROT)
+                    qb = rnd(
+                        rope_partial(
+                            qb, cos, sin, g.ROT, round_intermediates=rope_round
+                        )
+                        * (HD**-0.5)
+                    )
+                    kb = rope_partial(
+                        kb, cos, sin, g.ROT, round_intermediates=rope_round
+                    )
                     if use_paged_kv:
                         kb = jnp.clip(kb, -448.0, 448.0).astype(FP8).astype(F32)
                         vb = jnp.clip(vb, -448.0, 448.0).astype(FP8).astype(F32)

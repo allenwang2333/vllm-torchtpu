@@ -75,6 +75,7 @@ class GQAParams:
     eps: float
     theta: float
     zero_centered_norm: bool
+    rope_fp32: bool = False
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -96,6 +97,7 @@ class GQATunables:
     pair_kv: bool = False  # Pair KV attention items to overlap KV DMA + softmax
     gqa_qv: bool = False  # Head-batched Q/K norm+RoPE and 128-lane Q/O staging
     gq_pack: bool = False  # Pack G*nh Q heads into 16-row MXU tiles (needs gqa_qv)
+    rope_fp32: bool = False  # Keep RoPE intermediate products and sums in float32
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -111,6 +113,7 @@ class GQATunables:
         "pair_kv": "exact",  # paired KV items (TPU bisect, CPU test)
         "gqa_qv": "exact",  # head-batched Q/K norm + RoPE (TPU bisect, CPU test)
         "gq_pack": "approx",  # packed G*nh query tiles
+        "rope_fp32": "approx",  # float32 vs bfloat16-rounded RoPE intermediates
     }
 
 
@@ -244,4 +247,5 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         eps=g.eps,
         theta=g.theta,
         zero_centered_norm=bool(g.zero_centered_norm),
+        rope_fp32=bool(tt.rope_fp32),
     )

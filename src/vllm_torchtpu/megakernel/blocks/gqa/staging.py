@@ -33,7 +33,9 @@ def rms_zc(ap: GQAParams, x_in: Any, w_in: Any) -> Any:
 
 
 def rope(ap: GQAParams, x_in: Any, cos_in: Any, sin_in: Any) -> Any:
-    return rope_partial(x_in, cos_in, sin_in, ap.ROT)
+    return rope_partial(
+        x_in, cos_in, sin_in, ap.ROT, round_intermediates=not ap.rope_fp32
+    )
 
 
 def att_q(cx: GQAEmit, slot: Any) -> tuple[Any, Any, int, int, Any]:

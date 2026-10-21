@@ -76,28 +76,47 @@ def rms_zc(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
 
 
 def rope_partial(
-    x: jax.Array, cos: jax.Array, sin: jax.Array, rot_dim: int
+    x: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    rot_dim: int,
+    *,
+    round_intermediates: bool = True,
 ) -> jax.Array:
     """Partial rotary positional embedding on the leading `rot_dim` columns.
 
-    Intermediate products and sums are rounded through bfloat16 (`rnd`) to
-    match the op-by-op bfloat16 rounding of the reference rotary embedding.
+    When `round_intermediates` is `True` (default), intermediate products and
+    sums are rounded through bfloat16 (`rnd`) to mirror the op-by-op bfloat16
+    rounding of the reference rotary embedding. When `False`, intermediate
+    products and sums stay in float32.
     """
     half = rot_dim // 2
     x1, x2, rest = x[:, :half], x[:, half:rot_dim], x[:, rot_dim:]
-    return jnp.concatenate(
-        (
-            x1 * cos - x2 * sin,
-            x2 * cos + x1 * sin,
-            rest,
-        ),
-        axis=-1,
-    )
+    if round_intermediates:
+        y1 = rnd(rnd(x1 * cos) - rnd(x2 * sin))
+        y2 = rnd(rnd(x2 * cos) + rnd(x1 * sin))
+    else:
+        y1 = x1 * cos - x2 * sin
+        y2 = x2 * cos + x1 * sin
+    return jnp.concatenate((y1, y2, rest), axis=-1)
 
 
-def silu_mul(gate: jax.Array, up: jax.Array) -> jax.Array:
-    """SwiGLU activation `silu(gate) * up` rounded to BF16."""
-    return (jax.nn.silu(gate) * up).astype(BF16)
+def silu_mul(
+    gate: jax.Array,
+    up: jax.Array,
+    *,
+    round_intermediates: bool = True,
+) -> jax.Array:
+    """SwiGLU activation `silu(gate) * up` rounded to BF16.
+
+    When `round_intermediates` is `True` (default), `silu(gate)` is rounded
+    through bfloat16 (`rnd`) before multiplying by `up` to mirror the op-by-op
+    bfloat16 rounding of `F.silu(gate) * up` evaluated on bfloat16 tensors.
+    When `False`, the product is accumulated in float32 before casting to BF16.
+    Standalone/reference helper; MoE kernels emit their SwiGLU activation inline.
+    """
+    act = rnd(jax.nn.silu(gate)) if round_intermediates else jax.nn.silu(gate)
+    return (act * up).astype(BF16)
 
 
 def scope_fn(enabled: bool):

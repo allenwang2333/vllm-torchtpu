@@ -525,3 +525,41 @@ def test_m5_hier3_butterfly_all_reduce(R_test: int):
     out_h0, _ = step_h0(*args_r)
     out_h3, _ = step_h3(*args_r)
     assert jnp.allclose(out_h3.astype(F32), out_h0.astype(F32), atol=1e-2, rtol=1e-2)
+
+
+def test_gqa_rope_fp32_ref_vs_kernel_parity():
+    """Verify `GQATunables.rope_fp32=True` matches `reference_step` in the same mode."""
+    mesh1 = Mesh(jax.devices("cpu")[:1], ("tp",))
+    g = qwen35.Qwen35Geometry(**dict(_FLAG_GEOM, H=256))
+    tiles_def = dataclasses.replace(TINY_TILES, bank=256 << 10).with_blocks(
+        {"gqa": {"kv_blk": 128, "nkv": 3, "rope_fp32": False}}
+    )
+    tiles_fp32 = tiles_def.with_blocks({"gqa": {"rope_fp32": True}})
+    ex_def = ExecSpec(B=2, T=1, R=1, ctx=256, tiles=tiles_def, interpret=True)
+    ex_fp32 = dataclasses.replace(ex_def, tiles=tiles_fp32)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.PRNGKey(509), g, ex_fp32
+    )
+    ref_hid_def, ref_st_def = qwen35.reference_step(g, ex_def, pos, hid_l, w_l, st_l)
+    ref_hid, ref_st = qwen35.reference_step(g, ex_fp32, pos, hid_l, w_l, st_l)
+    assert not jnp.array_equal(ref_st["kc"], ref_st_def["kc"])
+    args = qwen35.pack_inputs(pos, hid_l, w_l, st_l, g, ex_fp32, mesh=mesh1)
+    step_def, _ = qwen35.make_step(mesh1, g, ex_def)
+    step, info = qwen35.make_step(mesh1, g, ex_fp32)
+    assert info["plan"].block_params["gqa"].rope_fp32 is True
+    _, out_st_def = step_def(*args)
+    out_hid, out_st = step(*args)
+    assert not jnp.array_equal(out_st["kc"], out_st_def["kc"])
+    assert jnp.allclose(
+        out_hid[: ex_fp32.B].astype(F32),
+        ref_hid.astype(F32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    assert jnp.array_equal(out_st["kc"][0], ref_st["kc"][0, 0])
+    assert jnp.allclose(
+        out_st["kc"].astype(F32), ref_st["kc"][0].astype(F32), atol=1e-2, rtol=1e-2
+    )
+    assert jnp.allclose(
+        out_st["vc"].astype(F32), ref_st["vc"][0].astype(F32), atol=1e-2, rtol=1e-2
+    )
