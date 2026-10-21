@@ -1243,6 +1243,7 @@ def _effective_row_lengths(
     cp_size: int = 1,
     interleave_c: int = 1,
     kv_window: tuple[jax.Array, jax.Array] | None = None,
+    strict_causal: bool = False,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
@@ -1260,7 +1261,11 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if strict_causal:
+        # Only the groups complete at this token's position.
+        visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
+    else:
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     if kv_window is not None:
         win_start, win_len = kv_window
@@ -1287,6 +1292,7 @@ def _effective_row_lengths(
         "return_scores",
         "uniform_q_len",
         "split_mixed_blocks",
+        "strict_causal",
         "sc_topk_one_launch",
         "sc_topk_coop_max_rows",
         "kv_split",
@@ -1320,6 +1326,7 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     split_mixed_blocks: bool = False,
+    strict_causal: bool = False,
     sc_topk_one_launch: bool = False,
     sc_topk_coop_max_rows: int = 0,
     kv_split: int = 1,
@@ -1400,6 +1407,12 @@ def streamindex_topk(
         compressed positions (`kv_split_window`) of a cache every rank holds
         whole. Returns that share's top-k as global columns, with scores;
         `merge_kv_split_topk` over all ranks' results is the unsplit top-k.
+      strict_causal: a token selects only among the compressed groups that are
+        complete at its own position, (pos + 1) // compression_ratio of them.
+        False keeps the previous bound, pos // compression_ratio + 1, under
+        which a multi-token forward (chunked prefill, speculative verify) lets
+        a token see its own group's entry when that group completes later in
+        the same forward.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1843,6 +1856,7 @@ def streamindex_topk(
             cp_size=cp_size,
             interleave_c=interleave_c,
             kv_window=kv_window,
+            strict_causal=strict_causal,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1988,7 +2002,9 @@ def streamindex_topk(
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
+            (q_abs_pos + 1) // compression_ratio - 1
+            if strict_causal
+            else q_abs_pos // compression_ratio,
         )
         max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]

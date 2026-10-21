@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
+    TPU_STREAMIDX_STRICT_CAUSAL: bool = False
     TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
     TPU_DSV4_SC_TOPK_ONE_LAUNCH: bool = False
     TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
@@ -955,6 +956,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlaps the second piece's scoring without scoring any extra q block.
     # Ignored when TPU_STREAMIDX_CHUNK_TOKENS chunks the call.
     "TPU_STREAMIDX_SPLIT_MIXED": env_bool("TPU_STREAMIDX_SPLIT_MIXED"),
+    # Indexer rows see only the compressed groups complete at their own
+    # position, (pos + 1) // ratio, in multi-token forwards.
+    "TPU_STREAMIDX_STRICT_CAUSAL": env_bool("TPU_STREAMIDX_STRICT_CAUSAL"),
     # Smallest token bucket TPU_STREAMIDX_SPLIT_MIXED splits. Below it a batch
     # without a mixed sequence would score and top-k an empty second piece.
     "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": env_int(
