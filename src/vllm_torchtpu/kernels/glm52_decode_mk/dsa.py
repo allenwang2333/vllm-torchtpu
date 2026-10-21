@@ -17,6 +17,15 @@ geometry and the exchange protocol are unchanged. Changes for the composed kerne
   * fault controls added for the composed kernel's oracle: causal_mask, page_off_by_one, kv_read_before_write, topk_swap,
     scale_twice (WHITEBOARD.v1 §11.2), and an F-DELAY hook `E.delay(group, round)` in the count exchange.
 
+Stage-B lane L1 (WHITEBOARD.v3 §6.1; branch hning/glm52-decode-mk-b-l1-threshold), each a Tiles flag whose default
+is the stage-A program (the default build lowers to the identical Mosaic module):
+  * thr_unroll  (L1-U) the threshold count loop takes thr_unroll tiles per iteration (per-splitter tree sums; exact);
+  * thr_merge   (L1-M) one count exchange per round: every 8-row group's counts in ONE (8, 128) vreg, group g in
+                lanes [32 g, 32 g + K) -- 15 x 4 KiB per round instead of NG x 15 x 4 KiB; same digits (exact);
+  * thr_switch >= pool compiles only the 4-bit body (L1-W: 8 rounds at every Sigma np);
+  * rec_thr / thr_given / union_given: timing-only backing arms (record b_row T / P / allowance and the resolved
+    union table in one build; load them and skip threshold() [and the unions] in another; outputs bit-identical).
+
 The original module docstring follows.
 
 Batched DSA core for the glm5_mk_dcp megakernel (G1 design: kernel_work/glm52-decode-mk/gates/g1/design.md).
@@ -272,6 +281,16 @@ def make(E):
     UNR = max(1, tiles.gunroll)
     MAXP_OK = E.max_pages <= 256
     SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
+    THR_U = max(1, int(tiles.thr_unroll))       # L1-U: count-loop tiles per iteration (1 = stage A)
+    MSLOT = 32                                  # L1-M: lanes per group in the merged count payload
+    # L1-M dispatch: merged exchange when the wave's rank-0 page count <= thr_merge (0: never = stage A; >= POOL:
+    # always, the per-group form is not compiled). L1-W: thr_switch >= POOL compiles only the 4-bit body.
+    MERGE = "never" if tiles.thr_merge <= 0 else ("always" if tiles.thr_merge >= POOL else "dispatch")
+    if MERGE != "never":
+        assert NG * MSLOT <= 128, ("merged count payload holds <= 4 groups (TMAX <= 32)", NG)
+    ONLY4 = tiles.thr_switch >= POOL
+    THR_GIVEN = bool(tiles.thr_given) or bool(tiles.union_given)   # timing-only backing arms (WHITEBOARD.v3 §6.1)
+    UNION_GIVEN = bool(tiles.union_given)
 
     def T_():
         return E.scal[0]
@@ -560,21 +579,16 @@ def make(E):
         integers <= 256, f32 accumulation), on the MXU instead of XLU reduces + converts."""
         return lax.dot_general(a.astype(BF16), ones_bf, NN, preferred_element_type=F32).astype(I32)
 
-    def threshold(DW, rt0, rt1, g0, g1, after_group):
-        """Exact distributed radix threshold for the radix rows of groups [g0, g1) restricted to rows
-        [rt0, rt1) (the current wave); writes per-row T / P / allowance into b_row (rows of the wave).
-        after_group(g): called once group g's rows are final (the union of requests ending in g)."""
-        NR = 32 // DW
+    def thr_parts(DW, rt0, rt1):
+        """The radix threshold's per-group pieces for digit width DW over the rows [rt0, rt1) of the current wave:
+        count_payload (count, no send), count_send (stage A: count + send group gi), finish (stage A: wait group gi's
+        exchange + decide) and finish_from (L1-M: decide group gi from already-received payloads, lane offset off)."""
         NK = (1 << DW) - 1
         KMAX = NK + 1                                    # last round: k = 0 .. 2^DW
 
-        def init(gi, c):
-            r8 = pl.multiple_of(gi * 8, 8)
-            row[1, pl.ds(r8, 8), :] = jnp.zeros((8, 128), I32)
-            return c
-        lax.fori_loop(g0, g1, init, 0)
-
-        def count_send(gi, r, last):
+        def count_payload(gi, r, last, off=None, payload0=None):
+            """Group gi's round-r counts: row (sublane) x lane k (+ off) = #(key >= splitter k) on this rank.
+            Returns (payload, parity) -- the parity computed where stage A computed it (identical program)."""
             sh = 32 - DW * (r + 1)
             par = r % 2
             ks = list(range(0, KMAX + 1)) if last else list(range(1, NK + 1))
@@ -598,7 +612,23 @@ def make(E):
                     tile = scr["b_keys"][pbase + i]
                     return tuple(a + (tile >= c_).astype(I32) for a, c_ in zip(accs, cs))
                 z = jnp.zeros((8, 128), I32)
-                accs = lax.fori_loop(0, npb, tbody, tuple(z for _ in ks))
+                if THR_U == 1:                   # stage A: one tile per iteration
+                    accs = lax.fori_loop(0, npb, tbody, tuple(z for _ in ks))
+                else:                            # L1-U: THR_U tiles per iteration, per-splitter tree sum (exact)
+                    def tbodyu(i, accs):
+                        base = pbase + i * THR_U
+                        tl = [scr["b_keys"][base + u] for u in range(THR_U)]
+                        outs = []
+                        for a, c_ in zip(accs, cs):
+                            ms = [(t_ >= c_).astype(I32) for t_ in tl]
+                            while len(ms) > 1:
+                                ms = [ms[j] + ms[j + 1] for j in range(0, len(ms) - 1, 2)] + (
+                                    [ms[-1]] if len(ms) % 2 else [])
+                            outs.append(a + ms[0])
+                        return tuple(outs)
+                    nfull = npb // THR_U
+                    accs = lax.fori_loop(0, nfull, tbodyu, tuple(z for _ in ks))
+                    accs = lax.fori_loop(nfull * THR_U, npb, tbody, accs)
                 mb = jnp.zeros((8, 128), I32)
                 if MAXP_OK:                      # all lane sums in one MXU pass (weights pushed once)
                     sums = lane_sum_small(jnp.concatenate(list(accs), axis=0))      # [8 * len(ks), 128]
@@ -607,36 +637,29 @@ def make(E):
                     tots = [jnp.sum(a, axis=1, keepdims=True) for a in accs]
                 for k, tot in zip(ks, tots):
                     tot = tot + pltpu.roll(tot, 4, 0)
-                    mb = jnp.where(lane8 == k, tot, mb)
+                    mb = jnp.where(lane8 == (k if off is None else k + off), tot, mb)
                 o = t0 - 8 * gi
                 rolled = pltpu.roll(mb, (o + 8) % 8, 0)
                 m = (sub8 >= o) & (sub8 < o + jnp.minimum(nq, 4))
+                if off is not None:              # merged payload: leave the other groups' lane slots alone
+                    m = m & (lane8 >= off) & (lane8 < off + MSLOT)
                 return jnp.where(m, rolled, payload)
-            payload = lax.fori_loop(scr["b_grp"][0, gi], scr["b_grp"][1, gi], per_req, jnp.zeros((8, 128), I32))
+            return lax.fori_loop(scr["b_grp"][0, gi], scr["b_grp"][1, gi], per_req,
+                                 jnp.zeros((8, 128), I32) if payload0 is None else payload0), par
+
+        def count_send(gi, r, last):
+            payload, par = count_payload(gi, r, last)
             scr["b_csend"][gi, par] = payload
             scr["b_crecv"][gi, par, me] = payload
             if getattr(E, "delay", None) is not None:
                 E.delay(gi, r)
             cx_start(gi, par)
 
-        def finish(gi, r, last):
-            sh = 32 - DW * (r + 1)
-            par = r % 2
-            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
-            if early:
-                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
-            cx_finish(gi, par)
-            if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
-                for s_ in range(R):
-                    @pl.when(me != s_)
-                    def _(s_=s_):
-                        scr["b_crecv"][gi, par, s_] = scr["b_crecv"][gi, par, me]
-            if not early:
-                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
-            Gs = crecv[0]
-            for s_ in range(1, R):
-                Gs = Gs + crecv[s_]
-            ge = (Gs >= KT) & (lane8 >= 1) & (lane8 <= NK)
+        def decide(gi, sh, last, crecv, Gs, off):
+            """Digit (and on the last round T / P / allowance) of group gi's rows from the summed counts Gs and the
+            per-rank payloads crecv, whose lanes [off, off + K) are this group's (sh: the round's digit shift)."""
+            lo_, hi_ = (1, NK) if off is None else (1 + off, NK + off)
+            ge = (Gs >= KT) & (lane8 >= lo_) & (lane8 <= hi_)
             d = jnp.sum(ge.astype(I32), axis=1, keepdims=True)                     # (8, 1) digit
             if fault == "digit" or (fault == "f_thr2" and DW == 2):
                 d = jnp.minimum(d + 1, NK)
@@ -649,11 +672,12 @@ def make(E):
                 return
             Tu = pref[:, 0:1] | d
             Ts = Tu ^ INT_MIN
+            dl = d if off is None else d + off
             ge_s, gt_s = [], []
             for s_ in range(R):
                 P_ = crecv[s_]
-                ge_s.append(jnp.sum(jnp.where(lane8 == d, P_, 0), axis=1, keepdims=True))
-                gt_s.append(jnp.sum(jnp.where(lane8 == d + 1, P_, 0), axis=1, keepdims=True))
+                ge_s.append(jnp.sum(jnp.where(lane8 == dl, P_, 0), axis=1, keepdims=True))
+                gt_s.append(jnp.sum(jnp.where(lane8 == dl + 1, P_, 0), axis=1, keepdims=True))
             n_gt = gt_s[0]
             for x in gt_s[1:]:
                 n_gt = n_gt + x
@@ -676,6 +700,40 @@ def make(E):
             for k_, v_ in ((2, T_f), (3, P_f), (4, a)):
                 old = row[k_, pl.ds(r8, 8), :]
                 row[k_, pl.ds(r8, 8), :] = jnp.where(inw, jnp.broadcast_to(v_, (8, 128)), old)
+
+        def finish(gi, r, last):
+            sh = 32 - DW * (r + 1)
+            par = r % 2
+            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
+            if early:
+                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
+            cx_finish(gi, par)
+            if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
+                for s_ in range(R):
+                    @pl.when(me != s_)
+                    def _(s_=s_):
+                        scr["b_crecv"][gi, par, s_] = scr["b_crecv"][gi, par, me]
+            if not early:
+                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
+            Gs = crecv[0]
+            for s_ in range(1, R):
+                Gs = Gs + crecv[s_]
+            decide(gi, sh, last, crecv, Gs, None)
+        return dict(NR=32 // DW, NK=NK, KMAX=KMAX, count_payload=count_payload, count_send=count_send,
+                    finish=finish, decide=decide)
+
+    def threshold(DW, rt0, rt1, g0, g1, after_group):
+        """Exact distributed radix threshold for the radix rows of groups [g0, g1) restricted to rows
+        [rt0, rt1) (the current wave); writes per-row T / P / allowance into b_row (rows of the wave).
+        after_group(g): called once group g's rows are final (the union of requests ending in g)."""
+        cp = thr_parts(DW, rt0, rt1)
+        NR, count_send, finish = cp["NR"], cp["count_send"], cp["finish"]
+
+        def init(gi, c):
+            r8 = pl.multiple_of(gi * 8, 8)
+            row[1, pl.ds(r8, 8), :] = jnp.zeros((8, 128), I32)
+            return c
+        lax.fori_loop(g0, g1, init, 0)
 
         def rbody(r, c):
             def gbody(gi, c2):
@@ -700,6 +758,63 @@ def make(E):
             after_group(gi)                      # overlaps the union with later groups' exchanges
             return c
         lax.fori_loop(g0, g1, gfin, 0)
+
+    def threshold_merged(DW, rt0, rt1, g0, g1, after_group):
+        """L1-M: threshold() with ONE count exchange per round. Every group's counts travel in one (8, 128) vreg,
+        group gi in lanes [MSLOT * gi, MSLOT * gi + K): a round sends 15 x 4 KiB and waits 2 x 15 semaphores,
+        instead of NG times that. Same counts, same digits, same T / P / allowance (exact)."""
+        cp = thr_parts(DW, rt0, rt1)
+        NR, KMAX = cp["NR"], cp["KMAX"]
+        assert NG * MSLOT <= 128 and KMAX + 1 <= MSLOT, (NG, MSLOT, DW)
+
+        def init(gi, c):
+            r8 = pl.multiple_of(gi * 8, 8)
+            row[1, pl.ds(r8, 8), :] = jnp.zeros((8, 128), I32)
+            return c
+        lax.fori_loop(g0, g1, init, 0)
+
+        def round_(r, last):
+            sh = 32 - DW * (r + 1)
+            par = r % 2
+
+            def gcount(gi, merged):
+                return cp["count_payload"](gi, r, last, off=MSLOT * gi, payload0=merged)[0]
+            merged = lax.fori_loop(g0, g1, gcount, jnp.zeros((8, 128), I32))
+            scr["b_csend"][0, par] = merged
+            scr["b_crecv"][0, par, me] = merged
+            if getattr(E, "delay", None) is not None:
+                E.delay(0, r)
+            cx_start(0, par)
+            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
+            if early:
+                crecv = [scr["b_crecv"][0, par, s_] for s_ in range(R)]
+            cx_finish(0, par)
+            if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
+                for s_ in range(R):
+                    @pl.when(me != s_)
+                    def _(s_=s_):
+                        scr["b_crecv"][0, par, s_] = scr["b_crecv"][0, par, me]
+            if not early:
+                crecv = [scr["b_crecv"][0, par, s_] for s_ in range(R)]
+            Gs = crecv[0]
+            for s_ in range(1, R):
+                Gs = Gs + crecv[s_]
+
+            def gfin(gi, c):
+                cp["decide"](gi, sh, last, crecv, Gs, MSLOT * gi)
+                return c
+            lax.fori_loop(g0, g1, gfin, 0)
+            if last:                             # unions after every group's rows are final (no exchange left)
+                def gu(gi, c):
+                    after_group(gi)
+                    return c
+                lax.fori_loop(g0, g1, gu, 0)
+
+        def rbody(r, c):
+            round_(r, False)
+            return c
+        lax.fori_loop(0, NR - 1, rbody, 0)
+        round_(NR - 1, True)
 
     def set_short(rt0, rt1):
         """No radix row in the wave: T / P straight from the modes (rows of the wave only)."""
@@ -934,25 +1049,64 @@ def make(E):
             st[5] = bw0
             after = lambda gi: union_upto(bw0, bw1, 8 * (gi + 1))
 
-            @pl.when(anyr > 0)
-            def _():
-                @pl.when(tot <= tiles.thr_switch)
-                def _():
-                    threshold(4, rt0, rt1, g0, g1, after)
+            def thr(DW):
+                if MERGE == "never":
+                    threshold(DW, rt0, rt1, g0, g1, after)
+                elif MERGE == "always":
+                    threshold_merged(DW, rt0, rt1, g0, g1, after)
+                else:
+                    @pl.when(tot <= tiles.thr_merge)
+                    def _():
+                        threshold_merged(DW, rt0, rt1, g0, g1, after)
 
-                @pl.when(tot > tiles.thr_switch)
-                def _():
-                    threshold(2, rt0, rt1, g0, g1, after)
+                    @pl.when(tot > tiles.thr_merge)
+                    def _():
+                        threshold(DW, rt0, rt1, g0, g1, after)
 
-            @pl.when(anyr == 0)
-            def _():
-                set_short(rt0, rt1)
+            if not THR_GIVEN:
+                @pl.when(anyr > 0)
+                def _():
+                    if ONLY4:
+                        thr(4)
+                    else:
+                        @pl.when(tot <= tiles.thr_switch)
+                        def _():
+                            thr(4)
+
+                        @pl.when(tot > tiles.thr_switch)
+                        def _():
+                            thr(2)
+
+                @pl.when(anyr == 0)
+                def _():
+                    set_short(rt0, rt1)
             pw.mark("I_union")
-            union_upto(bw0, bw1, jnp.int32(1 << 30))
+            if not UNION_GIVEN:
+                union_upto(bw0, bw1, jnp.int32(1 << 30))
             pw.end()
             return row0
         st[4] = jnp.int32(0)
+        if THR_GIVEN or E.xout is not None:
+            fp = jnp.clip(jnp.where(l < cfg.idx_skip, l, cfg.idx_skip + (l - cfg.idx_skip) // cfg.idx_freq), 0,
+                          max(E.Lf, 1) - 1)
+        if THR_GIVEN and not UNION_GIVEN:        # thr_given: this layer's recorded T / P / allowance -> b_row[2:5]
+            cpy = pltpu.make_async_copy(E.xin["thr"].at[fp], row.at[pl.ds(2, 3)], E.misc_sem)
+            cpy.start()
+            cpy.wait()
         lax.fori_loop(0, nw, wave, jnp.int32(0))
+        if UNION_GIVEN:                          # union_given: the recorded union table (resolved entries, request
+            for nm, dst in (("uv", scr["own_uv"]), ("req", req), ("greq", scr["b_greq"])):   # and granule maps)
+                cpy = pltpu.make_async_copy(E.xin[nm].at[fp], dst, E.misc_sem)
+                cpy.start()
+                cpy.wait()
+            st[4] = scr["b_greq"][UR2 - 1]
+        if E.xout is not None:                   # rec build: export what the given arms load (output unchanged)
+            scr["b_greq"][UR2 - 1] = st[4]       # past every written granule (U <= UR_ = UR2 - XKC / 128)
+            for nm, src in (("thr", row.at[pl.ds(2, 3)]), ("uv", scr["own_uv"]), ("req", req),
+                            ("greq", scr["b_greq"])):
+                cpy = pltpu.make_async_copy(src, E.xout[nm].at[fp], E.misc_sem)
+                cpy.start()
+                cpy.wait()
         U = st[4]
         st[0] = U
         pi.mark("I_udma")

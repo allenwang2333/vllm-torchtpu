@@ -108,6 +108,13 @@ class Tiles:
     scan_unroll: int = 4         # DSA scan inner unroll (was the MKD_SCAN_UNROLL env var: outside every cache key)
     interp_alias: bool = True    # interpret mode: run the Mosaic alias layout (dpool / epool views) through
                                  # interp_alias.install() instead of separate typed buffers (alias=False: typed)
+    # ---- stage-B lane L1 (WHITEBOARD.v3 §6.1); every default is the stage-A program ----
+    thr_unroll: int = 1          # L1-U: threshold count loop, tiles per iteration
+    thr_merge: int = 0           # L1-M: one merged count exchange per round when the wave's Sigma np <= thr_merge
+                                 # (0: never; >= pool: always, and the per-group form is not compiled)
+    rec_thr: bool = False        # timing harness only: export b_row[2:5] / own_uv / b_req / b_greq per fresh layer
+    thr_given: bool = False      # timing-only backing arm: load the recorded T / P / allowance, skip threshold()
+    union_given: bool = False    # timing-only backing arm: load the recorded union table, skip threshold() + unions
 
 
 def bf(x):
@@ -426,18 +433,28 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     n_e = len(e_names)
     n_c = len(c_names)
     GEO = DSA.geometry(cfg, tiles, max_pages, BMAX)
+    # L1 backing arms: records exported by a rec_thr build and loaded by a thr_given / union_given build (HBM)
+    LfX = max(Lf, 1)
+    rec_specs = {"thr": ((LfX, 3, GEO["TR"], 128), I32), "uv": ((LfX, GEO["UR2"], 128), I32),
+                 "req": ((LfX, BMAX, 16), I32), "greq": ((LfX, GEO["UR2"]), I32)}
+    xin_names = (["uv", "req", "greq"] if tiles.union_given else ["thr"] if tiles.thr_given else [])
+    xout_names = ["thr", "uv", "req", "greq"] if tiles.rec_thr else []
+    n_x = len(xin_names)
 
     def kernel(*refs):
         (scal, rmeta, qmeta, bt, bti, ltab, dtab, rvec, h0, rope_tab, smalls) = refs[:n_fixed]
         Wd = dict(zip(dkinds, refs[n_fixed:n_fixed + n_d]))
         e_in = refs[n_fixed + n_d:n_fixed + n_d + n_e]
         c_in = refs[n_fixed + n_d + n_e:n_fixed + n_d + n_e + n_c]
-        o0 = n_fixed + n_d + n_e + n_c
+        x_in = dict(zip(xin_names, refs[n_fixed + n_d + n_e + n_c:n_fixed + n_d + n_e + n_c + n_x]))
+        o0 = n_fixed + n_d + n_e + n_c + n_x
         out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
         rest = refs[o0 + 4:]
         if debug:
             (d_state, d_attn, d_xin, d_xffn, d_qc, d_kvcn, d_qall, d_oloc, d_wtab, d_uv, d_ureq) = rest[:11]
             rest = rest[11:]
+        x_out = dict(zip(xout_names, rest[:len(xout_names)]))
+        rest = rest[len(xout_names):]
         scr = dict(zip(s_names, rest))
         sc = (lambda nm: jax.named_scope(nm)) if tiles.trace else (lambda nm: contextlib.nullcontext())
 
@@ -785,7 +802,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             unpack_hi=unpack_hi, bf=bf, misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M,
             debug=False, nb=nb, ks=lambda: sm(cur_slot[0], "k_scale")[:, 0:1],
             dbg_uv=scr["dbg_uv"] if debug else None,
-            delay=delay_count)
+            delay=delay_count, Lf=Lf, xin=x_in, xout=x_out if xout_names else None)
         core.update(DSA.make(Ens))
 
         def save_table():
@@ -1178,7 +1195,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c)
+    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c + n_x)
     out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, TMAX, 128), U32),
                  jax.ShapeDtypeStruct((L, TMAX, 128), U32), jax.ShapeDtypeStruct((L, TMAX, 256), I32)]
     out_specs = [vmem, hbm, hbm, hbm]
@@ -1188,6 +1205,8 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                    ((L, M, EPAD), F32), ((max(Lf, 1), GEO["UR2"], 128), I32), ((max(Lf, 1), BMAX, 16), I32)]
         out_shape += [jax.ShapeDtypeStruct(s, d) for s, d in dshapes]
         out_specs += [hbm] * len(dshapes)
+    out_shape += [jax.ShapeDtypeStruct(*rec_specs[k]) for k in xout_names]
+    out_specs += [hbm] * len(xout_names)
     call = pl.pallas_call(
         kernel,
         name=KERNEL_NAME + ("_dbg" if debug else ""),
@@ -1205,5 +1224,6 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     info = dict(s_names=s_names, dkinds=dkinds, e_names=e_names, c_names=c_names, plan=plan, BANK=BANK, S=S,
                 lay=lay, ltab=ltab_np, dtab=dtab_np, M=M, ck=ck, groups=G, OW=OW, OH=OH, QH=QH, QA=QA, MB_SH=MB_SH,
                 geometry=GEO, epool=EPOOL, vmem_scratch_bytes=sum(vmem_by.values()), vmem_by=vmem_by,
-                moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed)
+                moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed,
+                xin=[(k,) + rec_specs[k] for k in xin_names], xout=[(k,) + rec_specs[k] for k in xout_names])
     return call, info
