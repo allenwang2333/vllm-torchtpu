@@ -103,6 +103,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
     copy_pool_blocks,
+    copy_stacked_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -2218,7 +2219,9 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         num_blocks = self.kv_cache_config.num_blocks
         pool_sets: dict[int, list[torch.Tensor]] = {}
-        seen: set[int] = set()
+        # GLM5_MKD_STACK_C stacks ([n_layers, num_blocks, ...]) are copied by
+        # `_dense_kv_copy_stacked_pools`' op instead.
+        seen: set[int] = {id(t) for t in self._dense_kv_copy_stacked_pools()}
         for cache in self.kv_caches:
             if id(cache) in seen:
                 continue
@@ -2229,6 +2232,17 @@ class TPUModelRunner(GPUModelRunner):
             )
             pool_sets.setdefault(cache.shape[0] // num_blocks, []).append(cache)
         return pool_sets
+
+    def _dense_kv_copy_stacked_pools(self) -> list[torch.Tensor]:
+        """GLM5_MKD_STACK_C stacked caches: one manager block per row each."""
+        groups = getattr(self, "glm5_kv_stack_groups", None) or {}
+        num_blocks = self.kv_cache_config.num_blocks
+        pools = []
+        for group in groups.values():
+            for tensor, _ in group:
+                assert tensor.shape[1] == num_blocks, (tensor.shape, num_blocks)
+                pools.append(tensor)
+        return pools
 
     def _apply_dense_kv_cache_block_copies(self, copies) -> None:
         """Copy CoW blocks in every per-layer KV cache tensor.
@@ -2252,6 +2266,18 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
             copy_pool_blocks(pools, src_t, dst_t)
+        stacked = self._dense_kv_copy_stacked_pools()
+        if stacked:
+            pairs = self._pad_to_bucket(
+                [(c.src_block_id, c.dst_block_id) for c in copies], pad=(0, 0)
+            )
+            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            copy_stacked_pool_blocks(stacked, src_t, dst_t)
 
     def _precompile_dense_kv_cache_block_copies(self) -> None:
         """Warm the dense CoW copy program at every bucket length.
@@ -2276,6 +2302,17 @@ class TPUModelRunner(GPUModelRunner):
                     copy_pool_blocks(pools, src, dst)
                     n *= 4
                 synchronize_tensors(pools)
+            stacked = self._dense_kv_copy_stacked_pools()
+            if stacked:
+                synchronize_tensors(stacked)
+                limit = self._bucket_len(self.max_num_reqs)
+                n = 8
+                while n <= limit:
+                    src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    copy_stacked_pool_blocks(stacked, src, dst)
+                    n *= 4
+                synchronize_tensors(stacked)
 
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
@@ -5418,6 +5455,8 @@ class TPUModelRunner(GPUModelRunner):
         through_handoff: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
+
+        Never takes the GLM52_DECODE_MK megakernel (``_glm52_mk_step`` is cleared).
 
         With ``profile_prefix`` the batch is one prefill request of
         ``num_tokens`` tokens behind that many computed tokens (the same
