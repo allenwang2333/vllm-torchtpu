@@ -1057,12 +1057,14 @@ class TpuPlatform(Platform):
     @classmethod
     def _find_non_ssm_backend(cls, vllm_config: VllmConfig) -> Any:
         """Returns the primary non-SSM attention backend for the config."""
-        backends = cls._find_non_ssm_backends(vllm_config)
-        if not backends:
-            return None
-        if isinstance(backends, (list, tuple)):
-            return backends[0]
-        return next(iter(backends), None)
+        if hasattr(cls, "_find_non_ssm_backends"):
+            backends = cls._find_non_ssm_backends(vllm_config)
+            if not backends:
+                return None
+            if isinstance(backends, (list, tuple)):
+                return backends[0]
+            return next(iter(backends), None)
+        return super()._find_non_ssm_backend(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
