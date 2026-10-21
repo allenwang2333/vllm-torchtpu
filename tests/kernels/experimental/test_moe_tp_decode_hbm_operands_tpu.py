@@ -39,7 +39,9 @@ def _staged(hlo: str) -> int:
     )
 
 
-@pytest.mark.parametrize("rows, n_valid", [(16, 4), (16, 16), (32, 12)])
+@pytest.mark.parametrize(
+    "rows, n_valid", [(16, 4), (16, 16), (32, 12), (64, 57), (128, 117)]
+)
 def test_hbm_operands_bitwise(rows, n_valid):
     import test_moe_tp_decode_kernel as base
     from jax.sharding import Mesh, NamedSharding

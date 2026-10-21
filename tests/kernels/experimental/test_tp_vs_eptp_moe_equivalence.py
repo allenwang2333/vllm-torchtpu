@@ -394,8 +394,52 @@ def _run_all():
             res["controls"][f"rank3_wrong_tp_slice@{rows}"] = _metrics(
                 bad[0, idx].astype(np.float64), want
             )
+    res["selftest"] = _selftest_all_buckets(mesh)
     print("RESULT " + json.dumps(res), flush=True)
     return res
+
+
+def _selftest_all_buckets(mesh):
+    """Arming's all-reduce self-test (all_reduce.standalone over every row path
+    of selftest_row_counts) at every ROW_BUCKETS entry, on the real ranks:
+    {"rows": [failing n_valid, ...]}."""
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import (
+        ROW_BUCKETS,
+        all_reduce,
+    )
+
+    per = NamedSharding(mesh, P("d"))
+    rank = jax.device_put(jnp.arange(N, dtype=jnp.int32).reshape(N, 1), per)
+    out = {}
+    for m in ROW_BUCKETS:
+        spec = all_reduce.make_spec(N, m, H)
+        call = all_reduce.standalone(spec)
+
+        def body(x, r, nv, call=call):
+            meta = jnp.stack([nv.reshape(()), r.reshape(())]).astype(jnp.int32)
+            return call(meta, x)
+
+        prog = jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P("d"), P("d"), P()),
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )
+        x = all_reduce.selftest_inputs(spec)
+        xs = jax.device_put(jnp.asarray(x.reshape(N * m, -1), jnp.bfloat16), per)
+        bad = []
+        for nv in all_reduce.selftest_row_counts(spec):
+            got = np.asarray(
+                jax.block_until_ready(prog(xs, rank, jnp.asarray([nv], jnp.int32)))
+            ).astype(np.float32)
+            got = got.reshape(N, m, -1)
+            if not all(all_reduce.selftest_ok(spec, x, got[r], nv) for r in range(N)):
+                bad.append(nv)
+        out[str(m)] = {"row_counts": all_reduce.selftest_row_counts(spec), "bad": bad}
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -442,6 +486,12 @@ def test_kernel_matches_the_psum_path_it_replaces(result, rows):
         assert v["chain_ranks_identical"], v
         assert _passes(v["chain_vs_ref"]), v
         assert v["rel_l2"] <= TOL["tp_vs_ep"], v
+
+
+def test_all_reduce_selftest_at_every_bucket(result):
+    st = result["selftest"]
+    assert "128" in st, st
+    assert all(not v["bad"] for v in st.values()), st
 
 
 def test_fault_controls_fail_the_gate(result):
