@@ -3431,10 +3431,6 @@ def prepare_outputs(
         "prologue_fault",
         "kv_write_fault",
         "mixed_fused_prep",
-        "mixed_union_gather",
-        "mixed_union_gather_rope",
-        "mixed_union_gather_pair",
-        "mixed_union_gather_fault",
         "decode_row_widths",
         "decode_body_levers",
         "send_world",
@@ -3494,10 +3490,6 @@ def sparse_ragged_paged_attention(
     send_world: int = 0,
     out_pieces: int = 0,
     decode_body_levers: tuple[str, ...] = (),
-    mixed_union_gather: bool = False,
-    mixed_union_gather_rope: bool = False,
-    mixed_union_gather_pair: bool = False,
-    mixed_union_gather_fault: str | None = None,
     out_pieces_fault: str | None = None,
     out_pieces_gather_first: bool = False,
     send_exchange: tuple | None = None,
@@ -3629,19 +3621,6 @@ def sparse_ragged_paged_attention(
         live-group window rows in one call that reads the top-k as 128-lane
         rows and writes one window array per chunk
         (`prepare_capped_window_live_fused`). Same rows, kv_lens and table.
-      mixed_union_gather: TPU_DCP_MLA_MIXED_UNION_GATHER. With
-        `mixed_live_gather` taken, on `native_sc_gather.union_gather_supported`
-        geometry: each chunk's gather reads each half grid step's distinct
-        cache rows once (`native_sc_gather.dsa_gather_native_sc_union`). Every
-        live slot holds the same row; padding slots hold an already-loaded
-        row or nothing (masked and zeroed by the attention either way), so
-        the outputs are bit-identical.
-      mixed_union_gather_rope: with `mixed_union_gather`: the rope rows come
-        from the union too (fewer rows fit in SparseCore memory).
-      mixed_union_gather_pair: with `mixed_union_gather`: the two SparseCore
-        subcores of a grid step share one union of its 16 tokens (more rows
-        fit; the second subcore's dedup follows the first's).
-      mixed_union_gather_fault: test-only (`native_sc_gather.UNION_FAULTS`).
       send_world: TPU_DCP_MLA_SEND_LAYOUT. With `lse_in_kernel` taking effect
         (lane-dense lse, one chunk) and split q, on `send_layout_supported`
         geometry: the kernel writes the DCP merge's packed real-rows send
@@ -3831,8 +3810,6 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
-    if mixed_union_gather_fault not in native_sc_gather.UNION_FAULTS:
-        raise ValueError(f"unknown mixed_union_gather_fault {mixed_union_gather_fault}")
     if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
         raise ValueError("mixed_body_levers: 'pair' and 'xqk' are alternatives")
     if not set(decode_body_levers) <= set(DECODE_BODY_LEVERS):
@@ -4157,17 +4134,6 @@ def sparse_ragged_paged_attention(
             send_exchange=send_exchange,
             send_peer=send_peer,
             send_recv_in=send_recv_in,
-            union_gather=(
-                # pyrefly: ignore[bad-argument-type]
-                (
-                    group_num_live,
-                    mixed_union_gather_fault,
-                    mixed_union_gather_rope,
-                    mixed_union_gather_pair,
-                )
-                if mixed_union_gather and group_tab is not None
-                else None
-            ),
             packed_rope=packed_rope,
             **extra,
         )
@@ -4363,7 +4329,6 @@ def sparse_attention_chunk(
     out_piece: tuple[int, int, jax.Array | None] | None = None,
     gather_only: bool = False,
     pre_gathered: tuple | None = None,
-    union_gather: tuple[jax.Array, str | None, bool, bool] | None = None,
     send_exchange: tuple | None = None,
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
@@ -4985,54 +4950,21 @@ def sparse_attention_chunk(
                     .transpose(1, 0, 2)
                     .reshape(capped_windows * chunk_size, topk_cap)
                 )
-            if (
-                union_gather is not None
-                and group_tab is not None
-                and kv_write is None
-                # The union gather reads padded rope rows only.
-                and not packed_rope
-                and not gather_live_in_indices
-                and start_pos % chunk_size == 0
-                and native_sc_gather.union_gather_supported(
-                    chunk_size, kernel_batch_size, topk_cap
-                )
-            ):
-                # TPU_DCP_MLA_MIXED_UNION_GATHER: the same rows on every live
-                # slot, each half grid step's distinct rows read once.
-                group_num_live_all, union_fault, union_rope, union_pair = union_gather
-                gathered = native_sc_gather.dsa_gather_native_sc_union(
-                    cache_kv_nope,
-                    cache_kv_rope,
-                    window_indices,
-                    group_tab,
-                    kv_lens,
-                    group_num_live_all,
-                    out_size=chunk_size * topk,
-                    chunk_index=start_pos // chunk_size,
-                    chunk_size=chunk_size,
-                    kernel_batch_size=kernel_batch_size,
-                    topk_cap=topk_cap,
-                    atoms_per_batch=gather_atoms,
-                    rope_union=union_rope,
-                    pair_union=union_pair,
-                    fault=union_fault,
-                )
-            else:
-                gathered = native_sc_gather.dsa_gather_native_sc(
-                    cache_kv_nope,
-                    cache_kv_rope,
-                    window_indices,
-                    out_size=chunk_size * topk,
-                    atoms_per_batch=gather_atoms,
-                    wait_mode=sparsecore_gather_wait_mode,
-                    serve_pipelined=sparsecore_gather_pipelined,
-                    live_multiple=kernel_batch_size
-                    * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
-                    kv_write=kv_write,
-                    write_fault=kv_write_fault,
-                    packed_rope=packed_rope,
-                    **live_kwargs,
-                )
+            gathered = native_sc_gather.dsa_gather_native_sc(
+                cache_kv_nope,
+                cache_kv_rope,
+                window_indices,
+                out_size=chunk_size * topk,
+                atoms_per_batch=gather_atoms,
+                wait_mode=sparsecore_gather_wait_mode,
+                serve_pipelined=sparsecore_gather_pipelined,
+                live_multiple=kernel_batch_size
+                * (GATHER_ATOM_ROWS if group_tab is not None else topk_cap),
+                kv_write=kv_write,
+                write_fault=kv_write_fault,
+                packed_rope=packed_rope,
+                **live_kwargs,
+            )
             gathered_nope_buffer, gathered_rope_buffer = gathered[:2]
             if kv_write is not None:
                 cache_kv_nope, cache_kv_rope = gathered[2:]
