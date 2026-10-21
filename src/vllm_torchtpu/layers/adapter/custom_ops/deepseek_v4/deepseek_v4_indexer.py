@@ -247,6 +247,7 @@ def _indexer_impl(
             or (q.shape[0] // 4 if q.shape[0] >= _FOUR_PIECE_MIN_TOKENS else None),
             split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED
             and q.shape[0] >= envs.TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS,
+            strict_causal=envs.TPU_STREAMIDX_STRICT_CAUSAL,
             # A kv-split share's rows fit one subcore, so its top-k takes the
             # by-length pass. Compiled next to the merge's SparseCore top-k,
             # shares from the cooperative (shared-memory) pass came back wrong
