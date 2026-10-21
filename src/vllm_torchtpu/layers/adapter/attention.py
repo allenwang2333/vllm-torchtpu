@@ -3137,14 +3137,25 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
                     w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
-                    if uv_first:
+                    # A chunked-merge bucket that V space covers takes V space
+                    # over UV_BEFORE_MERGE: the projection fused into each
+                    # merge chunk, where W_UV first writes heads-major and the
+                    # weighted merge relayouts it twice per chunk (GLM-5.2
+                    # DCP16 4096-token step: 541 us of merge ops per layer).
+                    vspace_wins = (
+                        w_uv_vspace is not None
+                        and use_qrep
+                        and _cp_mla_attention.vspace_merge_applies(
+                            partial.shape[0], is_backbone
+                        )
+                    )
+                    if uv_first and not vspace_wins:
                         # TPU_DCP_MLA_UV_BEFORE_MERGE (upstream #1931 + its
                         # follow-ups): project every partial through the DCP
                         # group's W_UV, then merge [T, H, v_head_dim]. A
                         # narrowed merge rounds to the wire dtype anyway, so
-                        # the backbone projects straight into it. Takes
-                        # precedence over TPU_DCP_MERGE_VSPACE (the same
-                        # projection, inside the chunked merge).
+                        # the backbone projects straight into it. Yields to
+                        # TPU_DCP_MERGE_VSPACE on the buckets V space covers.
                         wire_dtype = partial.dtype
                         narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
                         partial = project_uv_heads(
