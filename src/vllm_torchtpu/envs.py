@@ -117,6 +117,9 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_ALLOW_STAGE_TP: bool = False
+    TPU_PP_STAGE_DCP_MESH: bool = True
+    TPU_SC_GATHER_OWN_OUT: bool = False
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
@@ -1047,6 +1050,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
+    # Pipeline parallelism with tensor parallelism inside each stage. Needs a
+    # torch_tpu that compiles a process group's collectives for the group's
+    # own devices; with one that compiles them over the whole world a stage
+    # cannot launch its TP collectives while the other stages run theirs.
+    "TPU_PP_ALLOW_STAGE_TP": env_bool("TPU_PP_ALLOW_STAGE_TP"),
+    # Under pipeline parallelism, build the DCP Pallas mesh over this worker's
+    # stage (distributed/dcp.py) rather than over the world. 0 keeps the
+    # world mesh.
+    "TPU_PP_STAGE_DCP_MESH": env_bool("TPU_PP_STAGE_DCP_MESH", default=True),
+    # The sparse-MLA SparseCore gather (kernels/mla/sparse/native_sc_gather.py)
+    # writes into zeroed outputs of each call's own instead of `lax.empty`
+    # ones. When torch_tpu inlines the calls into one program, XLA merges
+    # identical empty outputs into one buffer and copies it before every call
+    # (a whole output, 320 MiB at a 256-query tile).
+    "TPU_SC_GATHER_OWN_OUT": env_bool("TPU_SC_GATHER_OWN_OUT"),
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),

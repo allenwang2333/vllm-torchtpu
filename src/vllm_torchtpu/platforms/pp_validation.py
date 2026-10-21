@@ -59,12 +59,16 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     if parallel_config.pipeline_parallel_size <= 1:
         return
 
+    from vllm_torchtpu import envs
+
     unsupported = None
     remedy = ""
-    if parallel_config.tensor_parallel_size > 1:
+    if parallel_config.tensor_parallel_size > 1 and not envs.TPU_PP_ALLOW_STAGE_TP:
         # On torch_tpu (dev20260813) a stage's TP collectives stall on the
         # first serving step, when the other stages are not launching the
         # same collectives; warmup, where every stage runs them, passes.
+        # A torch_tpu that compiles a group's collectives for the group's own
+        # devices lifts that (TPU_PP_ALLOW_STAGE_TP).
         unsupported = "tensor parallelism inside a stage"
         remedy = " Use --tensor-parallel-size 1."
     elif (
@@ -73,6 +77,10 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             parallel_config.data_parallel_size > 1
             and parallel_config.enable_expert_parallel
         )
+        or (
+            getattr(parallel_config, "decode_context_parallel_size", 1) > 1
+            and envs.TPU_PP_STAGE_DCP_MESH
+        )
     ) and not _torch_tpu_builds_stage_meshes():
         # A stage of several devices builds its meshes, and the hand-off its
         # per-column mesh, over a group smaller than the world.
@@ -80,8 +88,9 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # made standalone; make each stage group standalone and drop this
         # guard once the pinned torch_tpu has it.
         unsupported = (
-            "pipeline stages of several devices (context parallelism, or expert "
-            "parallelism across data-parallel ranks) with this torch_tpu"
+            "pipeline stages of several devices (context parallelism, a stage "
+            "DCP mesh, or expert parallelism across data-parallel ranks) with "
+            "this torch_tpu"
         )
         remedy = (
             " They need a torch_tpu that builds Pallas meshes over a stage's"

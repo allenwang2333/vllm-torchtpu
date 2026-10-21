@@ -363,9 +363,15 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
     same-shape, same-dtype `copy_` by aliasing the destination's storage to
     `t`'s base buffer, which keeps the shape mismatch. On TPU the `+ 0` forces
     a real op whose output buffer has `t`'s logical shape. Other devices get a
-    plain contiguous clone (CPU has no `add` kernel for float8 dtypes).
+    plain contiguous clone (CPU has no `add` kernel for float8 dtypes). A
+    one-byte float8 tensor takes the `+ 0` on its bytes (a `uint8` view, then
+    back): newer torch_tpu builds have no `add` for float8 either, and an
+    integer zero leaves every bit as it was.
     """
     out = torch.clone(t, memory_format=torch.contiguous_format)
     if out.device.type == "tpu":
-        out = out + 0
+        if out.dtype.is_floating_point and out.element_size() == 1:
+            out = (out.view(torch.uint8) + 0).view(out.dtype)
+        else:
+            out = out + 0
     return out

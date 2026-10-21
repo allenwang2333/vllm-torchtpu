@@ -135,7 +135,9 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     mesh carries a leading axis for the TP lanes DCP does not shard over. The
     kernels still collect only over `axis_name`, which gives one independent
     DCP group per lane. Under `dcp == tp` the shape is `(1, world)` and the
-    device order is the one the single-axis builder used to produce.
+    device order is the one the single-axis builder used to produce. Under
+    pipeline parallelism the mesh spans this worker's stage instead
+    (`_get_or_create_stage_dcp_mesh`, TPU_PP_STAGE_DCP_MESH).
 
     The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
     constant from here, so a caller that overrides it has to override it in
@@ -159,6 +161,12 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
         )
     _validate_dcp_rank_alignment(group, dcp_size)
 
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.distributed.mesh_utils import get_pipeline_stage
+
+    if get_pipeline_stage()[1] > 1 and envs.TPU_PP_STAGE_DCP_MESH:
+        return _get_or_create_stage_dcp_mesh(axis_names, dcp_size)
+
     shape = (world_size // dcp_size, dcp_size)
     ranks = tuple(int(value) for value in group.ranks)
     cache_key = (axis_names, shape, ranks)
@@ -177,6 +185,44 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
         shape,
         int(group.rank_in_group),
         ranks,
+    )
+    _MESH_CACHE[cache_key] = mesh
+    return mesh
+
+
+def _get_or_create_stage_dcp_mesh(axis_names: tuple[str, str], dcp_size: int) -> Any:
+    """The ``(lane, DCP)`` mesh over this worker's pipeline stage.
+
+    A world-sized mesh would put every stage's devices in each stage's
+    programs, so a stage could not launch its DCP kernels while the other
+    stages run their own layers. A stage is one TP group, and its DCP groups
+    are contiguous runs of its ranks (`_validate_dcp_rank_alignment`), one
+    per lane.
+    """
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from vllm_torchtpu.distributed.mesh_utils import get_stage_mesh
+
+    tp_group = get_tp_group()
+    tp_size = int(tp_group.world_size)
+    if tp_size % dcp_size:
+        raise NotImplementedError(
+            f"dcp_size={dcp_size} must divide the stage's tensor parallel "
+            f"size {tp_size}."
+        )
+    layout = get_cp_group_layout(tp_group)
+    shape = (tp_size // dcp_size, dcp_size)
+    cache_key = (axis_names, shape, layout.ranks)
+    cached = _MESH_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    mesh = get_stage_mesh(axis_names, shape, tp_group, layout.device_ids)
+    logger.info(
+        "DCP stage mesh | axes=%s shape=%s ranks=%s device_ids=%s",
+        axis_names,
+        shape,
+        layout.ranks,
+        layout.device_ids,
     )
     _MESH_CACHE[cache_key] = mesh
     return mesh

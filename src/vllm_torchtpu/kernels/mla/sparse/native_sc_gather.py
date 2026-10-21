@@ -36,6 +36,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
 
 NUM_CORES = 2
@@ -666,12 +667,36 @@ def dsa_gather_native_sc(
             kw["write_scratch"] = (write_dst_vmem, write_dst_sem, write_sem)
         return inner(nope, rope, idx, nope_o, rope_o, **kw, **scr)
 
+    out_types = (
+        jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
+        jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+    )
+    own_outs = ()
+    if envs.TPU_SC_GATHER_OWN_OUT:
+        # torch_tpu inlines every call of this kernel into one program, where XLA
+        # merges the calls' identical `lax.empty` outputs into one buffer and
+        # copies it before each call writes it in place (320 MiB, ~2.8 ms per
+        # call). Zeros passed through an optimization barrier together with one
+        # word of this call's indices and one of its cache are a value XLA can
+        # neither fold nor share between calls (layers that share their top-k
+        # indices differ in cache, a layer's tiles in indices): each call gets a
+        # buffer of its own and nothing is copied. Rows the gather leaves
+        # unwritten read zero, as from a fresh allocation. The body takes the
+        # outputs as its last two refs either way.
+        zero, _, _ = lax.optimization_barrier(
+            (
+                jnp.zeros((), jnp.uint32),
+                indices.reshape(-1)[0],
+                nope_cache.reshape(-1)[0],
+            )
+        )
+        own_outs = tuple(
+            jax.new_ref(jnp.full(t.shape, zero, t.dtype)) for t in out_types
+        )
+        operands.extend(own_outs)
     outs = core_map_helper.kernel(
         body,
-        out_type=(
-            jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
-            jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
-        ),
+        out_type=() if own_outs else out_types,
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
             needs_layout_passes=True,
@@ -685,6 +710,8 @@ def dsa_gather_native_sc(
             f"{'_kvw' if kv_write is not None else ''}"
         ),
     )(*operands)
+    if own_outs:
+        outs = tuple(jax.freeze(ref) for ref in own_outs)
     if kv_write is None:
         return outs
     return (

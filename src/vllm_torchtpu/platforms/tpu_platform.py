@@ -413,6 +413,9 @@ class TpuPlatform(Platform):
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_RAIDEN_GLM_DCP_IDENTITY",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_PP_ALLOW_STAGE_TP",
+        "TPU_PP_STAGE_DCP_MESH",
+        "TPU_SC_GATHER_OWN_OUT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
