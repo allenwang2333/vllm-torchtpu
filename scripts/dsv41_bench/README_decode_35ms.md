@@ -5,7 +5,8 @@
 The 35 ms main-model forward and 14000 output tokens/chip/s targets remain
 unmet. The serving measurements below cover an FP4 MoE height ladder for the
 observed EP8 geometry and a joint request/scorer configuration for the
-48-request full-context indexer, whole-batch router selection and WO_A row chunks.
+48-request full-context indexer, whole-batch router selection, WO_A row chunks
+and the normalized mHC output placement.
 
 ## Configuration and provenance
 
@@ -30,6 +31,7 @@ JAX/JAXLIB 0.11.2 and libtpu 0.0.50, with vLLM revision
 | FP4 ladder + indexer | `cd47b6c9` | `exp-1mv4ll6amh` / `results/indexer-tuned` |
 | FP4 ladder + indexer + router | `7b971e97` | `exp-qg29pd6unq` / `results/router-tuned` |
 | Previous + WO_A | `2881d570` | `exp-btjh485722` / `results/woa-tuned` |
+| Previous + mHC VMEM output | `7bf96de9` | `exp-qfs10zulj7` / `results/mhc-vmem-tuned` |
 
 The FP4 run's top-level runtime source and actual checkout are `c6ffd0fa`;
 its copied nested source metadata still names the base. The first combined
@@ -227,7 +229,7 @@ python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1033 --seed 1033 -
 python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1035 --seed 1035 --profile
 ```
 
-## mHC consumer-fusion prototypes
+## mHC output placement and consumer fusion
 
 Two additional prototypes in `exp-1yxqyt6ap6` preserve the five mHC outputs
 and the FP8 activation/scale values used by a following 5120-by-1792 Q/KV
@@ -241,10 +243,78 @@ quantized intermediates remain internal.
 | Keep the normalized BF16 value in VMEM for its consumer | 27.747 / 26.634 | 27.646 / 26.607 |
 
 These are complete microbenchmark device-module medians excluding entry
-barriers. Neither prototype is in serving dispatch. The first requires
-passing the prequantized values to the consumers; the second retains the
-existing interface but changes output memory placement. Other consumers,
-whole-model memory pressure and serving performance remain unvalidated.
+barriers. Explicit prequantization remains a prototype because it requires
+passing additional values to the consumers. The VMEM-output implementation
+retains the existing interface and has the serving validation below.
+
+The mHC VMEM-output implementation retains the normalized BF16 activation in VMEM
+for following consumers, without changing their interface or arithmetic.
+At seeds 1034 and 1036, all mHC outputs, FP8 activation/scale and projected
+values were bit-exact. Device medians for mHC plus the following 5120-by-1792
+projection fell from 27.747 to 26.634 us and from 27.646 to 26.607 us.
+The dispatch is limited to the kernel's TPU7x envelope with 288 tokens,
+four streams, width 5120, BF16 norm weights and HBM gate inputs.
+Other shapes retain the previous output placement. The isolated timings are
+reported separately from the serving measurements below.
+
+Source `7bf96de9` was rechecked in `exp-qfs10zulj7` with seeds 1045 and 1046;
+the integrated candidate and baseline remained bit-exact across all eight
+checked outputs. A 128-token fallback case at seed 1047 was also bit-exact.
+For 288 tokens, compiled code decreased from 1264128 to 1251328 bytes;
+arguments (29219840 bytes), outputs (15814688 bytes) and temporary storage
+(zero) were unchanged. The fallback's compiled memory sizes were unchanged.
+These pre-serving checks did not explicitly pin a DVFS state, so their timings
+are not compared with the earlier fixed-state measurements. The formal serving
+launcher retains its fixed P-state 7 configuration.
+
+Pre-commit passed. After installing the missing `uv` tool in the evaluation
+container, full-environment pyrefly reported the same 57 errors as a source copy
+with the baseline mHC files restored: zero added or removed diagnostics.
+The numerical/HLO/device-event archive is `results/mhc-vmem-tuned/micro-evidence.tgz`
+in that experiment (SHA-256
+`a59f7e3de9b4686927e58407cae04f34bdab913c030f9fae057c099024d0c78b`).
+Its saved typecheck log is the initial missing-tool failure; the subsequent
+paired check is stored separately as `typecheck-base.json` and
+`typecheck-candidate.json` in the same result directory.
+
+```bash
+git show a04817ac:src/vllm_torchtpu/kernels/deepseek_v41/mhc/shifted_post_pre_rms.py \
+  > /tmp/mhc-output-reference.py
+python scripts/dsv41_bench/bench_mhc_output.py \
+  --reference-source /tmp/mhc-output-reference.py \
+  --out /tmp/mhc-output --seed 1045 --profile
+```
+
+Serving and profile checks in `exp-qfs10zulj7` completed successfully. All six
+profile steps contain the expected four main-model modules with 1, 13, 6 and
+20 MoE layers, respectively.
+
+| Metric | WO_A run `2881d570` | mHC VMEM output `7bf96de9` |
+| --- | ---: | ---: |
+| Host step median, ms | 55.604 / 55.747 / 55.667 | 52.724 / 52.465 / 52.254 |
+| Fixed-acceptance output tokens/chip/s | 5991 / 5976 / 5984 | 6318 / 6349 / 6375 |
+| Observed accepted+bonus tokens/chip/s | 6876 / 6726 / 6641 | 7118 / 7200 / 7146 |
+| Main-model device forward, ms | 46.039 | 42.608 |
+| Forward minus identified entry barriers, ms | 41.912 | 41.728 |
+| Main-model mHC event time/step, ms | 1.370 | 1.292 |
+| Main-model FP4 MoE event time/step, ms | 15.160 | 15.152 |
+| Main-model CSA event time/step, ms | 5.195 | 5.117 |
+| Startup HBM used per logical device, GiB range | 49.02–49.04 | 48.98–49.04 |
+| Server launch to health ready, seconds | 1018.22 | 1042.22 |
+
+The new forward samples are 46.199, 42.728, 42.489, 60.111, 42.304 and
+42.320 ms; the entry-barrier median is 1.114 ms. Most of the raw forward
+reduction coincides with barrier variation. The per-step diagnostic excluding
+those intervals improves by 0.184 ms. Inclusive mHC event time decreases by
+0.078 ms, consistent with the paired isolated measurements; inclusive event
+times may overlap and must not be added as critical-path savings. These
+separate jobs do not isolate the cause of the larger host-step difference.
+The change is retained for its exact outputs, smaller generated code and
+measured mHC gain. Both requested performance targets remain unmet.
+
+The verified serving analysis archive is
+`results/mhc-vmem-tuned/serving-evidence.tgz` in that experiment (SHA-256
+`42438353c39424c06db0fbf3ff87121ecc9328ad8b4adaccec79e4f3ca761798`).
 
 ## Experiments not adopted
 
@@ -333,7 +403,23 @@ At uniform seed 1044 they were 0.459195, 0.459625 and 0.459485 ms. Generated
 code sizes and compiled argument/output/temporary storage were unchanged.
 Moving those reads earlier did not establish a speedup and is not adopted.
 
-A separate small MXU operand probe on that job tested FP8 LHS with a native
+After serving completed in `exp-qfs10zulj7`, a two-rung MoE sweep retained
+capacity 128 and changed only the lower height. Every EP8 output bit matched
+at biased seed 1048 and uniform seed 1049, including signed zero.
+
+| Routing / seed | 64/128 reference (ms) | 48/128 (ms) | 80/128 (ms) | 96/128 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Biased / 1048 | 0.561563 | 0.564828 | 0.573694 | 0.580213 |
+| Uniform / 1049 | 0.459417 | 0.465987 | 0.472470 | 0.483886 |
+
+These are complete device-module medians excluding entry barriers, with
+P-state 7 and five ordered profile repetitions. Argument/output/temporary
+storage was unchanged. None of the alternative lower heights improved
+performance, so the 64/128 dispatch remains. Source, HLO and results are at
+`results/nonuniform-heights/evidence.tgz` (SHA-256
+`ac1e646c094a42334aa7d1c13177a1e4018497d3b2612889f038334598d8701c`).
+
+A separate small MXU operand probe in `exp-c5bdngz3ad` tested FP8 LHS with a native
 FP4 RHS at M64/K256/N256 and M128/K512/N256. The pinned compiler rejected
 both with `Unsupported element type for matmul push rhs: 'f4E2M1FN'`.
 Explicit FP4-to-FP8 conversion followed by asynchronous MXU operations was
@@ -354,44 +440,6 @@ These results reject these layouts, not every possible packed representation.
 The job completed successfully; its result/HLO/device-event files were retrieved
 through a read-only CPU helper. The verified local archive SHA-256 is
 `85ae39d7abf1685f2fe382cca6014a62e1d7463e37028adb7e6121417d210991`.
-
-The mHC VMEM-output candidate retains the normalized BF16 activation in VMEM
-for following consumers, without changing their interface or arithmetic.
-At seeds 1034 and 1036, all mHC outputs, FP8 activation/scale and projected
-values were bit-exact. Device medians for mHC plus the following 5120-by-1792
-projection fell from 27.747 to 26.634 us and from 27.646 to 26.607 us.
-The dispatch is limited to the kernel's TPU7x envelope with 288 tokens,
-four streams, width 5120, BF16 norm weights and HBM gate inputs.
-Other shapes retain the previous output placement. Serving validation is
-pending; these isolated timings do not establish a whole-model improvement.
-
-Source `7bf96de9` was rechecked in `exp-qfs10zulj7` with seeds 1045 and 1046;
-the integrated candidate and baseline remained bit-exact across all eight
-checked outputs. A 128-token fallback case at seed 1047 was also bit-exact.
-For 288 tokens, compiled code decreased from 1264128 to 1251328 bytes;
-arguments (29219840 bytes), outputs (15814688 bytes) and temporary storage
-(zero) were unchanged. The fallback's compiled memory sizes were unchanged.
-These pre-serving checks did not explicitly pin a DVFS state, so their timings
-are not compared with the earlier fixed-state measurements. The formal serving
-launcher retains its fixed P-state 7 configuration.
-
-Pre-commit passed. After installing the missing `uv` tool in the evaluation
-container, full-environment pyrefly reported the same 57 errors as a source copy
-with the baseline mHC files restored: zero added or removed diagnostics.
-The numerical/HLO/device-event archive is `results/mhc-vmem-tuned/micro-evidence.tgz`
-in that experiment (SHA-256
-`a59f7e3de9b4686927e58407cae04f34bdab913c030f9fae057c099024d0c78b`).
-Its saved typecheck log is the initial missing-tool failure; the subsequent
-paired check is stored separately as `typecheck-base.json` and
-`typecheck-candidate.json` in the same result directory.
-
-```bash
-git show a04817ac:src/vllm_torchtpu/kernels/deepseek_v41/mhc/shifted_post_pre_rms.py \
-  > /tmp/mhc-output-reference.py
-python scripts/dsv41_bench/bench_mhc_output.py \
-  --reference-source /tmp/mhc-output-reference.py \
-  --out /tmp/mhc-output --seed 1045 --profile
-```
 
 Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
 above ran in `exp-qg29pd6unq` after its serving process exited. The initial
