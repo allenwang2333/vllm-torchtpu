@@ -70,7 +70,9 @@ FAULTS = ("", "digit", "tierank", "nofix", "kscale", "page", "ropeseg", "shareds
           # each perturbs only its path, so n/a at a build that never takes it and RED where it does
           "f_thr2",     # digit + 1, 2-bit threshold rounds only (Sigma np > thr_switch)
           "f_wave",     # digit + 1, waves after the first only (rows of a wave starting at row > 0)
-          "f_wrap")     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
+          "f_wrap",     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
+          # L4 (stage B, a2a_lse="tile"): the lse of row t is written at lane t + 1 of the per-peer lse tile
+          "f_lse_tile_row")
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
 ALIASED = ("b_keys", "b_memb", "b_pre", "b_xacc", "b_xcc", "g_nope", "g_rope", "kvb", "qb", "qrb", "b_sbuf",
            "att_acc")
@@ -272,6 +274,8 @@ def make(E):
     UNR = max(1, tiles.gunroll)
     MAXP_OK = E.max_pages <= 256
     SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
+    LSE_TILE = getattr(tiles, "a2a_lse", "lanes") == "tile"
+    HPAD = max(8, -(-cfg.HR // 8) * 8)          # lse tile rows per owner (kernel.build: the same rule)
 
     def T_():
         return E.scal[0]
@@ -1175,10 +1179,20 @@ def make(E):
         P = pack2(jnp.concatenate(H[:HR // 2], axis=1), jnp.concatenate(H[HR // 2:], axis=1))            # [R, OH]
         stg[1, 0:NH, :] = jnp.broadcast_to(lse, (NH, 128))
         lane_r = lax.broadcasted_iota(I32, (R, 128), 1)
-        L16 = jnp.full((R, 128), -jnp.inf, F32)
-        for hh in range(HR):                                 # lane hh of owner d's row = lse of head d * HR + hh
-            L16 = jnp.where(lane_r == hh, stg[1, pl.ds(hh, R, stride=HR), :], L16)
-        blk = jnp.concatenate([P, lax.bitcast_convert_type(L16, U32)], axis=1)                           # [R, OW]
+        if LSE_TILE:
+            # L4 C1: owner d's lse tile = rows d * HPAD + hh of `lsend`, lane = row t (one [HPAD, 128] f32 tile per
+            # peer instead of 128 lse lanes in every payload row); the payload row is P alone
+            tl = (t_ + 1) % TMAX if fault == "f_lse_tile_row" else t_
+            for hh in range(HR):
+                cur = scr["lsend"][pl.ds(hh, R, stride=HPAD), :]
+                scr["lsend"][pl.ds(hh, R, stride=HPAD), :] = jnp.where(lane_r == tl,
+                                                                        stg[1, pl.ds(hh, R, stride=HR), :], cur)
+            blk = P                                                                                      # [R, OH]
+        else:
+            L16 = jnp.full((R, 128), -jnp.inf, F32)
+            for hh in range(HR):                             # lane hh of owner d's row = lse of head d * HR + hh
+                L16 = jnp.where(lane_r == hh, stg[1, pl.ds(hh, R, stride=HR), :], L16)
+            blk = jnp.concatenate([P, lax.bitcast_convert_type(L16, U32)], axis=1)                       # [R, OW]
         for d in range(R):
             scr["osend"][d, pl.ds(t_, 1), :] = blk[d:d + 1]
 
@@ -1189,10 +1203,11 @@ def make(E):
             def _(qq=qq):
                 emit_row(t0 + qq, qq, empty, ks)
 
-    def attention(l, fresh, q_wait):
+    def attention(l, fresh, q_wait, after_req=None):
         """The all-request gather ring + attention: issue granules [0, min(U, GR)) (IndexShare layers:
         before the q all-gather wait), then per request: q, then per granule r of it: wait, compute,
-        issue r + GR into the freed slot; then emit."""
+        issue r + GR into the freed slot; then emit. after_req(b) (L4 C2: the chunked A2A) runs after request b's
+        rows are emitted."""
         del fresh                                        # one issue path: sources are resolved per fresh layer
         ks = E.ks()                                      # this layer's k_scale, [1, 1] f32
         U = st[0]
@@ -1269,6 +1284,8 @@ def make(E):
                         if compute:
                             back(0)
                     emit(b, False, ks)
+            if after_req is not None:
+                after_req(b)
             return c
         lax.fori_loop(0, B_(), per_req, 0)
         pa.end()
