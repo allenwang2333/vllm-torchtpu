@@ -6,7 +6,7 @@ weight N-major, row-major `[vocab/tp, hidden]` (vLLM's `F.linear`; GLM-5.2 TP16:
 n = 9680, k = 6144, 119 MB per rank). XLA's dot streams that layout at about 2.6 TB/s
 on tpu7x (44-47 us per call at m = 4..64), and torch_tpu/XLA will not keep the weight
 K-major. This kernel takes the weight as an HBM operand -- constrained to HBM with
-`pltpu.with_memory_space_constraint`, as in `router_gemm_hbm` -- and walks it through a
+`pltpu.with_memory_space_constraint` -- and walks it through a
 3-slot VMEM ring of contiguous row tiles `w[s:s+t, :]` in one grid step, computing each
 tile as it lands with one dot that contracts k on both operands (the weight tile is the
 MXU's transposed right-hand side; Mosaic absorbs the transpose into the push).

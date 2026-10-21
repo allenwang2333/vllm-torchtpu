@@ -284,7 +284,6 @@ if TYPE_CHECKING:
     TPU_FUSED_OPROJ_AR_WAVES: bool = True
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = "self_attn.o_proj,q_b_proj"
-    TPU_MOE_ROUTER_HBM_PIN: bool = False
     TPU_LM_HEAD_HBM: str = "drafter"
     TPU_FUSED_ADD_RMSNORM: bool = False
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
@@ -1997,15 +1996,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str(
         "TPU_FP8_SKINNY_HBM_PIN_SITES", "self_attn.o_proj,q_b_proj"
     ),
-    # MoE router logits (the bf16 gate GEMM, [T, hidden] x [E, hidden]^T) of a layer
-    # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
-    # Pallas kernel that streams the router weight from HBM (operand constrained
-    # to HBM), instead of an XLA dot whose weight XLA stages into VMEM with a copy
-    # (exposed at decode once the window before it shrinks). NOT bit-identical:
-    # Mosaic's MXU accumulation order differs from XLA's, ~1 in 10^4 logits lands on
-    # the neighbouring bf16 (a top-k flip needs a logit within an ulp of the
-    # boundary); needs an accuracy check. Prefill sizes unchanged.
-    "TPU_MOE_ROUTER_HBM_PIN": env_bool("TPU_MOE_ROUTER_HBM_PIN"),
     # The LM head (vocab-parallel `F.linear(x, W)`, W bf16 [vocab/tp, hidden] N-major)
     # at <= 64 logits rows runs as a Pallas kernel that streams W from HBM through a
     # 3-slot VMEM ring (kernels/lm_head_hbm.py; GLM-5.2 TP16 [9680, 6144] on tpu7x:
