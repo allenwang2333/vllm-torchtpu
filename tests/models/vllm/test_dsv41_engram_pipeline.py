@@ -191,6 +191,15 @@ def test_bucket_switch_releases_dormant_activation_outputs(staging):
     assert not old.consumers
 
 
+def test_upload_capacity_covers_all_columns_after_dp_exchange(staging):
+    layer, _, _, _, _ = staging
+    layer.embed_tokens.dp_size = 2
+    layer._init_staging(4, 32)
+    layer.enable_prepared_upload()
+    slot = layer._reserve_upload(3)
+    assert slot.host_words.numel() == 3 * (4 * 32 // 4 + 1)
+
+
 @pytest.fixture
 def prompt_inputs():
     module = load_nodes(

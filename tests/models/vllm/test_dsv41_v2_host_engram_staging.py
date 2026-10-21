@@ -10,6 +10,7 @@ Covers all lines and branches in:
 from __future__ import annotations
 
 import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1131,6 +1132,31 @@ class TestModelEngramPreparation:
             hashes, mask = model._prepare_engram(ids, pos, lookback, stage="full")
             mock_dev_hash.assert_called_once()
             assert hashes.shape == (2, 2, 8)
+
+    def test_incomplete_prefill_records_encoder_output_before_zero_result(self):
+        model = self._create_mock_model(cpu_offload=False, ced_enabled=True)
+        model._ced_boundary = 1
+        encoded = (torch.ones(2, 64), torch.ones(2, 64))
+        model.encoder_stage = MagicMock(return_value=encoded)
+        model._record_engram_consumers = MagicMock()
+        context = SimpleNamespace(
+            attn_metadata={"swa_0": SimpleNamespace(seq_lens=torch.tensor([2]))},
+            additional_kwargs={},
+            dp_metadata=None,
+        )
+        namespace = "vllm_torchtpu.models.vllm.deepseek_v41.v2.model"
+        with (
+            patch(namespace + ".upstream.get_forward_context", return_value=context),
+            patch(namespace + ".replace", return_value=context),
+            patch(namespace + ".override_forward_context", return_value=nullcontext()),
+            patch(
+                namespace + ".plan_decoder_replay",
+                return_value=SimpleNamespace(padded_num_tokens=0),
+            ),
+        ):
+            result = model._forward_impl(torch.tensor([1, 2]), torch.tensor([0, 1]))
+        assert torch.count_nonzero(result) == 0
+        model._record_engram_consumers.assert_called_once_with(0, 1, encoded)
 
     def test_forward_offload_engram_lifecycle_and_mega_moe(self):
         model = self._create_mock_model(cpu_offload=True, ced_enabled=False)

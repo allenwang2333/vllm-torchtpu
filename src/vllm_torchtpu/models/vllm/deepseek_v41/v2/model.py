@@ -574,7 +574,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             lookback_token_ids,
         )
         self._record_engram_consumers(self.start_layer, self.end_layer, output)
-        self._prefetch_next_prompt()
+        self._prefetch_next_prompt(output)
         return output
 
     def _record_engram_consumers(self, start: int, end: int, output) -> None:
@@ -598,7 +598,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         for engram in engrams:
             engram.record_upload_consumers(tensors)
 
-    def _prefetch_next_prompt(self) -> None:
+    def _prefetch_next_prompt(self, output) -> None:
         current = self._current_host_inputs
         self._engram_prefetch = None
         if current is None or not current.all_prompt or current.next_prompt is None:
@@ -619,6 +619,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         following = current.next_prompt(current)
         if following is None:
             return
+        if isinstance(output, upstream.IntermediateTensors):
+            output = output.tensors
+        synchronize_tensors(
+            [item for item in tree_leaves(output) if isinstance(item, torch.Tensor)],
+            wait=False,
+        )
         assert self.engram_hash is not None
         hashes = self.engram_hash.hash_on_host(
             following.input_ids,
@@ -723,6 +729,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         inputs_embeds,
                         lookback_token_ids,
                     )
+            # Incomplete prefills may return independent zero logits below.
+            # Their readiness does not prove the encoder has finished reading.
+            self._record_engram_consumers(self.start_layer, self._ced_boundary, encoded)
         finally:
             self._engram_prepared_outside_stage = False
             self._early_engram_hashes = None

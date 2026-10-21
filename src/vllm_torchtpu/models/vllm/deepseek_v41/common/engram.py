@@ -692,8 +692,7 @@ class Engram(upstream.Engram):
                     slot.release_consumers()
         uploads = self._prepared_uploads.get(num_tokens)
         if uploads is None:
-            cols = self.embed_tokens.part_n_hash_cols
-            dim = self.embed_tokens.weight.shape[-1]
+            cols, dim = self._host_raw.shape[1:]
             blocks = dim // self.embed_tokens.block_size
             words = num_tokens * (cols * dim // 4 + -(-(cols * blocks) // 4))
             uploads = [
