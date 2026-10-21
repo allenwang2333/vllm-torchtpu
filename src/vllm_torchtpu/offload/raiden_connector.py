@@ -394,11 +394,10 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         # External cache reset is unsupported by the Raiden store. Report
         # failure through the endpoint's documented channel instead of raising an
         # exception here
-        logger.warning(
-            "TPURaidenOffloadingConnector: external cache reset is not "
-            "supported by the Raiden offload store; reporting failure."
-        )
-        return False
+        if self.connector_scheduler is not None:
+            self.connector_scheduler._fence_pending.clear()
+            self.connector_scheduler.reset_cache()
+        return True
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         if self.connector_scheduler is not None:
@@ -450,6 +449,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             )
 
         # Retain pool tensor references to dispatch their writes during save fences.
+        pool_tensors.sort(key=lambda x: -x.page_size_bytes)
         self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
 
         group_data_refs = [

@@ -788,3 +788,18 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
         self.bundle_assignments = bundle_assignments
         return bundle_assignments
+
+
+def _select_tcpstore_port_fn(*args, **kwargs):
+    try:
+        from vllm.utils.network_utils import get_open_port
+        return get_open_port()
+    except Exception:
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            return sock.getsockname()[1]
+
+
+if "RayDistributedExecutorV2" in globals():
+    RayDistributedExecutorV2._select_tcpstore_port = staticmethod(_select_tcpstore_port_fn)

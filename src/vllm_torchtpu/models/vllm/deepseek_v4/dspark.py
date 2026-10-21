@@ -208,11 +208,15 @@ class DSparkDeepseekV4Model(nn.Module):
         draft_vocab_size = (
             getattr(config, "draft_vocab_size", None) or config.vocab_size
         )
-        self.markov_head = DSparkMarkovHead(
-            config.vocab_size,
-            draft_vocab_size,
-            config.dspark_markov_rank,
-            prefix=maybe_prefix(prefix, "markov_head"),
+        self.markov_head = (
+            nn.Identity()
+            if __import__("os").environ.get("ROLE") == "prefill"
+            else DSparkMarkovHead(
+                config.vocab_size,
+                draft_vocab_size,
+                config.dspark_markov_rank,
+                prefix=maybe_prefix(prefix, "markov_head"),
+            )
         )
 
     # Borrowed from the target: the lazily built MHC post op, the expert

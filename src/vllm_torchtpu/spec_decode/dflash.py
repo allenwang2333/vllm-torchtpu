@@ -664,6 +664,8 @@ class DFlashProposer:
 
                 # Context-KV updates allow short chunks;
                 # draft forward needs a full block.
+                if getattr(runner, "_is_dspark_pd_producer", False):
+                    continue
                 if not block_size <= num_tokens <= max_draft_tokens:
                     continue
 
@@ -776,23 +778,18 @@ class DFlashProposer:
         positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
 
         # Map actual request count based on block allocations; the guard
-        # above makes this >= 1.
+        # above makes this >= 1. Match runtime _build_draft_attn_metadata
+        # (padded_num_reqs = num_tokens // block_size, step = block_size)
+        # even when num_tokens is not a multiple of block_size (e.g. bucket 8
+        # with block_size=5).
         actual_num_reqs = num_tokens // block_size
-
-        num_tokens_per_req = num_tokens // actual_num_reqs
-        query_lens = [num_tokens_per_req] * actual_num_reqs
-        query_start_loc = torch.cumsum(
-            torch.tensor([0] + query_lens, dtype=torch.int32), dim=0, dtype=torch.int32
-        ).to(runner.device)
-
+        query_start_loc, request_distribution = self._get_static_attn_tensors(
+            actual_num_reqs
+        )
         seq_lens = (
             torch.ones((actual_num_reqs,), dtype=torch.int32).to(runner.device)
-            * num_tokens_per_req
+            * block_size
         )
-
-        request_distribution = torch.tensor(
-            [0, 0, actual_num_reqs], dtype=torch.int32
-        ).to(runner.device)
 
         per_layer_attn_metadata = self._build_attn_metadata_for_draft(
             num_reqs=actual_num_reqs,

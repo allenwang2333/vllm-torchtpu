@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -171,8 +171,8 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
-    # directly within the prefill engine.
+    if api == "/v1/completions":
+        return "/v1/completions/render"
     return None
 
 
@@ -583,16 +583,7 @@ async def _handle_completions(api: str, request: Request):
                     first = False
                 yield chunk
 
-        # text/event-stream when the caller asked for a stream, which is what
-        # the decode instance is actually sending back. Declared as
-        # application/json, a client parses each SSE frame - "data: {...}" prefix
-        # and all - as one JSON document, and every request fails; aiperf's
-        # agentic replay does exactly that, while the non-streaming callers this
-        # proxy had until now (check_completions.py, lm_eval) never noticed.
-        media_type = (
-            "text/event-stream" if req_data.get("stream") else "application/json"
-        )
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        return StreamingResponse(generate_stream(), media_type=("text/event-stream" if req_data.get("stream") else "application/json"))
 
     except Exception as e:
         import sys
@@ -615,28 +606,131 @@ async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
 
 
-@app.get("/v1/models")
-async def models():
-    """The decode instance's model list, which is the pair's.
+async def _check_backend_healthy(client_info: dict) -> bool:
+    client = client_info["client"]
+    try:
+        resp = await client.get("/health", timeout=10.0)
+        if resp.status_code == 200:
+            return True
+        logger.warning(
+            f"Backend {client_info['host']}:{client_info['port']} /health returned status {resp.status_code}"
+        )
+        return False
+    except Exception as e:
+        logger.debug(
+            f"Backend {client_info['host']}:{client_info['port']} health check failed: {e}"
+        )
+        return False
 
-    Part of the OpenAI surface this proxy presents: a client resolves the served
-    model name here, and the ModelCard's max_model_len is how a benchmark client
-    learns the window it is replaying against. Both instances serve the same
-    model; decode is the one that finishes a request.
-    """
-    client = app.state.decode_clients[0]["client"]
-    response = await client.get("/v1/models")
-    return JSONResponse(status_code=response.status_code, content=response.json())
 
-
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
-    """Simple endpoint to check if the server is running."""
-    return {
-        "status": "ok",
-        "prefill_instances": len(app.state.prefill_clients),
-        "decode_instances": len(app.state.decode_clients),
-    }
+    prefill_clients = getattr(app.state, "prefill_clients", [])
+    decode_clients = getattr(app.state, "decode_clients", [])
+
+    if not prefill_clients or not decode_clients:
+        return Response(
+            content='{"status": "no_clients_configured"}',
+            status_code=503,
+            media_type="application/json",
+        )
+
+    prefill_results = [await _check_backend_healthy(c) for c in prefill_clients]
+    decode_results = [await _check_backend_healthy(c) for c in decode_clients]
+
+    prefill_ok = all(prefill_results)
+    decode_ok = all(decode_results)
+
+    if prefill_ok and decode_ok:
+        return {
+            "status": "ok",
+            "prefill_instances": len(prefill_clients),
+            "decode_instances": len(decode_clients),
+        }
+    return Response(
+        content='{"status": "waiting_for_backends", "prefill_ready": %s, "decode_ready": %s}' % (
+            "true" if prefill_ok else "false", "true" if decode_ok else "false"),
+        status_code=503,
+        media_type="application/json",
+    )
+
+
+@app.get("/v1/models")
+async def handle_models():
+    for clients in [getattr(app.state, "decode_clients", []), getattr(app.state, "prefill_clients", [])]:
+        if clients:
+            try:
+                resp = await clients[0]["client"].get("/v1/models", timeout=10.0)
+                if resp.status_code == 200:
+                    return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+            except Exception:
+                pass
+    return {"object": "list", "data": [{"id": "deepseek-ai/DeepSeek-V4-Pro-0813", "object": "model"}]}
+
+
+@app.post("/reset_prefix_cache")
+async def handle_reset_prefix_cache(request: Request):
+    params = dict(request.query_params)
+    errors = []
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        success = False
+        for attempt in range(5):
+            try:
+                resp = await c["client"].post("/reset_prefix_cache", params=params, timeout=60.0)
+                if resp.status_code == 200:
+                    success = True
+                    break
+                logger.warning(f"Reset prefix cache on {c['host']}:{c['port']} returned {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"Reset prefix cache attempt {attempt + 1} on {c['host']}:{c['port']} failed: {e}")
+                await asyncio.sleep(2)
+        if not success:
+            errors.append(f"{c['host']}:{c['port']}")
+    if errors:
+        return Response(content='{"status": "error", "failed_backends": %s}' % str(errors), status_code=502, media_type="application/json")
+    return {"status": "ok"}
+
+
+@app.post("/start_profile")
+async def handle_start_profile(request: Request):
+    params = dict(request.query_params)
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        try:
+            await c["client"].post("/start_profile", params=params, timeout=30.0)
+        except Exception as e:
+            logger.warning(f"start_profile on {c['host']}:{c['port']} failed: {e}")
+    return {"status": "ok"}
+
+
+@app.post("/stop_profile")
+async def handle_stop_profile(request: Request):
+    params = dict(request.query_params)
+    clients = getattr(app.state, "prefill_clients", []) + getattr(app.state, "decode_clients", [])
+    for c in clients:
+        try:
+            await c["client"].post("/stop_profile", params=params, timeout=60.0)
+        except Exception as e:
+            logger.warning(f"stop_profile on {c['host']}:{c['port']} failed: {e}")
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def handle_metrics():
+    output = []
+    for role, client_list in [("decode", getattr(app.state, "decode_clients", [])), ("prefill", getattr(app.state, "prefill_clients", []))]:
+        if client_list:
+            try:
+                resp = await client_list[0]["client"].get("/metrics", timeout=10.0)
+                if resp.status_code == 200:
+                    output.append(resp.text.replace('engine="', f'engine="{role}_'))
+            except Exception:
+                pass
+    if output:
+        return Response(content="\n".join(output), media_type="text/plain")
+    return Response(content="", media_type="text/plain")
 
 
 if __name__ == "__main__":

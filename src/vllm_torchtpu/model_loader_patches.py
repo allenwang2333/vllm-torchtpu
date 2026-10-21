@@ -73,6 +73,14 @@ _EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale
 
 
 def _should_skip(name: str, local_expert_ids: set[int]) -> bool:
+    from vllm.compilation import backends as _vllm_backends
+    if getattr(_vllm_backends, "model_tag", None) == "dflash_head":
+        if not name.startswith("mtp."):
+            return True
+        if os.environ.get("ROLE") == "prefill" and any(
+            k in name for k in (".ffn.", ".markov_head.", ".wq_b.", ".wo_a.", ".wo_b.", ".q_norm.")
+        ):
+            return True
     from vllm.model_executor.model_loader.ep_weight_filter import parse_expert_id
 
     expert_id = parse_expert_id(name)
@@ -512,6 +520,22 @@ def patch_default_loader_ep_weight_filter() -> None:
         local_expert_ids=None,
         **kwargs,
     ):
+        from vllm.compilation import backends as _vllm_backends
+        if getattr(_vllm_backends, "model_tag", None) == "dflash_head":
+            _mtp_files = [
+                f
+                for f in hf_weights_files
+                if any(
+                    s in f
+                    for s in (
+                        "00064-of-00066",
+                        "00065-of-00066",
+                        "00066-of-00066",
+                    )
+                )
+            ]
+            if _mtp_files:
+                hf_weights_files = _mtp_files
         if safetensors_load_strategy == "prefetch" and local_expert_ids is not None:
             _start_ep_range_prefetch(
                 sorted(hf_weights_files, key=weight_utils._natural_sort_key),
@@ -716,6 +740,12 @@ def evict_loaded_weights_page_cache() -> None:
 
     Called by the runner after the target and any draft model are loaded.
     """
+    import ctypes
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
     if not envs.TPU_EVICT_WEIGHTS_PAGE_CACHE or not _loaded_weight_files:
         return
     files = list(_loaded_weight_files)
