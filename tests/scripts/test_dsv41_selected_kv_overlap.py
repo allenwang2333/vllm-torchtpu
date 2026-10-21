@@ -95,3 +95,30 @@ def test_corrupt_capture_is_rejected_before_loading(tmp_path):
         stream.write(b"corrupt")
     with pytest.raises(ValueError, match="checksum mismatch"):
         read_capture(path)
+
+
+@pytest.mark.parametrize("offset", [0, -3])
+def test_capture_matches_actual_stage_inputs_not_speculative_host_metadata(
+    tmp_path, offset
+):
+    path = write_capture(tmp_path)
+    with np.load(path) as payload:
+        arrays = dict(payload)
+    arrays["encoder_input_positions"] = arrays["layer0_positions"].copy()
+    arrays["decoder_input_positions"] = arrays["layer0_positions"].copy()
+    arrays["layer0_positions"] += offset
+    np.savez_compressed(path, **arrays)
+    metadata = json.loads(path.with_suffix(".json").read_text())
+    metadata["position_source"] = "actual_stage_input_tensors"
+    metadata["host_metadata_row"] = {
+        **metadata["row"],
+        "starts": [103, 203],
+        "ends": [105, 205],
+    }
+    metadata["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.with_suffix(".json").write_text(json.dumps(metadata))
+    if offset:
+        with pytest.raises(AssertionError):
+            read_capture(path)
+    else:
+        assert len(read_capture(path)) == 2

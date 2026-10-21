@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measure within-request KV reuse from calibration-only decode captures.
 
-Each NPZ has a JSON sidecar with its SHA-256, host decode boundaries and
+Each NPZ has a JSON sidecar with its SHA-256, decode boundaries and
 indexer metadata. The capture copies selected IDs, query positions and request
 IDs together after a real decode forward. IDs are local to each request and
 compressed cache; never merge them across requests or indexers.
@@ -56,6 +56,14 @@ def read_capture(path: Path) -> list[dict]:
         raise ValueError(f"Host request boundaries are incomplete: {path}")
     records = []
     with np.load(path, allow_pickle=False) as data:
+        input_positions = None
+        if metadata.get("position_source") == "actual_stage_input_tensors":
+            input_positions = data["encoder_input_positions"]
+            if input_positions.shape != (host["rows"],):
+                raise ValueError(f"Unexpected stage input shape: {path}")
+            np.testing.assert_array_equal(
+                input_positions, data["decoder_input_positions"]
+            )
         for layer in metadata["layers"]:
             key = layer["key"]
             selected = data[f"{key}_selected"]
@@ -76,6 +84,8 @@ def read_capture(path: Path) -> list[dict]:
             if layer["compress_ratio"] <= 0:
                 raise ValueError(f"Invalid compression ratio: {path}, {key}")
             np.testing.assert_array_equal(np.unique(requests), np.arange(count))
+            if input_positions is not None:
+                np.testing.assert_array_equal(positions, input_positions)
             lengths = (positions + 1) // layer["compress_ratio"]
             if np.any(selected < -1) or np.any(
                 (selected >= 0) & (selected >= lengths[:, None])

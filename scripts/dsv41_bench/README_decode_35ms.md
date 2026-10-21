@@ -326,8 +326,12 @@ python scripts/dsv41_bench/analyze_selected_kv.py /path/to/kv-selection \
 ```
 
 The NPZ/JSON pairs contain selected logical IDs, positions and request IDs
-copied together after a real decode forward. The analyzer verifies checksums,
-host query boundaries and compressed-context bounds before measuring per-request
+copied together after a real decode forward. Captures marked
+`actual_stage_input_tensors` also freeze encoder and decoder input positions
+before their respective calls; both must match every indexer's recorded
+positions. Preserve speculative host metadata separately, since its inferred
+positions can differ from the actual stage inputs. The analyzer verifies
+checksums, query boundaries and compressed-context bounds before measuring per-request
 unions. It compares sets rather than top-k column positions and never merges
 logical IDs across requests or indexers. Reported row-traffic reductions are
 ideal bounds for the captured selections, not kernel or serving speedups.
