@@ -101,6 +101,11 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
+    TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (128, 64, 64)
+    TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
+    TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (32, 64, 32)
+    TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
+    TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -308,6 +313,20 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
     return _get_nonnegative_int_env
 
 
+def env_positive_int(env_name: str, default: int) -> Callable[[], int]:
+    """Integer knob that must be greater than zero, such as a chunk size
+    that is divided by."""
+    parse_int = env_int(env_name, default)
+
+    def _get_positive_int_env() -> int:
+        value = parse_int()
+        if value <= 0:
+            raise ValueError(f"Invalid value '{value}' for {env_name}: must be > 0.")
+        return value
+
+    return _get_positive_int_env
+
+
 def env_float(env_name: str, default: float) -> Callable[[], float]:
     """Float knob with a default. An unparseable value raises."""
 
@@ -397,6 +416,37 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
         return value
 
     return _get_positive_int_or_none_env
+
+
+def env_positive_int_triple(
+    env_name: str, default: tuple[int, int, int]
+) -> Callable[[], tuple[int, int, int]]:
+    """Per-pass kernel block size written as ``decode,prefill,mixed``.
+
+    Unset or empty reads as the default. Anything else must be exactly three
+    comma-separated integers greater than zero.
+    """
+
+    def _get_positive_int_triple_env() -> tuple[int, int, int]:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return default
+        parts = value.split(",")
+        try:
+            ints = tuple(int(p) for p in parts)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be three "
+                "comma-separated integers (decode,prefill,mixed)."
+            ) from exc
+        if len(ints) != 3 or any(i <= 0 for i in ints):
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be three "
+                "comma-separated integers > 0 (decode,prefill,mixed)."
+            )
+        return ints[0], ints[1], ints[2]
+
+    return _get_positive_int_triple_env
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -773,6 +823,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
+    # DSv4 kernel block sizes, each "decode,prefill,mixed". Defaults are the
+    # microbenchmark-tuned values. HCA: compressed-KV pass
+    # (mla_ragged_paged_attention).
+    "TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK", (128, 64, 64)
+    ),
+    "TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
+    ),
+    # Indexer: StreamIndex top-k scoring (streamindex_topk).
+    "TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK", (32, 64, 32)
+    ),
+    "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
+        "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
+    ),
+    # CSA: query tokens per gather + attention chunk of the sparse attention
+    # (sparse_ragged_paged_attention). Steps of at most 128 tokens keep 32.
+    "TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE": env_positive_int(
+        "TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE", 64
+    ),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),

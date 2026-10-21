@@ -30,6 +30,8 @@ from vllm_torchtpu.envs import (
     env_int,
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
+    env_positive_int,
+    env_positive_int_triple,
     env_str,
 )
 
@@ -52,6 +54,7 @@ def _clear(monkeypatch):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
     ],
 )
@@ -65,6 +68,7 @@ def test_unset_reads_as_the_default(builder, default):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
+        (env_positive_int, 7),
         (env_float, 1.5),
     ],
 )
@@ -149,6 +153,14 @@ def test_nonnegative_int_rejects_negatives(monkeypatch):
         env_nonnegative_int(VAR, 0)()
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_positive_int_rejects_zero_and_negatives(monkeypatch, value):
+    """These are chunk sizes the token count is divided by."""
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match="must be > 0"):
+        env_positive_int(VAR, 1)()
+
+
 def test_float_parses_ints_too(monkeypatch):
     monkeypatch.setenv(VAR, "30")
     assert env_float(VAR, 1.0)() == 30.0
@@ -178,6 +190,25 @@ def test_int_or_auto_rejects_other_words_and_negatives(monkeypatch, value):
     monkeypatch.setenv(VAR, value)
     with pytest.raises(ValueError, match=VAR):
         env_nonnegative_int_or_auto(VAR)()
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_int_triple_reads_the_default_for_unset_or_empty(monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv(VAR, value)
+    assert env_positive_int_triple(VAR, (1, 32, 32))() == (1, 32, 32)
+
+
+def test_int_triple_parses_decode_prefill_mixed(monkeypatch):
+    monkeypatch.setenv(VAR, " 4, 16 ,8")
+    assert env_positive_int_triple(VAR, (1, 32, 32))() == (4, 16, 8)
+
+
+@pytest.mark.parametrize("value", ["8", "1,2", "1,2,3,4", "1,0,2", "1,-2,3", "a,b,c"])
+def test_int_triple_rejects_anything_but_three_positive_ints(monkeypatch, value):
+    monkeypatch.setenv(VAR, value)
+    with pytest.raises(ValueError, match=VAR):
+        env_positive_int_triple(VAR, (1, 32, 32))()
 
 
 # ---------------------------------------------------------------------------

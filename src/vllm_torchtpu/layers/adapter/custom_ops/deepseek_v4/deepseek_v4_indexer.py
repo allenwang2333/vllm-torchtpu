@@ -71,6 +71,8 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    num_kv_pages_per_block: tuple[int, int, int],
+    num_queries_per_block: tuple[int, int, int],
     verify_q_len: int | None = None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
@@ -116,9 +118,8 @@ def _indexer_jax(
             distribution=distribution,
             k=k,
             compression_ratio=compression_ratio,
-            # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(32, 64, 32),
-            num_queries_per_block=(1, 32, 32),
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
             decode_req_batch_size=4,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
             kv_layout=KVLayout.SEQ_ALONG_LANE,
@@ -188,6 +189,8 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            num_kv_pages_per_block=envs.TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=envs.TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK,
             verify_q_len=verify_q_len,
         )
 

@@ -69,4 +69,6 @@ def test_indexer_refuses_a_cache_of_the_other_layout():
             compression_ratio=4,
             softmax_scale=1.0,
             n_head=1,
+            num_kv_pages_per_block=(32, 64, 32),
+            num_queries_per_block=(1, 32, 32),
         )

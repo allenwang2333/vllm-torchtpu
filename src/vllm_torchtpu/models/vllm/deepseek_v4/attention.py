@@ -33,6 +33,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
@@ -378,6 +379,19 @@ class VllmDeepseekV4MLAAttention(
             spec_config.num_speculative_tokens + 1 if spec_config is not None else None
         )
 
+        kernel_tuning: dict[str, Any] = (
+            {
+                "csa_gather_and_attention_chunk_size": (
+                    envs.TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE
+                ),
+            }
+            if is_csa
+            else {
+                "hca_num_kv_pages_per_block": envs.TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK,
+                "hca_num_queries_per_block": envs.TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK,
+            }
+        )
+
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,
             sm_scale=sm_scale,
@@ -387,6 +401,7 @@ class VllmDeepseekV4MLAAttention(
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
+            **kernel_tuning,
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")

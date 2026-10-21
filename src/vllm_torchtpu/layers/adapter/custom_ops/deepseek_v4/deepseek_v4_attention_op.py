@@ -116,6 +116,8 @@ def _attention_hca(
     logical_page_size: int,
     swa_only: bool,
     two_caches_same_buffer: bool,
+    hca_num_kv_pages_per_block: tuple[int, int, int],
+    hca_num_queries_per_block: tuple[int, int, int],
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -171,9 +173,8 @@ def _attention_hca(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
-        # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(128, 64, 64),
-        num_queries_per_block=(1, 32, 32),
+        num_kv_pages_per_block=hca_num_kv_pages_per_block,
+        num_queries_per_block=hca_num_queries_per_block,
         chunk_prefill_size=verify_q_len,
     )
     return output, updated_sw_cache
@@ -201,6 +202,7 @@ def _attention_csa(
     logical_page_size: int,
     swa_only: bool,
     two_caches_same_buffer: bool,
+    csa_gather_and_attention_chunk_size: int,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
@@ -235,7 +237,7 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    gather_and_attention_chunk_size = 64
+    gather_and_attention_chunk_size = csa_gather_and_attention_chunk_size
     attention_kernel_batch_size = 16
     # small chunks override:
     if q.shape[0] <= 128:
