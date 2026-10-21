@@ -260,7 +260,6 @@ def _merge_chunked(
                     _gather_lse(lse_f32[c * step : (c + 1) * step], group),
                     group,
                     rs_dtype,
-                    after=_rs_lag_dep(pieces),
                 )
             )
         return torch.cat(pieces, dim=0)
@@ -289,28 +288,15 @@ def _gather_lse(lse_f32: torch.Tensor, group: Any) -> torch.Tensor:
     return group.all_gather(lse_f32.unsqueeze(0).contiguous(), dim=0)
 
 
-def _rs_lag_dep(done: list[torch.Tensor]) -> torch.Tensor | None:
-    """TPU_DCP_MERGE_RS_LAG=n: the merged result of the chunk n back, which
-    the next chunk's weights are tied to (None below n chunks, or off)."""
-    lag = envs.TPU_DCP_MERGE_RS_LAG
-    return done[-lag] if lag > 0 and len(done) >= lag else None
-
-
 def _weighted_reduce_scatter(
     output: torch.Tensor,
     lse_f32: torch.Tensor,
     lses: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
-    after: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows. `after`
-    (TPU_DCP_MERGE_RS_LAG, heads-major path): an earlier chunk's merged
-    result the merged lse is tied to by an optimization barrier -- a pure
-    ordering edge, so that chunk's reduce-scatter is completed on the
-    schedule before this one is built instead of every completion waiting
-    until the last chunk."""
+    `[world, T, H]` for exactly `output`'s `T` rows."""
     merged_lse = torch.logsumexp(lses, dim=0)
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
@@ -320,10 +306,6 @@ def _weighted_reduce_scatter(
         and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
         > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
     ):
-        if after is not None and merged_lse.device.type == "tpu":
-            from vllm_torchtpu.layers.adapter.dcp_weighted_hm import tie
-
-            merged_lse = tie(merged_lse, after)
         return _weighted_reduce_scatter_heads_major(
             output, lse_f32, merged_lse, group, rs_dtype
         )
@@ -440,7 +422,6 @@ def _merge_chunked_lse_gathered(
                 rows[c],
                 group,
                 rs_dtype,
-                after=_rs_lag_dep(pieces),
             )
         )
     return torch.cat(pieces, dim=0)

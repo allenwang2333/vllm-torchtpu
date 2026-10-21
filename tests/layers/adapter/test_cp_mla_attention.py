@@ -919,7 +919,6 @@ def _rs_merge_whole(outputs, lses, monkeypatch, **env):
         "TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS": 0,
         "TPU_DCP_MERGE_WEIGHTED_HM": False,
         "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": 0,
-        "TPU_DCP_MERGE_RS_LAG": 0,
         "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
     }
     for name, value in {**defaults, **env}.items():
@@ -1069,27 +1068,6 @@ def test_weighted_heads_major_is_bitwise_the_chunked_merge(
     assert got.dtype == torch.bfloat16 and got.shape == outputs.shape[1:]
     torch.testing.assert_close(got, today, rtol=0, atol=0)
     assert _bf16_close(got, _reference_merge(outputs.float(), lses))
-
-
-@pytest.mark.parametrize("lag", [1, 3])
-def test_rs_lag_is_bitwise_and_ties_the_right_chunk(lag, monkeypatch):
-    """TPU_DCP_MERGE_RS_LAG ties chunk k to chunk k-lag's merged rows (CPU: the
-    tie itself is TPU-only, so this checks which result is handed over) and
-    leaves the merge bit for bit."""
-    outputs, lses = _hard_partials(np.random.default_rng(71), 4, tokens=64)
-    on = dict(TPU_DCP_MERGE_CHUNKED=8, TPU_DCP_MERGE_WEIGHTED_HM=True)
-    today = _rs_merge_whole(outputs, lses, monkeypatch, **on)
-    seen = []
-    real = cp_mla._rs_lag_dep
-    monkeypatch.setattr(
-        cp_mla, "_rs_lag_dep", lambda done: seen.append(len(done)) or real(done)
-    )
-    got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_RS_LAG=lag, **on)
-    torch.testing.assert_close(got, today, rtol=0, atol=0)
-    assert sorted(set(seen)) == list(range(8))
-    assert real([torch.zeros(1)] * (lag - 1)) is None
-    marks = [torch.full((1,), float(i)) for i in range(5)]
-    assert real(marks).item() == 5 - lag
 
 
 def test_positive_control_reshaped_heads_major_operand_is_caught(monkeypatch):

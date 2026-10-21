@@ -87,7 +87,6 @@ _ARM_DEFAULTS = {
     "TPU_DCP_MERGE_CHUNKED_SMALL": 0,
     "TPU_DCP_MLA_MERGE_PIECES": 0,
     "TPU_DCP_MERGE_WEIGHTED_HM": False,
-    "TPU_DCP_MERGE_RS_LAG": 0,
 }
 # name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
 ARMS = {

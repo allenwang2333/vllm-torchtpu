@@ -64,7 +64,6 @@ def _set(cp_mla, rs_bf16, mp, pack):
     cp_mla.envs.TPU_DCP_MERGE_WEIGHTED_HM = mp
     cp_mla.envs.TPU_DCP_MLA_MERGE_PIECES = 2 if mp else 0
     cp_mla.envs.TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS = 2048
-    cp_mla.envs.TPU_DCP_MERGE_RS_LAG = 0
     cp_mla.envs.TPU_MTP_DCP_MERGE_SIZED = False
 
 

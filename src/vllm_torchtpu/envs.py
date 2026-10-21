@@ -60,7 +60,6 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_MERGE_PIECES_MIN_TOKENS: int = 2048
     TPU_DCP_MERGE_WEIGHTED_HM: bool = True
     TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS: int = 2048
-    TPU_DCP_MERGE_RS_LAG: int = 0
     TPU_MLA_DECODE_BODY_LEVERS: str = "1"
     TPU_DCP_MLA_MIXED_KERNEL_V2: bool = True
     JAX_PLATFORMS: str = ""
@@ -763,12 +762,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS", 2048
     ),
-    # With TPU_DCP_MERGE_WEIGHTED_HM: chunk k's weights wait (optimization
-    # barrier) for chunk k-n's merged result, so the schedule completes the
-    # SparseCore reduce-scatters as the chain runs instead of all after the
-    # last chunk (the offload stalls with three uncompleted in flight).
-    # Ordering only: bit-identical. 0 = off.
-    "TPU_DCP_MERGE_RS_LAG": env_int("TPU_DCP_MERGE_RS_LAG", 0),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
     # this many query tokens per kernel grid step instead of one, so the
