@@ -3719,6 +3719,11 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
+        # GLM52_DECODE_MK: the whole verify-step backbone as one megakernel on eligible steps (rank-uniform)
+        mk = getattr(self, "_glm52_mk", None)
+        self._glm52_mk_step = bool(
+            mk is not None and mk.step_ok(self, scheduler_output, target_num_chunks)
+        )
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -5216,6 +5221,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
+        self._glm52_mk_step = False
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5240,6 +5246,11 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+
+        # GLM52_DECODE_MK (after moe_tp_decode arming: it reads the served TP16 expert tensors by reference)
+        from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import Glm52DecodeMK
+
+        self._glm52_mk = Glm52DecodeMK.maybe_create(self)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
@@ -5418,6 +5429,7 @@ class TPUModelRunner(GPUModelRunner):
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
         """
+        self._glm52_mk_step = False  # bucket warm-ups always run the stock graphs (R7)
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -6413,6 +6425,10 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        mk = getattr(self, "_glm52_mk", None)
+        if mk is not None:
+            mk.bind_caches(self)
+            mk.warmup(self)
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
@@ -7522,6 +7538,15 @@ class TPUModelRunner(GPUModelRunner):
     def forward_model(
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
+        mk = getattr(self, "_glm52_mk", None)
+        if (
+            mk is not None
+            and mk.enabled
+            and getattr(self, "_glm52_mk_step", False)
+            and inputs_embeds is None
+            and intermediate_tensors is None
+        ):
+            return mk(self, input_ids, positions), None
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}
