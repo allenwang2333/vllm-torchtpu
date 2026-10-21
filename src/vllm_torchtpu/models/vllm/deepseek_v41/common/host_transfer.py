@@ -21,7 +21,7 @@ class PreparedEngramUpload:
         probe = torch.arange(num_words, dtype=torch.int32, device="cpu")
         probe.bitwise_xor_(0x13579BDF)
         self.device = probe.to(device)
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         self.layout = tpu_torch_compile.get_device_layout_if_materialized(self.device)
         if self.layout is None:
             raise RuntimeError("Engram raw upload requires a materialized layout")
@@ -53,6 +53,6 @@ class PreparedEngramUpload:
     def copy_from(self, host_words: torch.Tensor) -> None:
         if host_words.shape != self.host_words.shape:
             raise ValueError("Engram raw upload must use its exact token bucket")
-        torch.tpu.synchronize()
+        torch.accelerator.synchronize()
         self.host_words.copy_(host_words)
         self.transfer.h2d()

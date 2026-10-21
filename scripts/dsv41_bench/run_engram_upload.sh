@@ -27,4 +27,4 @@ python -m pip freeze > pip-freeze.txt
 python -m pip check > pip-check.txt
 unset TORCH_DEVICE_BACKEND_AUTOLOAD
 python bench_engram_upload.py --upload-source host_transfer.py \
-  --engram-source engram.py --output metrics.json --profile-dir profile
+  --engram-source engram.py --output metrics.json --profile-dir "${ARTIFACT_LOCAL_DIR:-.}/engram-upload-profile"

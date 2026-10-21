@@ -136,9 +136,9 @@ def check_staging(path, torch, device, prepared):
         staging._init_staging(4, dim)
     if prepared:
         staging.enable_prepared_upload()
-        consume = torch.compile(staging._ready_rows, backend="tpu", fullgraph=True)
-    else:
-        consume = staging._ready_rows
+    # The standalone dynamic compiler cannot lower the FP8 bitcast in this
+    # runtime. Exercise staging eagerly; run_case checks a static compiled consumer.
+    consume = staging._ready_rows
     identities = {}
     for tokens in (4, 1, 3, 4, 1, 3):
         ids = torch.randint(64, (tokens, cols))
@@ -291,7 +291,7 @@ def main():
                 block_size,
             )
 
-        compiled = torch.compile(consumer, backend="tpu", fullgraph=True)
+        compiled = torch.compile(consumer, backend="tpu", fullgraph=True, dynamic=False)
         candidate_view = candidate.device.view(tokens, words // tokens)
         checks = []
         for iteration in range(4):
@@ -331,7 +331,7 @@ def main():
             order = list(methods)
             rng.shuffle(order)
             for name in order:
-                torch.tpu.synchronize()
+                torch.accelerator.synchronize()
                 start = time.perf_counter_ns()
                 methods[name]()
                 samples[name].append((time.perf_counter_ns() - start) / 1e6)
@@ -378,7 +378,7 @@ def main():
                     for _ in range(5):
                         with torch.profiler.record_function("engram_upload/" + name):
                             methods[name]()
-                            torch.tpu.synchronize()
+                            torch.accelerator.synchronize()
             result["profile_dir"] = profile_dir
             save()
 
