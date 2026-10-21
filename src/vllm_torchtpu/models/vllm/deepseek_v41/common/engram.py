@@ -22,13 +22,17 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
-from ..config import engram_cpu_offload
+from ..config import DeepseekV41Config, EngramUpload, engram_cpu_offload
 from .host_exchange import PendingRowExchange, start_exchange_rows
 
 if TYPE_CHECKING:
     from .host_transfer import PreparedEngramUpload
+
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -656,12 +660,17 @@ class Engram(upstream.Engram):
             self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[max_tokens] = self._staged_raw
             self._active_raw = self._staged_views(max_tokens)
+            config = get_current_vllm_config_or_none()
+            if config is not None and (
+                DeepseekV41Config.from_vllm_config(config).engram_upload
+                == EngramUpload.PREPARED_DMA
+            ):
+                self.enable_prepared_upload()
 
     def enable_prepared_upload(self) -> None:
-        """Opt into the isolated raw-DMA experiment before any consumer runs.
+        """Opt into raw DMA before any consumer runs.
 
-        Serving keeps copy_ until consumer completion has a scoped event.
-        The prototype fences the whole device before each overwrite.
+        This path fences the whole device before each overwrite.
         """
         if self._staged_raw is None:
             raise ValueError("Prepared upload requires host-offloaded Engram")
@@ -767,6 +776,14 @@ class Engram(upstream.Engram):
                 self._prepared_uploads[num_tokens] = upload
                 self._staged_by_tokens[num_tokens] = upload.device
                 self._staged_views_by_tokens.pop(num_tokens, None)
+                logger.info(
+                    "[DSV41] prepared_dma Engram bucket: tokens=%d "
+                    "logical_bytes=%d physical_bytes=%d layout=%s",
+                    num_tokens,
+                    packed.numel() * 4,
+                    upload.host_buffer.size_bytes,
+                    upload.layout,
+                )
             upload.copy_from(packed)
         self._active_raw = self._staged_views(num_tokens)
 

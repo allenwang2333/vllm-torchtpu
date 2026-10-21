@@ -29,6 +29,13 @@ enum has no TPU fused-EP entry. Leave `--moe-backend=auto` for this model.
 | --- | --- | --- |
 | `deepseek_v41.execution` | `full`, `ced` | `full` |
 | `deepseek_v41.moe` | `gmm`, `fused_ep_w4a8` | `gmm` |
+| `deepseek_v41.engram_upload` | `copy`, `prepared_dma` | `copy` |
+
+`prepared_dma` requires host Engram offload. It keeps one validated host/device
+buffer pair per token bucket and reuses its raw DMA handle. Each upload waits
+for previous device work and copies packed bytes into the DMA host buffer.
+This device-wide fence can reduce compute/transfer overlap; measure serving
+throughput before selecting this experimental mode.
 | `engram_config.cpu_offload` | `false`, `true` | `false` (legacy TPU default) |
 
 `fused_ep_w4a8` explicitly selects FP4 weights with FP8 activations; selecting

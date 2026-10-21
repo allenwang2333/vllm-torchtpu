@@ -13,6 +13,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import logging
 import mmap
 import random
 import statistics
@@ -92,6 +93,8 @@ def load_staging(path, torch, unpack, dequant):
         torch=torch,
         dataclass=dataclass,
         PendingRowExchange=object,
+        get_current_vllm_config_or_none=lambda: None,
+        logger=logging.getLogger(__name__),
         _INVALID_SCALE=255,
         _unpack_bytes=unpack,
         dequant_fp8_rows=dequant,
