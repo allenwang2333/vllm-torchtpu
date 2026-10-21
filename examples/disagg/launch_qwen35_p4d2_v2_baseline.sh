@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -107,6 +120,7 @@ DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
+PREFILL_PP="${PREFILL_PP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
@@ -114,7 +128,7 @@ DECODE_DP="${DECODE_DP:-1}"
 # One slicebuilder address per worker in each instance's TorchTPU slice.
 # The count must equal the instance's TorchTPU world size, or
 # _prepare_singlehost_tpu_env falls back to random ports.
-prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+prefill_sb_workers=$((PREFILL_PP * PREFILL_TP * PREFILL_PCP))
 decode_sb_workers=$((DECODE_TP * DECODE_DP))
 prefill_sb_addresses=""
 for ((i = 0; i < prefill_sb_workers; i++)); do
@@ -329,6 +343,7 @@ CONNECTOR=TPUMultiConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
+PREFILL_PP=${PREFILL_PP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
 DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
@@ -409,6 +424,9 @@ EOF
 )
 
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
+if [[ "${PREFILL_PP}" -gt 1 ]]; then
+  prefill_args+=(--pipeline-parallel-size "${PREFILL_PP}")
+fi
 if [[ "${PREFILL_PCP}" -gt 1 ]]; then
   prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
 fi
