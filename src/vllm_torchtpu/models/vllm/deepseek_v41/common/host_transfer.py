@@ -54,11 +54,8 @@ class PreparedEngramUpload:
         self.needs_consumer = False
 
     def acquire(self) -> torch.Tensor:
-        """Return writable host storage after both previous readers finish."""
-        if self.needs_consumer:
-            raise RuntimeError("Record the Engram consumer before reusing its buffer")
+        """Return host storage once its prior DMA reader has finished."""
         self.wait()
-        self.release_consumers()
         return self.host_words
 
     def release_consumers(self) -> None:
@@ -69,6 +66,9 @@ class PreparedEngramUpload:
             self.consumers = []
 
     def start(self) -> None:
+        if self.needs_consumer:
+            raise RuntimeError("Record the Engram consumer before reusing its buffer")
+        self.release_consumers()
         self.pending = self.transfer.h2d_async()
 
     def wait(self) -> None:

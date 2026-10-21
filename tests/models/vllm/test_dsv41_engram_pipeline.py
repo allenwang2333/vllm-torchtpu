@@ -95,13 +95,15 @@ def test_upload_waits_before_reusing_host_and_device(transport):
     slot.acquire()  # Must finish DMA before the caller can rewrite host memory.
     assert slot.device.tolist() == [17] * 5
     slot.activate()
+    slot.acquire().fill_(29)  # Host preparation can overlap a device reader.
+    assert slot.device.tolist() == [17] * 5
     with pytest.raises(RuntimeError, match="Record the Engram consumer"):
-        slot.acquire()
+        slot.start()
     result = torch.tensor([23])
     slot.record_consumers([result])
-    slot.acquire().fill_(29)
-    assert events == ["upload-start", "upload-done", ("consumer-done", [result])]
+    assert events == ["upload-start", "upload-done"]
     slot.start()
+    assert events[-2:] == [("consumer-done", [result]), "upload-start"]
     slot.wait()
     assert slot.device.tolist() == [29] * 5
 
