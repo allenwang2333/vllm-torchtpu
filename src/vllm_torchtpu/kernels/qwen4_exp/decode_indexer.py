@@ -141,6 +141,9 @@ def select_index_blocks(
     ``cache`` is the reader's BF16 or byte-carrier view; ``table`` addresses
     those physical pages. Small padded token buckets conservatively use
     per-query causal lengths, even when a request contains multiple queries.
+    T>padded request capacity is a static scheduling heuristic, not a semantic
+    mode classifier, safety requirement or proven profitability boundary.
+    Per-request starts/context and per-query causal lengths are authoritative.
     """
     if topk_backend is None:
         topk_backend = SparseCoreTopK()

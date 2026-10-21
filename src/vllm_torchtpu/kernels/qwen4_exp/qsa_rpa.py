@@ -200,6 +200,9 @@ def qsa_attention(
 
     T<=request capacity can include multi-token prefill. Each row still uses
     its own request table, selected groups and causal length on that route.
+    T>padded request capacity is a static scheduling heuristic, not a semantic
+    mode classifier, safety requirement or proven profitability boundary.
+    Per-request starts/context and per-query causal lengths are authoritative.
     """
     if len(query) > len(starts) - 1:
         from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
