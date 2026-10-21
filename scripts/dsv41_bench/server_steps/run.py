@@ -117,6 +117,11 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--expert-permutations",
+        type=Path,
+        help="JSON logical-to-physical expert maps for an explicit placement probe",
+    )
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -190,6 +195,28 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    permutation_sha256 = None
+    if args.expert_permutations is not None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+            parse_expert_permutations,
+        )
+
+        source = args.expert_permutations.read_bytes()
+        permutations = parse_expert_permutations(json.loads(source))
+        permutation_sha256 = hashlib.sha256(source).hexdigest()
+        (args.out / "expert-permutations.json").write_bytes(source)
+        server_command += [
+            "--additional-config",
+            json.dumps(
+                {
+                    "deepseek_v41": {
+                        "execution": "ced",
+                        "moe": "fused_ep_w4a8",
+                        "expert_permutations": permutations,
+                    }
+                }
+            ),
+        ]
     if args.profile:
         server_command += [
             "--profiler-config",
@@ -211,6 +238,7 @@ def main() -> None:
             for name in ["torch", "torch-tpu", "jax", "jaxlib", "libtpu"]
         },
         "startup_scope": "server launch through HTTP health readiness",
+        "expert_permutations_sha256": permutation_sha256,
     }
     import vllm
 

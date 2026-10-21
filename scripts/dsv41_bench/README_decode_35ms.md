@@ -435,7 +435,7 @@ archived row/tile estimates are raw-count proxies, not native work counts.
 The analyzer now includes source padding (`--source-row-alignment`, default 2).
 For the same initial placements tested below, corrected sums of per-layer
 maximum 64-row-rounded work are 184960 versus 156480 rows. Refitting with
-source padding yields 156288 rows, still only a work estimate pending timing.
+source padding yields 156288 rows; the timing sweep below tests that refit.
 This correction does not change the recorded microbenchmark timings or outputs.
 The complete KV
 capture also confirmed a median six-query union of 1376 rows and an ideal
@@ -457,9 +457,7 @@ preserving top-k slot order. Every complete output bit matched:
 Times are five ordered complete-module device medians after entry-barrier
 subtraction at P-state 7. The dynamic prototype also passes correction bias
 as an operand. Load balancing benefits these skewed layers but regresses the
-more balanced layer 17. No placement change is enabled in serving yet;
-checkpoint ownership, fetch-time filtering and post-selection ID mapping must
-agree before integration. These probes do not establish an end-to-end gain.
+more balanced layer 17. These probes do not establish an end-to-end gain.
 
 An all-layer dynamic-map sweep with seed 1075 reused just two compiled
 executables across all 40 layers, using the same forward-40 placements and
@@ -468,7 +466,50 @@ improved and seven regressed (11, 12, 13, 17, 20, 21 and 36). The sum of
 isolated module medians was 21.664918 ms versus 20.676277 ms, a 4.56% reduction.
 This sum is not a main-model forward measurement. Twenty-nine layers saved
 more than 5 us apiece; their isolated savings sum to 1.040508 ms. Selective
-integration still needs checkpoint-loading and full-serving validation.
+integration needs full-serving validation.
+
+`exp-5a76c4qc86` (`art-162lb6bo44`, source `5d0c32f0`) repeats all 40 layers
+with the source-aligned placements, seed 1076, and a four-way comparison:
+
+| Variant | Sum of isolated MoE medians (ms) |
+| --- | ---: |
+| Original 64/128 heights, contiguous experts | 21.657505 |
+| Source-aligned expert placement | 20.638479 |
+| 32/128 heights, contiguous experts | 22.132250 |
+| 32/128 heights and source-aligned placement | 21.278096 |
+
+All 160 output checks were bit-exact. The smaller height regressed overall
+and is not integrated. Thirty layers saved more than 5 us under the placement
+change; their isolated savings total 1.075717 ms. Layer selection uses this
+timing sweep, so further serving measurements remain necessary. The verified
+`results/actual-route-sweep-evidence.tgz` is 9814079 bytes with SHA-256
+`210db553d1d8ec7b3ddab9cbbb243d80bc9846b43df2471ef018ce98330c965c`.
+
+The optional `additional_config.deepseek_v41.expert_permutations` policy maps
+logical expert IDs to physical IDs per main-model layer. Run:AI fetches the
+original checkpoint byte ranges but filters and yields physical expert names.
+The fused kernel applies the same replicated map after native top-k selection,
+before EP-to-mesh ordering. Gate logits, bias, selected weights and slot order
+are unchanged. Draft layers are excluded. This requires FP4 fused EP, linear
+placement without EPLB and EP-filtered Run:AI loading; unsupported loading is
+rejected rather than silently changing ownership. Defaults do not enable it.
+
+The workload-specific 30-layer map is checked in as
+`expert_permutations_decode_c384.json`. Its source bytes hash to
+`8cf1d65275f04e2a142edf6f00b295604c6da5c9522a4f4a8f4f13ddfb7bcb7b`.
+The launcher records the map and its hash in the benchmark output:
+
+```bash
+python scripts/dsv41_bench/server_steps/run.py --scenario decode \
+  --input /path/to/inputs.json --out /tmp/decode-permuted --rounds 3 --profile \
+  --expert-permutations scripts/dsv41_bench/expert_permutations_decode_c384.json
+```
+
+The runtime integration checks configuration, loader, bridge and model factory
+behavior on the pinned runtime. Full type checking adds no errors against the
+same-source baseline (57 existing errors become 54). Full-serving performance
+and output validation are pending;
+the microbenchmark sum is not a main-model forward time.
 
 Verified archives in `art-hhm1zvix50`:
 
