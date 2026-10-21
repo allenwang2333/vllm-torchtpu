@@ -50,12 +50,14 @@ def _recv_all(R, me, dst_of, recv_sem):
         pltpu.make_async_copy(dst_of(t), dst_of(t), recv_sem.at[t]).wait_recv()
 
 
-def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False):
+def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False, mids=()):
     """In-place all-reduce of buf ([rows, cols] bf16 VMEM). s: dict(zip(AR_NAMES, scratch)).
     drop_last (FAULT control `missing_rank_partial`): rank R-1's partial is left out of the f32 sum.
     early_read (FAULT control `f_ar_earlyread`, a delay-exposed race): the reduce-scatter slots are summed BEFORE
     their receives are waited, so a late peer's slot still holds the previous layer's partial (the barrier-free
-    slot reuse this protocol must never expose); the waits follow, keeping the semaphores balanced."""
+    slot reuse this protocol must never expose); the waits follow, keeping the semaphores balanced.
+    mids (stage-B L2 `gearly`): up to two callables run while the reduce-scatter (mids[0]) and the all-gather
+    (mids[1]) are in flight, i.e. in the TC's idle wait windows; they must not touch buf or the slot sets."""
     if R == 1:
         if drop_last:
             buf[...] = jnp.zeros(buf.shape, buf.dtype)
@@ -72,6 +74,8 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False):
     own = pltpu.make_async_copy(chunk(me), slot(me), s["loc"].at[0])
     own.start()
     rs = _send_all(R, me, chunk, slot, s["rs_send"], s["rs_recv"])
+    if len(mids) > 0 and mids[0] is not None:
+        mids[0]()
     own.wait()
     if not early_read:
         _recv_all(R, me, slot, s["rs_recv"])
@@ -87,6 +91,8 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False):
     own_ag = pltpu.make_async_copy(red, chunk(me), s["loc"].at[1])
     own_ag.start()
     ag = _send_all(R, me, lambda t: red, chunk, s["ag_send"], s["ag_recv"])
+    if len(mids) > 1 and mids[1] is not None:
+        mids[1]()
     own_ag.wait()
     _recv_all(R, me, chunk, s["ag_recv"])
     for c in (*rs, *ag):

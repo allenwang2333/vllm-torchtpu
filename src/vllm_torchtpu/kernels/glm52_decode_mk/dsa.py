@@ -70,7 +70,9 @@ FAULTS = ("", "digit", "tierank", "nofix", "kscale", "page", "ropeseg", "shareds
           # each perturbs only its path, so n/a at a build that never takes it and RED where it does
           "f_thr2",     # digit + 1, 2-bit threshold rounds only (Sigma np > thr_switch)
           "f_wave",     # digit + 1, waves after the first only (rows of a wave starting at row > 0)
-          "f_wrap")     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
+          "f_wrap",     # granules r >= GR read ring slot (r + 1) % GR (the gather ring has wrapped)
+          # stage-B L2 `gearly` control: the early (previous-layer) issue reads layer l - 1's caches -> RED
+          "f_early_stale")
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
 ALIASED = ("b_keys", "b_memb", "b_pre", "b_xacc", "b_xcc", "g_nope", "g_rope", "kvb", "qb", "qrb", "b_sbuf",
            "att_acc")
@@ -1005,6 +1007,109 @@ def make(E):
         if "gather" not in skip:
             csel(("nope", "rope"), l, go)
 
+    def issue_part(l, r, part):
+        """L2 `gearly` (stage B): granule r's OLD entries only (part "old": cache rows, issuable as soon as the
+        layer's caches are known, i.e. a layer early) or its NEW entries only (part "new": this step's own tokens
+        from the staging rows, which exist only after the layer's L_kvw). old + new = issue(l, r), same slots,
+        same semaphores, same byte counts."""
+        b = scr["b_greq"][r]
+        j = r - req[b, 1]
+        nu = req[b, 0]
+        n = jnp.clip(nu - 128 * j, 0, 128)
+        n_old = jnp.clip(req[b, 2] - 128 * j, 0, n)
+        slot = r % GR
+        base = slot * 128
+        own = scr["own_u"]
+        gs = scr["g_sem"]
+        if part == "old":
+            if fault == "f_early_stale":                 # FAULT: the early issue reads the PREVIOUS layer's caches
+                l = jnp.maximum(l - 1, 0)
+
+            def go(rn, rr):
+                def old_one(k):
+                    v = own[r, k] & SRC_MASK
+                    page, sl = v >> 8, v & 255
+                    pltpu.make_async_copy(rn.at[page, pl.ds(sl, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
+                                          gs.at[slot, 0]).start()
+                    pltpu.make_async_copy(rr.at[page, pl.ds(sl >> 2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
+                                          gs.at[slot, 1]).start()
+
+                def u_body(i, c):
+                    for u in range(UNR):
+                        old_one(i * UNR + u)
+                    return c
+                nu16 = n_old // UNR
+                lax.fori_loop(0, nu16, u_body, 0)
+
+                def r_body(k, c):
+                    old_one(k)
+                    return c
+                lax.fori_loop(nu16 * UNR, n_old, r_body, 0)
+            if "gather" not in skip:
+                csel(("nope", "rope"), l, go)
+        else:
+            def new_one(k, c):
+                t2 = (own[r, k] & SRC_MASK) >> 2
+                pltpu.make_async_copy(E.wrow.at[pl.ds(t2, 1)], scr["g_nope"].at[pl.ds(base + k, 1)],
+                                      gs.at[slot, 0]).start()
+                pltpu.make_async_copy(E.rwrow.at[pl.ds(t2, 1)], scr["g_rope"].at[pl.ds(base + k, 1)],
+                                      gs.at[slot, 1]).start()
+                return c
+            if "gather" not in skip:
+                lax.fori_loop(n_old, n, new_one, 0)
+
+    GE = tuple(int(x) for x in getattr(tiles, "gearly", ()) or ())   # (granules in the RS wait, ... + AG wait)
+    if GE:
+        assert len(GE) == 2 and 0 <= GE[0] <= GE[1] <= GR, (GE, GR)
+
+    def early_issue(l_next, which):
+        """Issue the old entries of the next (IndexShare) layer's granules [lo, hi) of the gather ring:
+        which 0 -> [0, GE[0]), which 1 -> [GE[0], GE[1]) (clipped to U and GR)."""
+        lo, hi = (0, GE[0]) if which == 0 else (GE[0], GE[1])
+        U = st[0]
+
+        def body(r, c):
+            issue_part(l_next, r, "old")
+            return c
+        lax.fori_loop(jnp.minimum(lo, U), jnp.minimum(hi, U), body, 0)
+
+    GREC_IN = getattr(E, "grec_in", None)
+    GREC_OUT = getattr(E, "grec_out", None)
+    GRECN = int(getattr(tiles, "grec", 0))
+
+    def replay_issue(l, r):
+        """Backing arm gather_replay: granule r's n gathered rows (nope and rope) DMA'd from the record of the
+        clean program instead of 2n row DMAs; n rows exactly, so gwait's byte counts are unchanged."""
+        b = scr["b_greq"][r]
+        j = r - req[b, 1]
+        n = jnp.clip(req[b, 0] - 128 * j, 0, 128)
+        slot = r % GR
+        base = slot * 128
+        for s_, (src, dst) in enumerate(((GREC_IN[0], scr["g_nope"]), (GREC_IN[1], scr["g_rope"]))):
+            @pl.when(n == 128)
+            def _(s_=s_, src=src, dst=dst):
+                pltpu.make_async_copy(src.at[l, pl.ds(r * 128, 128)], dst.at[pl.ds(base, 128)],
+                                      scr["g_sem"].at[slot, s_]).start()
+
+            for k in range(6, -1, -1):
+                @pl.when(jnp.logical_and(n < 128, (n & (1 << k)) != 0))
+                def _(s_=s_, src=src, dst=dst, k=k):
+                    off = n & ~((2 << k) - 1)
+                    pltpu.make_async_copy(src.at[l, pl.ds(r * 128 + off, 1 << k)], dst.at[pl.ds(base + off, 1 << k)],
+                                          scr["g_sem"].at[slot, s_]).start()
+
+    def record_rows(l, r):
+        """Record build: granule r's ring rows (after its wait) -> the record outputs (r < grec)."""
+        slot = r % GR
+        base = slot * 128
+
+        @pl.when(r < GRECN)
+        def _():
+            for s_, (src, dst) in enumerate(((scr["g_nope"], GREC_OUT[0]), (scr["g_rope"], GREC_OUT[1]))):
+                cp = pltpu.make_async_copy(src.at[pl.ds(base, 128)], dst.at[l, pl.ds(r * 128, 128)], E.rec_sem.at[1])
+                cp.start()
+                cp.wait()
+
     def gwait(r):
         b = scr["b_greq"][r]
         j = r - req[b, 1]
@@ -1189,19 +1294,47 @@ def make(E):
             def _(qq=qq):
                 emit_row(t0 + qq, qq, empty, ks)
 
-    def attention(l, fresh, q_wait):
+    def attention(l, fresh, q_wait, early=None):
         """The all-request gather ring + attention: issue granules [0, min(U, GR)) (IndexShare layers:
         before the q all-gather wait), then per request: q, then per granule r of it: wait, compute,
-        issue r + GR into the freed slot; then emit."""
+        issue r + GR into the freed slot; then emit.
+        early (L2 `gearly`, traced bool): the old entries of granules [0, GE[1]) were issued during the previous
+        layer's AR#2 (`early_issue`); only their new entries are issued here."""
         del fresh                                        # one issue path: sources are resolved per fresh layer
         ks = E.ks()                                      # this layer's k_scale, [1, 1] f32
         U = st[0]
         pa = Phases(tiles.trace)
         pa.mark("A_issue")
 
-        def pre(r, c):
-            issue(l, r)
-            return c
+        if GREC_IN is not None:
+            def issue_at(r):
+                @pl.when(r < GRECN)
+                def _():
+                    replay_issue(l, r)
+
+                @pl.when(r >= GRECN)
+                def _():
+                    issue(l, r)
+
+            def pre(r, c):
+                issue_at(r)
+                return c
+        elif GE and early is not None:
+            def pre(r, c):
+                done = jnp.logical_and(early, r < GE[1])
+
+                @pl.when(done)
+                def _():
+                    issue_part(l, r, "new")
+
+                @pl.when(jnp.logical_not(done))
+                def _():
+                    issue(l, r)
+                return c
+        else:
+            def pre(r, c):
+                issue(l, r)
+                return c
         lax.fori_loop(0, jnp.minimum(U, GR), pre, 0)
         pa.mark("A_qwait")
         q_wait()
@@ -1232,13 +1365,18 @@ def make(E):
                     def refill(r):                   # the slot of granule r is free once front(r) read it
                         @pl.when(r + GR < U)
                         def _():
-                            issue(l, r + GR)
+                            if GREC_IN is not None:
+                                issue_at(r + GR)
+                            else:
+                                issue(l, r + GR)
 
                     def fr(r, buf, last):
                         if last:
                             gwait(r)
                         else:
                             wait_full(r)
+                        if GREC_OUT is not None:
+                            record_rows(l, r)
                         if compute:
                             front(r, buf, ks)
                         refill(r)
@@ -1273,4 +1411,5 @@ def make(E):
         lax.fori_loop(0, B_(), per_req, 0)
         pa.end()
 
-    return dict(step_init=step_init, indexer_tail=indexer_tail, attention=attention, geometry=g)
+    return dict(step_init=step_init, indexer_tail=indexer_tail, attention=attention, geometry=g,
+                early_issue=early_issue)
