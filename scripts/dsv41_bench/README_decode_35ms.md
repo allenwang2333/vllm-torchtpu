@@ -191,7 +191,8 @@ Seed 1023 used array equality. In the automatic-dispatch run, the explicit
 307200 to 255488 bytes, with unchanged reported argument/output storage and
 zero temporary HBM. The roughly 1.6 us gain per layer projects to only
 0.064 ms over 40 layers and is not an end-to-end result. The serving table
-above predates this change.
+above predates this change. Serving experiment `exp-btjh485722` is running
+at source `2881d570`; its results are not yet available.
 
 Reproduce on the pinned TPU runtime from the repository root:
 
@@ -199,6 +200,25 @@ Reproduce on the pinned TPU runtime from the repository root:
 python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1033 --seed 1033 --profile
 python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1035 --seed 1035 --profile
 ```
+
+## mHC consumer-fusion prototypes
+
+Two additional prototypes in `exp-1yxqyt6ap6` preserve the five mHC outputs
+and the FP8 activation/scale values used by a following 5120-by-1792 Q/KV
+projection. All eight output checks, including the projection, were bit-exact
+at seeds 1034 and 1036. Timing returns the five mHC outputs and projection;
+quantized intermediates remain internal.
+
+| Prototype | Seed 1034 reference / candidate (us) | Seed 1036 reference / candidate (us) |
+| --- | ---: | ---: |
+| Quantize normalized values inside the mHC kernel | 27.796 / 23.396 | 27.824 / 23.362 |
+| Keep the normalized BF16 value in VMEM for its consumer | 27.747 / 26.634 | 27.646 / 26.607 |
+
+These are complete microbenchmark device-module medians excluding entry
+barriers. Neither prototype is in serving dispatch. The first requires
+passing the prequantized values to the consumers; the second retains the
+existing interface but changes output memory placement. Other consumers,
+whole-model memory pressure and serving performance remain unvalidated.
 
 ## Experiments not adopted
 
