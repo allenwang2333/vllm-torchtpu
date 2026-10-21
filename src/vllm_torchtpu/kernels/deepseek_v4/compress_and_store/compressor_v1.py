@@ -277,6 +277,33 @@ def prepare_boundary_batch(
     )
 
 
+def pack_boundary_tokens(
+    positions: jax.Array,
+    token_to_req_indices: jax.Array,
+    kv_slot_mapping: jax.Array,
+    is_boundary: jax.Array,
+    compress_ratio: int,
+    num_reqs: int,
+    tile_n: int = 4,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The boundary tokens packed densely, in token order.
+
+    A request's records then reach `scatter_rows` in ascending destination
+    order however its chunk boundaries fall. Each request adds at most one
+    boundary beyond `num_tokens // compress_ratio`; the size is rounded up to
+    the store kernel's tile so its last tile reads no slot past the end.
+    """
+    num_tokens = positions.shape[0]
+    size = min(num_tokens, num_tokens // compress_ratio + num_reqs)
+    size = -(-size // tile_n) * tile_n
+    safe, valid = _get_packing_indices(is_boundary, size)
+    return (
+        _pack_array(positions, safe, valid, 0),
+        _pack_array(token_to_req_indices, safe, valid, 0),
+        _pack_array(kv_slot_mapping, safe, valid, -1),
+    )
+
+
 def _store_records_seq_along_lane(store, cache, kv_slots, head_dim):
     """`store` the records into a scratch quad-layout array, then scatter them
     into `cache` in the SEQ_ALONG_LANE layout.
@@ -284,6 +311,10 @@ def _store_records_seq_along_lane(store, cache, kv_slots, head_dim):
     The compress kernel writes 4-token quads; the scratch array keeps that
     path and the state reads (from `cache`) as they are. Record `i` lands in
     scratch slot `i`, which is then row `i` of the flattened scratch.
+
+    `scatter_rows` needs the records bound for one 128-lane tile adjacent, so
+    the batch must be in destination order (`pack_boundary_tokens`), not the
+    row-size-sorted tiling of `prepare_boundary_batch`.
     """
     num_records = kv_slots.shape[0]
     page_size = cache.shape[3]
@@ -379,15 +410,25 @@ def compressor_forward(
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
 
-    boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
-        positions=positions,
-        token_to_req_indices=token_to_req_indices,
-        kv_slot_mapping=kv_slot_mapping,
-        is_boundary=is_boundary,
-        is_decode_token=is_decode_token,
-        compress_ratio=compress_ratio,
-        num_reqs=num_reqs,
-    )
+    if record_layout == KVLayout.SEQ_ALONG_LANE:
+        boundary_positions, boundary_req, boundary_kv_slot = pack_boundary_tokens(
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
+            kv_slot_mapping=kv_slot_mapping,
+            is_boundary=is_boundary,
+            compress_ratio=compress_ratio,
+            num_reqs=num_reqs,
+        )
+    else:
+        boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
+            positions=positions,
+            token_to_req_indices=token_to_req_indices,
+            kv_slot_mapping=kv_slot_mapping,
+            is_boundary=is_boundary,
+            is_decode_token=is_decode_token,
+            compress_ratio=compress_ratio,
+            num_reqs=num_reqs,
+        )
 
     store = functools.partial(
         compress_kernel.compress_norm_rope_store,
