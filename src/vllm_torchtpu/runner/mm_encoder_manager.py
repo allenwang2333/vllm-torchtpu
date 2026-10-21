@@ -19,6 +19,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     supports_encoder_cudagraph,
 )
+from vllm.v1.worker.encoder_cudagraph import (
+    CaptureAxisKeys,
+    EncoderCudaGraphManager,
+)
 try:
     from vllm.v1.worker.encoder_cudagraph import (
         CaptureAxisKeys,

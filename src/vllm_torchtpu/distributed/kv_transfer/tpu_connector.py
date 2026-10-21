@@ -3304,6 +3304,7 @@ class TPURaidenConnectorWorker:
 
         storages = list(manifest.storages)
         engine = self._construct_raiden_transfer_engine(storages, num_slots=1)
+        summary = dict(engine.register_pools(manifest.pool_dicts()))
         summary = self._register_raiden_pools(engine, manifest, kv_cache_groups)
 
         registration = self._register_raiden_stage3_work_unit(
@@ -6879,6 +6880,9 @@ class TPURaidenConnectorWorker:
             )
             manager_kwargs.update(
                 listener_port=0,
+                parallelism=(
+                    self._raiden_transfer_parallelism() if self.is_producer else 1
+                ),
                 parallelism=max(default_parallelism, socket_parallelism_env),
             )
             if _reshard_store_mode():
@@ -7056,6 +7060,8 @@ class TPURaidenConnectorWorker:
                 continue
             # Layers of one kv-cache group share a block table; a layer
             # outside every group is its own table.
+            layer_name = str(pool.layer_name)
+            table = group_of_layer.get(layer_name, layer_name)
             tables = tables_by_storage.setdefault(storage, {})
             tables[table] = max(tables.get(table, 0), blocks)
         hints: list[int] = []
