@@ -880,3 +880,74 @@ python scripts/dsv41_bench/bench_dense_fp8.py \
 Use a fresh output directory. The benchmark records every numerical failure and
 compilation error, and times only bit-exact candidates. `--interpret-check` runs
 the small CPU check instead of TPU timing.
+
+## Grouped FP4 contraction experiments
+
+`exp-lcj3uvjmz5` / `art-xte2ut35og` tested isolated alternatives to the FP4
+expert FFN at source `db6dccb4`. The reference widens each 512-row FP4 block
+to FP8, computes its dot, applies its FP32 column scale, then adds the partial
+results. The candidates instead combine two or all contraction blocks before
+the dot, either dequantizing to BF16 or rescaling to FP8 with a shared column
+scale. Weight storage, capacity 128, heights 64/128 and expert prefetch remain
+unchanged. These are experimental replacements used only by the benchmark.
+
+The complete EP8 workload uses 288 local rows, 384 experts, top-k six, hidden
+5120 and active intermediate 2304 padded to 2560. It uses synthetic weights
+and inputs; these tests do not establish model quality. The table reports
+device module medians excluding entry barriers, from five ordered profile
+repetitions after 31 randomized synchronized host repetitions. The 256-column
+variants are shown; narrowing to 128 columns regressed further in every case.
+
+| Case / seed | Reference (ms) | Two-block candidate (ms) | All-block candidate (ms) | Candidate relative L2 error |
+| --- | ---: | ---: | ---: | ---: |
+| BF16, biased / 1079 | 0.467859 | 0.841221 | 0.841238 | 0.037283 / 0.037283 |
+| BF16, uniform / 1080 | 0.459886 | 0.991852 | 0.992026 | 0.037287 / 0.037287 |
+| FP8, biased / 1081 | 0.451959 | 1.531566 | 0.743145 | 0.053716 / 0.064201 |
+| FP8, biased, power-of-two scales / 1082 | 0.484180 | 1.481079 | 0.727515 | 0 / 0 |
+
+Biased cases use `sqrtsoftplus`, correction bias, gate bias 2 and routed scale
+1.5. Uniform routing uses softmax. General scales are sampled from
+`[0.005, 0.025)`; the final case rounds these scales to powers of two. Both
+256-column FP8 variants are bit-exact in that final case, but remain slower.
+The 128-column FP8 variant is not bit-exact even with power-of-two scales
+(relative L2 0.039169). No assumption about real checkpoint scale distribution
+is made from this synthetic test.
+
+The BF16 regression is also present in the expert kernel event itself:
+0.299987 → 0.672144 ms for the biased all-block variant and
+0.291995 → 0.824101 ms for uniform routing. Its compiled temporary storage
+is unchanged, while generated code grows from 4645888 to 6827008 bytes in
+the biased case. These facts do not identify a specific compiler scheduling
+cause. All candidates are rejected on measured latency; none enters serving,
+and no quality benchmark was run for them.
+
+Both evidence archives contain the isolated source, full-output error checks,
+compiled HLO and device events. The original XPlane files remain in the same
+Falcon artifact under each case's `profile` directory.
+
+| Artifact path | Verified SHA-256 |
+| --- | --- |
+| `results/fp4-bf16-contract-evidence.tgz` | `7340748768193eacde81ba53ec783251d6b4203505e8e00ee0113beb1965e7cc` |
+| `results/fp4-fp8-contract-evidence.tgz` | `6610479e7b181061ca77e75bc9ea28b0c033d40865c147ced2d1944291e163a1` |
+
+After extracting the corresponding archive, put `source` on `PYTHONPATH`
+alongside the checkout's `src` and use the pinned runtime described above:
+
+```bash
+python source/bench_fp4_bf16_contract.py --out /tmp/fp4-bf16-biased \
+  --seed 1079 --profile --scoring-fn sqrtsoftplus --score-bias \
+  --gate-bias 2 --routed-scaling-factor 1.5
+python source/bench_fp4_bf16_contract.py --out /tmp/fp4-bf16-uniform \
+  --seed 1080 --profile
+python source/bench_fp4_fp8_contract.py --out /tmp/fp4-fp8-biased \
+  --seed 1081 --profile --scoring-fn sqrtsoftplus --score-bias \
+  --gate-bias 2 --routed-scaling-factor 1.5
+python source/bench_fp4_fp8_contract.py --out /tmp/fp4-fp8-power2 \
+  --seed 1082 --profile --scoring-fn sqrtsoftplus --score-bias \
+  --gate-bias 2 --routed-scaling-factor 1.5 --power-two-scales
+```
+
+A separate reinspection of `exp-gjb1967wya` finds four full-context index
+selection conditionals totaling 3.213629 ms per forward. They contain the
+2.671015 ms of score kernels already reported, plus top-k and preparation;
+these inclusive branch times must not be added to their contained operators.
