@@ -235,6 +235,14 @@ local libtpuInitArgs = cdk.var('LIBTPU_INIT_ARGS', std.join(' ', [
   '--deepsea_slice_builder_heartbeat_interval=%s' % sliceBuilderHeartbeatInterval,
 ]));
 local extraVllmArgs = cdk.var('EXTRA_VLLM_ARGS', '');
+// SERVER_EXTRA_ENV=K1=V1,K2=V2 sets more environment variables on the server pods and copies them into
+// the Ray workers, for knobs this recipe has no variable of its own for. A value that holds commas is
+// written with ':' in their place.
+local serverExtraEnv = {
+  [std.splitLimit(kv, '=', 1)[0]]: std.strReplace(std.splitLimit(kv, '=', 1)[1], ':', ',')
+  for kv in std.split(cdk.var('SERVER_EXTRA_ENV', ''), ',')
+  if kv != ''
+};
 // fastokens (crusoecloud/fastokens) in place of the Rust BPE backend of HF fast tokenizers, the
 // deepseek_v4 tokenizer mode included: VLLM_USE_FASTOKENS=1 (vLLM v0.24+, needs fastokens >= 0.2.0).
 // Pip-installed at this version on every pod unless the image already has it. none: HF's tokenizer.
@@ -742,7 +750,7 @@ local serverJob = cdk.job(
           'VLLM_TPU_MOST_MODEL_LEN',
           'VLLM_SERVER_DEV_MODE',
           'VLLM_USE_FASTOKENS',
-        ]),
+        ] + std.objectFields(serverExtraEnv)),
         TORCH_DIST_TIMEOUT: '1200',
         VLLM_RPC_TIMEOUT: '1200000',
         VLLM_SHM_BROADCAST_TIMEOUT_S: '1200',
@@ -783,7 +791,7 @@ local serverJob = cdk.job(
         VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1',
         RAY_memory_usage_threshold: '0.99',
         RAY_memory_monitor_refresh_ms: '0',
-      } + cdk.jobSetNameEnv + agentx.megascaleOff,
+      } + serverExtraEnv + cdk.jobSetNameEnv + agentx.megascaleOff,
       resources=cdk.tpuResources(chipsPerHost, cpu='32', memory='900Gi'),
       volumeMounts=serverVolumeMounts,
     ),
