@@ -166,6 +166,14 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
 
+`publish_perf_dashboard.py` sends a results directory's
+`isl<N>_osl<N>_c<N>.json` files to the Performance tab of
+[ci.vllm.ai](https://ci.vllm.ai/perf), next to the GPU runs of the same model.
+The nightly does this for the Qwen3.5-397B layouts; to publish another config,
+add its step to the publish step's `depends_on` in `.buildkite/pipeline_perf.yml`
+and its results directory to the command. `--dry-run` prints the rows without
+posting them.
+
 ## Environment Variables
 
 | Variable | Default | Description |
