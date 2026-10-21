@@ -3756,10 +3756,14 @@ class TPUModelRunner(GPUModelRunner):
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
         )
         self._dp_step_num_chunks = target_num_chunks
-        # GLM52_DECODE_MK: the whole verify-step backbone as one megakernel on eligible steps (rank-uniform)
+        # GLM52_DECODE_MK: the whole verify-step backbone as one megakernel on eligible steps. step_ok is the W4
+        # guard (rank-uniform: scheduler output + static facts); every decision is counted, and the next target
+        # forward_model consumes it (("step", bucket or None)).
         mk = getattr(self, "_glm52_mk", None)
-        self._glm52_mk_step = bool(
-            mk is not None and mk.step_ok(self, scheduler_output, target_num_chunks)
+        self._glm52_mk_step = (
+            ("step", mk.step_ok(self, scheduler_output, target_num_chunks))
+            if mk is not None
+            else None
         )
 
         # Run the multimodal (vision) encoder. vLLM's base
@@ -5258,7 +5262,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Ensure attention custom ops exist before any compile/inference path,
         self._initialize_pallas_kernels()
-        self._glm52_mk_step = False
+        self._glm52_mk_step = None
 
         from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
             VllmCompressedTensorsW4ANMxfp4MoEMethod,
@@ -5468,7 +5472,7 @@ class TPUModelRunner(GPUModelRunner):
         stage must then run the same sequence of forwards, and the caller
         settles the hand-off afterwards.
         """
-        self._glm52_mk_step = False  # bucket warm-ups always run the stock graphs (R7)
+        self._glm52_mk_step = None  # bucket warm-ups always run the stock graphs (R7)
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
@@ -7578,14 +7582,31 @@ class TPUModelRunner(GPUModelRunner):
         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
     ):
         mk = getattr(self, "_glm52_mk", None)
-        if (
-            mk is not None
-            and mk.enabled
-            and getattr(self, "_glm52_mk_step", False)
-            and inputs_embeds is None
-            and intermediate_tensors is None
-        ):
-            return mk(self, input_ids, positions), None
+        pending = getattr(self, "_glm52_mk_step", None)
+        if mk is not None and pending is not None and pending is not False:
+            if pending is True:
+                # the twin harness (stageB/L5 forward_run.py): rows_ok held over its timed iterations, not consumed
+                out = mk.try_call(
+                    self,
+                    mk.bucket_for(input_ids.shape[0]) if mk.enabled else None,
+                    input_ids,
+                    positions,
+                    inputs_embeds,
+                    intermediate_tensors,
+                    harness=True,
+                )
+            else:
+                self._glm52_mk_step = None  # one forward per step_ok decision
+                out = mk.try_call(
+                    self,
+                    pending[1],
+                    input_ids,
+                    positions,
+                    inputs_embeds,
+                    intermediate_tensors,
+                )
+            if out is not None:
+                return out, None
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
         kwargs = {}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
+import os
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -1830,6 +1831,29 @@ class KVCacheManager:
         stack_kinds = (
             frozenset() if (_is_ds_v4 or use_block_major) else glm5_stacked_kv_kinds()
         )
+        # GLM52_DECODE_MK (L3-c, the W4 served cache form): the megakernel takes the
+        # caches as stacked groups (per-layer groups at 78 layers do not compile), so
+        # a built megakernel stacks them unless GLM5_MKD_STACK_C is set explicitly
+        # ("0" keeps per-layer caches; the megakernel then declines past 10 layers).
+        if (
+            not stack_kinds
+            and getattr(self.runner, "_glm52_mk", None) is not None
+            and "GLM5_MKD_STACK_C" not in os.environ
+        ):
+            kv_transfer = self.runner.vllm_config.kv_transfer_config is not None
+            if _is_ds_v4 or use_block_major or kv_transfer:
+                logger.warning(
+                    "GLM52_DECODE_MK: caches not stacked (ds_v4=%s block_major=%s "
+                    "kv_transfer=%s): the megakernel will decline past 10 layers",
+                    _is_ds_v4,
+                    use_block_major,
+                    kv_transfer,
+                )
+            else:
+                stack_kinds = glm5_stacked_kv_kinds("1")
+                logger.info(
+                    "GLM52_DECODE_MK: stacking the target caches (served cache form)"
+                )
         if stack_kinds:
             stacked_kv = self._allocate_glm5_stacked_kv(
                 kv_cache_config, _per_layer_spec, stack_kinds

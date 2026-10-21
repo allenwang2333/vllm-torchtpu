@@ -10,16 +10,39 @@ zero-copy = the served operand form), **qrep 0** (the served q_b_proj is column-
 scale slice are taken as they are), MTP verify rows. Enabled by GLM52_DECODE_MK=1.
 
 Runner contract (runner/tpu_runner.py): `maybe_create` at load_model, `bind_caches` + `warmup` at capture_model,
-`step_ok` per scheduled step (sets runner._glm52_mk_step), `__call__` in place of the backbone inside forward_model when
-`enabled and runner._glm52_mk_step`. `enabled` is the runtime A/B toggle (twin harness R8: flipped by collective_rpc
-between interleaved stock / megakernel batches); `repack()` re-reads the router weight and bias after the harness
-re-draws them (R3).
+`step_ok` per scheduled step (sets runner._glm52_mk_step to the step's row bucket, or None), `try_call` inside
+forward_model, which consumes that decision (one forward per decision) and returns None to fall back to stock.
+`enabled` is the runtime A/B toggle (twin harness R8: flipped by collective_rpc between interleaved stock / megakernel
+batches); `repack()` re-reads the router weight and bias after the harness re-draws them (R3).
+
+The step_ok guard (WHITEBOARD.v3 §8 W4). The megakernel engages only when every precondition holds; otherwise the step
+runs the stock graphs, and every decline is counted under a named reason (no silent decline):
+- load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == DCP == world == 16 with the DCP group = the TP
+  group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide),
+  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256;
+- bind time (else every step declines 'unbound'; logged): the served cache form. The runner-stacked groups
+  (`runner.glm5_kv_stack_groups`, GLM5_MKD_STACK_C; allocated by default when this megakernel is built) in equal
+  groups of consecutive layers, nope / rope grouped alike, every layer bound to its group row; or per-layer caches
+  only up to GLM52_DECODE_MK_PERLAYER_MAX_L layers (per-layer groups at 78 layers are 263,806 bundles, blocked;
+  stageB/L3-served-form/RESULTS.md §0.5);
+- step time (`classify_step`, from the scheduler output and the runner's request bookkeeping, both identical on
+  every rank, so every rank decides alike): one chunk, no encoder inputs,
+  every request a verify request (1 + its scheduled draft tokens, >= 1 draft, past its prompt) with 2..QMAX rows,
+  <= BMAX requests, and a row bucket holding the tokens and the requests (<= bucket // QMAX); prefill and mixed steps
+  decline;
+- call time (`try_call`): the forward carries no inputs_embeds / intermediate tensors and the attention metadata has
+  the shapes the bucket was compiled for (else 'embeds' / 'shape': stock, counted).
+Counts: `counts` (per reason, mk per bucket), logged by rank 0 on the first step of each new reason and every
+GLM52_DECODE_MK_LOG_EVERY decisions (default 2000); `status()` returns them.
 
 Env:
 - GLM52_DECODE_MK=1            build the megakernel at load (else the runner never sees it);
-- GLM52_DECODE_MK_ROWS=16,32   one compiled step per row bucket; a step takes the smallest bucket >= its tokens;
+- GLM52_DECODE_MK_ROWS=16,32   one compiled step per row bucket; a step takes the smallest bucket that holds it;
 - GLM52_DECODE_MK_TRACE=1      trace build (named scopes 'L_norm' ... per layer; A1-N3: +0.05-0.14% time);
-- GLM52_DECODE_MK_OFF=1        built and warmed, but `enabled` starts False (the harness turns it on per arm).
+- GLM52_DECODE_MK_OFF=1        built and warmed, but `enabled` starts False (the harness turns it on per arm);
+- GLM52_DECODE_MK_LOG_EVERY=n  engagement log cadence (decisions; 0 = first-of-reason lines only);
+- GLM52_DECODE_MK_PERLAYER_MAX_L=10  the largest model served from per-layer caches (the 10-layer twin compiled);
+- GLM5_MKD_STACK_C             unset: stacked caches when the megakernel is built; "0" keeps per-layer caches.
 """
 
 import dataclasses
@@ -133,15 +156,15 @@ def _routed(mlp):
 
 
 def q_b_local(weight_kn: torch.Tensor, scale: torch.Tensor, cfg, rank: int):
-    """qrep 0: the served q_b_proj holds this rank's HR heads ([QL, HR*DQ], scale [HR*DQ]) -> as is; a replicated
-    q_b (qrep 1: [QL, NH*DQ]) -> this rank's columns. The glm5_mk_dcp adapter declined qrep 0 (AD:159)."""
+    """qrep 0: the served q_b_proj holds this rank's HR heads ([QL, HR*DQ], scale [HR*DQ]) -> as is. Anything else
+    (a replicated q_b, qrep 1: [QL, NH*DQ]) declines (W4 guard): only qrep 0 is timed and verified."""
     nqb = cfg.HR * cfg.DQ
     n = weight_kn.shape[1]
     if n == nqb:
         _need(scale.numel() == nqb, f"q_b scale {tuple(scale.shape)} != local [{nqb}]")
         return weight_kn, scale
-    _need(n == cfg.NH * cfg.DQ, f"q_b_proj N {n}: neither local {nqb} nor replicated {cfg.NH * cfg.DQ}")
-    return weight_kn[:, rank * nqb:(rank + 1) * nqb], scale.reshape(-1)[rank * nqb:(rank + 1) * nqb]
+    # W4 guard: the timed and verified form is qrep 0 only (a replicated q_b is X's layout, not this kernel's)
+    raise Unsupported(f"q_b_proj N {n} is not this rank's {nqb} columns (qrep 1 / replicated q_b): qrep 0 only")
 
 
 def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int, int]:
@@ -161,16 +184,105 @@ def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int,
     raise Unsupported(f"indexer pattern {has_indexer} is not max(l - skip + 1, 0) % freq == 0 for any (freq, skip)")
 
 
+PERLAYER_BLOCKED = ("per-layer cache groups at 78 layers are 263,806 bundles against the 65,536 limit (stageB/"
+                    "L3-served-form RESULTS §0.5): serve from runner-stacked caches (GLM5_MKD_STACK_C)")
+MAX_CACHE_GROUPS = 4          # the timed served form is nope / rope 2 groups, idx 1 (probe 15 bench_mkb FORM=srv)
+
+
+def stacked_groups_plan(bindings: dict, sizes: dict, max_groups: int = MAX_CACHE_GROUPS) -> dict:
+    """Validate the runner-stacked cache groups against the kernel's group contract (kernel.cache_groups / csel):
+    per kind, equal groups of consecutive layers, the kind's i-th layer at row i % gs of group i // gs; nope and rope
+    grouped alike. bindings: {kind: [(group index, row) of each layer of the kind, in layer order]}; sizes: {kind:
+    [layers per group]}. -> {kind: n_groups}; raises Unsupported."""
+    G = {}
+    for kind in ("nope", "rope", "idx"):
+        _need(kind in bindings and kind in sizes, f"stacked caches: no {kind} groups")
+        sz, bd = list(sizes[kind]), list(bindings[kind])
+        _need(bool(sz) and len(set(sz)) == 1, f"stacked caches: {kind} groups are not equal: {sz}")
+        gs, n = sz[0], len(sz)
+        _need(n <= max_groups, f"stacked caches: {kind} in {n} groups (> {max_groups}, untimed)")
+        _need(len(bd) == gs * n, f"stacked caches: {kind} {len(bd)} layers bound, groups hold {gs * n}")
+        for i, (gi, row) in enumerate(bd):
+            _need((gi, row) == (i // gs, i % gs),
+                  f"stacked caches: {kind} layer #{i} bound to group {gi} row {row}, want {i // gs} row {i % gs}")
+        G[kind] = n
+    _need(G["nope"] == G["rope"] and list(sizes["nope"]) == list(sizes["rope"]),
+          f"stacked caches: nope groups {sizes['nope']} != rope groups {sizes['rope']}")
+    return G
+
+
+# ------------------------------------------------------------------ the step guard (pure: CPU-tested)
+
+REASONS = ("mk", "off", "unbound", "multi_chunk", "encoder", "prefill", "mixed", "no_draft", "q_len", "over_reqs",
+           "over_bucket", "embeds", "shape")
+
+
+def classify_step(reqs, *, num_chunks: int, has_encoder: bool, qmax: int, rows, bmax: int):
+    """The step-time preconditions, from the scheduler's view (identical on every rank).
+    reqs: [(scheduled tokens, scheduled draft tokens, still in its prompt)] per request.
+    -> (row bucket or None, reason, detail). A request is a verify request iff it has >= 1 draft token, its scheduled
+    tokens are exactly 1 + its drafts and it is past its prompt. Prefill chunks (also a 2..4-token prompt tail after
+    a prefix-cache hit), plain decode without drafts and mixed steps decline."""
+    if num_chunks != 1:
+        return None, "multi_chunk", f"num_chunks {num_chunks}"
+    if has_encoder:
+        return None, "encoder", ""
+    n_ver = n_pref = n_nodraft = 0
+    big = 0
+    for n, k, in_prompt in reqs:
+        if k >= 1 and n == 1 + k and not in_prompt:
+            n_ver += 1
+            if not 2 <= n <= qmax:
+                big = max(big, n)
+        elif in_prompt or n != 1 + k:
+            n_pref += 1
+        else:
+            n_nodraft += 1
+    nreq = len(reqs)
+    total = sum(n for n, _, _ in reqs)
+    detail = f"{nreq} reqs, {total} tokens: {n_ver} verify, {n_pref} prefill, {n_nodraft} decode w/o draft"
+    if nreq == 0:
+        return None, "no_draft", detail
+    if n_ver and (n_pref or n_nodraft):
+        return None, "mixed", detail
+    if n_pref:
+        return None, "prefill", detail
+    if n_nodraft:
+        return None, "no_draft", detail
+    if big:
+        return None, "q_len", f"{detail}; a request has {big} rows > QMAX {qmax}"
+    if nreq > bmax:
+        return None, "over_reqs", f"{detail}; > BMAX {bmax}"
+    for t in rows:
+        if total <= t and nreq <= t // qmax:
+            return t, "mk", f"b{t}"
+    return None, "over_bucket", f"{detail}; buckets {list(rows)}"
+
+
+def sched_reqs(runner, scheduler_output) -> list:
+    """classify_step's per-request view of a SchedulerOutput (+ the runner's prompt bookkeeping after _update_states)."""
+    ns = scheduler_output.num_scheduled_tokens
+    spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None) or {}
+    ib = runner.input_batch
+    out = []
+    for req_id, n in ns.items():
+        i = ib.req_id_to_index[req_id]
+        in_prompt = int(ib.num_computed_tokens_cpu[i]) < int(ib.num_prompt_tokens[i])
+        out.append((int(n), len(spec.get(req_id) or ()), in_prompt))
+    return out
+
+
 N_FIX = 10     # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated),
                # rank i32[1], smalls (per rank)
 
 
-def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups):
+def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
     """The SPMD step program, jax only (also lowered by the lane's AOT script, stageB/L5-twin-harness/aot_l5.py):
     shard_map over the one-axis R-rank mesh of (metadata + rope table from wrapper.py -> megakernel -> writer).
     Inputs: N_FIX fixed (8 replicated + smalls per rank), then the dense stacks, the per-layer served expert tensors
-    and the per-layer caches [nb, ...] (each reshaped to the kernel's one-layer group [1, ...] inside the body, a
-    bitcast), all sharded on dim 0 (= this rank's own tensors). Outputs: out [M, H] bf16 and the written caches.
+    and the caches, all sharded on dim 0 (= this rank's own tensors). Caches: `stacked` -> the runner's stacked groups
+    [n_layers / G, nb, ...] as they are (the kernel's group operands); else per-layer [nb, ...], each reshaped to the
+    kernel's one-layer group [1, ...] inside the body (a bitcast). Outputs: out [M, H] bf16 and the written caches.
     -> (smap, in_specs, out_specs, info)."""
     import jax
     from jax.sharding import PartitionSpec as P
@@ -195,11 +307,11 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups):
         r = rank[0]          # an operand, not lax.axis_index: partition-id does not lower in torch_tpu's export
         scal, rmeta, qmeta, bt, bti, rvec = W.metadata(cfg, TMAX, pos, seq, qsl, btv, nb, nbi, max_pages, r)
         tab = W.rope_table(cfg, csr)
-        c1 = [c[None] for c in cs]                       # [1, ...]: the kernel's one-layer cache group
+        c1 = list(cs) if stacked else [c[None] for c in cs]      # per-layer: [1, ...], a one-layer group
         outs = call(scal, rmeta, qmeta, bt, bti, ltab_, dtab_, rvec, h0, tab, smalls, *dw, *ew, *c1)
         out, nrow, rrow, irec = outs[:4]
         new = writer(scal, rmeta, bt, bti, nrow, rrow, irec, *c1)
-        return (out, *[c[0] for c in new])
+        return (out, *(new if stacked else [c[0] for c in new]))
 
     smap = jax.shard_map(body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False)
     return smap, in_specs, out_specs, info
@@ -228,10 +340,13 @@ class Glm52DecodeMK:
         _need(pc.pipeline_parallel_size == 1, "pipeline parallel")
         _need(getattr(pc, "data_parallel_size", 1) == 1, "data parallel")
         R = int(pc.tensor_parallel_size)
+        _need(R == FULL.R, f"TP {R}: the megakernel is built and verified for TP = DCP = {FULL.R} only")
         _need(int(getattr(pc, "decode_context_parallel_size", 1)) == R, "DCP != TP")
         _need(dist.is_initialized() and dist.get_world_size() == R, "world != TP")
         _need(int(getattr(pc, "cp_kv_cache_interleave_size", 1)) == FULL.ILV, "interleave != 4")
         _need(not bool(getattr(pc, "enable_expert_parallel", False)), "EP is on (stage A is TP16 MoE, EP off)")
+        _need(not bool(getattr(pc, "dcp_q_replicate", False)), "qrep 1 (dcp_q_replicate): the megakernel is qrep 0")
+        self.rank_layout = self._check_rank_layout(R)
         spec = runner.speculative_config
         _need(spec is not None and getattr(spec, "method", "") == "mtp", "MTP is off")
         qmax = 1 + int(spec.num_speculative_tokens)
@@ -277,8 +392,18 @@ class Glm52DecodeMK:
         cfg = self.cfg = self.cfgs[self.rows[-1]]
         for l in range(L):
             _need(has_idx[l] == cfg.full_indexer(l), f"layer {l}: indexer pattern")
+        for l in range(L):
+            _need(not bool(getattr(bb.layers[l].self_attn.q_b_proj, "qrep_active", False)),
+                  f"layer {l}: q_b_proj is replicated (qrep_active); the megakernel is qrep 0")
         self.rank = int(dist.get_rank())
-        self.counts = {}
+        self.counts = {r: 0 for r in REASONS}
+        self.decisions = 0
+        self.consumed = 0
+        self.log_every = int(os.environ.get("GLM52_DECODE_MK_LOG_EVERY", "2000") or 0)
+        self.unbound = "capture_model has not bound the caches"
+        self.cache_form = None
+        self.call_shapes = {}
+        self.warm_shapes = {}
         self.enabled = os.environ.get("GLM52_DECODE_MK_OFF", "0") != "1"
         self.calls = 0
         from torch_tpu._internal.pallas import get_pallas_mesh
@@ -304,6 +429,24 @@ class Glm52DecodeMK:
                     "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s", self.rows, cfg.L,
                     LY.layers_of(cfg, "iwq"), freq, skip, int(self.cos_sin.shape[0]), mml, sorted(set(self.k_scales)),
                     self.tiles.trace, self.enabled, ",".join(self.levers) or "stage A")
+
+    @staticmethod
+    def _check_rank_layout(R: int) -> dict:
+        """The megakernel addresses peers and owns DCP KV positions by its mesh position, which get_pallas_mesh
+        numbers by torch rank (distributed/dcp.py), and takes the rank as an operand: all of that is the stock DCP
+        ownership only when the DCP group and the TP group are both ranks 0..R-1 in rank order."""
+        import torch.distributed as dist
+        from vllm.distributed import parallel_state as ps
+
+        rank = int(dist.get_rank())
+        out = {"rank": rank}
+        for name, get in (("tp", ps.get_tp_group), ("dcp", ps.get_dcp_group)):
+            g = get()
+            ranks = tuple(int(x) for x in g.ranks)
+            _need(ranks == tuple(range(R)), f"{name} group ranks {ranks} != 0..{R - 1}")
+            _need(int(g.rank_in_group) == rank, f"{name} rank_in_group {g.rank_in_group} != rank {rank}")
+            out[name] = int(g.rank_in_group)
+        return out
 
     # ---------------------------------------------------------------- weights
 
@@ -444,37 +587,96 @@ class Glm52DecodeMK:
     # ----------------------------------------------------------------- caches
 
     def bind_caches(self, runner) -> None:
-        """The served per-layer caches, one operand per (kind, layer), passed as the runner's own tensors (no view,
-        no stack); the jax body reshapes each to the kernel's [1, ...] group of one layer (a bitcast)."""
+        """Bind the served cache form (W4 precondition; L3-c). Never raises: on any mismatch the megakernel stays
+        unbound, every step declines 'unbound' and the reason is logged (and returned by status()).
+
+        - runner-stacked (runner.glm5_kv_stack_groups non-empty; GLM5_MKD_STACK_C): the groups ARE the kernel's
+          cache-group operands [n_layers / G, nb, ...], validated by `stacked_groups_plan` (equal consecutive
+          groups, nope / rope alike, each layer's module bound to its group tensor at its row); the stock DCP ops
+          address the same tensors through `kv_stack`. GLM-5.2 served: nope / rope 2 x 39, idx 1 x 21 (the
+          SparseCore 16 GiB per-tensor split) = the form probe 15 timed.
+        - per-layer: one operand per (kind, layer), the runner's own tensors, each reshaped to a one-layer group in
+          the body; only up to GLM52_DECODE_MK_PERLAYER_MAX_L layers (PERLAYER_BLOCKED)."""
+        try:
+            self._bind_caches(runner)
+            self.unbound = None
+        except Unsupported as e:
+            self.unbound = str(e)
+            self.caches = None
+            self._steps = {}
+            logger.warning("GLM-5.2 decode megakernel: NOT bound, every step will run stock ('unbound'): %s", e)
+
+    def _module_caches(self, l: int):
+        sa = self.backbone.layers[l].self_attn
+        at = _attn_module(sa)
+        kv = _unwrap(at.kv_cache)
+        _need(isinstance(kv, (tuple, list)) and len(kv) == 2, f"layer {l}: MLA cache is not (nope, rope)")
+        out = {"nope": (kv[0], getattr(at, "kv_stack", None)), "rope": (kv[1], getattr(at, "kv_stack", None))}
+        idx = getattr(sa, "indexer", None)
+        if idx is not None:
+            out["idx"] = (_unwrap(idx.k_cache.kv_cache), getattr(idx.k_cache, "kv_stack", None))
+        return out
+
+    def _bind_caches(self, runner) -> None:
         cfg = self.cfg
-        per = {}
-        for l in range(cfg.L):
-            sa = self.backbone.layers[l].self_attn
-            kv = _unwrap(_attn_module(sa).kv_cache)
-            _need(isinstance(kv, (tuple, list)) and len(kv) == 2, f"layer {l}: MLA cache is not (nope, rope)")
-            per[("nope", l)], per[("rope", l)] = kv[0], kv[1]
-            idx = getattr(sa, "indexer", None)
-            if idx is not None:
-                per[("idx", l)] = _unwrap(idx.k_cache.kv_cache)
-        nb = int(per[("nope", 0)].shape[0])
-        nbi = int(per[("idx", 0)].shape[0])
-        caches, G, views = [], {}, []
-        ck = LY.cache_kinds(cfg, nb, nbi)
-        for kind in ("nope", "rope", "idx"):
-            ls = ck[kind][0]
-            G[kind] = len(ls)
-            for l in ls:
-                t = per[(kind, l)]
-                _need(tuple(t.shape) == tuple(ck[kind][1]), f"cache {kind}[{l}]: {tuple(t.shape)} != {ck[kind][1]}")
-                _need(_dt(t) == _dt(ck[kind][2]), f"cache {kind}[{l}]: dtype {t.dtype} != {ck[kind][2]}")
-                if not _owns_storage(t):
-                    views.append(f"{kind}{l}")
-                caches.append(t)
+        per = {l: self._module_caches(l) for l in range(cfg.L)}
+        groups = getattr(runner, "glm5_kv_stack_groups", None) or {}
+        stacked = any(v[1] is not None for d in per.values() for v in d.values())
+        caches, views = [], []
+        if groups or stacked:
+            _need(bool(groups) and all(v[1] is not None for d in per.values() for v in d.values()),
+                  "caches partly stacked (runner groups %s; module kv_stack on some layers only)" % sorted(groups))
+            g0 = groups["nope"][0][0]
+            nb = int(g0.shape[1])
+            nbi = int(groups["idx"][0][0].shape[1]) if groups.get("idx") else nb
+            ck = LY.cache_kinds(cfg, nb, nbi)
+            bindings, sizes = {}, {}
+            for kind in ("nope", "rope", "idx"):
+                _need(bool(groups.get(kind)), f"stacked caches: the runner stacked no {kind}")
+                tens = [t for t, _ in groups[kind]]
+                sizes[kind] = [int(t.shape[0]) for t in tens]
+                bd = []
+                for l in ck[kind][0]:
+                    t, st = per[l][kind]
+                    gi = next((i for i, g in enumerate(tens) if g is t), None)
+                    _need(gi is not None, f"stacked caches: layer {l} {kind} is not bound to a runner group tensor")
+                    _need(st is not None and int(st[1]) == int(t.shape[1]),
+                          f"stacked caches: layer {l} {kind} kv_stack {st} vs group nb {int(t.shape[1])}")
+                    bd.append((gi, int(st[0])))
+                bindings[kind] = bd
+                for t in tens:
+                    want = (sizes[kind][0],) + tuple(ck[kind][1])
+                    _need(tuple(t.shape) == want, f"stacked {kind} group {tuple(t.shape)} != {want}")
+                    _need(_dt(t) == _dt(ck[kind][2]), f"stacked {kind} dtype {t.dtype} != {ck[kind][2]}")
+                    if not _owns_storage(t):
+                        views.append(f"{kind}-group")
+                    caches.append(t)
+            G = stacked_groups_plan(bindings, sizes)
+            form = "stacked"
+        else:
+            maxl = int(os.environ.get("GLM52_DECODE_MK_PERLAYER_MAX_L", "10"))
+            _need(cfg.L <= maxl, f"{cfg.L} layers on per-layer caches (> {maxl}): {PERLAYER_BLOCKED}")
+            nb = int(per[0]["nope"][0].shape[0])
+            nbi = int(next(d["idx"][0] for d in per.values() if "idx" in d).shape[0])
+            ck = LY.cache_kinds(cfg, nb, nbi)
+            G = {}
+            for kind in ("nope", "rope", "idx"):
+                ls = ck[kind][0]
+                G[kind] = len(ls)
+                for l in ls:
+                    t = per[l][kind][0]
+                    _need(tuple(t.shape) == tuple(ck[kind][1]), f"cache {kind}[{l}]: {tuple(t.shape)} != {ck[kind][1]}")
+                    _need(_dt(t) == _dt(ck[kind][2]), f"cache {kind}[{l}]: dtype {t.dtype} != {ck[kind][2]}")
+                    if not _owns_storage(t):
+                        views.append(f"{kind}{l}")
+                    caches.append(t)
+            form = "per-layer"
+        _need(not views, f"view cache operands {views} (re-materialized by torch_tpu on every call)")
         self.caches, self.groups, self.nb, self.nbi = caches, G, nb, nbi
-        self.cache_views = views
-        logger.info("GLM-5.2 decode megakernel: %d dense + %d expert + %d cache operands (groups %s), %d blocks "
-                    "(idx %d), max_pages %d; view caches %s", len(self.dense), len(self.experts), len(caches), G, nb,
-                    nbi, self.max_pages, views or "none")
+        self.cache_form, self.cache_views = form, views
+        logger.info("GLM-5.2 decode megakernel: %d dense + %d expert (served per-layer) + %d cache operands, cache form "
+                    "%s, groups %s, %d blocks (idx %d), max_pages %d", len(self.dense), len(self.experts), len(caches),
+                    form, G, nb, nbi, self.max_pages)
         for t in self.rows:
             self._steps[t] = self._build_op(self.cfgs[t])
 
@@ -489,7 +691,7 @@ class Glm52DecodeMK:
         n_d, n_e, n_c = len(self.dense), len(self.experts), len(self.caches)
         smap, in_specs, out_specs, info = build_spmd(cfg, self.mesh, max_pages=self.max_pages, nb=self.nb,
                                                      nbi=self.nbi, tiles=self.tiles_by_rows[cfg.TMAX],
-                                                     groups=self.groups)
+                                                     groups=self.groups, stacked=self.cache_form == "stacked")
         assert list(info["dkinds"]) == list(self._dense_kind), (info["dkinds"], list(self._dense_kind))
         assert len(info["e_names"]) == n_e, (len(info["e_names"]), n_e)
         assert len(info["c_names"]) == n_c
@@ -561,35 +763,56 @@ class Glm52DecodeMK:
                 return t
         return None
 
-    def step_ok(self, runner, scheduler_output, num_chunks: int) -> bool:
-        """Rank-uniform host predicate (WHITEBOARD.v1 §2, §16 W4): every request in verify with 2..QMAX tokens,
-        <= the largest row bucket, one chunk, no encoder inputs; q_len 1 (plain decode) and mixed steps decline."""
-        ok, why = self._step_ok(runner, scheduler_output, num_chunks)
-        c = self.counts
-        c[why] = c.get(why, 0) + 1
-        return ok
+    def step_ok(self, runner, scheduler_output, num_chunks: int) -> int | None:
+        """The W4 step guard (module docstring): the row bucket this step runs the megakernel at, or None (stock).
+        Decided from the scheduler output and static facts only, so every rank decides alike (a rank-local decline
+        of a collective kernel hangs the others). Every decision is counted under its reason."""
+        bucket, why, detail = self._decide(runner, scheduler_output, num_chunks)
+        self._count(why, detail, bucket)
+        return bucket
 
-    def _step_ok(self, runner, scheduler_output, num_chunks: int):
+    def _decide(self, runner, scheduler_output, num_chunks: int):
+        if not self.enabled:
+            return None, "off", ""
+        if self.unbound is not None or not self._steps:
+            return None, "unbound", str(self.unbound)
         cfg = self.cfg
-        if not self.enabled or not self._steps:
-            return False, "off"
-        if num_chunks != 1 or scheduler_output.scheduled_encoder_inputs:
-            return False, "other"
-        ns = scheduler_output.num_scheduled_tokens
-        ib = runner.input_batch
-        for req_id, n in ns.items():
-            i = ib.req_id_to_index[req_id]
-            if not 2 <= n <= cfg.QMAX or int(ib.num_computed_tokens_cpu[i]) < int(ib.num_prompt_tokens[i]):
-                return False, "not_verify"
-        if scheduler_output.total_num_scheduled_tokens > self.rows[-1] or len(ns) > cfg.BMAX:
-            return False, "over_bucket"
-        return True, "mk"
+        return classify_step(sched_reqs(runner, scheduler_output), num_chunks=num_chunks,
+                             has_encoder=bool(scheduler_output.scheduled_encoder_inputs), qmax=cfg.QMAX,
+                             rows=[t for t in self.rows if t in self._steps], bmax=cfg.BMAX)
+
+    def _count(self, why: str, detail: str = "", bucket: int | None = None) -> None:
+        c = self.counts
+        first = c.get(why, 0) == 0
+        c[why] = c.get(why, 0) + 1
+        if bucket is not None:
+            c[f"mk_b{bucket}"] = c.get(f"mk_b{bucket}", 0) + 1
+        if why != "embeds" and why != "shape":
+            self.decisions += 1
+        if self.rank == 0 and first:
+            logger.info("GLM-5.2 decode megakernel: first '%s' step (%s)%s", why, detail,
+                        "" if why == "mk" else ": runs stock")
+        if self.rank == 0 and self.log_every and self.decisions % self.log_every == 0 and why not in ("embeds",
+                                                                                                    "shape"):
+            self.log_counts()
+
+    def log_counts(self) -> None:
+        c = {k: v for k, v in self.counts.items() if v}
+        logger.info("GLM-5.2 decode megakernel engagement: %d decisions, mk %d (%s), declined %s; calls %d, "
+                    "decisions consumed %d", self.decisions, c.get("mk", 0),
+                    ", ".join(f"{k} {v}" for k, v in c.items() if k.startswith("mk_b")) or "-",
+                    {k: v for k, v in c.items() if k != "mk" and not k.startswith("mk_b")} or "none", self.calls,
+                    self.consumed)
 
     def rows_ok(self, q_lens: list[int], num_tokens: int) -> bool:
-        """The same predicate from host-known rows (the twin harness, which calls forward_model directly)."""
+        """The same predicate from host-known rows (the twin harness, which calls forward_model directly): every row
+        group a verify request, through classify_step; the twin also needs its padded size to be the bucket."""
+        if not self.enabled or self.unbound is not None or not self._steps or not q_lens:
+            return False
         cfg = self.cfg
-        return (self.enabled and bool(self._steps) and bool(q_lens) and all(2 <= q <= cfg.QMAX for q in q_lens)
-                and sum(q_lens) <= num_tokens and len(q_lens) <= cfg.BMAX and num_tokens in self._steps)
+        bucket, _, _ = classify_step([(int(q), int(q) - 1, False) for q in q_lens], num_chunks=1, has_encoder=False,
+                                     qmax=cfg.QMAX, rows=[t for t in self.rows if t in self._steps], bmax=cfg.BMAX)
+        return bucket is not None and bucket == num_tokens
 
     def _metadata(self):
         from vllm.forward_context import get_forward_context
@@ -600,14 +823,53 @@ class Glm52DecodeMK:
         assert md is not None and hasattr(md, "query_start_loc"), type(md)
         return md
 
-    @torch.no_grad()
-    def __call__(self, runner, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        if self.caches is None:               # capture_model was skipped
-            self.bind_caches(runner)
-        n = input_ids.shape[0]
-        t = self.bucket_for(n)
-        assert t is not None, (n, self.rows)
+    def try_call(self, runner, decision, input_ids, positions, inputs_embeds=None, intermediate_tensors=None,
+                 harness=False):
+        """forward_model's hook. `decision` is step_ok's bucket for this step (consumed by the caller; `harness`:
+        the twin harness's rows_ok bucket, not a step decision and not counted). -> the backbone hidden states
+        [n, H], or None = run stock. Counts the call-time declines ('embeds' / 'shape')."""
+        if not harness:
+            self.consumed += 1
+        if decision is None:
+            return None
+        if inputs_embeds is not None or intermediate_tensors is not None:
+            self._count("embeds", "inputs_embeds / intermediate tensors", None)
+            return None
         md = self._metadata()
+        why = self._shape_mismatch(decision, input_ids, md)
+        if why:
+            self._count("shape", why, None)
+            return None
+        return self(runner, input_ids, positions, bucket=decision, md=md)
+
+    def _shape_mismatch(self, bucket: int, input_ids, md) -> str:
+        """The step program is compiled with static shapes (torch.compile dynamic=False). The first served call of a
+        bucket fixes its metadata shapes (logged, with whether they equal the warmup's: if not, that call compiles
+        once); a later call with other shapes declines ('shape') instead of recompiling mid-serving. The runner's
+        shapes are config-static (query_start_loc is max_num_reqs + 1 under use_max_model_len), so this is a
+        tripwire, rank-uniform like the shapes themselves."""
+        if bucket not in self._steps:
+            return f"b{bucket} not built"
+        got = (tuple(md.query_start_loc.shape), tuple(md.seq_lens.shape), int(md.block_tables.numel()))
+        want = self.call_shapes.get(bucket)
+        if want is None:
+            self.call_shapes[bucket] = got
+            warm = self.warm_shapes.get(bucket)
+            if self.rank == 0:
+                (logger.info if got == warm else logger.warning)(
+                    "GLM-5.2 decode megakernel: b%d served metadata shapes %s (warmup %s%s)", bucket, got, warm,
+                    "" if got == warm else ": this first call compiles once")
+            return ""
+        if got != want:
+            return f"b{bucket}: qsl / seq_lens / block_tables {got} != the bucket's {want}"
+        return ""
+
+    @torch.no_grad()
+    def __call__(self, runner, input_ids: torch.Tensor, positions: torch.Tensor, bucket=None, md=None) -> torch.Tensor:
+        n = input_ids.shape[0]
+        t = bucket if bucket is not None else self.bucket_for(n)
+        assert t is not None, (n, self.rows)
+        md = md if md is not None else self._metadata()
         out = self._steps[t](input_ids, positions, md.query_start_loc, md.seq_lens, md.block_tables, self.smalls,
                              self.dense + self.experts, self.caches)
         self.calls += 1
@@ -623,7 +885,11 @@ class Glm52DecodeMK:
                 "max_pages": self.max_pages, "trace": self.tiles.trace,
                 "levers": list(self.levers), "calls": self.calls,
                 "cache_views": getattr(self, "cache_views", None), "k_scales": sorted(set(self.k_scales)),
-                "counts": dict(self.counts)}
+                "counts": dict(self.counts), "decisions": self.decisions, "consumed": self.consumed,
+                "cache_form": self.cache_form, "groups": dict(getattr(self, "groups", {}) or {}),
+                "unbound": self.unbound, "rank_layout": self.rank_layout,
+                "call_shapes": {str(k): v for k, v in self.call_shapes.items()},
+                "warm_shapes": {str(k): v for k, v in self.warm_shapes.items()}}
 
     def warmup(self, runner) -> None:
         """Compile and run each bucket once: one request of QMAX rows at positions 0..QMAX-1 on block 0 (the null
@@ -632,6 +898,8 @@ class Glm52DecodeMK:
 
         cfg = self.cfg
         dev = self.smalls.device
+        if self.unbound is not None:
+            return
         for t in self.rows:
             ids = torch.zeros(t, dtype=torch.int32, device=dev)
             pos = torch.arange(t, dtype=torch.int32, device=dev) % cfg.QMAX
@@ -642,4 +910,5 @@ class Glm52DecodeMK:
             t0 = time.monotonic()
             out = self._steps[t](ids, pos, qsl, seq, bt, self.smalls, self.dense + self.experts, self.caches)
             synchronize_tensors([out])
+            self.warm_shapes[t] = (tuple(qsl.shape), tuple(seq.shape), int(bt.numel()))
             logger.info("GLM-5.2 decode megakernel: b%d compiled and warmed in %.1f s", t, time.monotonic() - t0)
