@@ -169,10 +169,10 @@ Results are saved to `benchmark_runs/` (gitignored). Each run creates a director
 `publish_perf_dashboard.py` sends a results directory's
 `isl<N>_osl<N>_c<N>.json` files to the Performance tab of
 [ci.vllm.ai](https://ci.vllm.ai/perf), next to the GPU runs of the same model.
-The nightly does this for the Qwen3.5-397B layouts; to publish another config,
-add its step to the publish step's `depends_on` in `.buildkite/pipeline_perf.yml`
-and its results directory to the command. `--dry-run` prints the rows without
-posting them.
+A perf step opts in with `UPLOAD_TO_VLLM_CI: "1"` in its `env`;
+`run_eval_flow.sh` then publishes that step's own results after the database
+upload, and skips it on PRs and non-main branches like that upload. `--dry-run`
+prints the rows without posting them.
 
 ## Environment Variables
 

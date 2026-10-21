@@ -129,10 +129,10 @@ steps:
       # Qwen3.5-397B parallelism sweep: three layouts. Quality is independent
       # of parallelism, so the evals run only on the tp1-dp8 layout.
       - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
-        key: "perf_nightly_qwen35_397b_tp1_dp8_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -144,10 +144,10 @@ steps:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp1-dp8-ep --run-lm-eval --run-code-eval
 
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
-        key: "perf_nightly_qwen35_397b_tp2_dp4_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -175,10 +175,10 @@ steps:
           - .buildkite/kubernetes/run.sh bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-flash-dp8-ep --run-lm-eval
 
       - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
-        key: "perf_nightly_qwen35_397b_tp8_dp1_ep"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
+          UPLOAD_TO_VLLM_CI: "1"
           SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
@@ -187,29 +187,6 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-dp1-ep
-
-      # Sends the three layouts above to the Performance tab of ci.vllm.ai,
-      # through the ingest endpoint the GPU perf pipelines use. A layout whose
-      # perf gate failed still has its numbers published.
-      - label: "Perf: Publish Qwen3.5-397B results to ci.vllm.ai"
-        if: 'build.env("NIGHTLY") == "1" && build.branch == "main" && build.pull_request.id == null'
-        depends_on:
-          - "perf_nightly_qwen35_397b_tp1_dp8_ep"
-          - "perf_nightly_qwen35_397b_tp2_dp4_ep"
-          - "perf_nightly_qwen35_397b_tp8_dp1_ep"
-        allow_dependency_failure: true
-        soft_fail: true
-        timeout_in_minutes: 15
-        agents:
-          queue: "cpu"
-        commands:
-          - |
-            buildkite-agent artifact download "perf_eval_results/qwen3.5-397b-*/*.json" .
-            INGEST_BEARER_TOKEN=$$(buildkite-agent secret get INGEST_BEARER_TOKEN) \
-              python3 scripts/vllm/benchmarking/publish_perf_dashboard.py \
-                perf_eval_results/qwen3.5-397b-* \
-                --device tpu7x --chips 4 \
-                --image "$$(buildkite-agent meta-data get CI_IMAGE_TAG)"
 
       - label: "Perf/Eval: Nightly Kimi-K2.6 Real (TPU v7x-8)"
         <<: *perf_step
