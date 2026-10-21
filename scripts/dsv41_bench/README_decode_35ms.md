@@ -318,6 +318,21 @@ The verified serving analysis archive is
 
 ## Experiments not adopted
 
+For calibration captures of actual selected KV IDs, use:
+
+```bash
+python scripts/dsv41_bench/analyze_selected_kv.py /path/to/kv-selection \
+  --out /path/to/kv-selection-summary.json
+```
+
+The NPZ/JSON pairs contain selected logical IDs, positions and request IDs
+copied together after a real decode forward. The analyzer verifies checksums,
+host query boundaries and compressed-context bounds before measuring per-request
+unions. It compares sets rather than top-k column positions and never merges
+logical IDs across requests or indexers. Reported row-traffic reductions are
+ideal bounds for the captured selections, not kernel or serving speedups.
+Synchronous capture copies invalidate performance measurements for that run.
+
 The following prototypes remain outside the production path. Unless labeled
 otherwise, times are complete device-module medians after subtracting identified
 entry barriers; operator-only measurements are explicitly identified.
