@@ -24,6 +24,7 @@ reference (block references composed), and the caches.
 """
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -60,6 +61,9 @@ def main():
     p.add_argument("--kinds", default="hca,hca,csa")
     p.add_argument("--share-tables", action="store_true",
                    help="one block table per (role, kind): layers after the first reuse the staged tables")
+    # seq_len (incl. the 7 new rows) of the two requests
+    p.add_argument("--seqs", default="1030,3000")
+    p.add_argument("--strict", action="store_true", help="StepKernelConfig.strict_causal")
     a = p.parse_args()
     R, T, q, B = 16, 16, 7, 1
     M = B * q
@@ -74,6 +78,7 @@ def main():
     scfg = SK.StepKernelConfig(
         dense=tp_cfg, q=q, B=B, aux_layers=aux_layers, attn_impl="real",
         max_ctx=a.max_ctx, fault="" if a.fault == "none" else a.fault, debug_att=True,
+        strict_causal=a.strict,
     )  # fmt: skip
     w = dw.make_weights(full)
     packs = [dw.pack_weights(SR.rank_weights(w, full, r, R), tp_cfg) for r in range(R)]
@@ -83,7 +88,8 @@ def main():
     V = 512
     embed = jax.random.normal(jax.random.key(7), (V, full.hidden)).astype(jnp.bfloat16)
 
-    owners = {0: 1030, 9: 3000}  # rank -> seq_len (incl. the 7 new rows)
+    s0, s1 = (int(x) for x in a.seqs.split(","))
+    owners = {0: s0, 9: s1}  # rank -> seq_len (incl. the 7 new rows)
     sets = []
     for r in range(R):
         rng = np.random.default_rng(100 + r)
@@ -144,7 +150,8 @@ def main():
     ref, adict = {}, {}
     for order in ("kernel", "stock", "noise"):
         sets_o = [dataclasses.replace(s_) for s_ in sets]
-        adict[order] = dict(sets=sets_o, reference=H.reference,
+        adict[order] = dict(sets=sets_o,
+                            reference=functools.partial(H.reference, strict_causal=a.strict),
                             noise=1e-3 if order == "noise" else 0.0)  # fmt: skip
         ref[order] = SR.step_reference(
             rc, w, embed, cos_sin_cache, ids, pos, seq,
