@@ -284,12 +284,14 @@ def make(E):
     THR_U = max(1, int(tiles.thr_unroll))       # L1-U: count-loop tiles per iteration (1 = stage A)
     THR_SWAR = bool(getattr(tiles, "thr_swar", False))   # L1-S: 4-bit counts from packed 8-bit digit histograms
     SW_CH = 248                                 # SWAR flush period (tiles): an 8-bit counter gains <= 1 per tile
+    DSEND = bool(getattr(tiles, "thr_dsend", False))     # L1-D: count-exchange send waits deferred by two rounds
     MSLOT = 32                                  # L1-M: lanes per group in the merged count payload
     # L1-M dispatch: merged exchange when the wave's rank-0 page count <= thr_merge (0: never = stage A; >= POOL:
     # always, the per-group form is not compiled). L1-W: thr_switch >= POOL compiles only the 4-bit body.
     MERGE = "never" if tiles.thr_merge <= 0 else ("always" if tiles.thr_merge >= POOL else "dispatch")
     if MERGE != "never":
         assert NG * MSLOT <= 128, ("merged count payload holds <= 4 groups (TMAX <= 32)", NG)
+        assert not DSEND, "thr_dsend is implemented for the per-group (pipelined) exchange only"
     ONLY4 = tiles.thr_switch >= POOL
     THR_GIVEN = bool(tiles.thr_given) or bool(tiles.union_given)   # timing-only backing arms (WHITEBOARD.v3 §6.1)
     UNION_GIVEN = bool(tiles.union_given)
@@ -386,10 +388,30 @@ def make(E):
         def waits():
             for _ in range(R - 1):
                 desc.wait_recv()
+            if not DSEND:                    # L1-D: the send completions are waited 2 rounds later (cx_wait_send)
+                for _ in range(R - 1):
+                    desc.wait_send()
+        if tiles.trace:
+            with jax.named_scope("X_wait"):
+                waits()
+        else:
+            waits()
+
+    def cx_wait_send(gi, par):
+        """L1-D: wait this rank's R - 1 sends of (group gi, parity par): before b_csend[gi, par] is rewritten two
+        rounds later, and at the end of the threshold (drain). Same semaphore count as the eager form."""
+        if R == 1 or "coll" in skip:
+            return
+        desc = pltpu.make_async_remote_copy(
+            src_ref=scr["b_csend"].at[gi, par], dst_ref=scr["b_crecv"].at[gi, par, 0], send_sem=scr["b_csem_s"].at[gi, par],
+            recv_sem=scr["b_csem_r"].at[gi, 0 if fault == "sharedsem" else par], device_id=(me,),
+            device_id_type=pl.DeviceIdType.MESH)
+
+        def waits():
             for _ in range(R - 1):
                 desc.wait_send()
         if tiles.trace:
-            with jax.named_scope("X_wait"):
+            with jax.named_scope("X_wsend"):
                 waits()
         else:
             waits()
@@ -715,6 +737,14 @@ def make(E):
 
         def count_send(gi, r, last):
             payload, par = count_payload(gi, r, last)
+            if DSEND:                            # L1-D: b_csend[gi, par] was last sent in round r - 2
+                if isinstance(r, int):
+                    if r >= 2:
+                        cx_wait_send(gi, par)
+                else:
+                    @pl.when(r >= 2)
+                    def _():
+                        cx_wait_send(gi, par)
             scr["b_csend"][gi, par] = payload
             scr["b_crecv"][gi, par, me] = payload
             if getattr(E, "delay", None) is not None:
@@ -821,6 +851,9 @@ def make(E):
 
         def gfin(gi, c):
             finish(gi, NR - 1, True)
+            if DSEND:                            # L1-D: drain the last two rounds' sends of this group
+                cx_wait_send(gi, (NR - 2) % 2)
+                cx_wait_send(gi, (NR - 1) % 2)
             after_group(gi)                      # overlaps the union with later groups' exchanges
             return c
         lax.fori_loop(g0, g1, gfin, 0)
