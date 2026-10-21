@@ -73,6 +73,9 @@ ABLATE = frozenset()
 TRANSPOSE_KEYS = False  # explicit key transposes for PV in the HCA / union passes (A/B)
 TABLE_REUSE = True  # tests only: False restages the block tables at every layer
 DEBUG_TOPK = None  # test harness only: a VMEM ref [B, 8, TOPK] receiving the top-k lists
+# Positive control of the store tests only: "two_runs" writes both boundaries'
+# copies of a shared RoPE row / SAL lane tile, neither merged (lost records).
+STORE_FAULT = ""
 
 
 def round_up(a, b):
@@ -699,6 +702,8 @@ class _Phase:
                 pos = self.pos(r, jnp.minimum(t, T - 1))
                 k = pos // R
                 skip_rmw = share if (share is not None and slot == 0) else None
+                if STORE_FAULT == "two_runs":
+                    skip_rmw = None
                 if not wait:
                     start = pos - W + 1
                     f = lax.bitcast_convert_type(cwin[pl.ds(slot * W * spt, W * spt)], jnp.float32)
@@ -770,7 +775,7 @@ class _Phase:
             row = S.rope_rmw[slot: slot + 1, :]
             row = jnp.where(lane // 32 == slot_in % 4, wds, row)
             S.rope_rmw[slot: slot + 1, :] = row
-            if slot == 1:
+            if slot == 1 and STORE_FAULT != "two_runs":
                 k0 = k - 1
                 same = (k0 % CSA_PAGE) // 4 == slot_in // 4
                 @pl.when(same)
@@ -801,7 +806,7 @@ class _Phase:
         rowi = lax.broadcasted_iota(jnp.int32, (40, 1), 0)
         keep = (lane != (k % CSA_PAGE) % 128) | (rowi >= 33)
         S.sal_rmw[slot] = jnp.where(keep, S.sal_rmw[slot], col)
-        if slot == 1:
+        if slot == 1 and STORE_FAULT != "two_runs":
             k0 = k - 1
             same = ((k0 % CSA_PAGE) // 128) == ((k % CSA_PAGE) // 128)
             @pl.when(same)
