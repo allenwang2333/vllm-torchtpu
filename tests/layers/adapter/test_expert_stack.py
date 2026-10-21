@@ -165,3 +165,21 @@ def test_dummy_loader_is_refused(monkeypatch):
     monkeypatch.setattr(expert_stack, "_REFUSED", None)
     expert_stack.maybe_plan(torch.nn.Module(), SimpleNamespace(), SimpleNamespace())
     assert expert_stack.current() is None and "loader" in expert_stack.refused()
+
+
+def test_row_ops_build_and_lower(monkeypatch):
+    """The donated put and the read are real jax_ops (torch_tpu evaluates their annotations: a missing module-level
+    `jax` broke the first TPU run); their JAX bodies round-trip a checkpoint chunk through a served-layout row."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    monkeypatch.setattr(expert_stack, "_OPS", {})
+    ops = expert_stack._ops()
+    assert set(ops) == {"put", "get"}
+    stk = jnp.zeros((3, E, H, 2 * INTER), jnp.float32)
+    raw = np.random.default_rng(0).standard_normal((4, 2 * INTER, H)).astype(np.float32)
+    idx = jnp.array([1, 2], jnp.int32)
+    stk = expert_stack._put_fn(stk, jnp.asarray(raw.reshape(4, H, 2 * INTER)), idx)
+    back = expert_stack._get_fn(stk, idx, 4)
+    assert back.shape == (4, 2 * INTER, H) and np.array_equal(np.asarray(back), raw)
+    assert float(jnp.abs(stk[1, :2]).sum()) == 0.0 and float(jnp.abs(stk[0]).sum()) == 0.0

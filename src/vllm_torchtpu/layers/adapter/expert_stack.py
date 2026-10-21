@@ -38,6 +38,7 @@ import os
 import re
 from typing import Any
 
+import jax  # the row ops' annotations are evaluated by torch_tpu's jax_op (this module has postponed annotations)
 import torch
 
 from vllm_torchtpu.logger import init_logger
@@ -222,7 +223,6 @@ def _get_fn(stk, idx, n):
 
 def _ops():
     if not _OPS:
-        import jax
         from torch_tpu._internal import pallas
 
         def put(stk: jax.Array, x: jax.Array, idx: jax.Array) -> jax.Array:
