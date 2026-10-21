@@ -1016,7 +1016,7 @@ async def lifespan(app: FastAPI):
             dram_max_blocks=prefill_dram_blocks,
             peak_prefill_tok_s=_env_float("PROXY_PEAK_PREFILL_TOK_S", default_peak_prefill_tok_s),
             dram_load_tok_s=_env_float("PROXY_DRAM_LOAD_TOK_S", 280000.0),
-            quad_attn_coeff=_env_float("PROXY_PREFILL_QUAD_ATTN_COEFF", 0.0),
+            quad_attn_coeff=_env_float("PROXY_PREFILL_QUAD_ATTN_COEFF", 1.23e-5),
             # Mean effective/uncached ratio ~2.1 on the AgentX mix (prefix ~89K,
             # ~6K uncached per request; pp8load j-6e24352e) at k = 1.23e-5.
             peak_prefill_eff_tok_s=_env_float(
