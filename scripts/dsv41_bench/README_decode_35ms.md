@@ -405,6 +405,76 @@ in `results/csa-union-qk-early-evidence.tgz` in the same artifact
 (113826 bytes, SHA-256
 `d8683c6f96491a55a30e519defd20fac40c5d06120bbb3872e0e243a791d8665`).
 
+### Actual MoE routing calibration
+
+`exp-c6elv5uzb0`, source `f3962941`, captured actual FP32 router logits and
+correction biases from all 40 main-model MoE layers on all eight ranks.
+The collector used fixed forwards 40 and 48, with independent encoder/decoder
+position checks and actual EP ownership metadata. All 16 checksummed captures
+passed validation; their shortest generated contexts were 62–91 tokens.
+Startup completed in 1037.230 s and the request window completed. Synchronous
+copies make this a calibration run, not a serving performance measurement.
+The collector's alignment update is preserved in the evidence; its SHA-256 is
+`60518fc392345dd1829712c6cd6d8f2fedb76f4d12d72ae1b8dd6366e2d65d44`.
+
+Native TPU scoring and Pallas selection were replayed on these captured inputs.
+The original in-graph selected expert IDs were not captured directly. Analyze
+the replay with:
+
+```bash
+python scripts/dsv41_bench/analyze_moe_routes.py /path/to/replayed \
+  --out /path/to/route-balance.json
+```
+
+The analyzer rejects incomplete or duplicate same-forward EP groups and
+inconsistent biases or ownership. It retains 48 expert slots per rank, fits
+greedy placements only on forward 40, and evaluates forward 48 without refitting.
+On forward 48, the sum of per-layer maximum 64-row-rounded work decreased from
+182656 to 155200 rows; maximum 128-row tile counts summed to 2214 versus 1993.
+These are work counts, not a latency model. Round-robin placement yielded
+183296 rounded rows and did not improve this aggregate. The complete KV
+capture also confirmed a median six-query union of 1376 rows and an ideal
+selected-row traffic reduction of 54.50% across 6144 request/indexer samples.
+
+Paired complete EP8 MoE probes used actual forward-48 logits/biases and
+synthetic BF16 activations/FP4 weights. Permutations fitted on forward 40
+reordered weights and remapped expert IDs **after** native top-k selection,
+preserving top-k slot order. Every complete output bit matched:
+
+| Layer / seed | Map representation | Contiguous (ms) | Permuted (ms) |
+| --- | --- | ---: | ---: |
+| 8 / 1070 | Static prototype | 0.582439 | 0.499474 |
+| 22 / 1071 | Static prototype | 0.592856 | 0.529180 |
+| 17 / 1072 | Static prototype | 0.496447 | 0.501880 |
+| 8 / 1073 | Replicated runtime operand | 0.582814 | 0.505419 |
+| 17 / 1074 | Replicated runtime operand | 0.496446 | 0.509975 |
+
+Times are five ordered complete-module device medians after entry-barrier
+subtraction at P-state 7. The dynamic prototype also passes correction bias
+as an operand. Load balancing benefits these skewed layers but regresses the
+more balanced layer 17. No placement change is enabled in serving yet;
+checkpoint ownership, fetch-time filtering and post-selection ID mapping must
+agree before integration. These probes do not establish an end-to-end gain.
+
+An all-layer dynamic-map sweep with seed 1075 reused just two compiled
+executables across all 40 layers, using the same forward-40 placements and
+forward-48 router inputs. All outputs matched bitwise. Thirty-three layers
+improved and seven regressed (11, 12, 13, 17, 20, 21 and 36). The sum of
+isolated module medians was 21.664918 ms versus 20.676277 ms, a 4.56% reduction.
+This sum is not a main-model forward measurement. Twenty-nine layers saved
+more than 5 us apiece; their isolated savings sum to 1.040508 ms. Selective
+integration still needs checkpoint-loading and full-serving validation.
+
+Verified archives in `art-hhm1zvix50`:
+
+| Artifact path | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `results/route-selection-evidence.tgz` | 138161865 | `8f232eba7bd3c6e66a0a74ebd81d35dc9cb942b83c744c0526d874dd7adf3c7c` |
+| `results/route-replay-evidence.tgz` | 6097444 | `b28637e02f6767023f415a826b51b3c5f2d618653f747cb4a542b524c88dde6f` |
+| `results/route-placement-evidence.tgz` | 990226 | `fbe6ed5b11650d7e02c46c57ff09b2cc2b3ca2b7b7e52023224c5c13259e03b6` |
+| `results/dynamic-placement-evidence.tgz` | 672993 | `38b654cb0a171e57210658f8f683b45c4f10c63d6df611fbd8559d33274e689d` |
+| `results/placement-sweep-evidence.tgz` | 4753934 | `8e06019db94f7c7401ca9c5eba885ec4977a4afc6afe4f4ba6bcf1185cc63b29` |
+
 The following prototypes remain outside the production path. Unless labeled
 otherwise, times are complete device-module medians after subtracting identified
 entry barriers; operator-only measurements are explicitly identified.
