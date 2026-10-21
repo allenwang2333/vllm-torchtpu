@@ -1,4 +1,11 @@
 {
+ "_meta": {
+  "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (x86_64)",
+  "jax": "0.11.2",
+  "jaxlib": "0.11.2",
+  "numpy": "2.5.4",
+  "python": "3.12.3"
+ },
  "c30_fused_t1_b4": {
   "gpr": false,
   "hid": "17846c5f2f476bd4cb0b0565",

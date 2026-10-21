@@ -14,12 +14,25 @@
 """Behaviour-preservation gate: golden hashes of hidden + every pool output.
 
 Each case runs one tiny paged pooled step (CPU interpret) and hashes the hidden
-output and every returned pool (the pools carry all KV / GDN state). The goldens
-in `golden/b1_bitexact.json` were generated at the B1 head; Phase B refactor PRs
-must reproduce them bit-for-bit. Only public APIs are used (profiles,
-`default_pool_layout`, `states_to_pool`, `PallasWriter`), so the harness itself
-stays unchanged across refactors. Regenerate only for an intentional numerics
-change, and say so in the PR: `MK_REGEN_GOLDEN=1 pytest <this file>`.
+output and every returned pool (the pools carry all KV / GDN state). Only public
+APIs are used (profiles, `default_pool_layout`, `states_to_pool`,
+`PallasWriter`), so the harness stays unchanged across internal refactors.
+
+Two execution modes are supported:
+1. Committed-golden mode (default, `MK_GOLDEN_JSON` unset): compares against
+   `golden/b1_bitexact.json` when the current host fingerprint matches the
+   `"_meta"` entry recorded in that file. Because Pallas CPU-interpret lowering
+   depends on the host CPU microarchitecture and library versions, a host
+   fingerprint mismatch skips with instructions to run base-vs-head mode.
+2. Base-vs-head mode (`MK_GOLDEN_JSON=<path>` or
+   `tests/megakernel/golden/compare_base_head.sh <base-ref> [-n N]`): records
+   fresh reference hashes at `<base-ref>` on the current host with
+   `MK_REGEN_GOLDEN=1 MK_GOLDEN_JSON=$TMP/base.json pytest <this file>`, then
+   verifies the working tree against `$TMP/base.json` with
+   `MK_GOLDEN_JSON=$TMP/base.json pytest <this file>`.
+
+Regenerate the committed golden file only for an intentional numerics change,
+and say so in the PR: `MK_REGEN_GOLDEN=1 pytest <this file>`.
 """
 
 from __future__ import annotations
@@ -29,13 +42,16 @@ import os
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
 
 import dataclasses
+import fcntl
 import hashlib
 import json
 import pathlib
+import platform
 from typing import Any
 
 import jax
 import jax.numpy as jnp
+import jaxlib
 import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding
@@ -45,7 +61,60 @@ from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel.models import qwen35
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
+_META_KEY = "_meta"
 R = 2
+
+
+def _cpu_model_name() -> str:
+    cpuinfo = pathlib.Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text(errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                _, _, val = line.partition(":")
+                if val.strip():
+                    return val.strip()
+    return platform.processor() or "unknown"
+
+
+def _host_fingerprint() -> dict[str, str]:
+    return {
+        "cpu": f"{_cpu_model_name()} ({platform.machine()})",
+        "jax": jax.__version__,
+        "jaxlib": jaxlib.__version__,
+        "numpy": np.__version__,
+        "python": platform.python_version(),
+    }
+
+
+def _format_fingerprint(fp: dict[str, Any] | None) -> str:
+    if not isinstance(fp, dict):
+        return "<missing _meta>"
+    return (
+        f"{fp.get('cpu', '?')} "
+        f"(jax={fp.get('jax', '?')}, jaxlib={fp.get('jaxlib', '?')}, "
+        f"numpy={fp.get('numpy', '?')}, python={fp.get('python', '?')})"
+    )
+
+
+def _golden_path() -> tuple[pathlib.Path, bool]:
+    override = os.environ.get("MK_GOLDEN_JSON", "").strip()
+    if override:
+        return pathlib.Path(override), True
+    return GOLDEN, False
+
+
+def _write_golden_case(
+    golden_path: pathlib.Path, name: str, got: dict[str, Any]
+) -> None:
+    golden_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = golden_path.with_name(golden_path.name + ".lock")
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        gold = json.loads(golden_path.read_text()) if golden_path.exists() else {}
+        gold[_META_KEY] = _host_fingerprint()
+        gold[name] = got
+        golden_path.write_text(json.dumps(gold, indent=1, sort_keys=True) + "\n")
+
 
 CASES: dict[str, dict[str, Any]] = {
     # Qwen3.5 default profile (qwen35-baseline), production-size and tiny tiles
@@ -184,17 +253,43 @@ def run_case(
 @pytest.mark.slow
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_golden_bitexact(name: str):
-    """Hidden + every pool output reproduces the B1 golden hash bit-for-bit."""
-    got = run_case(**CASES[name])
+    """Hidden + every pool output reproduces the golden hash bit-for-bit."""
+    golden_path, is_custom_golden = _golden_path()
     if os.environ.get("MK_REGEN_GOLDEN"):
-        gold = json.loads(GOLDEN.read_text()) if GOLDEN.exists() else {}
-        gold[name] = got
-        GOLDEN.write_text(json.dumps(gold, indent=1, sort_keys=True) + "\n")
+        got = run_case(**CASES[name])
+        _write_golden_case(golden_path, name, got)
         pytest.skip("regenerated golden")
-    gold = json.loads(GOLDEN.read_text())[name]
+    all_gold = json.loads(golden_path.read_text())
+    if not is_custom_golden:
+        meta = all_gold.get(_META_KEY)
+        cur = _host_fingerprint()
+        if meta != cur:
+            pytest.skip(
+                f"golden recorded on {_format_fingerprint(meta)}, "
+                f"this host is {_format_fingerprint(cur)}; "
+                "use base-vs-head mode: "
+                "tests/megakernel/golden/compare_base_head.sh <base-ref>"
+            )
+    elif name not in all_gold:
+        pytest.skip(f"case {name!r} only exists in HEAD (not in {golden_path})")
+    got = run_case(**CASES[name])
+    gold = all_gold[name]
     assert got["hid"] == gold["hid"], (name, "hidden", got["hid"], gold["hid"])
     assert got["pools"] == gold["pools"], (name, "pools", got["pools"], gold["pools"])
 
 
 def test_golden_covers_every_case():
-    assert set(json.loads(GOLDEN.read_text())) == set(CASES)
+    golden_path, is_custom_golden = _golden_path()
+    if os.environ.get("MK_REGEN_GOLDEN") and os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip("regenerating golden across xdist workers")
+    gold_cases = set(json.loads(golden_path.read_text())) - {_META_KEY}
+    head_cases = set(CASES)
+    if is_custom_golden:
+        base_only = sorted(gold_cases - head_cases)
+        head_only = sorted(head_cases - gold_cases)
+        if base_only or head_only:
+            pytest.skip(
+                f"case set differs from {golden_path}: "
+                f"base_only={base_only}, head_only={head_only}"
+            )
+    assert gold_cases == head_cases
