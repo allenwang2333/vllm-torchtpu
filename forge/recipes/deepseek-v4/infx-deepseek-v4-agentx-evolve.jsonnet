@@ -262,8 +262,10 @@ local numSpecTokens = cdk.numVar('NUM_SPEC_TOKENS', 6);
 // length (vLLM rejection_sample_method=synthetic) instead of by the target's probabilities, as the InferenceX
 // reference measures DSpark throughput. Outputs are then not samples of the target. The reference's
 // golden curve for DeepSeek-V4-Pro-0813 DSpark is K1 1.84, K2 2.51, K3 3.01, K4 3.36, K5 3.61, K6 3.77.
-// Empty = real rejection sampling.
-local specSyntheticAl = cdk.var('SPEC_SYNTHETIC_AL', '3.77');
+// Empty or none = real rejection sampling. none exists because an empty value on the job command line
+// falls back to the 3.77 default.
+local specSyntheticAlVar = cdk.var('SPEC_SYNTHETIC_AL', '3.77');
+local specSyntheticAl = if specSyntheticAlVar == 'none' then '' else specSyntheticAlVar;
 // SPEC_DRAFT_SAMPLE=probabilistic draws drafts from the draft distribution at the request's temperature
 // (vLLM draft_sample_method); on TPU it needs SPEC_SYNTHETIC_AL. Empty = greedy drafting.
 local specDraftSample = cdk.var('SPEC_DRAFT_SAMPLE', 'probabilistic');
@@ -343,6 +345,22 @@ local prefixRoutingNewSessionAffinity = cdk.var('PREFIX_ROUTING_NEW_SESSION_AFFI
 // 1: the DP routing hook sends a new session to the engine with the fewest prompt tokens in flight
 // (waiting + running) rather than the fewest requests. Pair with TPU_SRPT_ATTN_WORK_CAP. Empty = off.
 local prefixRoutingContextLoad = cdk.var('PREFIX_ROUTING_CONTEXT_LOAD', '');
+// 1: the API server tokenizes chat prompts piecewise between added tokens and reuses the pieces earlier
+// turns already encoded (vllm-torchtpu segment_tokenize.py; exact ids). The full encode costs ~2.7 us per
+// prompt token on the API server, before the request reaches an engine. Empty = off.
+local segmentTokenize = cdk.var('VLLM_TPU_SEGMENT_TOKENIZE', '');
+// true: install fastokens (pinned) on every server pod if the image lacks it and set VLLM_USE_FASTOKENS=1,
+// vLLM's switch to the fastokens BPE backend for HF fast tokenizers. On DSv4 agentx prompts it encodes at
+// ~0.02-0.05 us/token vs ~2.5 for the HF backend, with identical ids on 2534 replayed prompts. Pick this or
+// VLLM_TPU_SEGMENT_TOKENIZE: with both, the piecewise split costs more than fastokens' full encode.
+local useFastokens = cdk.boolVar('USE_FASTOKENS', false);
+// 1: EngineCore copies a new prompt's prefix-cache block hashes (one per 16 tokens on DSv4) from the stored
+// prompt sharing the longest token prefix instead of rehashing it (vllm-torchtpu core/block_hash_reuse.py;
+// identical hashes). CPU: 83 -> 28 ms per ~450k-token turn. Empty = off.
+local blockHashReuse = cdk.var('TPU_BLOCK_HASH_REUSE', '');
+// 1: the API server logs one "request timing:" line per request (TTFT split into front / queued / prefill,
+// with ISL and cached tokens). Diagnostic; empty = off.
+local requestTimingLog = cdk.var('TPU_REQUEST_TIMING_LOG', '');
 // SrptPrefillScheduler caps each step's attention work (sum over scheduled tokens of their context) by
 // clipping prefill chunks, so one rank's chunk deep in a long prompt stops setting every rank's step.
 // Empty = off.
@@ -523,6 +541,11 @@ local serverScript = agentx.fill(
       rm -rf /workspace/vllm-torchtpu/src && mv /tmp/vllm-torchtpu-src/src /workspace/vllm-torchtpu/src
       echo "vllm-torchtpu src replaced: $(find /workspace/vllm-torchtpu/src -name '*.py' | wc -l) .py files"
     fi
+    if [ "@USE_FASTOKENS@" = "true" ]; then
+      python3 -c 'import fastokens' 2>/dev/null || python3 -m pip install --quiet 'fastokens==0.3.4' || exit 1
+      export VLLM_USE_FASTOKENS=1
+      echo "VLLM_USE_FASTOKENS=1 with fastokens $(python3 -c 'import importlib.metadata as m; print(m.version("fastokens"))')"
+    fi
 
     # Ensure pool_tensors[0] in TPURaidenOffloadingConnector has max(page_size_bytes) (HCA 128 KiB)
     # so pre-CL-976485301 KVCacheManagerBase allocates host_size large enough for all 122 arrays.
@@ -676,6 +699,7 @@ local serverScript = agentx.fill(
   |||,
   {
     HEAD_ADDR: cdk.host(serverJobName),
+    USE_FASTOKENS: if useFastokens then 'true' else 'false',
     HOST_MEM_SAMPLE_SECONDS: hostMemSampleSeconds,
     EXPECTED_TPU: rayExpectedTpu,
     XPROF_DIR: xprofDir,
@@ -853,6 +877,9 @@ local serverJob = cdk.job(
         [if moeSharedBeforeKernel != '' then 'MOE_FUSED_EP_SHARED_BEFORE_KERNEL']: moeSharedBeforeKernel,
         [if prefixRoutingNewSessionAffinity != '' then 'PREFIX_ROUTING_NEW_SESSION_AFFINITY']: prefixRoutingNewSessionAffinity,
         [if prefixRoutingContextLoad != '' then 'PREFIX_ROUTING_CONTEXT_LOAD']: prefixRoutingContextLoad,
+        [if segmentTokenize != '' then 'VLLM_TPU_SEGMENT_TOKENIZE']: segmentTokenize,
+        [if blockHashReuse != '' then 'TPU_BLOCK_HASH_REUSE']: blockHashReuse,
+        [if requestTimingLog != '' then 'TPU_REQUEST_TIMING_LOG']: requestTimingLog,
         [if srptAttnWorkCap != '' then 'TPU_SRPT_ATTN_WORK_CAP']: srptAttnWorkCap,
         [if attnIntraChipTp != '' then 'TPU_DSV4_ATTN_INTRA_CHIP_TP']: attnIntraChipTp,
         [if kvHoldReplayCheckpoint != '' then 'TPU_KV_HOLD_REPLAY_CHECKPOINT']: kvHoldReplayCheckpoint,
