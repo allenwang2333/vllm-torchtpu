@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# DSv4.1 decode measurements, 2026-10-20 UTC
+# DSv4.1 decode measurements, 2026-10-21 UTC
 
 The 35 ms main-model forward and 14000 output tokens/chip/s targets remain
 unmet. The serving measurements below cover an FP4 MoE height ladder for the
 observed EP8 geometry and a joint request/scorer configuration for the
-48-request full-context indexer, followed by whole-batch router selection.
+48-request full-context indexer, whole-batch router selection and WO_A row chunks.
 
 ## Configuration and provenance
 
@@ -29,6 +29,7 @@ JAX/JAXLIB 0.11.2 and libtpu 0.0.50, with vLLM revision
 | FP4 ladder | `c6ffd0fa` | `exp-qcbagjr3z8` / `results/rungs2-tuned` |
 | FP4 ladder + indexer | `cd47b6c9` | `exp-1mv4ll6amh` / `results/indexer-tuned` |
 | FP4 ladder + indexer + router | `7b971e97` | `exp-qg29pd6unq` / `results/router-tuned` |
+| Previous + WO_A | `2881d570` | `exp-btjh485722` / `results/woa-tuned` |
 
 The FP4 run's top-level runtime source and actual checkout are `c6ffd0fa`;
 its copied nested source metadata still names the base. The first combined
@@ -170,7 +171,7 @@ This mode compares 32, 96, 144 and 288 rows with automatic table dispatch,
 retaining compiled HLO and checking complete EP8 outputs against the 32-row
 reference. Height tuning remains automatic throughout the router sweep.
 
-## WO_A row chunks awaiting serving validation
+## WO_A row chunks and serving validation
 
 The TPU7x decode shape `[288,64,512]` with FP8 weight `[4096,8192]`,
 FP32 scales, tile T=288/R=1024, quantized activations and no fused RoPE now
@@ -190,9 +191,34 @@ Seed 1023 used array equality. In the automatic-dispatch run, the explicit
 288-row variant measured 23.825 us. Compiled generated code shrank from
 307200 to 255488 bytes, with unchanged reported argument/output storage and
 zero temporary HBM. The roughly 1.6 us gain per layer projects to only
-0.064 ms over 40 layers and is not an end-to-end result. The serving table
-above predates this change. Serving experiment `exp-btjh485722` is running
-at source `2881d570`; its results are not yet available.
+0.064 ms over 40 layers and is not an end-to-end result.
+
+Serving experiment `exp-btjh485722` completed three formal rounds and the
+six-step profile at source `2881d570`. Its result is **not a serving speedup**:
+
+| Metric | Router run `7b971e97` | WO_A run `2881d570` |
+| --- | ---: | ---: |
+| Host step median, ms | 53.495 / 53.188 / 53.376 | 55.604 / 55.747 / 55.667 |
+| Fixed-acceptance output tokens/chip/s | 6227 / 6263 / 6241 | 5991 / 5976 / 5984 |
+| Observed accepted+bonus tokens/chip/s | 7021 / 7032 / 6819 | 6876 / 6726 / 6641 |
+| Main-model device forward, ms | 42.599 | 46.039 |
+| Forward minus identified entry barriers, ms | 41.847 | 41.912 |
+| Main-model FP4 MoE event time/step, ms | 15.127 | 15.160 |
+| Full-context index score event time/step, ms | 2.669 | 2.672 |
+| Startup HBM used per logical device, GiB range | 49.00–49.06 | 49.02–49.04 |
+| Server launch to health ready, seconds | 1015.20 | 1018.22 |
+
+The WO_A run's entry-barrier median is 4.076 ms; its six individual forward
+samples are 52.396, 45.878, 45.796, 66.516, 45.982 and 46.097 ms. All six
+contain the expected 40 main-model MoE layers. Removing entry barriers gives
+41.912 ms versus 41.847 ms previously, so the raw forward regression mostly
+coincides with increased barriers. These are separate jobs, not a same-node
+A/B comparison; this does not isolate the cause of the host regression.
+Inclusive WO_A-named event time decreased by about 0.060 ms per step, consistent
+with its paired microbenchmarks, while main MoE, indexer and mHC event times
+were similar. The exact-shape tuning remains enabled for this isolated gain
+and smaller generated code, with **no demonstrated whole-model throughput gain**.
+The 35 ms and 14000 output tokens/chip/s targets remain unmet.
 
 Reproduce on the pinned TPU runtime from the repository root:
 
@@ -241,6 +267,23 @@ entry barriers; operator-only measurements are explicitly identified.
 | mHC 288-token tile with the original 96-row projection chunks | With RMSNorm: 18.695 to 20.777 us, all five outputs bit-exact | Reject |
 | Compact MoE gate/up staging with three gate/up slots and two down slots | Biased whole EP8 layer: 0.50020 to 0.50150 ms; uniform: 0.45972 to 0.45887 ms, bit-exact | No meaningful gain |
 | Packed-word FP4-to-FP8 expansion | Biased whole EP8 layer: 0.50085 to 4.18015 ms; uniform: 0.45934 to 4.07370 ms, bit-exact | Reject |
+| Compact gate/up weights in HBM, two staging slots | Biased whole EP8 layer: 0.53772 to 0.53714 ms; uniform: 0.45938 to 0.45773 ms, bit-exact | No meaningful performance gain; retain existing weight layout |
+
+The compact-HBM experiment ran after serving in `exp-btjh485722`, with
+biased `sqrtsoftplus` routing at seed 1037 and uniform softmax at seed 1038.
+Compaction occurs outside the timed forward and removes the two unused
+256-column gate/up tails. All output bit patterns, including signed zero,
+match the original layout. Compiled argument storage decreases by exactly
+62914560 bytes (60 MiB) per logical device and layer; temporary storage and
+generated code sizes stay unchanged. Operator-only MoE medians are
+0.369390 to 0.369348 ms (biased) and 0.292022 to 0.289723 ms (uniform).
+The small time change does not justify changing the production weight loader.
+
+A further compact-HBM/three-slot prototype halted during execution before
+correctness checks or profiling completed. Static inspection found a missing
+modulo-three mapping in its DMA slot index. The corrected prototype is being
+retested in `exp-bazj9i3rq6`; the failed execution supplies no performance result.
+Neither prototype is in the production dispatch.
 
 Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
 above ran in `exp-qg29pd6unq` after its serving process exited. The initial
