@@ -19,7 +19,8 @@ The step_ok guard (WHITEBOARD.v3 §8 W4). The megakernel engages only when every
 runs the stock graphs, and every decline is counted under a named reason (no silent decline):
 - load time (else no megakernel is built; logged): GLM-5.2 DSA, TP == DCP == world == 16 with the DCP group = the TP
   group = ranks 0..15 in rank order (the megakernel's mesh position, DCP KV ownership and rank operand coincide),
-  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256;
+  interleave 4, EP off, qrep 0 (no q_b_proj replicated, the served column-parallel q_b), MTP 3, block 256, and the
+  A0-10 pool guard (a max_model_len request's rank-0 pages <= Tiles.pool, else the DSA wave overflows: `check_pool`);
 - bind time (else every step declines 'unbound'; logged): the served cache form. The runner-stacked groups
   (`runner.glm5_kv_stack_groups`, GLM5_MKD_STACK_C; allocated by default when this megakernel is built) in equal
   groups of consecutive layers, nope / rope grouped alike, every layer bound to its group row; or per-layer caches
@@ -82,6 +83,26 @@ def _rows_env() -> list[int]:
     rows = sorted({int(x) for x in v.split(",") if x.strip()})
     _need(bool(rows) and all(r in (16, 32) for r in rows), f"GLM52_DECODE_MK_ROWS={v}")
     return rows
+
+
+def rank0_pages(seq: int, *, page: int, R: int, ilv: int) -> int:
+    """Rank 0's local page count for a request of `seq` tokens under DCP interleave ownership: the kernel's per-request
+    wave weight (dsa.py step_init `req[b, 11]`, nl0 = (seq // (R * ilv)) * ilv + min(seq % (R * ilv), ilv))."""
+    g = R * ilv
+    nl0 = (seq // g) * ilv + min(seq % g, ilv)
+    return -(-nl0 // page)
+
+
+def check_pool(max_model_len: int, pools, *, page: int, R: int, ilv: int) -> int:
+    """The A0-10 pool guard (stageA/a0/RESULTS.md §8): step_init opens a new DSA wave only when the pool is already
+    non-empty, so ONE request with more rank-0 pages than `Tiles.pool` overflows b_keys / b_blk (UB, no in-kernel
+    check). vLLM never schedules seq > max_model_len and rank0_pages is non-decreasing in seq, so bounding a
+    max_model_len request at load time bounds every step. -> that page count; raises Unsupported (no megakernel)."""
+    need = rank0_pages(max_model_len, page=page, R=R, ilv=ilv)
+    for t, pool in pools.items():
+        _need(need <= int(pool), f"pool guard (A0-10): a {max_model_len}-token request has {need} rank-0 pages > "
+              f"Tiles.pool {pool} (b{t}): the DSA wave would overflow")
+    return need
 
 
 def _unwrap(x):
@@ -422,6 +443,8 @@ class Glm52DecodeMK:
         # stage-B levers (presets.py): GLM52_DECODE_MK_LEVERS = "" / "A" (stage A) | "B" (all) | "L4,L1,..."
         self.levers = PR.parse(os.environ.get("GLM52_DECODE_MK_LEVERS", ""))
         self.tiles_by_rows = {t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers)) for t in self.rows}
+        self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}, page=cfg.page, R=R,
+                                     ilv=cfg.ILV)
         self.caches = None
         self._steps = {}
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
@@ -882,7 +905,7 @@ class Glm52DecodeMK:
                 "L": self.cfg.L, "fresh_layers": LY.layers_of(self.cfg, "iwq"),
                 "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip], "n_dense": len(self.dense),
                 "n_experts": len(self.experts), "n_caches": len(self.caches or []), "nb": getattr(self, "nb", None),
-                "max_pages": self.max_pages, "trace": self.tiles.trace,
+                "max_pages": self.max_pages, "pool_pages": getattr(self, "pool_pages", None), "trace": self.tiles.trace,
                 "levers": list(self.levers), "calls": self.calls,
                 "cache_views": getattr(self, "cache_views", None), "k_scales": sorted(set(self.k_scales)),
                 "counts": dict(self.counts), "decisions": self.decisions, "consumed": self.consumed,

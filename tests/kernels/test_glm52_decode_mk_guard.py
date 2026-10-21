@@ -111,6 +111,49 @@ def test_bad_groups_decline(mutate, msg):
         stacked_groups_plan(b, s)
 
 
+# ------------------------------------------------------------------ the A0-10 pool guard (load time)
+
+
+def _owner_pages_bruteforce(seq, page=256, R=16, ilv=4):
+    # rank 0 owns position p iff (p % (R * ilv)) // ilv == 0 (config.FullCfg.owner): count, then pages
+    n = sum(1 for p in range(seq) if (p % (R * ilv)) // ilv == 0)
+    return -(-n // page)
+
+
+@pytest.mark.parametrize("seq", [1, 3, 4, 5, 63, 64, 65, 68, 69, 4095, 4096, 4097, 16383, 16384, 16385, 65536, 65537,
+                                 131072, 131073])
+def test_rank0_pages_matches_ownership(seq):
+    assert VA.rank0_pages(seq, page=256, R=16, ilv=4) == _owner_pages_bruteforce(seq)
+    assert VA.rank0_pages(seq, page=1, R=16, ilv=4) == _owner_pages_bruteforce(seq, page=1)   # token-exact
+
+
+def test_rank0_pages_monotone():
+    p = [VA.rank0_pages(s, page=256, R=16, ilv=4) for s in range(1, 40000, 7)]
+    assert all(a <= b for a, b in zip(p, p[1:]))
+
+
+def test_pool_guard_served_lengths_pass():
+    # 640K served, the 1M twin: 160 / 256 rank-0 pages against the production pool 1344
+    assert VA.check_pool(655360, {16: 1344, 32: 1344}, page=256, R=16, ilv=4) == 160
+    assert VA.check_pool(1 << 20, {16: 1344, 32: 1344}, page=256, R=16, ilv=4) == 256
+
+
+def test_pool_guard_refuses_overflow():
+    # a request one page past the pool: the DSA wave would overflow b_keys / b_blk (A0-10) -> no megakernel
+    mml = 1344 * 256 * 16 + 1          # 1345 rank-0 pages
+    assert VA.rank0_pages(mml, page=256, R=16, ilv=4) == 1345
+    with pytest.raises(Unsupported, match="pool guard"):
+        VA.check_pool(mml, {16: 1344, 32: 1344}, page=256, R=16, ilv=4)
+    with pytest.raises(Unsupported, match=r"b32"):     # any bucket's smaller pool refuses
+        VA.check_pool(1 << 20, {16: 1344, 32: 255}, page=256, R=16, ilv=4)
+    assert VA.check_pool(1344 * 256 * 16, {16: 1344}, page=256, R=16, ilv=4) == 1344   # exactly full: allowed
+
+
+def test_pool_guard_is_wired_at_load():
+    src = __import__("inspect").getsource(VA.Glm52DecodeMK.__init__)
+    assert "self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}" in src
+
+
 # ------------------------------------------------------------------ bind_caches on fake modules
 
 L, NB, NBI = 6, 2, 3
