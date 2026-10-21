@@ -1456,6 +1456,7 @@ def run_mla_batched_decode_kernel(
         "unnormalized_output",
         "non_causal_block",
         "q_compute_block_size",
+        "padded_lm_out",
     ),
     donate_argnames=("cache_kv",),
 )
@@ -1487,6 +1488,7 @@ def mla_sliding_window_ragged_paged_attention(
     # context keys). Requires q_len <= sliding_window.
     non_causal_block: bool = False,
     decode_seq_batch_size: int = 32,
+    padded_lm_out: bool = False,
 ) -> tuple[
     jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     jax.Array,  # [total_num_pages, physical_page_size_per_kv_packing, 4, 128] uint8
@@ -1524,10 +1526,15 @@ def mla_sliding_window_ragged_paged_attention(
         attention block in the pallas kernel. This is a tuple of (decode, prefill,
         mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      padded_lm_out: with `unnormalized_output`, return l/m at the kernel's
+        lane-padded width (only the first actual_num_q_heads lanes are
+        meaningful) and leave padding rows uninitialized, for a consumer that
+        reads only the real rows' heads (the HCA / CSA kernels).
 
     Returns:
       The output of attention and the updated kv cache.
     """
+    assert unnormalized_output or not padded_lm_out
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError(
             "num_kv_pages_per_block and num_queries_per_block must be specified."
@@ -1755,8 +1762,14 @@ def mla_sliding_window_ragged_paged_attention(
         )
 
     num_l_heads = align_to(num_q_heads, 128)
-    l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
-    m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
+    if padded_lm_out:
+        # Like `in_output` below: every real row is written by one of the passes
+        # and the padding rows are never read.
+        l = jnp.empty((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+        m = jnp.empty((q.shape[0], num_l_heads), dtype=jnp.float32)
+    else:
+        l = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)  # noqa: E741
+        m = jnp.zeros((q.shape[0], num_l_heads), dtype=jnp.float32)
     # output of swa attn is consumed by csa, hca attn, padding tokens'
     # data won't be used downstream at all, so un-initialized buffer is fine.
     in_output = jnp.empty_like(q) if unnormalized_output else jnp.zeros_like(q)
@@ -1851,7 +1864,8 @@ def mla_sliding_window_ragged_paged_attention(
     output = prepare_outputs(
         output, actual_num_q_heads, actual_head_dim
     )  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
-    out_l = out_l[:, :actual_num_q_heads]
-    out_m = out_m[:, :actual_num_q_heads]
+    if not padded_lm_out:
+        out_l = out_l[:, :actual_num_q_heads]
+        out_m = out_m[:, :actual_num_q_heads]
 
     return output, updated_kv, out_l, out_m

@@ -604,6 +604,8 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
+        if runner._step_timing_log is not None:
+            runner._step_timing_log.step_start()
         bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must

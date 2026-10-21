@@ -28,7 +28,11 @@ from __future__ import annotations
 import torch
 from vllm.config import VllmConfig
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 logger = init_logger(__name__)
@@ -81,6 +85,12 @@ class DSparkProposer(DFlashProposer):
                 "DSpark on TPU does not support draft_sample_method="
                 f"{spec.draft_sample_method!r}."
             )
+        self._vocab_parallel_markov = envs.TPU_DSPARK_VOCAB_PARALLEL_MARKOV
+        if self._vocab_parallel_markov and self._probabilistic:
+            raise ValueError(
+                "TPU_DSPARK_VOCAB_PARALLEL_MARKOV implements greedy drafting "
+                "only; set draft_sample_method='greedy'."
+            )
         # Width of compute_draft_logits: a reduced-vocab draft samples in its
         # own vocabulary and remaps after, which draws the same token as
         # upstream's scatter into target space (the other columns are -inf).
@@ -88,7 +98,9 @@ class DSparkProposer(DFlashProposer):
             "vocab_size"
         )
         if self._probabilistic and not self._draft_vocab_size:
-            raise ValueError("Probabilistic DSpark drafting needs the draft vocab size.")
+            raise ValueError(
+                "Probabilistic DSpark drafting needs the draft vocab size."
+            )
         # Keyed by padded request count: the all-greedy inputs of dummy
         # forwards.
         self._dummy_sample_inputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -129,6 +141,153 @@ class DSparkProposer(DFlashProposer):
                     f"DSpark draft model lacks {attr}(); expected a "
                     "Qwen3DSpark/Gemma4DSpark-family model."
                 )
+        if self._vocab_parallel_markov:
+            if not hasattr(self.draft_model, "prepare_vocab_parallel_markov"):
+                raise RuntimeError(
+                    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV: "
+                    f"{type(self.draft_model).__name__} has no vocabulary-parallel "
+                    "Markov head."
+                )
+            self.draft_model.prepare_vocab_parallel_markov()
+        if envs.TPU_DSPARK_SHARDED_CONTEXT_KV:
+            prepare = getattr(
+                self.draft_model.model, "prepare_sharded_context_kv", None
+            )
+            if prepare is None:
+                raise RuntimeError(
+                    "TPU_DSPARK_SHARDED_CONTEXT_KV: "
+                    f"{type(self.draft_model).__name__} has no sharded context-KV "
+                    "projection."
+                )
+            prepare()
+
+    # --- the draft forward on the DeepSeek-V4 megakernel ------------------
+
+    def _megakernel_draft(self):
+        """(target megakernel, its draft) when this step's target forward ran
+        on the megakernel and the draft runs there too; else (None, None)."""
+        mk = getattr(self.runner, "_dsv4_mk", None)
+        if mk is None or mk.draft is None or mk.last_run is None:
+            return None, None
+        return mk, mk.draft
+
+    @torch.no_grad()
+    def run_dp_dummy_draft(self, num_chunks: int) -> None:
+        mk, draft = self._megakernel_draft()
+        if draft is None:
+            super().run_dp_dummy_draft(num_chunks)
+            return
+        # a megakernel step is one chunk on every rank (decide_step)
+        draft.idle(mk.last_run)
+
+    @torch.no_grad()
+    def propose(
+        self,
+        sampled_token_ids,
+        discard_sampled_tokens_req_indices,
+        num_rejected_tokens_np,
+        scheduler_output,
+        return_device: bool = False,
+        next_tokens_per_chunk: list[torch.Tensor] | None = None,
+        device_seed: torch.Tensor | None = None,
+    ):
+        mk, draft = self._megakernel_draft()
+        if draft is None:
+            return super().propose(
+                sampled_token_ids,
+                discard_sampled_tokens_req_indices,
+                num_rejected_tokens_np,
+                scheduler_output,
+                return_device=return_device,
+                next_tokens_per_chunk=next_tokens_per_chunk,
+                device_seed=device_seed,
+            )
+        if self.runner.input_batch.num_reqs == 0:
+            return []
+        chunks = self.draft_chunks
+        if len(chunks) != 1:
+            raise AssertionError(f"megakernel step with {len(chunks)} draft chunks")
+        chunk = chunks[0]
+        seed = (
+            device_seed[chunk.start_index : chunk.start_index + chunk.num_reqs]
+            if device_seed is not None
+            else None
+        )
+        input_ids, positions, seq_lens = self._prepare_dflash_inputs(
+            chunk,
+            next_tokens_device=next_tokens_per_chunk[0]
+            if next_tokens_per_chunk
+            else None,
+            device_seed=seed,
+        )
+        aux = chunk.aux_hidden_states
+        aux = list(aux) if isinstance(aux, (list, tuple)) else [aux]
+        ctx_positions = chunk.position_ids
+        if ctx_positions.dim() > 1:
+            ctx_positions = ctx_positions[0]
+        md = chunk.attn_metadata
+        first = md[draft.caches.group_layer_names[0]]
+        hidden = draft.forward(
+            mk.last_run,
+            input_ids,
+            positions,
+            seq_lens,
+            aux,
+            ctx_positions,
+            first.seq_lens,
+            first.request_distribution[2],
+            [md[n].block_tables for n in draft.caches.group_layer_names],
+        )
+        padded_len = input_ids.shape[0]
+        sample_inputs = self._draft_sample_inputs(
+            padded_len // self.block_size, chunk.start_index, chunk.num_reqs
+        )
+        with set_vllm_model_wrapper_context(
+            mesh=self.runner.mesh, vllm_config=self.vllm_config
+        ):
+            if draft.logits:  # the draft step applied norm + lm_head
+                draft_tokens = self._sample_from_draft_logits(
+                    hidden, input_ids, self.block_size, *sample_inputs
+                )
+            else:
+                draft_tokens, _ = self._sample_from_hidden(
+                    hidden, input_ids, self.block_size, *sample_inputs
+                )
+        if return_device:
+            return draft_tokens[: chunk.num_reqs]
+        return draft_tokens.cpu().tolist()[: chunk.num_reqs]
+
+    @torch.no_grad()
+    def precompile_megakernel_sampling(self, logits: bool, width: int) -> None:
+        """Warm the sampling graph the megakernel draft path calls
+        (`_sample_from_draft_logits` on [rows, vocab] logits, else
+        `_sample_from_hidden` on [rows, hidden]) at every draft bucket
+        `precompile` warms the stock draft forward at."""
+        from vllm_torchtpu.utils import synchronize_tensors
+
+        runner, block_size = self.runner, self.block_size
+        max_chunk_reqs = max(
+            runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0
+        )
+        max_draft_tokens = self._get_padded_len(max_chunk_reqs * block_size)
+        for rows in runner.num_tokens_paddings:
+            if not block_size <= rows <= max_draft_tokens:
+                continue
+            x = torch.zeros((rows, width), dtype=torch.bfloat16).to(runner.device)
+            ids = torch.zeros(rows, dtype=torch.int32).to(runner.device)
+            sample_inputs = self._draft_sample_inputs(rows // block_size)
+            with set_vllm_model_wrapper_context(
+                mesh=runner.mesh, vllm_config=self.vllm_config
+            ):
+                if logits:
+                    out = self._sample_from_draft_logits(
+                        x, ids, block_size, *sample_inputs
+                    )
+                else:
+                    out, _ = self._sample_from_hidden(
+                        x, ids, block_size, *sample_inputs
+                    )
+            synchronize_tensors(out)
 
     def _num_sampled(self, block_size: int) -> int:
         return block_size if self.sample_from_anchor else block_size - 1
@@ -203,7 +362,37 @@ class DSparkProposer(DFlashProposer):
         temps: torch.Tensor | None = None,
         noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Backbone forward + sequential Markov sampling, in-graph.
+        """Backbone forward + sequential Markov sampling, in-graph."""
+        assert self.draft_model is not None
+        hidden = self.draft_model.model(
+            input_ids=input_ids,
+            positions=positions,
+        )
+        return self._logits_and_sample(hidden, input_ids, block_size, temps, noise)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _sample_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        block_size: int,
+        temps: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`_dflash_forward_and_sample` after the backbone: for a draft hidden
+        computed elsewhere (the DeepSeek-V4 megakernel's draft call)."""
+        return self._logits_and_sample(hidden, input_ids, block_size, temps, noise)
+
+    def _logits_and_sample(
+        self,
+        hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+        block_size: int,
+        temps: torch.Tensor | None,
+        noise: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft logits + the sequential Markov sampling, traced inside a
+        caller's compiled graph.
 
         Dense layout: every query slot predicts the token at its position + 1,
         so all block_size slots are sampled (DFlash samples only the mask
@@ -213,19 +402,72 @@ class DSparkProposer(DFlashProposer):
         loop: embedding gather + rank-r bias + argmax.
         """
         assert self.draft_model is not None
-        hidden = self.draft_model.model(
-            input_ids=input_ids,
-            positions=positions,
-        )
-
         padded_num_reqs = hidden.shape[0] // block_size
         valid_hidden = hidden[: padded_num_reqs * block_size]
 
+        if self._vocab_parallel_markov:
+            logits = self.draft_model.compute_draft_logits_local(valid_hidden)
+            return self._markov_sample_vocab_parallel(
+                logits, input_ids, block_size
+            ), hidden
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after sampling.
         logits = self.draft_model.compute_draft_logits(valid_hidden)
-        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        return self._markov_sample(logits, input_ids, block_size, temps, noise), hidden
 
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _sample_from_draft_logits(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        block_size: int,
+        temps: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The Markov sampling on full draft-vocab logits computed elsewhere
+        (the DeepSeek-V4 megakernel's draft call with its lm_head)."""
+        padded_num_reqs = logits.shape[0] // block_size
+        logits = logits[: padded_num_reqs * block_size]
+        return self._markov_sample(logits, input_ids, block_size, temps, noise)
+
+    def _markov_sample_vocab_parallel(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Greedy on this rank's vocabulary shard of the draft logits; one
+        (max, argmax) pair per rank and row is exchanged per draft position."""
+        assert self.draft_model is not None
+        padded_num_reqs = logits.shape[0] // block_size
+        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
+        prev = input_ids[: padded_num_reqs * block_size].view(
+            padded_num_reqs, block_size
+        )[:, 0]
+        draft_tokens = []
+        sample_start = 0 if self.sample_from_anchor else 1
+        for i in range(sample_start, block_size):
+            bias = self.draft_model.markov_bias_local(
+                self.draft_model.markov_embed(prev)
+            )
+            step = self.draft_model.vocab_parallel_argmax(logits_3d[:, i] + bias)
+            draft_tokens.append(step)
+            prev = step
+        return torch.stack(draft_tokens, dim=1)
+
+    def _markov_sample(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        block_size: int,
+        temps: torch.Tensor | None,
+        noise: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """[padded_num_reqs * block_size, V] draft logits -> the draft tokens
+        [padded_num_reqs, num_sampled]."""
+        assert self.draft_model is not None
+        padded_num_reqs = logits.shape[0] // block_size
+        logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
             padded_num_reqs, block_size
         )
@@ -243,6 +485,4 @@ class DSparkProposer(DFlashProposer):
             )
             draft_tokens.append(step)
             prev = step
-        draft_tokens_chunk = torch.stack(draft_tokens, dim=1)
-
-        return draft_tokens_chunk, hidden
+        return torch.stack(draft_tokens, dim=1)

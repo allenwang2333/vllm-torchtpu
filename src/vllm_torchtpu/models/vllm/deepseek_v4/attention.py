@@ -38,6 +38,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
@@ -93,6 +94,18 @@ def _rope_jax(
     return rope_kernel.rope(x, positions, cos_sin_cache)
 
 
+def _qkv_rope_jax(
+    q: jax.Array,
+    kv: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    *,
+    eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    """`_qnorm_rope_jax(q)` and `_rope_jax(kv)` as one kernel."""
+    return rope_kernel.qkv_rope(q, kv, positions, cos_sin_cache, eps=eps)
+
+
 def _o_proj_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -118,6 +131,11 @@ def _o_proj_jax(
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
+
+
+def _fake_qkv_rope(q, kv, positions, cos_sin_cache, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(q), torch.empty_like(kv)
 
 
 def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
@@ -383,6 +401,21 @@ class VllmDeepseekV4MLAAttention(
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
+            swa_padded_lm=envs.TPU_DSV4_SWA_PADDED_LM,
+            **(
+                {
+                    "csa_gather_no_pad": envs.TPU_DSV4_CSA_GATHER_NO_PAD,
+                    "masked_dense_max_kv": envs.TPU_DSV4_CSA_MASKED_DENSE_MAX_KV,
+                    "masked_dense_min_tokens": (
+                        envs.TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS
+                    ),
+                }
+                if is_csa
+                else {
+                    "hca_mixed_q_block": envs.TPU_DSV4_HCA_MIXED_Q_BLOCK,
+                    "hca_pipelined": envs.TPU_DSV4_HCA_MLA_PIPELINED,
+                }
+            ),
         )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
@@ -522,6 +555,34 @@ class VllmDeepseekV4MLAAttention(
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
+    @property
+    def qkv_rope_op(self):
+        """`qnorm_rope_op` and `kv_rope_op` as one op, built lazily."""
+        op = self.__dict__.get("_qkv_rope_op_instance")
+        if op is not None:
+            return op
+
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qkv_rope_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qkv_rope_jax, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(
+                    P(None, "model", None),  # q
+                    P(),  # kv
+                    P(),  # positions
+                    P(),  # cos_sin_cache
+                ),
+                output_partition_specs=(P(None, "model", None), P()),
+            )
+            op.register_fake(_fake_qkv_rope)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qkv_rope_op_instance", op)
+        return op
+
     def qnorm_rope(
         self,
         q: torch.Tensor,
@@ -551,8 +612,13 @@ class VllmDeepseekV4MLAAttention(
         q = self.wq_b(qr).view(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
+        if envs.TPU_DSV4_FUSED_QKV_ROPE:
+            q, kv = self.qkv_rope_op(
+                q, kv, positions, self.mla_attn.rotary_emb.cos_sin_cache
+            )
+        else:
+            q = self.qnorm_rope(q, positions)
+            kv = self.kv_rope(kv, positions)
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
