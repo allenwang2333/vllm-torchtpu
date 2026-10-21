@@ -3,9 +3,9 @@
 """Resource ownership and scheduling for paged MQA.
 
 Separates the static schedule from numerical operations, following sglang-jax
-PR #1800, flash_attention_v2/{config,pipeline}.py (e6cffb7e). The separate K,
-accumulator and output rings adapt DeepGEMM's sparse MQA pipeline to TPU DMA
-and MRB. MQA needs no softmax/PV stages.
+PR #1800, flash_attention_v2/{config,pipeline}.py (e6cffb7e). The separate Q,
+K and output buffers adapt DeepGEMM's sparse MQA pipeline to TPU DMA.
+The compiler schedules MXU operations. MQA needs no softmax/PV stages.
 """
 
 from collections.abc import Callable
@@ -76,26 +76,6 @@ class BufferPlan:
             pltpu.SemaphoreType.DMA((c.key_buffers,)),
             pltpu.SemaphoreType.DMA((2, c.query_tile)),
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.VMEM(
-                (
-                    c.issue_depth * self.groups,
-                    c.query_group * self.heads,
-                    self.mxu_size,
-                ),
-                jnp.bfloat16,
-            ),
-        )
-
-    def accumulator_shapes(self) -> tuple:
-        shape = (self.config.query_group * self.heads, self.mxu_size)
-        primary = tuple(
-            pltpu.ACC(i // self.groups % 2)(shape, jnp.float32)
-            for i in range(self.config.issue_depth * self.groups)
-        )
-        weight_shape = (pl.cdiv(3 * self.config.query_group, 16) * 16, self.mxu_size)
-        return primary + tuple(
-            pltpu.ACC(i // self.groups % 2)(weight_shape, jnp.float32)
-            for i in range(self.config.issue_depth * self.groups)
         )
 
     def vmem_bytes(self, info: pltpu.TpuInfo, tokens: int, key_groups: int) -> int:
@@ -116,7 +96,6 @@ class BufferPlan:
         scale_bytes = size((tokens, self.heads), jnp.float32)
         return (
             sum(size(s.shape, s.dtype) for s in scratch[:3])
-            + size(scratch[-1].shape, scratch[-1].dtype)
             + scale_bytes
             + (
                 size((tokens, self.heads), jnp.float32)
@@ -127,30 +106,11 @@ class BufferPlan:
     def smem_bytes(self, tokens: int, key_groups: int) -> int:
         return (2 * self.page_count + tokens + key_groups + 1) * 4
 
-    def mrb_bytes_per_mxu(self) -> int:
-        return (
-            pl.cdiv(self.config.issue_depth, 2)
-            * self.groups
-            * self.config.query_group
-            * self.heads
-            * self.mxu_size
-            * 4
-            + pl.cdiv(self.config.issue_depth, 2)
-            * self.groups
-            * pl.cdiv(3 * self.config.query_group, 16)
-            * 16
-            * self.mxu_size
-            * 4
-        )
-
     def validate(self, info: pltpu.TpuInfo, tokens: int, key_groups: int) -> None:
         if self.vmem_bytes(info, tokens, key_groups) >= info.vmem_capacity_bytes:
             raise ValueError("Paged MQA buffers exceed VMEM; reduce tile sizes")
         if self.smem_bytes(tokens, key_groups) >= info.smem_capacity_bytes:
             raise ValueError("Paged MQA metadata exceeds SMEM; reduce batch/context")
-        capacity = info.num_accumulators * info.num_sublanes * info.mxu_column_size * 4
-        if self.mrb_bytes_per_mxu() > capacity:
-            raise ValueError("Paged MQA exceeds MRB; reduce query tile or issue depth")
 
 
 @dataclass(frozen=True)
@@ -158,8 +118,8 @@ class Pipeline:
     """Trace-time producer/consumer schedule; no runtime Python dispatch.
 
     K slots stay resident through the final scale read. QK results pass through
-    a BF16 ring before head reduction; its slots are read before reuse. MRB
-    slots are popped before reuse. Output DMA starts after the last pop and must
+    BF16 rounding before head reduction without a VMEM logit ring. MXU
+    scheduling is compiler-managed. Output DMA starts after compute and must
     finish before the slot is overwritten. Q and page metadata each have two
     slots: the next Q is loaded while the current Q's K tiles are processed.
     A Q slot is reused only after its query block finishes.
@@ -191,10 +151,9 @@ class Pipeline:
         metadata = jnp.where(
             following < ops.live_tiles, ops.metadata_slot, 1 - ops.metadata_slot
         )
-        depth = self.plan.config.issue_depth
         fragments = self.plan.fragments
-        for stage in range(fragments + 3 * depth):
-            if stage < fragments and prefetch:
+        for stage in range(fragments):
+            if prefetch:
                 for page in range(
                     stage * size // self.page_records,
                     (stage + 1) * size // self.page_records,
@@ -202,18 +161,8 @@ class Pipeline:
                     ops.load_page(
                         following_tile, page, metadata, ops.key_slot(following)
                     )
-            parts = []
-            for group in range(self.plan.groups):
-                if stage >= 3 * depth:
-                    parts.append(ops.consume(tile, stage - 3 * depth, group))
-                if 2 * depth <= stage < fragments + 2 * depth:
-                    ops.reduce(stage - 2 * depth, group)
-                if depth <= stage < fragments + depth:
-                    ops.transform(stage - depth, group)
-                if stage < fragments:
-                    ops.issue(tile, stage, group)
-            if parts:
-                ops.store(tile, stage - 3 * depth, parts)
+            parts = [ops.score(tile, stage, group) for group in range(self.plan.groups)]
+            ops.store(tile, stage, parts)
 
     def step(self, ops: "MQAOps", tile, *, initial: bool) -> None:
         ops.wait_keys(tile)

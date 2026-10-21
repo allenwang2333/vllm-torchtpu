@@ -3,9 +3,9 @@
 """Paged decode MQA: sum_h(weight_h * relu(dot(q_h, k))).
 
 The resident-Q / paged-K organization follows DeepGEMM's
-impls/sm90_fp8_paged_mqa_logits.cuh (5081f851). The issue/consume schedule
-follows sglang-jax PR #1800, flash_attention_v2/pipeline.py (e6cffb7e),
-specialized to weighted ReLU, with JAX 0.11 accumulator refs. Neither
+impls/sm90_fp8_paged_mqa_logits.cuh (5081f851). DMA scheduling follows
+sglang-jax PR #1800, flash_attention_v2/pipeline.py (e6cffb7e), specialized
+to weighted ReLU with compiler-managed dot_general operations. Neither
 softmax nor a gathered HBM key workspace is needed.
 Query-pair math fragments follow sm100_sparse_mqa_logits.cuh at the same
 DeepGEMM revision; resident Q and K reuse remain independent of this tile.
@@ -54,8 +54,6 @@ class MQAOps:
     read_sem: Ref
     write_sem: Ref
     q_sem: Ref
-    staged_logits: Ref
-    accumulators: tuple[Ref, ...]
     page_records: int
     next_tiles: jax.Array = field(init=False)
     live_tiles: jax.Array = field(init=False)
@@ -161,7 +159,7 @@ class MQAOps:
                 ),
                 axis=0,
             )
-        self.lhs = jnp.concatenate((lhs, jnp.zeros_like(lhs)), axis=1)
+        self.lhs = lhs
 
     def prefetch_query(self, query: QueryTile, slot) -> None:
         """Load the next Q tile, zeroing unused rows for ragged groups."""
@@ -249,11 +247,9 @@ class MQAOps:
                 else:
                     transfer.start()
 
-    def issue(self, tile, fragment: int, group: int) -> None:
+    def score(self, tile, fragment: int, group: int) -> jax.Array:
         c = self.plan.config
         group_heads = c.query_group * self.plan.heads
-        index = fragment % c.issue_depth * self.plan.groups + group
-        acc = self.accumulators[index]
         query = self.lhs[group * group_heads : (group + 1) * group_heads]
         data_rows = self.page_records // self.plan.key_slots
         page_rows = data_rows + 1
@@ -265,25 +261,13 @@ class MQAOps:
             words = self.keys[self.key_slot(tile), pl.ds(page * page_rows, data_rows)]
             key_parts.append(pltpu.bitcast(words, self.q.dtype))
         keys = jnp.concatenate(key_parts, axis=0)
-        rhs = jnp.concatenate((keys, jnp.zeros_like(keys)), axis=1)
-        # Head reduction overwrites staged RHS, so every QK group reloads K.
-        pltpu.matmul_push_rhs(rhs, 0, fragment % c.issue_depth % 2, transpose=True)
-        pltpu.matmul_acc_lhs(acc, query, load_staged_rhs=0)
-
-    def transform(self, fragment: int, group: int) -> None:
-        c = self.plan.config
-        index = fragment % c.issue_depth * self.plan.groups + group
-        logits = pltpu.matmul_pop(self.accumulators[index])
-        self.staged_logits[index] = jnp.maximum(
-            logits.astype(jnp.bfloat16), jnp.bfloat16(0)
+        logits = jax.lax.dot_general(
+            query,
+            keys,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
         )
-
-    def reduce(self, fragment: int, group: int) -> None:
-        c = self.plan.config
-        size = self.plan.mxu_size
-        group_heads = c.query_group * self.plan.heads
-        index = fragment % c.issue_depth * self.plan.groups + group
-        logits = self.staged_logits[index]
+        logits = jnp.maximum(logits.astype(jnp.bfloat16), jnp.bfloat16(0))
         matrix = self.weight_matrix.reshape(
             3, self.plan.groups * c.query_group, self.plan.groups * group_heads
         )[
@@ -291,23 +275,12 @@ class MQAOps:
             group * c.query_group : (group + 1) * c.query_group,
             group * group_heads : (group + 1) * group_heads,
         ].reshape(3 * c.query_group, group_heads)
-        reduction = self.accumulators[c.issue_depth * self.plan.groups + index]
-        mxu = fragment % c.issue_depth % 2
-        rhs = jnp.pad(logits, ((0, size - group_heads), (0, 0)))
-        lhs = jnp.pad(
-            matrix, ((0, reduction.shape[0] - matrix.shape[0]), (0, size - group_heads))
-        )
-        pltpu.matmul_push_rhs(rhs, 0, mxu)
-        pltpu.matmul_acc_lhs(reduction, lhs, load_staged_rhs=0)
-
-    def consume(self, tile, fragment: int, group: int) -> jax.Array:
-        c = self.plan.config
-        index = fragment % c.issue_depth * self.plan.groups + group
-        acc = self.accumulators[c.issue_depth * self.plan.groups + index]
-        products = pltpu.matmul_pop(acc)
-        products = products[: 3 * c.query_group].reshape(
-            3, c.query_group, self.plan.mxu_size
-        )
+        products = jax.lax.dot_general(
+            matrix,
+            logits,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        ).reshape(3, c.query_group, self.plan.mxu_size)
         # K remains resident until this tile has finished consuming its results.
         data_rows = self.page_records // self.plan.key_slots
         scales = [
@@ -388,8 +361,6 @@ def _kernel(
     read_sem,
     write_sem,
     q_sem,
-    staged_logits,
-    accumulators,
     *,
     pipeline,
 ):
@@ -412,8 +383,6 @@ def _kernel(
             read_sem,
             write_sem,
             q_sem,
-            staged_logits,
-            accumulators,
             pipeline.page_records,
         )
 
@@ -544,10 +513,7 @@ def paged_mqa_logits(
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
 
     def kernel(*refs):
-        pl.run_scoped(
-            functools.partial(_kernel, *refs, pipeline=pipeline),
-            plan.accumulator_shapes(),
-        )
+        _kernel(*refs, pipeline=pipeline)
 
     return pl.pallas_call(
         kernel,

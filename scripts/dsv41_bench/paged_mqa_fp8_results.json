@@ -439,5 +439,437 @@
       "400us target not met.",
       "Full environment type checking not run."
     ]
+  },
+  "compiler_managed_mxu": {
+    "experiment_id": "exp-y8snmcfwcz",
+    "artifact_id": "art-gagsadvicu",
+    "analysis_id": "an-9fyjz1g5ej",
+    "baseline_commit": "ea254a76eea43075c443012ec03ce9dfb822012b",
+    "retained_variant": "fused",
+    "versions": {
+      "jax": "0.11.2",
+      "jaxlib": "0.11.2",
+      "libtpu": "0.0.50"
+    },
+    "timing": "Mean of two seed medians, five XProf samples per seed; scorer XLA Ops and whole XLA Module reported separately.",
+    "metrics": [
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 801.834258,
+        "latency_ms": 0.801834258,
+        "module_samples_us": [
+          804.370949,
+          804.993922,
+          804.672269,
+          805.332608,
+          806.71196
+        ],
+        "module_us": 804.993922,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.639931,
+            1.489721,
+            1.663791,
+            1.659964,
+            1.646984
+          ],
+          "copy.refs_3_": [
+            1.631602,
+            1.656588,
+            1.64946,
+            1.60159,
+            1.673469
+          ],
+          "paged_mqa_logits.1": [
+            801.082983,
+            801.834258,
+            801.344538,
+            802.057548,
+            803.376951
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          801.082983,
+          801.834258,
+          801.344538,
+          802.057548,
+          803.376951
+        ],
+        "seed": 2026,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "control",
+        "width": 98304
+      },
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 696.220963,
+        "latency_ms": 0.696220963,
+        "module_samples_us": [
+          699.605042,
+          699.831783,
+          699.190876,
+          699.116446,
+          699.528137
+        ],
+        "module_us": 699.528137,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.638656,
+            1.606017,
+            1.595439,
+            1.672269,
+            1.650661
+          ],
+          "copy.refs_3_": [
+            1.66244,
+            1.583509,
+            1.576155,
+            1.47419,
+            1.641131
+          ],
+          "paged_mqa_logits.1": [
+            696.289316,
+            696.628977,
+            696.004652,
+            695.954382,
+            696.220963
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          696.289316,
+          696.628977,
+          696.004652,
+          695.954382,
+          696.220963
+        ],
+        "seed": 2026,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "fused",
+        "width": 98304
+      },
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 725.475315,
+        "latency_ms": 0.7254753150000001,
+        "module_samples_us": [
+          728.842962,
+          728.708208,
+          728.154862,
+          728.797119,
+          728.679397
+        ],
+        "module_us": 728.708208,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.648334,
+            1.681797,
+            1.6256,
+            1.662816,
+            1.632653
+          ],
+          "copy.refs_3_": [
+            1.632653,
+            1.537741,
+            1.558299,
+            1.586134,
+            1.646984
+          ],
+          "paged_mqa_logits.1": [
+            725.54862,
+            725.475315,
+            724.954607,
+            725.530762,
+            725.385204
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          725.54862,
+          725.475315,
+          724.954607,
+          725.530762,
+          725.385204
+        ],
+        "seed": 2026,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "staged",
+        "width": 98304
+      },
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 801.045543,
+        "latency_ms": 0.801045543,
+        "module_samples_us": [
+          804.408013,
+          804.118698,
+          803.687875,
+          805.839211,
+          804.653136
+        ],
+        "module_us": 804.408013,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.687875,
+            1.665066,
+            1.618247,
+            1.567903,
+            1.581032
+          ],
+          "copy.refs_3_": [
+            1.659064,
+            1.669868,
+            1.567527,
+            1.661314,
+            1.631603
+          ],
+          "paged_mqa_logits.1": [
+            801.045543,
+            800.769657,
+            800.489646,
+            802.596639,
+            801.426095
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          801.045543,
+          800.769657,
+          800.489646,
+          802.596639,
+          801.426095
+        ],
+        "seed": 2027,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "control",
+        "width": 98304
+      },
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 696.39856,
+        "latency_ms": 0.69639856,
+        "module_samples_us": [
+          699.778811,
+          699.577506,
+          699.722765,
+          699.570153,
+          699.814
+        ],
+        "module_us": 699.722765,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.636405,
+            1.546369,
+            1.676996,
+            1.663866,
+            1.620573
+          ],
+          "copy.refs_3_": [
+            1.726591,
+            1.675945,
+            1.611044,
+            1.588235,
+            1.60009
+          ],
+          "paged_mqa_logits.1": [
+            696.39856,
+            696.340786,
+            696.420169,
+            696.304847,
+            696.580957
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          696.39856,
+          696.340786,
+          696.420169,
+          696.304847,
+          696.580957
+        ],
+        "seed": 2027,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "fused",
+        "width": 98304
+      },
+      {
+        "config": {
+          "issue_depth": 8,
+          "key_buffers": 4,
+          "key_tile": 32768,
+          "query_group": 6,
+          "query_tile": 6
+        },
+        "correctness": true,
+        "groups": 48,
+        "heads": 32,
+        "kernel_us": 725.199205,
+        "latency_ms": 0.725199205,
+        "module_samples_us": [
+          728.33756,
+          727.978392,
+          728.714136,
+          728.645934,
+          728.505327
+        ],
+        "module_us": 728.505327,
+        "op_samples_us": {
+          "copy.1.refs_6_": [
+            1.639781,
+            1.577356,
+            1.655462,
+            1.652986,
+            1.648184
+          ],
+          "copy.refs_3_": [
+            1.680747,
+            1.67587,
+            1.565426,
+            1.524535,
+            1.643308
+          ],
+          "paged_mqa_logits.1": [
+            725.003602,
+            724.710759,
+            725.476741,
+            725.454981,
+            725.199205
+          ]
+        },
+        "queries": 6,
+        "samples_us": [
+          725.003602,
+          724.710759,
+          725.476741,
+          725.454981,
+          725.199205
+        ],
+        "seed": 2027,
+        "timing": "XProf XLA Ops scorer; module includes all device operations",
+        "variant": "staged",
+        "width": 98304
+      }
+    ],
+    "means": {
+      "control": {
+        "kernel_us": 801.4399005,
+        "module_us": 804.7009674999999,
+        "latency_reduction_percent": 0.0
+      },
+      "fused": {
+        "kernel_us": 696.3097614999999,
+        "module_us": 699.625451,
+        "latency_reduction_percent": 13.117657223506319
+      },
+      "staged": {
+        "kernel_us": 725.33726,
+        "module_us": 728.6067674999999,
+        "latency_reduction_percent": 9.49573891348825
+      }
+    },
+    "native_checks": 45,
+    "native_checks_per_variant": 15,
+    "full_shape_comparisons": 4,
+    "retained_variant_full_shape_comparisons": 2,
+    "tolerance": {
+      "rtol": 2e-05,
+      "atol": 0.0001
+    },
+    "tested_source_sha256": {
+      "logits_fused.py": "3f4ff4c5d4a738504834f6714d05d904ff738a5b11e6a4b9eb6a104177d1d61a",
+      "pipeline_fused.py": "61bb2e53efdc125a3cd62ae28c82d12882500b31c897fcb6764533334f64597f"
+    },
+    "static_llo": {
+      "control": {
+        "bundles": 18523,
+        "raw_spill_instructions": {
+          "vst": 3992,
+          "vld": 4006,
+          "sst": 23,
+          "sld": 34
+        },
+        "dtype_mxu_instructions": {
+          "FP8 mxu0": 768,
+          "FP8 mxu1": 768,
+          "BF16 mxu0": 256,
+          "BF16 mxu1": 256
+        }
+      },
+      "fused": {
+        "bundles": 15042,
+        "raw_spill_instructions": {
+          "vst": 24,
+          "vld": 25,
+          "sst": 23,
+          "sld": 42
+        },
+        "dtype_mxu_instructions": {
+          "FP8 mxu0": 1536,
+          "BF16 mxu1": 512
+        }
+      },
+      "staged": {
+        "bundles": 14840,
+        "raw_spill_instructions": {
+          "vst": 117,
+          "vld": 128,
+          "sst": 20,
+          "sld": 38
+        },
+        "dtype_mxu_instructions": {
+          "FP8 mxu0": 48,
+          "FP8 mxu1": 1488,
+          "BF16 mxu0": 496,
+          "BF16 mxu1": 16
+        }
+      }
+    },
+    "limitations": "Standalone scorer; serving integration and model-quality validation remain outstanding."
   }
 }

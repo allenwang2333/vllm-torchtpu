@@ -26,7 +26,7 @@ K lives in one or two global INT32 banks. Each physical page has 32 rows holding
 128 FP8 D128 keys and one row holding 128 FP32 scales: `[33,128]` INT32 words.
 The benchmark packs pages before timing. A production cache writer for this
 layout is not included. Q uses FP8 E4M3FN and FP32 scales per head; weights and
-outputs are FP32. The implementation uses native TPU accumulator refs and has
+outputs are FP32. The implementation uses native TPU FP8/BF16 matrix operations and has
 no CPU interpreter mode.
 
 ## Pipeline
@@ -35,19 +35,17 @@ no CPU interpreter mode.
 `paged_mqa_logits.py` implements DMA, matrix operations, masking, and writes.
 
 The measured configuration keeps six queries resident, four 32K-key DMA buffers,
-two Q buffers, two output buffers, and separate QK/reduction accumulator rings.
-Each fragment handles 256 keys. At issue depth eight, a static stage consumes
-fragment `i-24`, reduces `i-16`, converts QK `i-8` into the BF16 ring, and issues
-QK for `i`. Loop bounds also cover fill and drain. Page DMA for a later tile
-overlaps these operations. The BF16 ring uses 0.75 MiB for this configuration.
-K scales are read from the resident tile when scores are consumed; separate
-scale-transfer rings are unnecessary with this schedule.
+two Q buffers and two output buffers. Each statically expanded fragment handles
+256 keys: native FP8 QK, BF16 rounding and ReLU, then BF16 weighted head reduction
+with FP32 accumulation. Both matrix operations use `jax.lax.dot_general`; the
+compiler owns MXU scheduling and accumulator allocation. There is no explicit
+logit ring. Page DMA for a later tile overlaps these operations. K scales remain
+in the resident K tile until the corresponding scores have been computed.
 
-The QK and reduction rings together reserve 896 KiB of MRB per MXU for this
-configuration. Explicit VMEM and SMEM allocations are checked against device
-capacity; compiler temporaries and spills still need profiling. The default
-issue depth is four, so reproduce the reported result with the explicit command
-below.
+Explicit VMEM and SMEM allocations are checked against device capacity;
+compiler temporaries and spills still need profiling. The existing `issue_depth`
+config field no longer controls matrix scheduling. The reproduction command
+keeps its measured value, eight.
 
 Raw FP32 QK results are rounded to BF16 for ReLU and the second MXU operation.
 Q scales fold into head weights, which are decomposed into three BF16 residual
@@ -63,7 +61,7 @@ Use JAX/JAXlib 0.11.2 and libtpu 0.0.50 on TPU v7x:
 ```bash
 python -m scripts.dsv41_bench.bench_paged_mqa \
   --fp8 --requests 48 --queries 6 --width 98304 --page-records 128 \
-  --key-tile 32768 --issue-depth 8 --query-group 8 --key-buffers 4 \
+  --key-tile 32768 --issue-depth 8 --query-group 6 --key-buffers 4 \
   --seed 2026 --repeats 21 --profile --out /tmp/tpu_logs/paged-mqa
 pytest tests/kernels/test_dsv41_paged_mqa_logits.py -q
 ```
@@ -109,7 +107,7 @@ after excluding imports, docstrings, and exception message text from AST compari
 | VPU reduction with FP32 logits | 892.06 | 984.16 |
 
 Removing BF16 rounding from the VPU variant reduces its latency by 12.6%, but
-beats the same-run MXU variant by only 0.6%. This branch retains the staged MXU
+beats the same-run MXU variant by only 0.6%. That checkpoint retained the staged MXU
 implementation; the VPU alternatives are experimental measurements, not exposed
 kernel modes. Across-run 888.34 µs and 897.60 µs should not be interpreted as a
 code regression: the latter reruns the native implementation after cleanup.
@@ -197,3 +195,30 @@ four baseline native checks, and two full-size comparisons passed. Tests cover
 ragged groups crossing row boundaries, trailing partial tiles, empty groups,
 page holes, arbitrary positive scales, one/two K banks, and two/four K buffers.
 The previously failing `query_tile=5, key_tile=512` case also passes.
+
+## Compiler-managed MXU scheduling
+
+The retained implementation is the `fused` variant from Falcon `exp-y8snmcfwcz`,
+artifact `art-gagsadvicu`, analysis `an-9fyjz1g5ej`. It keeps direct 2D output and
+the same FP8/BF16 arithmetic, replacing explicit accumulator rings and logit
+staging with two `dot_general` operations per fragment.
+
+| Variant | Kernel time (µs) | Module time (µs) |
+| --- | ---: | ---: |
+| Previous explicit pipeline (`ea254a76e`) | 801.44 | 804.70 |
+| Compiler-managed MXU, explicit BF16 logit ring | 725.34 | 728.61 |
+| Compiler-managed MXU, no logit ring (retained) | 696.31 | 699.63 |
+
+These are matched 96K measurements with the shape, versions and timing scope
+described above. Scorer latency falls by 13.12%. All 45 native checks across
+three variants passed, including 15 for the retained variant. Both candidate
+variants passed full-shape comparisons against the control for two seeds at
+`rtol=2e-5, atol=1e-4`. Source hashes and individual samples are recorded under
+`compiler_managed_mxu` in `paged_mqa_fp8_results.json`.
+
+Local final LLO reduces vector spill stores/loads from 3,992/4,006 to 24/25 and
+static bundles from 18,523 to 15,042. FP8 QK instructions use MXU0 and BF16
+reduction instructions use MXU1. These are static compiler observations, not
+measured MXU utilization. The minimum-HBM-traffic estimate remains unchanged,
+giving 28.63% effective bandwidth at 696.31 µs. Serving integration, model-quality
+validation and the 400 µs target remain outstanding.
