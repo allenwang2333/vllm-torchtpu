@@ -19,10 +19,15 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     supports_encoder_cudagraph,
 )
-from vllm.v1.worker.encoder_cudagraph import (
-    CaptureAxisKeys,
-    EncoderCudaGraphManager,
-)
+try:
+    from vllm.v1.worker.encoder_cudagraph import (
+        CaptureAxisKeys,
+        EncoderCudaGraphManager,
+    )
+except ImportError:
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    CaptureAxisKeys = Any  # type: ignore[assignment,misc]
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.mm_video_chunking import (

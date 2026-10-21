@@ -142,18 +142,18 @@ _all_ranks_kv_bytes_per_block: int | None = None
 def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
     """One worker's bytes per block, as vLLM's ``build_offloading_config``
     derives ``worker_kv_bytes_per_block`` from that worker's config."""
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    if (
+        getattr(kv_cache_config, "hisparse_host_num_blocks", None) is None
+        and kv_cache_config.kv_cache_tensors
+    ):
+        return kv_cache_config.kv_cache_tensors[0].size // kv_cache_config.num_blocks
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
         _group_kv_bytes_per_block,
         get_offloading_group_ids,
     )
 
-    if kv_cache_config.num_blocks <= 0:
-        return 0
-    if (
-        kv_cache_config.hisparse_host_num_blocks is None
-        and kv_cache_config.kv_cache_tensors
-    ):
-        return kv_cache_config.kv_cache_tensors[0].size // kv_cache_config.num_blocks
     return sum(
         _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[group_id])
         for group_id in get_offloading_group_ids(kv_cache_config)

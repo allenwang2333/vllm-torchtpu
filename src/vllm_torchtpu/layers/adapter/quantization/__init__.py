@@ -39,7 +39,10 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.layers.adapter.quantization.mxfp4 import VllmMxfp4Config
-from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+try:
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+except ImportError:
+    VllmNvfp4Config = None  # type: ignore[assignment,misc]
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import attach_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.layers.core import quant_methods
