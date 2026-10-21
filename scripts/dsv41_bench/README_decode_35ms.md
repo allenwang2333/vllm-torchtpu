@@ -419,6 +419,60 @@ performance, so the 64/128 dispatch remains. Source, HLO and results are at
 `results/nonuniform-heights/evidence.tgz` (SHA-256
 `ac1e646c094a42334aa7d1c13177a1e4018497d3b2612889f038334598d8701c`).
 
+MoE combine experiments in `exp-rtlysk81mx` used source `ea0558b8`,
+the same pinned runtime, EP8 with 288 local rows, P-state 7, 31 rotating
+host repetitions and five ordered device repetitions. All complete EP8
+output bits matched, including signed zero. Each biased case used
+`sqrtsoftplus`, correction bias, gate bias 0.9 and routed scale 1.5;
+uniform cases used softmax. Each row below has its own paired reference.
+
+| Change | Biased seed: reference → candidate (ms) | Uniform seed: reference → candidate (ms) |
+| --- | --- | --- |
+| Fused scale lookup, HBM output | 1050: 0.504663 → 0.505881 | 1051: 0.459752 → 0.459507 |
+| Fused scale lookup, VMEM output | 1050: 0.504663 → 0.506629 | 1051: 0.459752 → 0.461006 |
+| External coefficients, VMEM output | 1050: 0.504663 → 0.512965 | 1051: 0.459752 → 0.467408 |
+| Resident arrivals, fused scale lookup | 1052: 0.591569 → 0.592461 | 1053: 0.459744 → 0.459872 |
+| Resident arrivals, external coefficients | 1054: 0.558883 → 0.557544 | 1055: 0.460206 → 0.458994 |
+
+These are whole-device-module medians excluding entry barriers. The first
+three variants used the existing three-buffer row-DMA combine. Resident
+variants instead staged the entire 2112-by-40-by-128 FP8 arrival buffer in
+VMEM, then indexed rows there. The scale-fused variants read the scale mirror
+through scalar memory; external-coefficient variants retained the XLA scale
+gather. All retained the original accumulation order and masked-row handling.
+
+The post-expert tail, measured from the expert kernel's end to the enclosing
+module's end, did not improve. Fused-scale row DMA increased it from about
+26.3 us to 28.0–29.3 us; external coefficients with row DMA took 34.4–34.7 us.
+Resident arrivals with fused scales took about 28.0 us. With external
+coefficients, their paired tails were 26.836 → 26.939 us at seed 1054 and
+26.262 → 26.443 us at seed 1055. Thus the small whole-module reductions in
+the final table row do not establish a faster combine.
+
+A further resident-arrival/external-coefficient sweep used reduction groups
+16, 32, 48 and 96 at biased seed 1056 and uniform seed 1057. All were bit-exact.
+Their whole-module medians were 0.505005–0.505284 ms against 0.505263 ms and
+0.460385–0.460719 ms against 0.460986 ms, respectively. Their tails remained
+26.738–26.870 us against 26.541 us and 26.328–26.558 us against 26.266 us.
+No combine replacement is enabled.
+
+Compiled argument/output storage stayed at 970702848/2949120 bytes.
+For biased seed 1052, resident arrivals with fused scales reduced generated
+code from 4645888 to 4333568 bytes and temporary storage from 99334336 to
+98886112 bytes. External coefficients at seed 1054 used 4403200 bytes of code
+and 99293408 bytes of temporary storage. These smaller compiled artifacts
+did not produce a measured tail improvement; they are not server HBM peaks.
+
+Source, HLO, numerical checks and device events are preserved under
+`exp-rtlysk81mx` / `art-l6lqmlmybw`:
+
+| Artifact path | Verified SHA-256 |
+| --- | --- |
+| `results/combine-scale-evidence.tgz` | `b73b33bc53c21e19cb4aee4a9f5902354b04b74860e55de802c426c4490e8a35` |
+| `results/combine-resident-evidence.tgz` | `d223531c6d9d522c09e6f12884f3ccff550318db9f99eedf55b217c9573ecbf7` |
+| `results/combine-resident-coef-evidence.tgz` | `1d52001cad5fedd1800afd61ae95fcb97f1c956e820374e83602c598d8ea422f` |
+| `results/combine-resident-groups-evidence.tgz` | `3f3e3a827e769287ef3a1159d23303403481f0fdb97285436cd50c83ec20963e` |
+
 A separate small MXU operand probe in `exp-c5bdngz3ad` tested FP8 LHS with a native
 FP4 RHS at M64/K256/N256 and M128/K512/N256. The pinned compiler rejected
 both with `Unsupported element type for matmul push rhs: 'f4E2M1FN'`.
