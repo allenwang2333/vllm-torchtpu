@@ -48,6 +48,8 @@ class MoEParams:
     stack_e: bool
     topk_packed: bool
     topk_lanes: bool
+    # Resolved vectorized routing flag (`MoETunables.route_vec` gated by static
+    # preconditions in `MoEBlock.plan_params`).
     route_vec: bool
     r2_direct_store: bool
     unroll: bool
@@ -73,7 +75,8 @@ class MoETunables:
     pipe_ep: bool = False  # Software-pipeline EP experts with T13 == 2 * T2
     r2_direct_store: bool = False  # Direct VMEM store on r2 tile 0
     # Vectorized MXU expert route packing (a distinct routing/Po2C policy that
-    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.route` holds)
+    # supersedes `ecopy_opt` whenever its static gate in `MoEBlock.plan_params`
+    # holds; resolved into `MoEParams.route_vec`)
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills

@@ -32,7 +32,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     """Route layer `l_idx`'s rows; returns this rank's routed-expert count."""
     ctx, ex, mp, scr, sc, sp, skip = m.ctx, m.ex, m.mp, m.scr, m.sc, m.sp, m.skip
     MR, R = ex.MR, ex.R
-    E, ECOPY, ER, EXTRA, NBE, TE = mp.E, mp.ECOPY, mp.ER, mp.EXTRA, mp.NBE, mp.TE
+    E, ECOPY, EXTRA, NBE, TE = mp.E, mp.ECOPY, mp.EXTRA, mp.NBE, mp.TE
     choice = p8
     if m.dbg.forced_routing:
         rs = l_idx % 2
@@ -59,14 +59,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     # is a distinct routing/Po2C policy (the default `route_vec=False`
     # preserves first-appearance order).
     nb_picks = scr["elist"].shape[0]
-    VEC = (
-        mp.route_vec
-        and ECOPY
-        and E % 128 == 0
-        and E // 128 + 1 <= MR
-        and R * EXTRA + R + 1 <= 128
-        and nb_picks >= ER
-    )
+    VEC = mp.route_vec
     slot_ec = l_idx % 2
     NCP = R * EXTRA
     MROW = E // 128

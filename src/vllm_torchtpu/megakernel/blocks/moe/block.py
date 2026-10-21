@@ -24,6 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, I32, rnd, rup
 from ...spec import Block, ExtraInput, SmallField, WeightDecl
@@ -136,6 +137,22 @@ class MoEBlock(Block):
         assert not (self.debug_flags(ex).row_mask and ecopy), (
             "row_mask: identity expert placement only"
         )
+        if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
+            raise MegakernelConfigError(
+                "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
+                f"for 9-bit float32 mantissa packing), got E={g.E}"
+            )
+        nb_picks = rup(ex.B * g.TOPK, 128)
+        route_vec = bool(
+            tt.route_vec
+            and ecopy  # redundant-expert placement table active
+            and g.E > 0
+            and g.E % 128 == 0  # 128-lane expert bitmask tiling
+            and (g.E >> 5) <= 256  # packed bitmask rows fit 256-lane scratch
+            and g.E // 128 + 1 <= ex.MR  # MROW + 1 <= MR for route_topk scratch
+            and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
+            and nb_picks >= er  # elist/wlist capacity covers ER local slots
+        )
         return MoEParams(
             H=g.H,
             E=g.E,
@@ -160,7 +177,7 @@ class MoEBlock(Block):
             stack_e=ex.stack_e,
             topk_packed=tt.topk,
             topk_lanes=tt.topk_lanes,
-            route_vec=tt.route_vec,
+            route_vec=route_vec,
             r2_direct_store=tt.r2_direct_store,
             unroll=bool(tt.moe_unroll or pipe_ep),
             group_rel=tt.moe_group_rows >= ex.B,
