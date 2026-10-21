@@ -31,6 +31,7 @@ A RESULT json line carries every number. (No timings: a host-timed loop of an
 measures the layers.)
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -326,6 +327,9 @@ def _run_all():
     res = {"tol": TOL, "cases": {}, "controls": {}}
     prog_tp, prog_ep, prog_bs = program(st_tp), program(st_ep), program(st_tp_bad_scale)
     chain_tp, chain_ep = chain_program(st_tp), chain_program(st_ep)
+    # TPU_MOE_TP_DECODE_FAST (served on): the same output bits.
+    fast_tp = program(dataclasses.replace(st_tp, fast=True))
+    fast_ep = program(dataclasses.replace(st_ep, fast=True))
     for rows, n_valid in DECODE + PREFILL:
         ops_tp, x, scores = operands(rows, n_valid, w_tp)
         ops_ep, _, _ = operands(rows, n_valid, w_ep)
@@ -370,6 +374,11 @@ def _run_all():
                 ("tp", chain_tp, ops_tp, out_tp),
                 ("ep", chain_ep, ops_ep, out_ep),
             ):
+                fast_prog = fast_tp if arm == "tp" else fast_ep
+                fast_out, _ = run(fast_prog, ops, rows)
+                case[f"{arm}_fast_bitwise"] = bool(
+                    np.array_equal(fast_out.view(np.uint32), out.view(np.uint32))
+                )
                 ref, same = run(prog, ops, rows)
                 got = out[0, :n_valid]
                 want_c = ref[0, :n_valid]
@@ -482,6 +491,7 @@ def test_kernel_matches_the_psum_path_it_replaces(result, rows):
     c = result["cases"][str(rows)]
     for arm in ("tp", "ep"):
         v = c[f"{arm}_kernel_vs_chain"]
+        assert c[f"{arm}_fast_bitwise"], arm
         assert v["chain_kernels"]["moe_tp_decode"] == 0, v
         assert v["chain_ranks_identical"], v
         assert _passes(v["chain_vs_ref"]), v
