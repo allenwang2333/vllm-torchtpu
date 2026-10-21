@@ -38,6 +38,22 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _std_name(name: str) -> str:
+    """``name`` when it is set, else ``PROXY_<name>``. The fork recipes pass the
+    engine sizing variables below to the proxy container; the standard
+    agentx-397b-pd-baseline recipe passes only PROXY_* variables, so there the
+    same values are given as PROXY_BLOCK_SIZE_PREFILL=2176 and so on."""
+    return name if os.getenv(name, "").strip() else "PROXY_" + name
+
+
+def _env_int_std(name: str, default: int) -> int:
+    return _env_int(_std_name(name), default)
+
+
+def _env_float_std(name: str, default: float) -> float:
+    return _env_float(_std_name(name), default)
+
+
 @dataclass
 class _PodMetricsSnapshot:
     running_reqs: float = 0.0
@@ -982,15 +998,15 @@ async def lifespan(app: FastAPI):
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
 
     base_block_tokens = _env_int("PROXY_BLOCK_SIZE_TOKENS", _env_int("BLOCK_SIZE", 640))
-    prefill_pp_size = max(1, _env_int("PIPELINE_PARALLEL_SIZE_PREFILL", 1))
-    prefill_block_tokens = _env_int("BLOCK_SIZE_PREFILL", 2176 if prefill_pp_size >= 8 else base_block_tokens)
-    decode_block_tokens = _env_int("BLOCK_SIZE_DECODE", base_block_tokens)
+    prefill_pp_size = max(1, _env_int_std("PIPELINE_PARALLEL_SIZE_PREFILL", 1))
+    prefill_block_tokens = _env_int_std("BLOCK_SIZE_PREFILL", 2176 if prefill_pp_size >= 8 else base_block_tokens)
+    decode_block_tokens = _env_int_std("BLOCK_SIZE_DECODE", base_block_tokens)
     prefill_chunk_bytes = _env_int("PROXY_PREFILL_PREFIX_HASH_CHUNK", prefill_block_tokens * 4)
     decode_chunk_bytes = _env_int("PROXY_DECODE_PREFIX_HASH_CHUNK", decode_block_tokens * 4)
     chunk_bytes = prefill_chunk_bytes
     block_tokens = prefill_block_tokens
 
-    kv_offload_bytes = _env_int("KV_OFFLOAD_BYTES_PREFILL", 770000000000)
+    kv_offload_bytes = _env_int_std("KV_OFFLOAD_BYTES_PREFILL", 770000000000)
     if prefill_pp_size >= 8 and kv_offload_bytes == 420000000000:
         kv_offload_bytes = 550000000000
     bytes_per_prefill_block = 35651584 if prefill_pp_size >= 8 else 41944704
@@ -1040,9 +1056,9 @@ async def lifespan(app: FastAPI):
         .strip()
         .lower()
     )
-    decode_dcp_size = max(1, _env_int("DECODE_CONTEXT_PARALLEL_SIZE_DECODE", _env_int("PROXY_DECODE_DCP_SIZE", 4)))
+    decode_dcp_size = max(1, _env_int_std("DECODE_CONTEXT_PARALLEL_SIZE_DECODE", _env_int("PROXY_DECODE_DCP_SIZE", 4)))
     default_decode_hbm_blocks = 27481 if decode_dcp_size >= 4 else (7903 * decode_dcp_size)
-    default_mk_ceiling = _env_float("MAX_NUM_SEQS_DECODE", 40.0 if decode_dcp_size >= 4 else 32.0)
+    default_mk_ceiling = _env_float_std("MAX_NUM_SEQS_DECODE", 40.0 if decode_dcp_size >= 4 else 32.0)
     if (len(app.state.decode_clients) > 1 and decode_routing in ("prefix_hash", "llmd")) or (
         len(app.state.decode_clients) >= 1 and decode_routing == "llmd"
     ):
