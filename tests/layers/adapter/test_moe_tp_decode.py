@@ -595,3 +595,177 @@ def test_stack_experts_releases_the_per_layer_tensors(harness):
     gc.collect()
     assert all(r() is None for r in refs), "a per-layer routed parameter is still referenced"
     del stores
+
+
+# ---- load-time expert stacks (layers.adapter.expert_stack): adoption at arming
+
+
+class _LoadPlan:
+    """What adopt_load_stacks reads of expert_stack.LoadStacks: the target layers in row order and the four
+    stacks, already holding the served bytes (the loader and the fp8 processing wrote them)."""
+
+    def __init__(self, layers, gap=None):
+        self.layers = layers
+        self.stacks = {
+            k: torch.stack([_bits(getattr(layer, n)).clone() for layer in layers]).view(getattr(layers[0], n).dtype)
+            for k, n in zip(("w13", "w2", "s13", "s2"), moe_tp_decode._EXPERT_PARAMS)
+        }
+        self.device = torch.device("cpu")
+        self.adopted = False
+        self.hbm = {}
+        self.gap = gap
+
+    def incomplete(self):
+        return self.gap
+
+    def report(self):
+        return {"layers": len(self.layers), "stacked_bytes": 1, "per_layer_bytes": 1, "hbm": {}}
+
+
+def test_arming_adopts_the_load_time_stacks(harness, monkeypatch):
+    from vllm_torchtpu.layers.adapter import expert_stack
+
+    model = harness.model({}, {}, {})
+    runners = list(model.layers)
+    layers = [r.routed_experts for r in runners]
+    before = _snapshot(runners)
+    plan = _LoadPlan(layers)
+    monkeypatch.setattr(expert_stack, "_PLAN", plan)
+
+    assert moe_tp_decode.arm(model) == 3
+
+    assert plan.adopted
+    for row, layer in enumerate(layers):
+        for name, buf, kind in zip(moe_tp_decode._EXPERT_PARAMS, moe_tp_decode._STACK_BUFFERS,
+                                   ("w13", "w2", "s13", "s2")):
+            assert getattr(layer, name) is None  # the per-layer placeholders are gone
+            assert getattr(layer, buf) is plan.stacks[kind]
+            assert torch.equal(_bits(plan.stacks[kind][row]), before[row][name])
+        assert moe_tp_decode.expert_stacks(layer)[1] == row
+        assert getattr(layer.quant_method, moe_tp_decode._OP_ATTR) == harness.op_stk
+    assert any("adopted the load-time expert stacks of 3 layers" in m for m in harness.logs)
+    assert moe_tp_decode.stacked_form().startswith("3:")
+    x = _x()
+    runners[2](hidden_states=x, router_logits=x)
+    assert len(harness.stk_calls) == 1 and harness.stk_calls[0][-1].tolist() == [[2]]
+
+
+@pytest.mark.parametrize("why", ["refused", "incomplete"])
+def test_unadoptable_load_time_stacks_fail_the_load_loudly(harness, monkeypatch, why):
+    """A layer with a row holds no per-layer expert data: if it is not armed (or a row was never written), it
+    cannot run any path, so arming raises with the reason instead of serving garbage."""
+    from vllm_torchtpu.layers.adapter import expert_stack
+
+    if why == "refused":
+        model = harness.model({}, {}, {"scoring_func": "softmax"})
+        plan = _LoadPlan([r.routed_experts for r in model.layers])
+        match = "is not armed"
+    else:
+        model = harness.model({}, {})
+        plan = _LoadPlan([r.routed_experts for r in model.layers], gap="rows never loaded [1]")
+        match = "rows never loaded"
+    monkeypatch.setattr(expert_stack, "_PLAN", plan)
+    with pytest.raises(RuntimeError, match=match):
+        moe_tp_decode.arm(model)
+    assert not plan.adopted
+
+
+# ---- the megakernel's post-load stacking: a failure keeps every operand valid (j-e2afec10)
+
+
+def _fake_mk(runners, monkeypatch):
+    from vllm_torchtpu.kernels.glm52_decode_mk import vllm_adapter as VA
+
+    mk = object.__new__(VA.Glm52DecodeMK)
+    n = len(runners)
+    monkeypatch.setattr(VA.LY, "layers_of", lambda cfg, kind: list(range(n)) if kind == "gate" else [])
+    mk.cfg = SimpleNamespace()
+    mk._per_layer = {}
+    mk.experts = []
+    for l, r in enumerate(runners):
+        rt = r.routed_experts
+        mk._per_layer[l] = {"rt": rt, "ew13": rt.w13_weight, "ew2": rt.w2_weight,
+                            "es13": rt.w13_weight_scale_inv, "es2": rt.w2_weight_scale_inv}
+        mk.experts += [rt.w13_weight, rt.w2_weight, rt.w13_weight_scale_inv, rt.w2_weight_scale_inv]
+    mk.dense = [torch.ones(4, 8)]
+    mk.smalls = torch.zeros(3)
+    mk.cos_sin = torch.ones(2, 2)
+    mk.stack_e = False
+    return mk, VA
+
+
+def _flaky_stack(monkeypatch, fail_on):
+    real, calls = torch.stack, []
+
+    def flaky(ts):
+        calls.append(1)
+        if len(calls) == fail_on:
+            raise RuntimeError("RESOURCE_EXHAUSTED: Attempting to reserve 28.12G (test)")
+        return real(ts)
+
+    monkeypatch.setattr(torch, "stack", flaky)
+    return real
+
+
+@pytest.mark.parametrize("fail_on", [1, 3])
+def test_megakernel_failed_stack_falls_back_to_per_layer_experts(harness, monkeypatch, fail_on):
+    """Forced stacking failure (the first kind, as in j-e2afec10, or a later one): the megakernel keeps the
+    per-layer experts (674f916ae behaviour), its operand list is the model's per-layer tensors, its own
+    operands were materialized before the stacking program and checked after it, and the boot goes on."""
+    model = harness.model({}, {}, {})
+    moe_tp_decode.arm(model)
+    runners = list(model.layers)
+    before = _snapshot(runners)
+    mk, VA = _fake_mk(runners, monkeypatch)
+    order = []
+    monkeypatch.setattr(mk, "_materialize_operands", lambda: order.append("materialize"))
+    real_check = VA.Glm52DecodeMK._unreadable
+    monkeypatch.setattr(VA.Glm52DecodeMK, "_unreadable",
+                        staticmethod(lambda named: (order.append("check"), real_check(named))[1]))
+    real = _flaky_stack(monkeypatch, fail_on)
+
+    mk._stack_experts()
+
+    monkeypatch.setattr(torch, "stack", real)
+    assert order[0] == "materialize" and "check" in order
+    assert mk.stack_e is False and mk.expert_stack["form"].startswith("per-layer (stacking failed")
+    layers = [r.routed_experts for r in runners]
+    assert mk.experts == [t for layer in layers for t in (layer.w13_weight, layer.w2_weight,
+                                                         layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)]
+    for r, b in zip(runners, before):
+        assert moe_tp_decode.expert_stacks(r.routed_experts) is None
+        for n in moe_tp_decode._EXPERT_PARAMS:
+            assert torch.equal(_bits(getattr(r.routed_experts, n)), b[n])
+
+
+def test_megakernel_rebuilds_operands_a_failed_stack_left_unreadable(harness, monkeypatch):
+    model = harness.model({}, {})
+    moe_tp_decode.arm(model)
+    runners = list(model.layers)
+    mk, VA = _fake_mk(runners, monkeypatch)
+    poisoned = {"dense[0]"}
+    rebuilt = []
+
+    def unreadable(named):
+        return [n for n, _ in named if n in poisoned]
+
+    def collect():
+        rebuilt.append("collect")
+        poisoned.clear()
+        return [torch.ones(4, 8)], list(mk.experts)
+
+    monkeypatch.setattr(VA.Glm52DecodeMK, "_unreadable", staticmethod(unreadable))
+    monkeypatch.setattr(mk, "_materialize_operands", lambda: None)
+    monkeypatch.setattr(mk, "_collect_weights", collect)
+    monkeypatch.setattr(mk, "_build_smalls", lambda: torch.zeros(3))
+    mk.backbone = SimpleNamespace(layers=[SimpleNamespace(self_attn=SimpleNamespace(
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.ones(2, 2))))])
+    real = _flaky_stack(monkeypatch, 1)
+    mk._stack_experts()
+    monkeypatch.setattr(torch, "stack", real)
+    assert rebuilt == ["collect"] and mk.stack_e is False
+
+    # if the model's own expert tensors were left unreadable there is nothing to rebuild from: refuse (stock)
+    poisoned.add("expert[0]")
+    with pytest.raises(VA.Unsupported, match="operands unreadable"):
+        mk._recover_operands("stacking failed (test)")

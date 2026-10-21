@@ -733,6 +733,13 @@ def evict_loaded_weights_page_cache() -> None:
         logger.warning("[tpu-model-loader] Page cache eviction skipped: %s", e)
 
 
+def _expert_stack():
+    """layers.adapter.expert_stack, imported on use (the layers package imports models)."""
+    from vllm_torchtpu.layers.adapter import expert_stack
+
+    return expert_stack
+
+
 # Shards every expert of a parameter receives, keyed by the shard written.
 _SHARDS_PER_EXPERT = {"w1": 2, "w3": 2, "w2": 1}
 
@@ -790,6 +797,7 @@ class ExpertParamStager:
         self._tracker = ExpertWriteTracker()
         self.written_early: set[int] = set()
         self.flushed = 0
+        self.stacked = 0
 
     def staging(self, param: torch.nn.Parameter) -> bool:
         """Whether writes to ``param`` still go through a stand-in.
@@ -803,9 +811,20 @@ class ExpertParamStager:
         entry = self._staged.get(id(param))
         if entry is None:
             if len(self._staged) >= _MAX_STAGED:
-                oldest = next(iter(self._staged.values()))[0]
-                self.written_early.add(id(oldest))
-                self.flush(oldest)
+                # A parameter with a row in the load-time expert stacks is never
+                # written early: its later experts would have no device target.
+                early = [p for p, _ in self._staged.values() if not _expert_stack().owns(p)]
+                if early:
+                    oldest = early[0]
+                    self.written_early.add(id(oldest))
+                    self.flush(oldest)
+                elif len(self._staged) % _MAX_STAGED == 0:
+                    logger.warning(
+                        "Expert staging holds %d stacked-row parameters on the host "
+                        "(rss=%.1f GiB)",
+                        len(self._staged),
+                        _rss_gib(),
+                    )
             key = (tuple(param.shape), param.dtype)
             free = self._pool.get(key)
             buffer = (
@@ -840,6 +859,17 @@ class ExpertParamStager:
         if entry is None:
             return
         param, host = entry
+        if _expert_stack().owns(param):
+            # Load-time expert stacks: the parameter's bytes go to its row of the
+            # stack; the parameter itself stays a loader target with no HBM.
+            plan = _expert_stack().current()
+            assert plan is not None
+            plan.write_raw(param, host)
+            self.flushed += 1
+            self.stacked += 1
+            buffer = torch.Tensor._make_subclass(torch.Tensor, host.data, False)
+            self._pool.setdefault((tuple(host.shape), host.dtype), []).append(buffer)
+            return
         device = param.data.device
         per_row = max(1, host[0].numel() * host.element_size())
         step = max(1, _UPLOAD_CHUNK_BYTES // per_row)
@@ -919,6 +949,14 @@ def patch_moe_expert_write_staging() -> None:
             or not stager.staging(param)
             or self._map_global_expert_id_to_local_expert_id(expert_id) == -1
         ):
+            if (
+                _expert_stack().owns(param)
+                and self._map_global_expert_id_to_local_expert_id(expert_id) != -1
+            ):
+                raise RuntimeError(
+                    "expert staging: a parameter with a row in the load-time expert "
+                    "stacks reached the direct device path"
+                )
             return orig_weight_loader(
                 self,
                 param,
@@ -954,15 +992,29 @@ def patch_moe_expert_write_staging() -> None:
         stager.flush_all()
         logger.info(
             "Expert parameters written to the device: %d as their last "
-            "expert landed, %d at the end of loading.",
+            "expert landed, %d at the end of loading (%d into load-time expert "
+            "stack rows); hbm %s.",
             during_load,
             stager.flushed - during_load,
+            stager.stacked,
+            _expert_stack().hbm_stats(),
         )
         return orig_process(model, model_config, target_device)
+
+    # Load-time expert stacks are allocated right after the model is built,
+    # before any expert byte reaches the device (_expert_stack().maybe_plan).
+    orig_create = base_loader.BaseModelLoader.create_model
+
+    @functools.wraps(orig_create)
+    def create_model(self, vllm_config, model_config, prefix=""):
+        model = orig_create(self, vllm_config, model_config, prefix=prefix)
+        _expert_stack().maybe_plan(model, vllm_config, self)
+        return model
 
     RoutedExperts.weight_loader = weight_loader
     RoutedExperts._tpu_expert_staging_patch = True
     base_loader.process_weights_after_loading = process_weights_after_loading
+    base_loader.BaseModelLoader.create_model = create_model
     logger.info(
         "Applied TPU patch: expert parameters are staged on the host "
         "and written to the device once each."

@@ -652,6 +652,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
+    adopt_load_stacks()
     armed_drafter = sum(1 for r, _ in plan if id(r) not in known)
     log = logger.info if plan else logger.warning
     log(
@@ -721,6 +722,73 @@ def _hbm_stats() -> dict:
     return {k: int(s[k]) for k in keys if k in s}
 
 
+def _install_stacks(layers: list, stacks: list, stacked_op, device) -> None:
+    """Point each layer (row order) at the stacks and its row, through the stacked op."""
+    for row, layer in enumerate(layers):
+        for buf, st in zip(_STACK_BUFFERS, stacks):
+            layer.register_buffer(buf, st, persistent=False)
+        layer.register_buffer(
+            _ROW_BUFFER,
+            torch.tensor([[row]], dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        layer._moe_tp_row = row
+        setattr(layer.quant_method, _OP_ATTR, stacked_op)
+    global _STACKED_FORM
+    _STACKED_FORM = f"{len(layers)}:" + ";".join(str(list(t.shape)) for t in stacks)
+
+
+def adopt_load_stacks() -> dict | None:
+    """Hand the armed target layers the load-time expert stacks (layers.adapter.expert_stack), if this process
+    built them: buffers, row index and the stacked op, the per-layer placeholders dropped -- the state
+    stack_experts leaves, with no stacking program. Returns the report, or None without load-time stacks.
+
+    Raises when a layer with a row is not armed: its per-layer parameters are placeholders with no data (the
+    bytes exist only in the stacks), so it has no unarmed path."""
+    from vllm_torchtpu.layers.adapter import expert_stack
+
+    plan = expert_stack.current()
+    if plan is None:
+        return None
+    if plan.adopted:
+        return plan.report()
+    layers = plan.layers
+    problems = []
+    gap = plan.incomplete()
+    if gap:
+        problems.append(gap)
+    key = None
+    for i, layer in enumerate(layers):
+        qm = layer.quant_method
+        k = getattr(qm, "_moe_tp_decode_key", None)
+        if getattr(qm, _OP_ATTR, None) is None or k is None:
+            problems.append(f"{getattr(layer, 'layer_name', i)} is not armed")
+        elif key is not None and k != key:
+            problems.append(f"{getattr(layer, 'layer_name', i)}: op mesh / statics differ")
+        key = key or k
+    if problems:
+        raise RuntimeError(
+            "moe_tp_decode: the load-time expert stacks cannot be adopted ("
+            + "; ".join(problems[:6])
+            + "). Their layers hold no per-layer expert data, so they cannot run "
+            "unarmed; serve with GLM52_DECODE_MK_STACK_E=0 (per-layer experts) or "
+            "fix the arming refusal logged above."
+        )
+    mesh, statics = key
+    stacked_op = _get_op(mesh, statics, stacked=True)
+    stacks = [plan.stacks[k] for k in expert_stack.KINDS]
+    with torch.no_grad():
+        for layer in layers:
+            for name in _EXPERT_PARAMS:  # placeholders: shape only, never materialized
+                layer.register_parameter(name, None)
+        _install_stacks(layers, stacks, stacked_op, plan.device)
+    plan.adopted = True
+    plan.hbm["after_adopt"] = _hbm_stats()
+    report = plan.report()
+    logger.info("moe_tp_decode: adopted the load-time expert stacks of %d layers: %s", len(layers), report)
+    return report
+
+
 def stack_experts(layers: list) -> dict:
     """Move the routed experts of armed layers (target RoutedExperts modules, in
     row order) into one tensor per kind, [len(layers), E, ...], and point each
@@ -764,6 +832,12 @@ def stack_experts(layers: list) -> dict:
     mesh, statics = key
     stacked_op = _get_op(mesh, statics, stacked=True)
     device = layers[0].w13_weight.device
+    if device.type == "tpu":
+        # A stacking program that fails puts every deferred computation it was
+        # fused with into a failed state (torch_tpu fuses all pending work into
+        # the program a synchronize builds; L3c2 probe01 j-ad206c55): run the
+        # pending work first, so a failure here can only fail the stack itself.
+        synchronize_tensors(None, wait=True)
     report = {"layers": len(layers), "hbm_before": _hbm_stats(), "kinds": {}}
     per_layer_bytes = 0
     stacks = []
@@ -803,18 +877,7 @@ def stack_experts(layers: list) -> dict:
                         )
             stacks.clear()
             raise ValueError(f"stacking failed ({type(e).__name__}: {e}); per-layer form kept") from e
-        for row, layer in enumerate(layers):
-            for buf, st in zip(_STACK_BUFFERS, stacks):
-                layer.register_buffer(buf, st, persistent=False)
-            layer.register_buffer(
-                _ROW_BUFFER,
-                torch.tensor([[row]], dtype=torch.int32, device=device),
-                persistent=False,
-            )
-            layer._moe_tp_row = row
-            setattr(layer.quant_method, _OP_ATTR, stacked_op)
-    global _STACKED_FORM
-    _STACKED_FORM = f"{len(layers)}:" + ";".join(str(list(t.shape)) for t in stacks)
+        _install_stacks(layers, stacks, stacked_op, device)
     report["per_layer_bytes"] = per_layer_bytes
     report["stacked_bytes"] = sum(s.numel() * s.element_size() for s in stacks)
     report["hbm_after"] = _hbm_stats()

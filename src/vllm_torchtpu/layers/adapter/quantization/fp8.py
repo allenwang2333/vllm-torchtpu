@@ -77,7 +77,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
-from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter import expert_stack, moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -451,6 +451,43 @@ def _requantize_expert_chunks(
     return w, w_scale
 
 
+def _requantize_expert_rows(
+    stacks: expert_stack.LoadStacks,
+    layer: torch.nn.Module,
+    kind: str,
+    scale: torch.Tensor | None,
+    dequantize: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    zero_padding: Callable[[torch.Tensor], None] | None,
+    **format_kwargs,
+) -> torch.Tensor | None:
+    """``_requantize_expert_chunks`` for a layer whose checkpoint experts sit in
+    its row of the load-time expert stacks: the same chunks and the same math,
+    each chunk read from the row and its requantized bytes written over it (the
+    served row [E, K, N] has the checkpoint row's bytes, so chunk ``[s, e)``
+    overwrites exactly the experts it was read from). Returns the scales.
+    """
+    num_experts, n, k = stacks.raw_shape[kind]
+    per_expert = n * k * 4
+    per_chunk = max(1, _REQUANT_CHUNK_BYTES // per_expert)
+    scales = []
+    for start in range(0, num_experts, per_chunk):
+        end = min(start + per_chunk, num_experts)
+        weight = stacks.read_raw(layer, kind, start, end)
+        fp32 = dequantize(weight, None if scale is None else scale[start:end])
+        if zero_padding is not None:
+            zero_padding(fp32)
+        w, w_scale = _quantize_and_format_single_moe_weight(fp32, **format_kwargs)
+        del fp32, weight
+        if w.device.type == "tpu":
+            synchronize_tensors([w] if w_scale is None else [w, w_scale])
+        stacks.write_rows(layer, kind, start, w)
+        del w
+        scales.append(w_scale)
+    if scales[0] is None:
+        return None
+    return scales[0] if len(scales) == 1 else torch.cat(scales, dim=0)
+
+
 def _quantize_and_format_moe_weights(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -583,6 +620,40 @@ def _process_fp8_moe_weights(
                 s2 = s2.view(-1, 1, 1)
             return w_q * s2
 
+    stacks = expert_stack.current() if expert_stack.row_of(layer) is not None else None
+    if stacks is not None:
+        # Load-time expert stacks: the same chunks, read from this layer's rows
+        # and requantized over the bytes they came from.
+        for kind, scale_param, dequantize, zero_padding in (
+            ("w13", w13_scale_param, dequantize_w13, zero_w13),
+            ("w2", w2_scale_param, dequantize_w2, zero_w2),
+        ):
+            w_scale = _requantize_expert_rows(
+                stacks,
+                layer,
+                kind,
+                scale_param.data,
+                dequantize,
+                zero_padding,
+                name=kind,
+                quant_dtype=requant_dtype,
+                block_size=requant_block_size,
+                activation=activation,
+            )
+            if w_scale is None:
+                raise ValueError("load-time expert stacks need per-channel scales")
+            stacks.write_scale(layer, "s13" if kind == "w13" else "s2", w_scale)
+            # The checkpoint scale is dead (as on the per-layer path).
+            scale_param.data = stacks.placeholder("s13" if kind == "w13" else "s2")
+        stacks.mark_processed(layer)
+        return (
+            stacks.placeholder("w13"),
+            stacks.placeholder("s13"),
+            stacks.placeholder("w2"),
+            stacks.placeholder("s2"),
+            desired_quant_dtype,
+            requant_block_size,
+        )
     w13, w13_scale = _requantize_expert_chunks(
         layer.w13_weight.data,
         w13_scale_param.data,
@@ -1035,7 +1106,12 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
         # Eagerly materialize weights to avoid OOM during vLLM memory probing.
         # Without this, lazy tensors accumulate and the profiling run OOMs.
-        if layer.w13_weight.device.type == "tpu":
+        # (Load-time expert stacks: the experts are in the stacks already and
+        # these are placeholders that must never be materialized.)
+        if (
+            layer.w13_weight.device.type == "tpu"
+            and expert_stack.row_of(layer) is None
+        ):
             synchronize_tensors(
                 [
                     layer.w13_weight,

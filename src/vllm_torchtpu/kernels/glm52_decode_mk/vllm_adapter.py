@@ -572,11 +572,24 @@ class Glm52DecodeMK:
             _need(_owns_storage(t), "an expert stack is a view operand")
 
     def _stack_experts(self) -> None:
-        """L3-c experts: move the routed experts into the stacked operand form (moe_tp_decode.stack_experts) unless
-        GLM52_DECODE_MK_STACK_E=0 or a precondition fails (then the per-layer form stays, logged)."""
+        """L3-c experts: the stacked operand form. Load-time stacks (layers.adapter.expert_stack, adopted by
+        moe_tp_decode.arm) are taken as they are. Otherwise, unless GLM52_DECODE_MK_STACK_E=0, stack after load
+        (moe_tp_decode.stack_experts, one torch.stack per kind); if that fails, every operand of this object is
+        left valid and the per-layer form stays (674f916ae behaviour), or the megakernel refuses (Unsupported:
+        stock) with the reason -- a failed stack never kills the boot."""
         self.expert_stack = None
         if self.stack_e:
-            self.expert_stack = {"form": "stacked (pre-existing)"}
+            from vllm_torchtpu.layers.adapter import expert_stack as ES
+
+            plan = ES.current()
+            if plan is not None and plan.adopted:
+                self.expert_stack = dict(plan.report(), form="stacked at load")
+                logger.info("GLM-5.2 decode megakernel: experts stacked at load (no stacking program): "
+                            "stacked_bytes %d = per_layer_bytes %d, %d layers, hbm %s",
+                            self.expert_stack["stacked_bytes"], self.expert_stack["per_layer_bytes"],
+                            self.expert_stack["layers"], self.expert_stack["hbm"])
+            else:
+                self.expert_stack = {"form": "stacked (pre-existing)"}
             return
         if os.environ.get("GLM52_DECODE_MK_STACK_E", "1") == "0":
             self.expert_stack = {"form": "per-layer (GLM52_DECODE_MK_STACK_E=0)"}
@@ -585,6 +598,10 @@ class Glm52DecodeMK:
 
         moe = LY.layers_of(self.cfg, "gate")
         rts = [self._per_layer[l]["rt"] for l in moe]
+        # A failed stacking program leaves every deferred tensor it was fused with in a failed state, and torch_tpu
+        # fuses pending work into the program a synchronize builds (j-e2afec10: the warmup then found "a required
+        # argument is in a failed state"). Materialize this object's own operands before stacking.
+        self._materialize_operands()
         # Drop this object's own references to the per-layer tensors first: stack_experts frees each kind's per-layer
         # tensors right after stacking it, so the load-time transient is one kind's bytes, not a second full copy
         # (j-b6b945d5 G1: with these references held, bytes_in_use rose by the whole stack during stacking).
@@ -602,6 +619,8 @@ class Glm52DecodeMK:
                 d["ew13"], d["ew2"] = rt.w13_weight, rt.w2_weight
                 d["es13"], d["es2"] = rt.w13_weight_scale_inv, rt.w2_weight_scale_inv
                 self.experts += [d["ew13"], d["ew2"], d["es13"], d["es2"]]
+            self.stack_e = False
+            self._recover_operands(f"stacking failed: {e}")
             logger.warning("GLM-5.2 decode megakernel: experts stay per layer (%s)", e)
             self.expert_stack = {"form": f"per-layer ({e})"}
             return
@@ -612,6 +631,47 @@ class Glm52DecodeMK:
         self.experts = list(stk[0][0])
         self.stack_e = True
         self.expert_stack = dict(rep, form="stacked")
+
+    def _own_operands(self) -> list:
+        """The tensors this object built for itself (not the model's): rebuilt if a failed program took them."""
+        return [*self.dense, self.smalls, self.cos_sin]
+
+    def _materialize_operands(self) -> None:
+        ts = [t for t in self._own_operands() if isinstance(t, torch.Tensor) and t.device.type == "tpu"]
+        if ts:
+            from vllm_torchtpu.utils import synchronize_tensors
+            synchronize_tensors(ts, wait=True)
+
+    @staticmethod
+    def _unreadable(named) -> list[str]:
+        """Names of the tensors whose first element cannot be read back (a failed-state buffer raises)."""
+        bad = []
+        for name, t in named:
+            try:
+                float(t.detach().reshape(-1)[:1].float().sum().cpu())
+            except Exception as e:                       # noqa: BLE001 - the probe's whole point
+                bad.append(f"{name} ({type(e).__name__}: {str(e)[:120]})")
+        return bad
+
+    def _recover_operands(self, why: str) -> None:
+        """After a failed stacking program: every operand the megakernel will pass must be readable. Its own
+        operands are rebuilt from the model if not; the model's expert tensors cannot be, so then refuse."""
+        own = [(f"dense[{i}]", t) for i, t in enumerate(self.dense)] + [("smalls", self.smalls),
+                                                                         ("cos_sin", self.cos_sin)]
+        bad = self._unreadable(own)
+        if bad:
+            logger.warning("GLM-5.2 decode megakernel: %s left %d own operand(s) unreadable (%s); rebuilding them",
+                           why, len(bad), "; ".join(bad[:4]))
+            rot = self.backbone.layers[0].self_attn.rotary_emb
+            self.cos_sin = _own(rot.cos_sin_cache.detach())
+            self.dense, self.experts = self._collect_weights()
+            self.smalls = self._build_smalls().detach()
+            self._materialize_operands()
+            bad = self._unreadable([(f"dense[{i}]", t) for i, t in enumerate(self.dense)]
+                                   + [("smalls", self.smalls), ("cos_sin", self.cos_sin)])
+        bad += self._unreadable([(f"expert[{i}]", t) for i, t in enumerate(self.experts)])
+        if bad:
+            raise Unsupported(f"{why}; operands unreadable after recovery: {'; '.join(bad[:4])}")
 
     def _build_smalls(self) -> torch.Tensor:
         cfg = self.cfg

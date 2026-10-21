@@ -5199,7 +5199,9 @@ class TPUModelRunner(GPUModelRunner):
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
 
         model_loader = get_model_loader(self.load_config)
-        logger.info("Loading model from scratch...")
+        from vllm_torchtpu.layers.adapter import expert_stack
+
+        logger.info("Loading model from scratch... (hbm %s)", expert_stack.hbm_stats())
         with (
             set_vllm_model_wrapper_context(
                 mesh=self.mesh, vllm_config=self.vllm_config
@@ -5288,10 +5290,19 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+        # Weights loaded and processed, MoE armed: the load's HBM (peak = the load's peak; nothing else has run).
+        logger.info(
+            "load_model HBM after loading and arming: %s (load-time expert stacks: %s)",
+            expert_stack.hbm_stats(),
+            "adopted" if expert_stack.current() is not None else (expert_stack.refused() or "not asked"),
+        )
+
         # GLM52_DECODE_MK (after moe_tp_decode arming: it reads the served TP16 expert tensors by reference)
         from vllm_torchtpu.kernels.glm52_decode_mk.vllm_adapter import Glm52DecodeMK
 
         self._glm52_mk = Glm52DecodeMK.maybe_create(self)
+        if self._glm52_mk is not None:
+            logger.info("load_model HBM after the decode megakernel: %s", expert_stack.hbm_stats())
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
