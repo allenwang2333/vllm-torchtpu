@@ -510,9 +510,16 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - kv_connector_hbm_reserve
-        )
+        local_available = budget.available - kv_connector_hbm_reserve
+        # A model adapter that owns its cache (Qwen4Exp's unified pool) can
+        # report the bytes its cache may take, e.g. after profiling on a
+        # scratch pool and with graph-time pool copies reserved.
+        adapter = getattr(self.model_runner, "model_adapter", None)
+        adapter_budget = getattr(adapter, "kv_cache_memory_budget", None)
+        sized = adapter_budget() if callable(adapter_budget) else None
+        if isinstance(sized, int):
+            local_available = sized
+        available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
