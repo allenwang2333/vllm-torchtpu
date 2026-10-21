@@ -1141,15 +1141,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Shortcut for TPU_MICROBATCH_SCHEDULE="layerwise" (full-layer windowing).
     "TPU_MICROBATCH_LAYERWISE": env_bool("TPU_MICROBATCH_LAYERWISE", default=False),
     # Micro-batch execution schedule:
-    #   "" (default): resolves to "layerwise" if TPU_MICROBATCH_LAYERWISE=1
-    #                 else "stagewise"
+    #   "" (default): resolves to "layerwise" if TPU_MICROBATCH_LAYERWISE=1,
+    #                 "staggered" if USE_MOE_FUSED_EP_KERNEL=1, else "stagewise"
     #   "stagewise": split each decoder stage across windows (optional merged MoE)
     #   "layerwise": run each window through an entire decoder layer before next
     #   "staggered": interleave compute and collective sub-stages across windows
+    #   "attn_only": split only Attention across windows; run MLP/MoE unsplit
     "TPU_MICROBATCH_SCHEDULE": env_with_choices(
         "TPU_MICROBATCH_SCHEDULE",
         "",
-        ["", "stagewise", "layerwise", "staggered"],
+        ["", "stagewise", "layerwise", "staggered", "attn_only"],
         case_sensitive=False,
     ),
     # Optimization-barrier fencing policy between micro-batch windows/stages:

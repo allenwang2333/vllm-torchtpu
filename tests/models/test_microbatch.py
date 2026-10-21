@@ -276,6 +276,34 @@ class _FakeRoutedExperts(nn.Module):
     def _ensure_moe_quant_config_init(self) -> None:
         return None
 
+    def forward_monolithic(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        topk_w, topk_ids = _fake_route(self, x, router_logits)
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            topk_ids, topk_w = token_padding.zero_routing_weights_for_padding(
+                topk_ids,
+                topk_w,
+                is_local_tensor=True,
+            )
+        return _fake_fused_moe_gmm(
+            hidden_states=x,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
+            w1_scale=self.w13_weight_scale_inv,
+            w2_scale=self.w2_weight_scale_inv,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=topk_w,
+            topk_ids=topk_ids,
+            experts_start=self._experts_start,
+            topk=self.top_k,
+            activation="silu",
+        )
+
 
 class _FakeSharedExpertsWrapper(nn.Module):
     """Mimics vLLM 0.29.0 ``SharedExperts`` wrapper with ``._layer``."""
@@ -732,6 +760,7 @@ def test_config_and_mode_parsing(monkeypatch):
     assert parse_schedule_mode("", layerwise=False) == ScheduleMode.STAGEWISE
     assert parse_schedule_mode("", layerwise=True) == ScheduleMode.LAYERWISE
     assert parse_schedule_mode("staggered", layerwise=True) == ScheduleMode.STAGGERED
+    assert parse_schedule_mode("attn_only") == ScheduleMode.ATTN_ONLY
     with pytest.raises(ValueError, match="Invalid microbatch schedule"):
         parse_schedule_mode("bogus")
 
@@ -820,7 +849,7 @@ def test_slice_attention_metadata_and_padding_state():
 
 
 @pytest.mark.parametrize("factor", [2, 4])
-@pytest.mark.parametrize("schedule", ["stagewise", "layerwise", "staggered"])
+@pytest.mark.parametrize("schedule", ["stagewise", "layerwise", "staggered", "attn_only"])
 @pytest.mark.parametrize("merge_moe", [True, False])
 @pytest.mark.parametrize("fence", ["none", "window", "stage", "substage"])
 @pytest.mark.parametrize("shared_expert_overlap", [True, False])
@@ -911,7 +940,7 @@ def test_qwen_microbatch_numerical_equivalence_and_moe_call_counts(
         # Verify MoE kernel call count and batch shapes
         num_layers = len(model.layers)
         window_tokens = num_tokens // factor
-        if schedule != "layerwise" and merge_moe:
+        if schedule == "attn_only" or (schedule != "layerwise" and merge_moe):
             assert gmm_call_shapes == [num_tokens] * num_layers
         else:
             assert gmm_call_shapes == [window_tokens] * (num_layers * factor)
@@ -1260,7 +1289,81 @@ def test_unsupported_config_reasons(monkeypatch, cpu_vllm_cfg: VllmConfig):
     )
 
     monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "1")
+    # When TP > 1 (default in _FakeQwenModel out_proj/o_proj), fused EP MoE is supported
+    assert unsupported_config_reasons(model) == []
+    # When TP == 1 (e.g., DP8_EP with no TP collectives), fused EP MoE has no collectives to overlap
+    for layer in model.layers:
+        if hasattr(layer, "linear_attn"):
+            layer.linear_attn.out_proj.tp_size = 1
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.o_proj.tp_size = 1
     assert "USE_MOE_FUSED_EP_KERNEL=1" in unsupported_config_reasons(model)
+
+
+@pytest.mark.parametrize("schedule", ["", "staggered", "stagewise", "attn_only"])
+@pytest.mark.parametrize("merge_moe", [True, False])
+@pytest.mark.parametrize("fence", ["substage", "stage", "window"])
+def test_fused_ep_moe_microbatch_schedules(
+    monkeypatch,
+    cpu_vllm_cfg: VllmConfig,
+    schedule: str,
+    merge_moe: bool,
+    fence: str,
+):
+    """Verify fused EP MoE (Design A attn_only, Design B merge_moe=True, and split merge_moe=False)."""
+    torch.manual_seed(7)
+    monkeypatch.setattr(
+        "vllm_torchtpu.layers.adapter.moe_routing.route",
+        _fake_route,
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.models.microbatch.qwen.fused_moe_gmm",
+        _fake_fused_moe_gmm,
+    )
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+
+    num_tokens = 16
+    hidden_size = 16
+    pad_state = token_padding.TokenPaddingState.create(num_tokens, device="cpu")
+    pad_state.update(local_valid_tokens=12, local_padded_tokens=num_tokens)
+    token_padding.set_padding_state(pad_state)
+
+    try:
+        model = _FakeQwenModel(hidden_size=hidden_size)
+        for layer in model.layers:
+            layer.mlp.experts.routed_experts.quant_method._use_fused_ep = True
+
+        input_ids = torch.randint(0, 64, (num_tokens,))
+        positions = torch.arange(num_tokens, dtype=torch.int32)
+
+        gmm_call_shapes.clear()
+        with set_forward_context(None, cpu_vllm_cfg):
+            ref_out = model(input_ids, positions)
+        assert gmm_call_shapes == [num_tokens, num_tokens]
+
+        cfg = MicroBatchConfig(
+            factor=2,
+            min_tokens=8,
+            merge_moe=merge_moe,
+            schedule=schedule,
+            fence=fence,
+        )
+        assert install_microbatch(model, cfg)
+        if schedule == "":
+            assert model._microbatch_config.resolved_schedule == ScheduleMode.STAGGERED
+        gmm_call_shapes.clear()
+        with set_forward_context(None, cpu_vllm_cfg):
+            mb_out = model(input_ids, positions)
+
+        torch.testing.assert_close(mb_out, ref_out, rtol=1e-5, atol=1e-5)
+
+        num_layers = len(model.layers)
+        if schedule == "attn_only" or merge_moe:
+            assert gmm_call_shapes == [num_tokens] * num_layers
+        else:
+            assert gmm_call_shapes == [num_tokens // 2] * (num_layers * 2)
+    finally:
+        token_padding.set_padding_state(None)
 
 
 def test_vllm_upstream_signatures_compatibility():

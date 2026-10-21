@@ -20,15 +20,19 @@ explicit ``jax.lax.optimization_barrier`` fences (`pallas::microbatch_fence`
 and `pallas::microbatch_fence_pair`).
 
 Supported schedules (``TPU_MICROBATCH_SCHEDULE`` / ``MicroBatchConfig.schedule``):
-- ``"stagewise"`` (default): splits each decoder stage (Attention, MoE) across
-  windows; when ``merge_moe=True``, concatenates the routed-expert inputs across
-  windows so ``fused_moe_gmm`` runs once per layer at full batch density.
+- ``"stagewise"`` (default when ``USE_MOE_FUSED_EP_KERNEL=0``): splits each
+  decoder stage (Attention, MoE) across windows; when ``merge_moe=True``,
+  concatenates the routed-expert inputs across windows so ``fused_moe_gmm`` runs
+  once per layer at full batch density.
 - ``"layerwise"`` (also enabled by ``TPU_MICROBATCH_LAYERWISE=1``): runs each
   window through an entire decoder layer (Attention + MoE) before advancing to
   the next window.
-- ``"staggered"``: explicitly interleaves Window ``w-1``'s collective sub-stage
-  (Attention TP All-Reduce, MoE DP/EP All-Gather, MoE Combine/All-Reduce) with
-  Window ``w``'s compute sub-stage across coupled diamond fences.
+- ``"staggered"`` (auto-selected when ``USE_MOE_FUSED_EP_KERNEL=1``): explicitly
+  interleaves Window ``w-1``'s collective sub-stage (Attention TP All-Reduce,
+  MoE DP/EP All-Gather, MoE Combine/All-Reduce) with Window ``w``'s compute
+  sub-stage across coupled diamond fences.
+- ``"attn_only"``: splits only the Attention stage across windows and runs the
+  entire MLP / MoE block once on the full concatenated token batch.
 
 Supported fence modes (``TPU_MICROBATCH_FENCE`` / ``MicroBatchConfig.fence``):
 - ``"none"``: no ``optimization_barrier`` ops emitted.
@@ -43,7 +47,7 @@ Supported fence modes (``TPU_MICROBATCH_FENCE`` / ``MicroBatchConfig.fence``):
 
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -87,6 +91,7 @@ class ScheduleMode(StrEnum):
     STAGEWISE = "stagewise"
     LAYERWISE = "layerwise"
     STAGGERED = "staggered"
+    ATTN_ONLY = "attn_only"
 
 
 def parse_schedule_mode(
@@ -97,7 +102,11 @@ def parse_schedule_mode(
     if isinstance(schedule, ScheduleMode):
         return schedule
     if schedule is None or schedule.strip() == "":
-        return ScheduleMode.LAYERWISE if layerwise else ScheduleMode.STAGEWISE
+        if layerwise:
+            return ScheduleMode.LAYERWISE
+        if envs.USE_MOE_FUSED_EP_KERNEL:
+            return ScheduleMode.STAGGERED
+        return ScheduleMode.STAGEWISE
     normalized = schedule.strip().lower()
     try:
         return ScheduleMode(normalized)
@@ -222,6 +231,44 @@ def _apply_layer_scale(
             return hidden_states * (scale[0] + 1)
         return hidden_states * (scale + 1)
     return hidden_states * scale
+
+
+def _is_fused_ep_moe(moe_block: nn.Module | None) -> bool:
+    """Return True if ``moe_block`` uses the monolithic fused EP MoE kernel."""
+    if moe_block is None:
+        return False
+    if hasattr(moe_block, "_moe_monolithic_fn"):
+        return True
+    experts = getattr(moe_block, "experts", None)
+    if experts is None:
+        return False
+    runner = _get_moe_runner(experts)
+    if runner is None:
+        return False
+    gate = getattr(runner, "gate", None) or getattr(moe_block, "gate", None)
+    if gate is None:
+        return False
+    moe_config = getattr(runner, "moe_config", None)
+    if (
+        getattr(moe_block, "is_sequence_parallel", False)
+        or getattr(experts, "is_sequence_parallel", False)
+        or getattr(moe_config, "is_sequence_parallel", False)
+    ):
+        return False
+    if (
+        getattr(experts, "has_ici_cp_collectives", False)
+        or getattr(moe_config, "pcp_size", 1) > 1
+    ):
+        return False
+    routed = getattr(runner, "routed_experts", getattr(experts, "routed_experts", None))
+    quant_method = getattr(routed, "quant_method", None)
+    if quant_method is None:
+        return False
+    if getattr(quant_method, "_use_fused_ep", False):
+        return True
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    return bool(fused_moe_ep_supported(quant_method))
 
 
 def can_split_moe_stages(moe_block: nn.Module | None) -> bool:
@@ -543,6 +590,32 @@ def _moe_forward_kernel(
     return fused_moe_gmm(**kwargs)
 
 
+def _moe_forward_monolithic(
+    self: Any,
+    hidden_states_2d: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Sub-stage 2c (monolithic fused EP MoE): invoke ``routed_experts.forward_monolithic``."""
+    custom_monolithic = getattr(self, "_moe_monolithic_fn", None)
+    if custom_monolithic is not None:
+        return custom_monolithic(hidden_states_2d, router_logits)
+
+    experts = self.experts
+    runner = _get_moe_runner(experts)
+    routed: Any = getattr(
+        runner, "routed_experts", getattr(experts, "routed_experts", None)
+    )
+    assert routed is not None
+    if hasattr(routed, "_ensure_moe_quant_config_init"):
+        routed._ensure_moe_quant_config_init()
+    with _maybe_sp_context(runner):
+        return routed.forward_monolithic(
+            x=hidden_states_2d,
+            router_logits=router_logits,
+            input_ids=None,
+        )
+
+
 def _moe_forward_post(
     self: Any,
     pre_state: tuple[
@@ -771,6 +844,15 @@ def _layer_forward_moe_kernel(
     return self.mlp.forward_moe_kernel(dispatched_x, topk_weights, topk_ids)
 
 
+def _layer_forward_moe_monolithic(
+    self: Any,
+    hidden_states_2d: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Sub-stage 2c (monolithic fused EP MoE): invoke ``self.mlp.forward_moe_monolithic``."""
+    return self.mlp.forward_moe_monolithic(hidden_states_2d, router_logits)
+
+
 def _layer_forward_moe_post(
     self: Any,
     layer_pre_state: tuple[Any, torch.Tensor],
@@ -844,6 +926,40 @@ def _run_merged_or_split_moe_kernels(
     return routed_outs
 
 
+def _run_attn_only_mlp(
+    layer: Any,
+    hs_windows: list[torch.Tensor],
+    res_windows: list[torch.Tensor | None],
+    fc: Any,
+    orig_md: Any,
+    orig_padding: token_padding.TokenPaddingState | None,
+    *,
+    fence: FenceMode,
+) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
+    """Concatenate windows after Attention, run ``layer.forward_mlp`` once, and split back."""
+    num_windows = len(hs_windows)
+    hs_windows = fence_windows(hs_windows, fence)
+    full_hs = torch.cat(hs_windows, dim=0)
+    res_list = [r for r in res_windows if r is not None]
+    full_res = torch.cat(res_list, dim=0) if len(res_list) == num_windows else None
+
+    with _window_context(fc, orig_md, orig_padding):
+        full_hs, full_res = layer.forward_mlp(full_hs, full_res)
+
+    if fence != FenceMode.NONE:
+        full_hs = microbatch_fence(full_hs)
+        if full_res is not None:
+            full_res = microbatch_fence(full_res)
+
+    hs_windows = _split_tokens(full_hs, num_windows)
+    res_windows = (
+        [None] * num_windows
+        if full_res is None
+        else [t for t in _split_tokens(full_res, num_windows)]
+    )
+    return hs_windows, res_windows
+
+
 def _run_layer_substage_staggered(
     layer: Any,
     hs_windows: list[torch.Tensor],
@@ -855,6 +971,9 @@ def _run_layer_substage_staggered(
     *,
     merge_moe: bool,
     fence: FenceMode,
+    orig_md: Any = None,
+    orig_padding: token_padding.TokenPaddingState | None = None,
+    attn_only: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
     """Run one decoder layer with diamond-fenced sub-stage compute/collective overlap.
 
@@ -912,7 +1031,35 @@ def _run_layer_substage_staggered(
             )
 
     mlp = getattr(layer, "mlp", None)
-    if not can_split_moe_stages(mlp):
+    is_fused_ep = _is_fused_ep_moe(mlp)
+    if attn_only:
+        attn_local_last, res_last, out_proj_last, orig_reduce_last = attn_state_prev
+        if fence == FenceMode.WINDOW:
+            attn_local_last = microbatch_fence(attn_local_last)
+        with _window_context(
+            fc, md_windows[num_windows - 1], pad_windows[num_windows - 1]
+        ):
+            hs_windows[num_windows - 1], res_windows[num_windows - 1] = (
+                layer.forward_attn_reduce(
+                    (
+                        attn_local_last,
+                        res_last,
+                        out_proj_last,
+                        orig_reduce_last,
+                    )
+                )
+            )
+        return _run_attn_only_mlp(
+            layer,
+            hs_windows,
+            res_windows,
+            fc,
+            orig_md,
+            orig_padding,
+            fence=fence,
+        )
+
+    if not can_split_moe_stages(mlp) and not (is_fused_ep and merge_moe):
         # Complete Window N-1's attention reduce, then run dense MLP per window.
         attn_local_last, res_last, out_proj_last, orig_reduce_last = attn_state_prev
         if fence == FenceMode.WINDOW:
@@ -973,71 +1120,171 @@ def _run_layer_substage_staggered(
             res_windows[0],
         )
 
-    # --- Sub-stage 2b (w-1) || Sub-stage 2a (w) for w=1..N-1 ---
-    layer_pre_states: list[tuple[Any, torch.Tensor]] = []
-    for w in range(1, num_windows):
-        moe_pc_prev, res_pc_prev = pre_compute_prev
-        (
-            hs_2d_prev,
-            orig_shape_prev,
-            logits_prev,
-            inner_sh_prev,
-            outer_sh_prev,
-        ) = moe_pc_prev
-        if use_substage_pair_fence:
-            logits_prev, hs_windows[w] = microbatch_fence_pair(
-                logits_prev,
-                hs_windows[w],
-            )
-            if inner_sh_prev is not None:
-                inner_sh_prev, hs_windows[w] = microbatch_fence_pair(
-                    inner_sh_prev,
-                    hs_windows[w],
-                )
-            if outer_sh_prev is not None:
-                outer_sh_prev, hs_windows[w] = microbatch_fence_pair(
-                    outer_sh_prev,
-                    hs_windows[w],
-                )
-        elif fence == FenceMode.WINDOW:
-            logits_prev = microbatch_fence(logits_prev)
-            if inner_sh_prev is not None:
-                inner_sh_prev = microbatch_fence(inner_sh_prev)
-            if outer_sh_prev is not None:
-                outer_sh_prev = microbatch_fence(outer_sh_prev)
-
-        pre_compute_fenced = (
+    if is_fused_ep:
+        pre_computes: list[tuple[Any, torch.Tensor]] = []
+        for w in range(1, num_windows):
+            moe_pc_prev, res_pc_prev = pre_compute_prev
             (
                 hs_2d_prev,
                 orig_shape_prev,
                 logits_prev,
                 inner_sh_prev,
                 outer_sh_prev,
-            ),
-            res_pc_prev,
+            ) = moe_pc_prev
+            if use_substage_pair_fence:
+                logits_prev, hs_windows[w] = microbatch_fence_pair(
+                    logits_prev,
+                    hs_windows[w],
+                )
+                if inner_sh_prev is not None:
+                    inner_sh_prev, hs_windows[w] = microbatch_fence_pair(
+                        inner_sh_prev,
+                        hs_windows[w],
+                    )
+                if outer_sh_prev is not None:
+                    outer_sh_prev, hs_windows[w] = microbatch_fence_pair(
+                        outer_sh_prev,
+                        hs_windows[w],
+                    )
+            elif fence == FenceMode.WINDOW:
+                logits_prev = microbatch_fence(logits_prev)
+                if inner_sh_prev is not None:
+                    inner_sh_prev = microbatch_fence(inner_sh_prev)
+                if outer_sh_prev is not None:
+                    outer_sh_prev = microbatch_fence(outer_sh_prev)
+            pre_computes.append(
+                (
+                    (
+                        hs_2d_prev,
+                        orig_shape_prev,
+                        logits_prev,
+                        inner_sh_prev,
+                        outer_sh_prev,
+                    ),
+                    res_pc_prev,
+                )
+            )
+            with _window_context(fc, md_windows[w], pad_windows[w]):
+                pre_compute_prev = layer.forward_moe_pre_compute(
+                    hs_windows[w],
+                    res_windows[w],
+                )
+        pre_computes.append(pre_compute_prev)
+
+        hs_2d_list = [pc[0][0] for pc in pre_computes]
+        logits_list = [pc[0][2] for pc in pre_computes]
+        if use_stage_pair_fence and num_windows > 1:
+            hs_2d_list = fence_windows(hs_2d_list, fence)
+            logits_list = fence_windows(logits_list, fence)
+        cat_hs_2d = torch.cat(hs_2d_list, dim=0)
+        cat_logits = torch.cat(logits_list, dim=0)
+
+        # Couple cat_logits with Window 0's inner_shared_output so Window 0's
+        # shared-expert TP all-reduce on SparseCore overlaps with the 1x
+        # monolithic fused EP MoE kernel on TensorCore.
+        inner_sh_0 = pre_computes[0][0][3]
+        if use_stage_pair_fence and inner_sh_0 is not None:
+            cat_logits, inner_sh_0 = microbatch_fence_pair(cat_logits, inner_sh_0)
+            pc0, res0 = pre_computes[0]
+            pre_computes[0] = (
+                (pc0[0], pc0[1], pc0[2], inner_sh_0, pc0[4]),
+                res0,
+            )
+
+        with _window_context(fc, orig_md, orig_padding):
+            merged_routed_out = layer.forward_moe_monolithic(cat_hs_2d, cat_logits)
+        routed_outs = list(
+            merged_routed_out.view(
+                num_windows, -1, merged_routed_out.shape[-1]
+            ).unbind(0)
         )
-        with _window_context(fc, md_windows[w - 1], pad_windows[w - 1]):
+        dummy_idx = torch.empty(0, dtype=torch.int32, device=cat_hs_2d.device)
+        layer_pre_states = [
+            (
+                (
+                    pc[0][1],
+                    pc[0][3],
+                    pc[0][4],
+                    False,
+                    None,
+                    pc[0][0],
+                    pc[0][2],
+                    dummy_idx,
+                ),
+                pc[1],
+            )
+            for pc in pre_computes
+        ]
+    else:
+        # --- Sub-stage 2b (w-1) || Sub-stage 2a (w) for w=1..N-1 ---
+        layer_pre_states = []
+        for w in range(1, num_windows):
+            moe_pc_prev, res_pc_prev = pre_compute_prev
+            (
+                hs_2d_prev,
+                orig_shape_prev,
+                logits_prev,
+                inner_sh_prev,
+                outer_sh_prev,
+            ) = moe_pc_prev
+            if use_substage_pair_fence:
+                logits_prev, hs_windows[w] = microbatch_fence_pair(
+                    logits_prev,
+                    hs_windows[w],
+                )
+                if inner_sh_prev is not None:
+                    inner_sh_prev, hs_windows[w] = microbatch_fence_pair(
+                        inner_sh_prev,
+                        hs_windows[w],
+                    )
+                if outer_sh_prev is not None:
+                    outer_sh_prev, hs_windows[w] = microbatch_fence_pair(
+                        outer_sh_prev,
+                        hs_windows[w],
+                    )
+            elif fence == FenceMode.WINDOW:
+                logits_prev = microbatch_fence(logits_prev)
+                if inner_sh_prev is not None:
+                    inner_sh_prev = microbatch_fence(inner_sh_prev)
+                if outer_sh_prev is not None:
+                    outer_sh_prev = microbatch_fence(outer_sh_prev)
+
+            pre_compute_fenced = (
+                (
+                    hs_2d_prev,
+                    orig_shape_prev,
+                    logits_prev,
+                    inner_sh_prev,
+                    outer_sh_prev,
+                ),
+                res_pc_prev,
+            )
+            with _window_context(fc, md_windows[w - 1], pad_windows[w - 1]):
+                layer_pre_states.append(
+                    layer.forward_moe_pre_dispatch_route(pre_compute_fenced)
+                )
+
+            with _window_context(fc, md_windows[w], pad_windows[w]):
+                pre_compute_prev = layer.forward_moe_pre_compute(
+                    hs_windows[w],
+                    res_windows[w],
+                )
+
+        # --- Sub-stage 2b (w=N-1): Dispatch + route last window ---
+        with _window_context(
+            fc, md_windows[num_windows - 1], pad_windows[num_windows - 1]
+        ):
             layer_pre_states.append(
-                layer.forward_moe_pre_dispatch_route(pre_compute_fenced)
+                layer.forward_moe_pre_dispatch_route(pre_compute_prev)
             )
 
-        with _window_context(fc, md_windows[w], pad_windows[w]):
-            pre_compute_prev = layer.forward_moe_pre_compute(
-                hs_windows[w],
-                res_windows[w],
-            )
-
-    # --- Sub-stage 2b (w=N-1): Dispatch + route last window ---
-    with _window_context(fc, md_windows[num_windows - 1], pad_windows[num_windows - 1]):
-        layer_pre_states.append(layer.forward_moe_pre_dispatch_route(pre_compute_prev))
-
-    # --- Sub-stage 2c: Routed expert GMM kernel (merged or split) ---
-    routed_outs = _run_merged_or_split_moe_kernels(
-        layer,
-        layer_pre_states,
-        merge_moe=merge_moe,
-        fence=fence,
-    )
+        # --- Sub-stage 2c: Routed expert GMM kernel (merged or split) ---
+        routed_outs = _run_merged_or_split_moe_kernels(
+            layer,
+            layer_pre_states,
+            merge_moe=merge_moe,
+            fence=fence,
+        )
 
     # --- Sub-stage 2d: MoE post (Combine + TP All-Reduce) ---
     for w in range(num_windows):
@@ -1048,11 +1295,32 @@ def _run_layer_substage_staggered(
             )
         if w + 1 < num_windows and use_stage_pair_fence:
             # Chain fence_pair across w=0..N-2 so each window's moe_post is
-            # coupled with the next window's routed_out before its moe_post runs.
+            # coupled with the next window's routed_out (and inner_shared_output)
+            # before its moe_post runs.
             hs_windows[w], routed_outs[w + 1] = microbatch_fence_pair(
                 hs_windows[w],
                 routed_outs[w + 1],
             )
+            next_pre, next_res = layer_pre_states[w + 1]
+            next_inner_sh = next_pre[1]
+            if next_inner_sh is not None:
+                hs_windows[w], next_inner_sh = microbatch_fence_pair(
+                    hs_windows[w],
+                    next_inner_sh,
+                )
+                layer_pre_states[w + 1] = (
+                    (
+                        next_pre[0],
+                        next_inner_sh,
+                        next_pre[2],
+                        next_pre[3],
+                        next_pre[4],
+                        next_pre[5],
+                        next_pre[6],
+                        next_pre[7],
+                    ),
+                    next_res,
+                )
         elif fence == FenceMode.WINDOW:
             hs_windows[w] = microbatch_fence(hs_windows[w])
 
@@ -1070,6 +1338,9 @@ def _run_layer_stagewise(
     *,
     merge_moe: bool,
     fence: FenceMode,
+    orig_md: Any = None,
+    orig_padding: token_padding.TokenPaddingState | None = None,
+    attn_only: bool = False,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
     """Run one decoder layer in stagewise order (when fence != SUBSTAGE)."""
     num_windows = len(hs_windows)
@@ -1092,8 +1363,20 @@ def _run_layer_stagewise(
     if fence == FenceMode.STAGE:
         hs_windows = fence_windows(hs_windows, fence)
 
+    if attn_only:
+        return _run_attn_only_mlp(
+            layer,
+            hs_windows,
+            res_windows,
+            fc,
+            orig_md,
+            orig_padding,
+            fence=fence,
+        )
+
     # --- Stage 2: MoE / MLP across windows 0..N-1 ---
     mlp = getattr(layer, "mlp", None)
+    is_fused_ep = _is_fused_ep_moe(mlp)
     if can_split_moe_stages(mlp):
         layer_pre_states: list[tuple[Any, torch.Tensor]] = []
         for w in range(num_windows):
@@ -1118,6 +1401,58 @@ def _run_layer_stagewise(
             with _window_context(fc, md_windows[w], pad_windows[w]):
                 hs_windows[w], res_windows[w] = layer.forward_moe_post(
                     layer_pre_states[w],
+                    routed_outs[w],
+                )
+            if fence == FenceMode.WINDOW:
+                hs_windows[w] = microbatch_fence(hs_windows[w])
+        if fence == FenceMode.STAGE:
+            hs_windows = fence_windows(hs_windows, fence)
+    elif is_fused_ep and merge_moe:
+        pre_computes: list[tuple[Any, torch.Tensor]] = []
+        for w in range(num_windows):
+            if w > 0 and fence == FenceMode.STAGE:
+                hs_windows[w - 1], hs_windows[w] = microbatch_fence_pair(
+                    hs_windows[w - 1],
+                    hs_windows[w],
+                )
+            with _window_context(fc, md_windows[w], pad_windows[w]):
+                pre_computes.append(
+                    layer.forward_moe_pre_compute(hs_windows[w], res_windows[w])
+                )
+
+        hs_2d_list = [pc[0][0] for pc in pre_computes]
+        logits_list = [pc[0][2] for pc in pre_computes]
+        if fence == FenceMode.STAGE and num_windows > 1:
+            hs_2d_list = fence_windows(hs_2d_list, fence)
+            logits_list = fence_windows(logits_list, fence)
+        cat_hs_2d = torch.cat(hs_2d_list, dim=0)
+        cat_logits = torch.cat(logits_list, dim=0)
+
+        with _window_context(fc, orig_md, orig_padding):
+            merged_routed_out = layer.forward_moe_monolithic(cat_hs_2d, cat_logits)
+        routed_outs = list(
+            merged_routed_out.view(
+                num_windows, -1, merged_routed_out.shape[-1]
+            ).unbind(0)
+        )
+        dummy_idx = torch.empty(0, dtype=torch.int32, device=cat_hs_2d.device)
+        for w, pc in enumerate(pre_computes):
+            pre_state_w = (
+                (
+                    pc[0][1],
+                    pc[0][3],
+                    pc[0][4],
+                    False,
+                    None,
+                    pc[0][0],
+                    pc[0][2],
+                    dummy_idx,
+                ),
+                pc[1],
+            )
+            with _window_context(fc, md_windows[w], pad_windows[w]):
+                hs_windows[w], res_windows[w] = layer.forward_moe_post(
+                    pre_state_w,
                     routed_outs[w],
                 )
             if fence == FenceMode.WINDOW:
@@ -1385,7 +1720,10 @@ def _microbatch_model_forward(
                     fc,
                     fence=fence,
                 )
-            elif schedule == ScheduleMode.STAGGERED or fence == FenceMode.SUBSTAGE:
+            elif (
+                schedule in (ScheduleMode.STAGGERED, ScheduleMode.ATTN_ONLY)
+                or fence == FenceMode.SUBSTAGE
+            ):
                 hs_windows, res_windows = _run_layer_substage_staggered(
                     layer,
                     hs_windows,
@@ -1396,6 +1734,9 @@ def _microbatch_model_forward(
                     fc,
                     merge_moe=merge_moe,
                     fence=fence,
+                    orig_md=orig_md,
+                    orig_padding=orig_padding,
+                    attn_only=(schedule == ScheduleMode.ATTN_ONLY),
                 )
             else:
                 hs_windows, res_windows = _run_layer_stagewise(
@@ -1408,6 +1749,9 @@ def _microbatch_model_forward(
                     fc,
                     merge_moe=merge_moe,
                     fence=fence,
+                    orig_md=orig_md,
+                    orig_padding=orig_padding,
+                    attn_only=(schedule == ScheduleMode.ATTN_ONLY),
                 )
 
         hidden_states = torch.cat(hs_windows, dim=0)
@@ -1460,6 +1804,7 @@ def _instrument_decoder_layer_class(layer_cls: type[nn.Module]) -> None:
         "forward_moe_pre_dispatch_route": _layer_forward_moe_pre_dispatch_route,
         "forward_moe_pre": _layer_forward_moe_pre,
         "forward_moe_kernel": _layer_forward_moe_kernel,
+        "forward_moe_monolithic": _layer_forward_moe_monolithic,
         "forward_moe_post": _layer_forward_moe_post,
         "forward_mlp": _layer_forward_mlp,
     }
@@ -1475,6 +1820,7 @@ def _instrument_moe_block_class(moe_cls: type[nn.Module]) -> None:
         "forward_moe_pre_dispatch_route": _moe_forward_pre_dispatch_route,
         "forward_moe_pre": _moe_forward_pre,
         "forward_moe_kernel": _moe_forward_kernel,
+        "forward_moe_monolithic": _moe_forward_monolithic,
         "forward_moe_post": _moe_forward_post,
     }
     for name, fn in methods.items():
@@ -1531,6 +1877,32 @@ def _find_inner_model(model: nn.Module) -> nn.Module | None:
     return None
 
 
+def _has_tp_collectives(
+    inner: nn.Module | None,
+    vllm_config: VllmConfig | None = None,
+) -> bool:
+    """Return True when Attention or MoE has tensor-parallel (TP > 1) collectives."""
+    if vllm_config is not None:
+        p_cfg = getattr(vllm_config, "parallel_config", None)
+        if p_cfg is not None and getattr(p_cfg, "tensor_parallel_size", 1) > 1:
+            return True
+    if inner is None:
+        return False
+    for layer in _active_layers(inner):
+        _, out_proj = _get_attn_module_and_out_proj(layer)
+        if getattr(out_proj, "tp_size", 1) > 1:
+            return True
+        mlp = getattr(layer, "mlp", None)
+        if getattr(mlp, "tp_size", 1) > 1:
+            return True
+        experts = getattr(mlp, "experts", None)
+        runner = _get_moe_runner(experts) if experts is not None else None
+        moe_config = getattr(runner, "moe_config", None)
+        if getattr(moe_config, "tp_size", 1) > 1:
+            return True
+    return False
+
+
 def unsupported_config_reasons(
     model: nn.Module,
     vllm_config: VllmConfig | None = None,
@@ -1547,10 +1919,12 @@ def unsupported_config_reasons(
 
     if envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0:
         reasons.append("TPU_MOE_COLLECTION_CHUNK_SIZE > 0")
-    if envs.USE_MOE_FUSED_EP_KERNEL:
-        reasons.append("USE_MOE_FUSED_EP_KERNEL=1")
 
     inner = _find_inner_model(model)
+    has_tp = _has_tp_collectives(inner, vllm_config)
+    if envs.USE_MOE_FUSED_EP_KERNEL and not has_tp:
+        reasons.append("USE_MOE_FUSED_EP_KERNEL=1")
+
     if inner is None:
         reasons.append("model has no decoder layers list")
         return reasons
@@ -1580,7 +1954,9 @@ def unsupported_config_reasons(
                 runner, "routed_experts", getattr(experts, "routed_experts", None)
             )
             qm = getattr(routed, "quant_method", None)
-            if getattr(qm, "_use_fused_ep", False) or fused_moe_ep_supported(qm):
+            if not has_tp and (
+                getattr(qm, "_use_fused_ep", False) or fused_moe_ep_supported(qm)
+            ):
                 reasons.append("FusedMoE quant_method._use_fused_ep=True")
                 break
 
@@ -1598,11 +1974,22 @@ def install_microbatch(
 
     # Ensure custom decoder layers / MoE blocks (e.g. in unit tests) also have
     # the stage/sub-stage methods attached.
+    uses_fused_ep = False
     for layer in _active_layers(inner):
         _instrument_decoder_layer_class(type(layer))
         mlp = getattr(layer, "mlp", None)
         if isinstance(mlp, nn.Module):
             _instrument_moe_block_class(type(mlp))
+            if _is_fused_ep_moe(mlp):
+                uses_fused_ep = True
+
+    if (
+        (uses_fused_ep or envs.USE_MOE_FUSED_EP_KERNEL)
+        and isinstance(config.schedule, str)
+        and config.schedule.strip() == ""
+        and not config.layerwise
+    ):
+        config = replace(config, schedule=ScheduleMode.STAGGERED)
 
     inner_any: Any = inner
     model_any: Any = model
