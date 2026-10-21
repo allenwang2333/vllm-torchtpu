@@ -70,9 +70,11 @@ pytest tests/kernels/test_dsv41_paged_mqa_logits.py -q
 
 Repeat with seed 2027. The benchmark JSON uses host `block_until_ready` timing;
 the device figures below come from XProf XLA Ops. XLA Modules additionally
-include output layout conversion. Do not compare these timing scopes directly.
-The `[T,1,N]` DMA output currently needs a layout conversion to the returned
-`[T,N]` tensor. Packing and reference checks are outside kernel timing.
+include surrounding device operations. Do not compare these timing scopes directly.
+The historical `[T,1,N]` DMA output needed conversion to the returned `[T,N]`
+tensor. The current kernel writes directly to `[T,N]` using two-dimensional
+single-row DMA slices; see the direct-output comparison below. Packing and
+reference checks are outside kernel timing.
 
 ## Measurements
 
@@ -91,8 +93,8 @@ the mean of two seed medians, with five device samples per seed.
 
 All 16 native checks and 12 full-size checks passed in that experiment. The
 source hashes and individual seed measurements are in
-`paged_mqa_fp8_results.json`. This checkpoint removes the interpreter code and
-formats the native implementation; subsequent ablation results are recorded
+`paged_mqa_fp8_results.json`. The initial checkpoint removed the interpreter
+code and formatted the native implementation; subsequent results are recorded
 separately in that JSON.
 
 Falcon `exp-f4z6frgpyy`, analysis `an-m39u778h97`, then compared epilogues at the
@@ -102,7 +104,7 @@ after excluding imports, docstrings, and exception message text from AST compari
 
 | Epilogue | Kernel time (µs) | Module time (µs) |
 | --- | ---: | ---: |
-| Staged MXU reduction (this branch) | 897.60 | 989.40 |
+| Staged MXU reduction (initial checkpoint) | 897.60 | 989.40 |
 | VPU reduction with BF16 rounding | 1021.04 | 1113.25 |
 | VPU reduction with FP32 logits | 892.06 | 984.16 |
 
@@ -151,8 +153,9 @@ Other measured variants were rejected: smaller math groups, repeated steady
 loops instead of full unrolling, and removal of the scale rings alone were
 slower. The 48K and 96K K tiles were also slower than 32K. Native tests cover
 selected tile configurations; explicit `query_tile=5, key_tile=512` triggered
-an existing libtpu 0.0.50 output-DMA layout failure in the original pipeline.
-Detailed measurements and source hashes are in `paged_mqa_fp8_results.json`.
+an output-DMA layout failure in the original pipeline under libtpu 0.0.50.
+The direct-output change below also fixes that case. Detailed measurements and
+source hashes are in `paged_mqa_fp8_results.json`.
 
 A final run (`exp-o0ftn9bnzl`, artifact `art-j7t3dm8gd8`, analysis
 `an-3xlth3rce0`) replaced complementary bank-selection and prefetch branches
@@ -160,11 +163,37 @@ with one conditional each. The staged 32K kernel measured 796.16 µs before
 this cleanup and 795.86 µs afterward; this difference is within timing
 variation. The original 16K control measured 891.97 µs in the same run.
 Final module time was 887.43 µs, including the existing output conversion.
-All 16 native checks and six full-shape comparisons passed. The maintained
-code AST matches this final variant after removing docstrings.
+All 16 native checks and six full-shape comparisons passed. The code at
+`e1054febd` matches this variant's AST after removing docstrings.
 
-The approximately 92 µs module/kernel gap includes a materialized conversion
-from the kernel's `[T,1,N]` DMA layout to the returned `[T,N]` layout. At
+Before direct output, the approximately 92 µs module/kernel gap included a
+materialized conversion from the kernel's `[T,1,N]` DMA layout to the returned
+`[T,N]` layout. At
 288 queries and 98,304 positions, the logical FP32 output is 108 MiB. Module
 time is the relevant device duration when the caller needs the returned tensor;
 the scorer-only timing excludes this extra work.
+
+## Direct two-dimensional output
+
+Falcon `exp-rysox43mh8`, artifact `art-l8smsanokh`, analysis `an-osmqlywm24`
+compares the `e1054febd` pipeline with direct output at the same 32K K tile,
+depth eight, four K buffers, 96K context, software versions, and two seeds:
+
+| Output | Kernel time (µs) | Module time (µs) |
+| --- | ---: | ---: |
+| `[T,1,N]` followed by layout conversion | 794.25 | 886.20 |
+| Direct `[T,N]` | 796.93 | 800.16 |
+
+Direct output reduces complete module latency by 9.71%. The scorer itself is
+2.68 µs slower, but the separate output conversion is gone: `copy.4` takes
+88.60 µs in the control and is absent from the candidate's native XProf trace
+and local final LLO. About 3.23 µs of input-copy and module overhead remains.
+QK, weighting, precision, buffer allocation, and pipeline scheduling are unchanged.
+
+DMA now uses size-one row slices on both refs instead of squeezing the row
+axis. This permits writing directly into the final tiled two-dimensional
+output without an intermediate HBM result. All 12 candidate native checks,
+four baseline native checks, and two full-size comparisons passed. Tests cover
+ragged groups crossing row boundaries, trailing partial tiles, empty groups,
+page holes, arbitrary positive scales, one/two K banks, and two/four K buffers.
+The previously failing `query_tile=5, key_tile=512` case also passes.

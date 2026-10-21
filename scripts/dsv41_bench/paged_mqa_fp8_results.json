@@ -176,13 +176,13 @@
       "iteration34_full_shape_comparisons": 6,
       "iteration35_native": 8,
       "iteration35_full_shape_comparisons": 6,
-      "source_equivalence": "Maintained code AST matches iteration36 both variant after removing docstrings; formatting differs.",
+      "source_equivalence": "Code at e1054febd matches iteration36 both variant after removing docstrings; formatting differs.",
       "iteration36_native": 16,
       "iteration36_full_shape_comparisons": 6
     },
     "limitations": [
       "400us target not met.",
-      "Explicit query_tile=5 and key_tile=512 triggers pre-existing output DMA layout compilation failure in libtpu 0.0.50.",
+      "At this checkpoint, query_tile=5 and key_tile=512 triggered a pre-existing output DMA layout compilation failure. The later direct_2d_output change fixes this case.",
       "No serving or model-quality validation."
     ],
     "experiments": [
@@ -364,5 +364,80 @@
       }
     ],
     "raw_samples_file": "paged_mqa_fp8_followup.jsonl"
+  },
+  "direct_2d_output": {
+    "baseline_commit": "e1054febd",
+    "experiment_id": "exp-rysox43mh8",
+    "artifact_id": "art-l8smsanokh",
+    "analysis_id": "an-osmqlywm24",
+    "shape": {
+      "groups": 48,
+      "queries_per_group": 6,
+      "heads": 32,
+      "head_dim": 128,
+      "context": 98304,
+      "visible_tokens": 98287,
+      "page_records": 128
+    },
+    "versions": {
+      "jax": "0.11.2",
+      "jaxlib": "0.11.2",
+      "libtpu": "0.0.50"
+    },
+    "config": {
+      "query_tile": 6,
+      "query_group": 6,
+      "key_tile": 32768,
+      "issue_depth": 8,
+      "key_buffers": 4
+    },
+    "timing": "Mean of two seed medians; five XProf samples per seed. module_us includes all device operations.",
+    "summary": {
+      "control": {
+        "kernel_us": 794.2533765,
+        "module_us": 886.2035185,
+        "ops_median_us": {
+          "copy.1.refs_6_": 1.630214,
+          "copy.4": 88.6043295,
+          "copy.refs_3_": 1.624812,
+          "paged_mqa_logits.1": 794.2533765
+        }
+      },
+      "direct": {
+        "kernel_us": 796.931047,
+        "module_us": 800.1625525,
+        "ops_median_us": {
+          "copy.1.refs_6_": 1.614496,
+          "copy.refs_3_": 1.6464965,
+          "paged_mqa_logits.1": 796.931047
+        }
+      }
+    },
+    "module_latency_reduction_percent": 9.708939786837467,
+    "mechanism": "Keep source and destination row axes as size-one slices in DMA; write final FP32 [T,N] directly, removing the unit output axis and reshape. Output copy.4 absent from native XProf and local final LLO.",
+    "validation": {
+      "baseline_native": 4,
+      "direct_native": 12,
+      "full_shape_comparisons": 2,
+      "tolerance": {
+        "rtol": 2e-05,
+        "atol": 0.0001
+      },
+      "coverage": "One/two K banks, two/four K buffers, ragged and empty groups, row boundaries, partial output tiles, page holes, arbitrary positive scales, query_tile=5.",
+      "source_equivalence": "Maintained kernel AST and test bodies match tested sources after formatting; test parametrization replaces manual case invocation."
+    },
+    "source_sha256": {
+      "logits_control.py": "3f69d987ec527af6c61012515be7d7b3db9a56fd23917fb267bf67985a7eb630",
+      "logits_direct.py": "de45f1a6575c9429750d29b1d6a536ea4d9f701a8b360ff7dc6ae851198cf66b",
+      "pipeline_direct.py": "395825fe2b702d0938bd6931bdfd95d8d82d636e75470e68b295df70c7301d1f",
+      "test_native.py": "54ea1e8936c7bf004dbe3d1450862dcb36ffc1b4ccc452c9ad6a6e474e39f352",
+      "run_fast.py": "6cc547b6fa8663bf6bdf7527f6af70fe77417d8030945be62851cc1330a02960"
+    },
+    "raw_samples_file": "paged_mqa_fp8_followup.jsonl",
+    "limitations": [
+      "Standalone scorer; not integrated into serving.",
+      "400us target not met.",
+      "Full environment type checking not run."
+    ]
   }
 }

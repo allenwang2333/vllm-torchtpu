@@ -233,11 +233,11 @@ class MQAOps:
 
             @pl.when(local < self.count)
             def copy(local=local):
+                # Preserve the row axis for DMA into the final tiled 2D layout.
                 transfer = pltpu.make_async_copy(
-                    self.scores.at[slot, local],
+                    self.scores.at[slot, pl.ds(local, 1)],
                     self.out.at[
-                        self.state.query.start + local,
-                        0,
+                        pl.ds(self.state.query.start + local, 1),
                         pl.ds(
                             tile * self.plan.config.key_tile, self.plan.config.key_tile
                         ),
@@ -551,8 +551,7 @@ def paged_mqa_logits(
 
     return pl.pallas_call(
         kernel,
-        # The unit axis makes each row contiguous for individual output DMAs.
-        out_shape=jax.ShapeDtypeStruct((tokens, 1, width), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             grid=(1,),
@@ -573,6 +572,4 @@ def paged_mqa_logits(
             disable_bounds_checks=True,
         ),
         name="paged_mqa_logits",
-    )(
-        query_start_loc, lengths, q, weights, banks, block_table, q_scale, scales
-    ).reshape(tokens, width)
+    )(query_start_loc, lengths, q, weights, banks, block_table, q_scale, scales)

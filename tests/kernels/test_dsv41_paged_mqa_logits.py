@@ -70,10 +70,14 @@ def reference(inputs, native, page_records, q_scale=None, k_scale=None):
 
 @pytest.mark.parametrize("banks,page_records", [(1, 128), (2, 128)])
 @pytest.mark.parametrize("key_buffers", [2, 4])
-def test_paged_mqa_fp8_scales(banks, page_records, key_buffers):
+@pytest.mark.parametrize(
+    "counts,query_tile",
+    [((0, 1, 0, 3, 1, 0), 2), ((0, 1, 7, 2, 0, 9), 6), ((0, 1, 0, 3, 1, 0), 5)],
+)
+def test_paged_mqa_fp8_scales(banks, page_records, key_buffers, counts, query_tile):
     if jax.default_backend() != "tpu":
         pytest.skip("Requires native TPU v7 FP8 MXU")
-    inputs, native = make_inputs((0, 1, 0, 3, 1, 0), 1024, page_records, banks)
+    inputs, native = make_inputs(counts, 1024, page_records, banks)
     q, weights, _, pages, _, offsets = inputs
     rng = np.random.default_rng(451)
     q = q.astype(jnp.float8_e4m3fn)
@@ -81,7 +85,7 @@ def test_paged_mqa_fp8_scales(banks, page_records, key_buffers):
     q_scale = jnp.asarray(rng.uniform(0.25, 2, q.shape[:2]), jnp.float32)
     key_scales = jnp.asarray(rng.uniform(0.25, 2, keys.shape[:1]), jnp.float32)
     pool = keys if banks == 1 else tuple(jnp.split(keys, 2))
-    lengths = jnp.array([0, 1024, 513, 37, 257], jnp.int32)
+    lengths = jnp.asarray(np.resize([0, 1024, 513, 37, 257], sum(counts)), jnp.int32)
     inputs = q, weights, pool, pages, lengths, offsets
     packed = pack_pages(keys, key_scales)
     packed_pool = packed if banks == 1 else tuple(jnp.split(packed, 2))
@@ -95,7 +99,7 @@ def test_paged_mqa_fp8_scales(banks, page_records, key_buffers):
         page_records=page_records,
         q_scale=q_scale,
         config=PagedMQAConfig(
-            query_tile=2,
+            query_tile=query_tile,
             query_group=1,
             key_tile=512,
             issue_depth=2,
