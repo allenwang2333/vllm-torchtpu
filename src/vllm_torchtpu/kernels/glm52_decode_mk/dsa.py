@@ -634,7 +634,9 @@ def make(E):
                 count: count_k = above + sum_{j >= k} bin_j. Exactly stage A's compare counts, en / wrap included."""
                 cpref = jnp.where(en, pref ^ INT_MIN, INT_MAX)
                 cu = pref + shl(jnp.int32(16), sh)
-                wrap = (cu ^ INT_MIN) < (pref ^ INT_MIN)                             # bracket end past 2^32
+                # bracket end past 2^32: an unsigned overflow of pref + 16 << sh, or 16 << sh itself >= 2^32 (sh >= 28,
+                # the first round), which int32 wraps to 0 without tripping the overflow test (T2 j-104eabdd: RED)
+                wrap = ((cu ^ INT_MIN) < (pref ^ INT_MIN)) | (sh >= 32 - 4)
                 cend = jnp.where(en & ~wrap, cu ^ INT_MIN, INT_MAX)
                 one = jnp.ones((8, 128), I32)
                 z = jnp.zeros((8, 128), I32)
