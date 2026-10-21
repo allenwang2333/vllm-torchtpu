@@ -175,6 +175,28 @@ def test_chunk_buckets_follow_the_final_block_when_aligned():
     assert runner.num_tokens_paddings.count(4352) == 1
 
 
+def test_chunk_buckets_reach_the_drafters_compile_config():
+    # An MTP/EAGLE drafter compiles under its own config copy; a bucket the
+    # target pads to that the draft never compiled fails at warmup.
+    runner = _bucket_runner([16, 4096, 8192, 16384], 4352, True, "none")
+    runner.drafter = SimpleNamespace(
+        draft_vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(compile_sizes=[16, 4096, 8192, 16384])
+        )
+    )
+    runner._add_pipeline_chunk_buckets()
+    assert runner.drafter.draft_vllm_config.compilation_config.compile_sizes == (
+        runner.num_tokens_paddings
+    )
+
+
+def test_chunk_buckets_without_a_drafter():
+    runner = _bucket_runner([16, 4096, 8192, 16384], 4352, True, "none")
+    runner.drafter = None
+    runner._add_pipeline_chunk_buckets()
+    assert 2048 in runner.num_tokens_paddings
+
+
 def test_chunk_buckets_use_an_eighth_step_without_alignment():
     runner = _bucket_runner([16, 4096, 8192, 16384], 4352, True, "none")
     runner._add_pipeline_chunk_buckets()

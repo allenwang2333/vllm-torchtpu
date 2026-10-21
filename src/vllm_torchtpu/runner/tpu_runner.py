@@ -5968,6 +5968,15 @@ class TPUModelRunner(GPUModelRunner):
             self.vllm_config.compilation_config.compile_sizes = list(
                 self.num_tokens_paddings
             )
+            # The draft compiles under its own copy of the compilation
+            # config, taken when it was loaded, and pads to these buckets too.
+            draft_config = getattr(
+                getattr(self, "drafter", None), "draft_vllm_config", None
+            )
+            if draft_config is not None:
+                draft_config.compilation_config.compile_sizes = list(
+                    self.num_tokens_paddings
+                )
         logger.info(
             "Pipeline chunks: granularity %d tokens (KV block %d, block "
             "aligned %s), buckets added %s",
