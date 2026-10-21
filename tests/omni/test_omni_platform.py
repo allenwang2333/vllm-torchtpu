@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -6,13 +18,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
+from .mock_omni import (  # isort: split
+    _MockRMSNorm,
+    _MockRotaryEmbeddingWan,
+    vllm_omni_mock,
+)
 
 import vllm_omni
-from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
+from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
     TpuFlashAttentionImpl,
@@ -26,8 +42,11 @@ from vllm_torchtpu.omni.patches import (
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.rope import (
+    _pair_swap_matrix,
     apply_rotary_pair_swap,
+    can_fuse_qk_norm_rope,
     rotary_embedding_wan_forward,
+    wan_self_attention_fused,
 )
 
 pytestmark = pytest.mark.omni
@@ -241,6 +260,21 @@ def test_shared_slicebuilder_addresses(monkeypatch):
     )
 
 
+def test_offload_dense_all_to_all(monkeypatch):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+    # An explicit user setting wins.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", f"{flag}=false")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=false"
+    monkeypatch.delenv("LIBTPU_INIT_ARGS")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
+
+
 def test_dist_backend_after_world_size_pop(monkeypatch):
     # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
     # size set_device recorded must keep multi-rank groups on tpu_dist.
@@ -342,54 +376,6 @@ def test_vllm_omni_is_mocked():
     assert not hasattr(vllm_omni, "__file__") or vllm_omni.__file__ is None
 
 
-def test_ltx2_safe_decode_output():
-    apply_omni_model_specific_patches()
-
-    class TrackedTensor(torch.Tensor):
-        cpu_called: bool = False
-
-        def cpu(self, *args, **kwargs):
-            self.cpu_called = True
-            return super().cpu(*args, **kwargs)
-
-    runtime = ltx2_runtime.LTXRuntime()
-
-    decode_kwargs = dict(
-        latents=torch.randn(1, 128, 4, 4),
-        audio_latents=torch.randn(1, 8, 16),
-        output_type="pt",
-        connector_prompt_embeds=torch.randn(1, 10, 64),
-        generator=None,
-        device=torch.device("cpu"),
-        decode_timestep=0.0,
-        decode_noise_scale=None,
-        prompt_batch_size=1,
-    )
-
-    # Case 1: Video and audio are both Tensors (verify .cpu() is invoked)
-    v = torch.randn(1, 3, 16, 16).as_subclass(TrackedTensor)
-    a = torch.randn(1, 100).as_subclass(TrackedTensor)
-    runtime.output = (v, a)
-    res = runtime._decode_output(**decode_kwargs)
-    assert v.cpu_called is True
-    assert a.cpu_called is True
-    assert res.output[0].device.type == "cpu"
-    assert res.output[1].device.type == "cpu"
-
-    # Case 2: Video is Tensor, audio is None
-    v = torch.randn(1, 3, 16, 16).as_subclass(TrackedTensor)
-    runtime.output = (v, None)
-    res = runtime._decode_output(**decode_kwargs)
-    assert v.cpu_called is True
-    assert res.output[0].device.type == "cpu"
-    assert res.output[1] is None
-
-    # Case 3: Both are None (verify non-tensor outputs pass through safely)
-    runtime.output = (None, None)
-    res = runtime._decode_output(**decode_kwargs)
-    assert res.output == (None, None)
-
-
 @pytest.mark.parametrize(
     "rope_cls_name",
     ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
@@ -413,51 +399,39 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
 
 
 def test_safe_pack_tensor_if_large():
-    from unittest.mock import MagicMock
-
     from vllm_omni.diffusion import ipc
 
-    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
-
-    # Provide an original pack function to mock_omni's ipc
-    orig_mock = MagicMock(
-        side_effect=lambda tensor, d2h_stream=None: {
-            "packed": True,
-            "device": getattr(tensor, "device", None).type
-            if hasattr(tensor, "device")
-            else "unknown",
-        }
-    )
-    ipc._pack_tensor_if_large = orig_mock
+    orig_pack = MagicMock()
+    ipc._pack_tensor_if_large = orig_pack
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
 
-    class MockDeviceTensor:
-        def __init__(self, device_type="tpu"):
-            self.device = MagicMock()
-            self.device.type = device_type
-            self.cpu_called = False
+    cpu_tensor = torch.empty(1, device="cpu")
+    tpu_tensor = MagicMock()
+    tpu_tensor.cpu.return_value = cpu_tensor
+    created = []
 
-        def cpu(self):
-            self.cpu_called = True
-            return torch.empty(1, device="cpu")
+    res = ipc._pack_tensor_if_large(
+        tpu_tensor, "stream", created, enable_registered_shm=True
+    )
 
-    t = MockDeviceTensor("tpu")
-    res = ipc._pack_tensor_if_large(t)
-    assert t.cpu_called is True
-    assert res["device"] == "cpu"
+    tpu_tensor.cpu.assert_called_once_with()
+    orig_pack.assert_called_once_with(
+        cpu_tensor, "stream", created, enable_registered_shm=True
+    )
+    assert res is orig_pack.return_value
 
 
-def test_omni_tpu_patches_configuration(monkeypatch):
+def test_omni_tpu_patches_configuration():
     # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var, F.interpolate).
-    orig_interpolate = torch.nn.functional.interpolate
-    monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    # restore the process-global state it edits (env var).
+    orig = torch.nn.functional.interpolate
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+        assert torch.nn.functional.interpolate is orig
 
 
 def test_startup_warmup_device_sync(monkeypatch):
@@ -477,3 +451,86 @@ def test_startup_warmup_device_sync(monkeypatch):
 
     DiffusionEngine.run_startup_warmup(object())
     assert calls == ["warmup", "sync"]
+
+
+def _rms_norm(x, w, eps):
+    x32 = x.float()
+    out = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (w.float() * out).to(x.dtype)
+
+
+def _reference_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
+    # Semantics of the fused kernel: (T, 3C) in, repeated-pair tables.
+    dim = qkv.shape[1] // 3
+    swap = _pair_swap_matrix(head_dim, qkv.dtype, qkv.device)
+    outs = []
+    for j, w in ((0, wq), (1, wk)):
+        y = _rms_norm(qkv[:, j * dim : (j + 1) * dim], w, eps)
+        y = y.unflatten(1, (-1, head_dim))
+        out = y * cos[:, None] + (y @ swap) * sin[:, None]
+        outs.append(out.flatten(1))
+    return tuple(outs)
+
+
+class _FakeWanSelfAttention(torch.nn.Module):
+    def __init__(self, dim=64, heads=2, head_dim=128):
+        super().__init__()
+        self.num_heads = self.num_kv_heads = heads
+        self.head_dim = head_dim
+        self.qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
+        self.norm_q = _MockRMSNorm(heads * head_dim)
+        self.norm_k = _MockRMSNorm(heads * head_dim)
+        with torch.no_grad():
+            self.norm_q.weight.uniform_(0.5, 1.5)
+            self.norm_k.weight.uniform_(0.5, 1.5)
+        self.to_gate_compress = None
+        self.to_out = torch.nn.Identity()
+        self.dropout = torch.nn.Identity()
+
+    def to_qkv(self, x):
+        return self.qkv(x), None
+
+    def attn(self, q, k, v, attn_metadata=None):
+        return q * 3 + k * 2 + v
+
+
+def test_wan_self_attention_fused_matches_native(monkeypatch):
+    # The fused forward's glue (flattening, tables, value slice) around the
+    # kernel reproduces vLLM-Omni's norm -> unflatten -> RoPE -> attention.
+    torch.manual_seed(0)
+    attn = _FakeWanSelfAttention()
+    batch, seq, half = 2, 5, attn.head_dim // 2
+    x = torch.randn(batch, seq, 64)
+    cos, sin = torch.randn(1, seq, 1, half), torch.randn(1, seq, 1, half)
+    monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", lambda: _reference_qk_norm_rope)
+    out = wan_self_attention_fused(attn, x, (cos, sin))
+
+    qkv, _ = attn.to_qkv(x)
+    q, k, v = qkv.split(attn.num_heads * attn.head_dim, dim=-1)
+    shape = (attn.num_heads, attn.head_dim)
+    q = _rms_norm(q, attn.norm_q.weight, 1e-6).unflatten(2, shape)
+    k = _rms_norm(k, attn.norm_k.weight, 1e-6).unflatten(2, shape)
+    q = apply_rotary_pair_swap(q, cos, sin)
+    k = apply_rotary_pair_swap(k, cos, sin)
+    want = attn.attn(q, k, v.unflatten(2, shape)).flatten(2, 3)
+    torch.testing.assert_close(out, want)
+
+
+def test_can_fuse_qk_norm_rope():
+    attn = _FakeWanSelfAttention()
+    rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
+    bf16_x = torch.ones(1, 3, 64, dtype=torch.bfloat16)
+    assert can_fuse_qk_norm_rope(attn, bf16_x, rot)
+    assert not can_fuse_qk_norm_rope(attn, torch.ones(1, 3, 64), rot)
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, None)
+    attn.norm_q = torch.nn.LayerNorm(8)  # e.g. DistributedRMSNorm under TP
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, rot)
+
+
+def test_wan_self_attention_patch_falls_back_on_f32():
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanSelfAttention,
+    )
+
+    apply_omni_model_specific_patches()
+    assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"

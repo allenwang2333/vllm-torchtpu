@@ -438,6 +438,81 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
+def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        max_num_reqs=max_reqs,
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+
+
+@pytest.mark.parametrize(
+    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
     attempts = MagicMock(side_effect=[False, True, True])
     runner = SimpleNamespace(
@@ -2850,34 +2925,49 @@ def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
     assert runner._pre_async_results is None
 
 
-@pytest.mark.parametrize("max_logprobs", [0, 2])
-def test_gather_logprobs_computes_in_fp32(max_logprobs):
-    # Row 0 has a dominant logit (10.0 vs 4.0): in bfloat16, logsumexp rounds
-    # to 10.0 and collapses the selected token's logprob to 0.0.
-    logits = torch.tensor(
-        [[10.0, 4.0, 0.0, -2.0], [1.0, 3.0, 2.5, -1.0]],
-        dtype=torch.bfloat16,
-    )
-    sampled_tokens = torch.tensor([[0], [2]], dtype=torch.int32)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
+    """Covers bf16 and fp32 inputs, large-offset logits, a sampled token outside
+    the top-k, and a row with a single finite logit."""
     runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    logits = torch.tensor(
+        [
+            [20, 16, 15, 13, 12],
+            [84, 80, 79, 77, 76],
+            [20, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=dtype,
+    )
+    original_logits = logits.clone()
+    sampled_tokens = torch.tensor([[0], [4], [0]])
 
     with torch.compiler.set_stance("force_eager"):
-        out = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
+        result = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
 
-    ref_log_probs = logits.log_softmax(dim=-1, dtype=torch.float32)
-    expected_ids = sampled_tokens.to(torch.int64)
-    if max_logprobs > 0:
-        topk_ids = torch.topk(logits, max_logprobs, dim=-1).indices
-        expected_ids = torch.cat((expected_ids, topk_ids), dim=1)
-    expected_logprobs = ref_log_probs.gather(-1, expected_ids)
-
-    assert out.logprobs.dtype == torch.float32
-    assert out.logprobs[0, 0].item() < -1e-3
-    assert torch.equal(out.logprobs, expected_logprobs)
-    assert torch.equal(out.logprob_token_ids, expected_ids.to(torch.int32))
-    assert torch.equal(
-        out.selected_token_ranks, torch.tensor([1, 2], dtype=torch.int32)
+    # log(1 + exp(-4) + exp(-5) + exp(-7) + exp(-8)), independently in FP64.
+    log_normalizer = 0.02596100830585109
+    expected = torch.tensor(
+        [
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=torch.float64,
     )
+    assert result.logprobs.dtype == torch.float32
+    assert result.logprobs.shape == (3, max_logprobs + 1)
+    assert result.logprob_token_ids[:, 0].tolist() == [0, 4, 0]
+    assert result.selected_token_ranks.tolist() == [1, 5, 1]
+    if max_logprobs:
+        assert result.logprob_token_ids[:2, 1:].tolist() == [[0, 1, 2], [0, 1, 2]]
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
 
 
 def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
@@ -2925,6 +3015,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         top_p,
         all_greedy=False,
         topk_candidates=0,
+        apply_topk_topp=True,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -2936,19 +3027,22 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         torch.ones((2, 1), dtype=torch.float32),
     )
 
-    # 1. _precompile_sample_from_logits
-    precompile_runner = SimpleNamespace(
-        num_reqs_paddings=[2],
-        _hidden_states_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: 0,
-        _precompile_timed=lambda _name: contextlib.nullcontext(),
-        sample_from_logits_func=fake_sample_from_logits,
-    )
-    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-    assert seen_u_dtypes == [torch.float32, torch.float32]
-    seen_u_dtypes.clear()
+    # 1. _precompile_sample_from_logits: two graphs without speculative
+    # decoding, plus the no-top-k/top-p graph with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+        precompile_runner = SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: 0,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+        assert seen_u_dtypes == [torch.float32] * num_graphs
+        seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -2964,6 +3058,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         ),
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_applies_topk_topp=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -3000,6 +3095,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
+            _pp_wave=None,
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3034,6 +3130,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             ),
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
@@ -3042,6 +3140,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,

@@ -2,12 +2,12 @@
 
 `vllm-torchtpu` supports **6D composable parallelism** across single-host and multi-host Cloud TPU slices:
 
-1. **Tensor Parallelism (TP)**: `--tensor-parallel-size`
-2. **Data Parallelism (DP)**: `--data-parallel-size`
-3. **Pipeline Parallelism (PP)**: `--pipeline-parallel-size`
-4. **Expert Parallelism (EP)**: `--enable-expert-parallel`
-5. **Prefill Context Parallelism (PCP)**: `--prefill-context-parallel-size`
-6. **Decode Context Parallelism (DCP)**: `--decode-context-parallel-size`
+- **Tensor Parallelism (TP)**: `--tensor-parallel-size`
+- **Data Parallelism (DP)**: `--data-parallel-size`
+- **Pipeline Parallelism (PP)**: `--pipeline-parallel-size`
+- **Expert Parallelism (EP)**: `--enable-expert-parallel`
+- **Prefill Context Parallelism (PCP)**: `--prefill-context-parallel-size`
+- **Decode Context Parallelism (DCP)**: `--decode-context-parallel-size`
 
 ---
 
@@ -96,6 +96,8 @@ vllm serve meta-llama/Llama-3.1-70B-Instruct \
 ```
 
 By default, `TPU_PP_DYNAMIC_CHUNKS=1` dynamically sizes microbatch chunks to keep pipeline bubbles minimal without recompiling static token buckets.
+
+A pipeline stage may also span a prefill context-parallel group (`--prefill-context-parallel-size`), splitting each chunk's attention across the stage's cores (MoE models then require `--enable-expert-parallel`). On dual-core TPU v7x hosts, a two-core stage must not bind the two cores of a single physical chip: set `VLLM_TPU_DEVICE_ORDER` to the device each local rank binds (for example, `0,2,1,3,4,6,5,7` for four two-core stages on one host).
 
 ---
 

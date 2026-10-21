@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Qwen3.5 MTP drafts that one pipeline stage hosts whole."""
 
 from typing import Any, ClassVar, Literal, cast
@@ -74,11 +86,12 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
     """Upstream's draft, admitted under pipeline parallelism.
 
     vLLM's config check requires every model under a pipeline to satisfy
-    `SupportsPP`, which `supports_pp` tests by attribute (the protocol's
-    `forward` signature differs from a draft's, so the class is not a
-    subclass). The pipeline never splits this draft: the last stage builds
-    and runs it whole, and the predictor's forward above takes its embedding
-    branch there.
+    `SupportsPP`; the upstream class inherits it and sets
+    `make_empty_intermediate_tensors` on the instance in `__init__`, so this
+    subclass must not shadow that attribute with a read-only property (doing
+    so fails the assignment: "property ... has no setter"). The pipeline never
+    splits this draft: the last stage builds and runs it whole, and the
+    predictor's forward above takes its embedding branch there.
     """
 
     supports_pp: ClassVar[Literal[True]] = True

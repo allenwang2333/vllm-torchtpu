@@ -7,6 +7,8 @@ This page has two sections:
 - [Validated Models](#validated-models) — Models running on TPU, which checkpoints are tested, and in which way.
 - [Feature Support](#feature-support) — Supported features, how to turn them on, and which models they have been validated with.
 
+Both tables describe what is supported **today**. For planned models and features, see the [Roadmap](../roadmap.md).
+
 Validation levels used in both tables:
 
 | Level | Meaning |
@@ -39,7 +41,7 @@ Click a family to see its architecture-specific TPU support.
 
 </div>
 
-See the [TPU v7x](../deployment/v7x_recipes.md) and [TPU v6e](../deployment/v6e_recipes.md) serving recipes for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints.
+See the [TPU v7x serving recipes](../deployment/v7x_recipes.md) for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints. The [TPU v6e serving recipes](../deployment/v6e_recipes.md) are reference configurations that are not run in CI.
 
 ---
 
@@ -55,7 +57,7 @@ All features below are merged in `main`. "Validated with" lists the models and v
 | **Multi-head Latent Attention (MLA)** | Automatic for MLA architectures; `TPU_SPARSE_MLA_NOPE_LAYOUT` / `TPU_SPARSE_MLA_ROPE_LAYOUT`, `TPU_LATENT_PROJ_INTRA_CHIP_TP`, `TPU_MLA_MASKED_DENSE_ENABLED` | <ul><li>✅ DeepSeek-V2</li><li>🌙 DeepSeek-V4</li><li>✅ Kimi-K3</li><li>🌙 GLM-5.2</li></ul> | — |
 | **Hybrid linear attention (GDN / KDA)** | Automatic for hybrid architectures; `TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1` shares one block pool between linear-attention state and KV cache | <ul><li>✅ Qwen3.5-35B</li><li>🌙 Qwen3.5-397B</li><li>✅ Kimi-K3</li><li>🧪 Kimi-Linear</li></ul> | — |
 | **Tensor / Data / Expert parallelism** | `--tensor-parallel-size`, `--data-parallel-size`, `--enable-expert-parallel`; `TPU_MOE_HIERARCHICAL_EP=1` on dual-core TPU v7x | <ul><li>Every CI recipe, from `TP=1, DP=8 + EP` to `TP=32 + EP`</li></ul> | [Parallelism](parallelism.md) |
-| **Pipeline & context parallelism (PP, PCP, DCP)** | `--pipeline-parallel-size`, `--prefill-context-parallel-size`, `--decode-context-parallel-size`; `TPU_PP_DYNAMIC_CHUNKS`, `TPU_PCP_TOPOLOGY_AWARE_MESH`, `TPU_DCP_LSE_MERGE_A2A` | <ul><li>PCP + DCP:<ul><li>✅ Qwen3.5 (PCP4 / DP4 and PCP4-TP1 to TP4-DCP2 disaggregated correctness tests)</li></ul></li><li>🧪 PP</li></ul> | [Parallelism](parallelism.md) |
+| **Pipeline & context parallelism (PP, PCP, DCP)** | `--pipeline-parallel-size`, `--prefill-context-parallel-size`, `--decode-context-parallel-size`; `TPU_PP_DYNAMIC_CHUNKS`, `TPU_PCP_TOPOLOGY_AWARE_MESH`, `TPU_DCP_LSE_MERGE_A2A` | <ul><li>PCP + DCP:<ul><li>✅ Qwen3.5 (PCP4 / DP4 and PCP4-TP1 to TP4-DCP2 disaggregated correctness tests)</li></ul></li><li>🧪 PP:<ul><li>🌙 Qwen3.5 (PP4 / DP4 disaggregated with host offload)</li></ul></li></ul> | [Parallelism](parallelism.md) |
 | **Multi-host serving** | `mp` backend (`--nnodes`, or multi-host `--data-parallel-size`) or `TPU_MULTIHOST_BACKEND=ray` | <ul><li>✅ Qwen3-0.6B (v7x-16 presubmit)</li><li>🌙 GLM-5.2 (v7x-16)</li><li>🌙 DeepSeek-V4-Pro (v7x-16)</li><li>Kimi-K3 (on-demand v7x-32)</li></ul> | [Multi-Host Serving](multihost.md) |
 | **Quantization** | Auto-detected from the checkpoint, or `--quantization fp8`, `compressed-tensors`, `mxfp4`, `nvfp4`, `awq`, `gptq`, `deepseek_v4_fp8`, `online_fp8`; `--kv-cache-dtype fp8`; load-time requantization via `REQUANTIZE_*` / `MOE_REQUANTIZE_*` | <ul><li>FP8 weights + KV:<ul><li>✅ Qwen3-Coder-30B</li><li>🌙 Qwen3-Coder-480B</li><li>✅ Qwen3.5-35B</li><li>🌙 Qwen3.5-397B</li><li>🌙 GLM-5.2</li><li>✅ Kimi-K3</li><li>✅ Gemma 4</li></ul></li><li>NVFP4:<ul><li>✅ Qwen3-30B</li><li>🌙 GLM-5.2</li></ul></li><li>W4A16:<ul><li>🌙 Kimi-K2.6</li></ul></li><li>`deepseek_v4_fp8` (W4A8 MoE):<ul><li>🌙 DeepSeek-V4</li></ul></li></ul> | [Quantization](quantization.md) |
 | **Automatic prefix caching** | `--enable-prefix-caching` (with prefix-aware request scheduling, `PrefixAwareScheduler`) | <ul><li>✅ Qwen3.5</li><li>✅ Kimi-K3 (including hybrid KDA state)</li></ul> | — |
@@ -70,7 +72,7 @@ All features below are merged in `main`. "Validated with" lists the models and v
 | **Compilation & warmup cache** | `VLLM_XLA_CACHE_PATH`, `--compilation-config '{"compile_sizes": [...]}'`, `TPU_PARALLEL_PRECOMPILE=1`, `VLLM_XLA_CHECK_RECOMPILATION=1` | <ul><li>✅ Qwen3-0.6B (compilation-cache end-to-end test)</li><li>Every recipe</li></ul> | [Compilation Cache](compilation_cache.md) |
 | **Weight streaming & loading** | `--load-format runai_streamer` (from `gs://`), `--enable-ep-weight-filter`, `--safetensors-load-strategy prefetch`, `--model-loader-extra-config '{"memory_limit": ...}'` | <ul><li>🌙 GLM-5.2</li><li>🌙 DeepSeek-V4-Pro</li><li>Kimi-K3 (multi-host recipes)</li></ul> | [Multi-Host Serving](multihost.md) |
 | **SparseCore offload** | `USE_MOE_SPARSE_CORE=1` (default), `ONEHOT_MOE_PERMUTE_THRESHOLD` | <ul><li>Every MoE recipe</li><li>🌙 Sparse MLA top-k on DeepSeek-V4</li></ul> | [Parallelism](parallelism.md) |
-| **Profiling & observability** | `--profiler-config.profiler torch` with `--profile-result-dir`; `USE_PHASED_PROFILER=1`; Python / host / device tracer levels; vLLM Prometheus metrics (local and external prefix-cache hit counters) | <ul><li>📝 `examples/tpu_profiling.py`</li><li>📝 `examples/run_profiling_suite.sh`</li></ul> | [Profiling](../developers_guide/profiling.md) |
+| **Profiling & observability** | `--profiler-config.profiler torch` with `--profile-result-dir`; `USE_PHASED_PROFILER=1`; Python / host / device tracer levels; vLLM Prometheus metrics (local and external prefix-cache hit counters) | <ul><li>📝 `examples/tpu_profiling.py`</li><li>📝 `examples/run_profiling_suite.sh`</li></ul> | [Profiling](../developers_guide/profiling/index.md) |
 
 </div>
 

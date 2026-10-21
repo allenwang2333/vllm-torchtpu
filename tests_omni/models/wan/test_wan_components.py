@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 
@@ -26,3 +38,81 @@ class TestWanRoPEOnTpu:
 
         assert out.device.type == "tpu"
         torch.testing.assert_close(out.cpu(), native_out.cpu(), rtol=0, atol=0)
+
+
+class TestWanFusedQKNormRoPEOnTpu:
+    """Verify fused q/k RMSNorm + RoPE on the real WanSelfAttention on TPU."""
+
+    def test_wan_self_attention_fused_matches_unpatched_on_tpu(self) -> None:
+        from unittest.mock import patch
+
+        from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+            WanSelfAttention,
+        )
+
+        from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
+        from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
+
+        apply_omni_model_specific_patches()
+
+        torch.manual_seed(42)
+        with (
+            patch(
+                "vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm.model_executor.layers.linear.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+        ):
+            attn = WanSelfAttention(dim=256, num_heads=2, head_dim=128).to(
+                device="tpu", dtype=torch.bfloat16
+            )
+        with torch.no_grad():
+            for p in attn.parameters():
+                torch.nn.init.normal_(p, std=0.02)
+            attn.norm_q.weight.copy_(
+                torch.linspace(0.5, 1.5, 256, device="tpu", dtype=torch.bfloat16)
+            )
+            attn.norm_k.weight.copy_(
+                torch.linspace(1.5, 0.5, 256, device="tpu", dtype=torch.bfloat16)
+            )
+
+            hidden = torch.randn(2, 128, 256, device="tpu", dtype=torch.bfloat16)
+            cos = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
+            sin = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
+            rotary_emb = (cos, sin)
+
+            assert can_fuse_qk_norm_rope(attn, hidden, rotary_emb)
+            fused_out = attn(hidden, rotary_emb)
+            unpatched_out = WanSelfAttention._tpu_orig_forward(attn, hidden, rotary_emb)
+
+        assert fused_out.device.type == "tpu"
+        assert torch.isfinite(fused_out).all()
+        torch.testing.assert_close(
+            fused_out.cpu().float(),
+            unpatched_out.cpu().float(),
+            rtol=1e-2,
+            atol=1e-2,
+        )
