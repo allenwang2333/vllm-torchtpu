@@ -1455,7 +1455,10 @@ DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", 
 # The stage-A levers TPU_DCP_MLA_MIXED_KERNEL_V2=1 adds to the body levers.
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
-MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
+# "pk" (cg7-1 probe 02, DCP16 64 heads): -1.1 .. -1.6 % per call in every
+# phase, bitwise. Not "am" (atom-major single DMA: null, -0.0 .. -1.0 %) and
+# not "pbf16" (+1.0 .. +1.1 %), both measured in the same probe.
+MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair", "pk")
 # Buckets up to this many tokens keep the plain live body (`T <= 32`; such
 # buckets take the decode path when the fused window prep serves them); every
 # larger live-group bucket (`T > 32`) runs the lever body. The earlier edge 64

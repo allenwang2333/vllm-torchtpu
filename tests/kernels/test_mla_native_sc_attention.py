@@ -1188,6 +1188,13 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                     ("fxskip",),
                     ("pair",),
                     sparse_mla.MIXED_BODY_DEFAULT + sparse_mla.MIXED_KERNEL_V2_LEVERS,
+                    # cg7-1 stage-A levers (exact): pack/unpack transpose,
+                    # atom-major live staging (with either transpose).
+                    ("pk",),
+                    ("tr", "am"),
+                    sparse_mla.MIXED_BODY_DEFAULT
+                    + sparse_mla.MIXED_KERNEL_V2_LEVERS
+                    + ("am",),
                 )
             ),
             {
