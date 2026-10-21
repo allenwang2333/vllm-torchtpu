@@ -829,6 +829,33 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+def _llmd_proxy_path() -> str | None:
+    """The final lineage's llm-d proxy, toy_proxy_server_llmd.py: beside this file,
+    or in the tree locations the agentx recipes use (they run a copy of this file
+    from /tmp, so the directory of __file__ alone is not enough)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (
+        here,
+        "/workspace/vllm-torchtpu/examples/disagg",
+        "/root/torchtpu-vllm/examples/disagg",
+    ):
+        p = os.path.join(d, "toy_proxy_server_llmd.py")
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _wants_llmd_proxy() -> bool:
+    """PROXY_PREFILL_ROUTING=llmd or PROXY_DECODE_ROUTING=llmd selects the llm-d
+    proxy (2-tier cache affinity + token-load TTFT router on both legs). This
+    file has no llmd mode of its own: before the merge it fell back to round
+    robin for that value, which is identical to prefix_hash at one pod per leg."""
+    return "llmd" in (
+        os.getenv("PROXY_PREFILL_ROUTING", "").strip().lower(),
+        os.getenv("PROXY_DECODE_ROUTING", "").strip().lower(),
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
 
@@ -1328,6 +1355,19 @@ async def healthcheck():
 
 
 if __name__ == "__main__":
+    if _wants_llmd_proxy():
+        _llmd = _llmd_proxy_path()
+        if _llmd is None:
+            raise SystemExit(
+                "PROXY_PREFILL_ROUTING/PROXY_DECODE_ROUTING=llmd needs "
+                "examples/disagg/toy_proxy_server_llmd.py next to this file or under "
+                "/workspace/vllm-torchtpu/examples/disagg"
+            )
+        print(f"toy_proxy_server: routing=llmd, running the llm-d proxy {_llmd}", flush=True)
+        import runpy
+
+        runpy.run_path(_llmd, run_name="__main__")
+        raise SystemExit(0)
     global global_args
     global_args = parse_args()
 
