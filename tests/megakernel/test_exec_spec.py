@@ -16,8 +16,9 @@ model-agnostic default tile rule (`profiles.default`)."""
 
 from __future__ import annotations
 
+import ast
 import dataclasses
-import re
+import sys
 import types
 from pathlib import Path
 
@@ -96,24 +97,26 @@ def test_tiles_block_tunables_are_canonical_and_hashable():
         t.with_blocks({"no_such_block": {"x": 1}})
 
 
-# Block and cache names `exec_spec.py` must not mention (in any case).
-_NON_CORE_NAMES = ("gqa", "gdn", "moe", "pool", "fused", "paged", "ckpt")
-
-
-def test_core_exec_spec_mentions_no_block_or_cache_names():
-    """`exec_spec.py` holds core knobs only: no block or pool name in it."""
-    text = Path(exec_spec.__file__).read_text(encoding="utf-8")
-    for name in _NON_CORE_NAMES:
-        hits = [
-            f"{i}: {line.strip()}"
-            for i, line in enumerate(text.splitlines(), 1)
-            if re.search(name, line, flags=re.IGNORECASE)
-        ]
-        assert not hits, (name, hits)
+def test_exec_spec_imports_only_ops_and_profiles():
+    """`exec_spec.py` depends only on Python stdlib, `ops`, and `profiles`."""
+    path = Path(exec_spec.__file__)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name.split(".")[0] in sys.stdlib_module_names
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level == 0:
+                assert mod.split(".")[0] in sys.stdlib_module_names
+            else:
+                assert node.level == 1
+                roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
+                assert set(roots) <= {"ops", "profiles"}, roots
 
 
 def test_default_tile_rule_is_model_agnostic():
-    """One tile set for every bucket, rank count and MoE mode; chip budgets."""
+    """One tile set for every bucket, rank count and TP flag; chip budgets."""
     ref = default_tiles(1)
     assert ref.hier == 0  # flat-ring all-reduce, no topology-specific mode
     assert (ref.vmem_mib, ref.smem_mib) == (

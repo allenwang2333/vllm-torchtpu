@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
-import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -38,20 +39,24 @@ from vllm_torchtpu.megakernel.spec import (
     WeightDecl,
 )
 
-# Block and cache names `spec.py` must not mention (in any case).
-_NON_CORE_NAMES = ("gqa", "gdn", "moe", "pool", "fused", "paged", "ckpt")
 
-
-def test_core_spec_declarations_mention_no_block_or_cache_names():
-    """`spec.py` holds core declarations only: no block or pool name in it."""
-    text = Path(spec_mod.__file__).read_text(encoding="utf-8")
-    for name in _NON_CORE_NAMES:
-        hits = [
-            f"{i}: {line.strip()}"
-            for i, line in enumerate(text.splitlines(), 1)
-            if re.search(name, line, flags=re.IGNORECASE)
-        ]
-        assert not hits, (name, hits)
+def test_spec_imports_only_exec_spec_lazily_or_under_type_checking():
+    """`spec.py` has no top-level internal imports; only `exec_spec` is referenced."""
+    path = Path(spec_mod.__file__)
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for stmt in tree.body:
+        if isinstance(stmt, ast.ImportFrom):
+            assert stmt.level == 0, "top-level imports in spec.py must be stdlib only"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name.split(".")[0] in sys.stdlib_module_names
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if node.level == 0:
+                assert mod.split(".")[0] in sys.stdlib_module_names
+            else:
+                assert node.level == 1 and mod == "exec_spec", (node.level, mod)
 
 
 def test_spec_declaration_dataclasses_and_defaults():

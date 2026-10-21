@@ -39,7 +39,7 @@ class Spec:
 class WeightDecl:
     """Declarative specification for a block weight tensor.
 
-    The planner derives the leading layer count and layer-to-index map from the
+    The leading layer count and layer-to-index map are derived from the
     slot/branch in `ModelSpec.layer_type` where the owning `Block` appears.
     """
 
@@ -58,8 +58,8 @@ class WeightDecl:
 class StateDecl:
     """Declarative specification for a state, cache, or per-layer output tensor.
 
-    `shape` is the per-layer, per-rank shape; when `per_layer=True`, the planner
-    prefixes the owning block's active layer count `L_block`.
+    `shape` is the per-layer, per-rank shape; when `per_layer=True`, the full
+    state shape is prefixed with the owning block's active layer count.
     """
 
     name: str
@@ -73,11 +73,11 @@ class StateDecl:
 
 @dataclass(frozen=True)
 class ExtraInput:
-    """Positional kernel input after the states, declared by a block.
+    """Positional input after the states, declared by a block.
 
-    Used for optional debug inputs (e.g. externally forced routing). The kernel
-    passes them in block declaration order after the state inputs; the block
-    reads the ref as `ctx.extra[name]`. HBM inputs are sharded across ranks,
+    Used for optional debug inputs (e.g. externally forced routing). Passed in
+    block declaration order after the state inputs and exposed to the block as
+    `ctx.extra[name]`. HBM inputs are sharded across ranks,
     SMEM inputs replicated and counted against the SMEM budget.
     """
 
@@ -244,8 +244,8 @@ class ModelSpec:
     name: str
     config: Any
     layer_type: LayerType
-    # Model-injected cache backend (layout + gather / scatter callbacks) from
-    # the cache package; None for models without a page-based cache.
+    # Optional cache backend (layout + gather / scatter callbacks); None for
+    # models without a page-based cache.
     cache_backend: Any = None
 
     def all_blocks(self) -> list[Block]:

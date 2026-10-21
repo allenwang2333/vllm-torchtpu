@@ -11,16 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tile rule of the `default` profile: one model-agnostic schedule.
+"""Model-agnostic default tile rule: one schedule for every bucket.
 
 `default_tiles` returns the same tiles for every bucket: library field defaults,
 the flat-ring all-reduce (`hier=0`) and the chip's VMEM / SMEM budgets. It does
-not branch on the batch size, the rank count or the model. Models whose scratch
-outgrows the budget at a bucket are handled by the VMEM fit step
-(`vmem.fit_default_tiles`), which shrinks the dense / expert ring depths when
-`ExecSpec.tiles` is left `None`, and raises `MegakernelConfigError` rather than
-return an over-budget plan. Model-specific schedules live in named profiles
-(e.g. a model's default profile, `profile.model_default_profile`).
+not branch on the batch size, the rank count or the model; ring depths may be
+refined at build time to fit the VMEM budget when `ExecSpec.tiles` is left
+`None`.
 """
 
 from __future__ import annotations
@@ -49,9 +46,9 @@ def default_tiles(
 ) -> Tiles:
     """Model-agnostic default tiles (identical for every bucket).
 
-    `B`, `moe_tp` and `R` are accepted for the tile-rule signature
-    (`profile.TileRule`) and ignored: field defaults everywhere, flat-ring
-    all-reduce (`hier=0`), and `chip`'s VMEM / SMEM budgets.
+    `B`, `moe_tp` and `R` are accepted for tile-rule call-site compatibility
+    and ignored: field defaults everywhere, flat-ring all-reduce (`hier=0`),
+    and `chip`'s VMEM / SMEM budgets.
     """
     del B, moe_tp, R
     return Tiles(hier=0, vmem_mib=chip.vmem_mib, smem_mib=chip.smem_mib)

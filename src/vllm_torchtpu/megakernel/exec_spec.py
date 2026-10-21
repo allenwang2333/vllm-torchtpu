@@ -13,11 +13,11 @@
 # limitations under the License.
 """Core execution config for the megakernel: tiles, tunables registry, ExecSpec.
 
-Only core execution knobs live here. A block with its own knobs declares a
-frozen `Tunables` dataclass (`Block.Tunables`, with a per-field `NUMERICS`
-class); `Tiles.blocks` holds one instance per block name, and blocks read theirs
-through `Block.tunables(ex)`. Execution extensions owned by other packages ride
-on `ExecSpec.cache`.
+Only core execution knobs live here. A block with its own knobs registers a
+frozen `Tunables` dataclass (`register_tunables`, with a per-field `NUMERICS`
+class); `Tiles.blocks` holds one instance per block name (`Tiles.block` and
+`Tiles.with_blocks`). Optional cache-specific execution settings ride on
+`ExecSpec.cache`.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ _T = TypeVar("_T")
 # ---------------------------------------------------------------------------
 # Block tunables
 # ---------------------------------------------------------------------------
-# Block name -> its `Tunables` class (registered by `Block` subclasses).
+# Block name -> its `Tunables` class (registered via `register_tunables`).
 _TUNABLES: dict[str, type] = {}
 
 
@@ -157,12 +157,12 @@ class Tiles:
     # Per-bucket schedule threshold (rows). Blocks never compare `B` to a
     # literal; they read this, and tile rules (`profiles/`) may tune it.
     wide_rows: int = 16  # `B > wide_rows`: WIDE schedule (`ExecSpec.WIDE`)
-    # Opt-in performance flags below default to off. Named profiles
-    # (`profile.py`, `profiles/`) turn them on; defaults never do.
+    # Opt-in performance flags below default to off; the default tile rule
+    # leaves them off.
     dense_acc_pair: bool = False  # Unrolled / paired dense matmul accumulation
     dmm_unroll: int = 0  # Max tiles to fully unroll in dmatmul (0: never)
     rel_fetch: bool = False  # Trace-time-decoded dense refills (fetch_rel/flush_rel)
-    # Per-block tunables (`Block.Tunables` instances keyed by block name).
+    # Per-block tunables (registered `Tunables` instances keyed by block name).
     blocks: Mapping[str, Any] = TunablesMap()
 
     def __post_init__(self) -> None:
@@ -191,15 +191,14 @@ class Tiles:
         return dataclasses.replace(self, blocks=TunablesMap(blocks))
 
 
-# Numerics class of every core `Tiles` field (`profile.approx_features` reads
-# this together with each block's `Tunables.NUMERICS`, see `tile_numerics`).
-# `exact`: moving the field off the reference profile's value keeps hidden
-# states and caches bit-identical, because it only changes DMA / ring
-# scheduling, budgets or debug checks. `approx`: changes the
-# arithmetic (matmul K-tiling, reduction order, rounding, routing) or
-# is not proven exact; profiles that move any of these are `approx`.
+# Numerics class of every core `Tiles` field (combined with each registered
+# block's `Tunables.NUMERICS` by `tile_numerics`).
+# `exact`: moving the field off its baseline value keeps outputs and states
+# bit-identical, because it only changes DMA / ring scheduling, memory budgets
+# or debug checks. `approx`: changes the arithmetic (matmul K-tiling,
+# reduction order, rounding, routing) or is not proven exact.
 TILE_NUMERICS: dict[str, NumericsClass] = {
-    "bank": "approx",  # dense K-tiling (`planner.k_tile`)
+    "bank": "approx",  # dense K-tiling
     "nbd": "exact",  # dense ring depth (scheduling)
     "nbe": "approx",  # expert ring depth also gates block pipelining paths
     "ebank": "approx",  # expert K-tiling
@@ -230,9 +229,9 @@ def tile_numerics() -> dict[str, NumericsClass]:
 def default_tiles(B: int, **kw: Any) -> Tiles:
     """Model-agnostic default tiles (`profiles/default.py:default_tiles`).
 
-    Used for `ExecSpec.tiles=None`; the kernel builder then fits their ring
-    depths to the model's VMEM budget (`vmem.fit_default_tiles`). Keyword
-    arguments follow the tile-rule signature (`profile.TileRule`).
+    Used when `ExecSpec.tiles` is `None`; ring depths may be refined at build
+    time to fit the VMEM budget. Extra keyword arguments are forwarded to
+    `profiles.default.default_tiles`.
     """
     from .profiles.default import default_tiles as _rule
 
@@ -243,9 +242,7 @@ def default_tiles(B: int, **kw: Any) -> Tiles:
 class DebugOptions:
     """Debug and ablation flags kept separate from model geometry and execution."""
 
-    skip: frozenset[str] = (
-        frozenset()
-    )  # Ablation skip set (e.g. {"dense", "comm", "kv", "experts"})
+    skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
     scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
 
 
@@ -259,11 +256,11 @@ class ExecSpec:
     ctx: int = 2048  # Max KV sequence length
     stack_e: bool = False  # True: 4D stacked expert weights; False: per-layer 3D
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
-    # None -> default_tiles(B, R=R), ring depths fitted to VMEM at build
+    # None -> default_tiles(B, R=R), which may be refined at build time to fit VMEM
     tiles: Tiles | None = None
     debug: DebugOptions = DebugOptions()
-    # Cache extension (a frozen `CacheExec` from the cache package; None: plain
-    # states without page tables). Core code never reads it.
+    # Optional extension object for cache-specific execution settings (None when
+    # using plain states without page tables). Core execution config never reads it.
     cache: Any = None
 
     @property

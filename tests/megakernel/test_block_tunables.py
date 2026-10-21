@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import dataclasses
+import re
+from pathlib import Path
 
 import pytest
 from conftest import EXACT_FLIPS, tile_field
@@ -23,6 +25,9 @@ from conftest import EXACT_FLIPS, tile_field
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec
 from vllm_torchtpu.megakernel.blocks import GDNBlock, GQABlock, MoEBlock
+
+# Block and cache names the core spec modules must not mention (in any case).
+_NON_CORE_NAMES = ("gqa", "gdn", "moe", "pool", "fused", "paged", "ckpt")
 
 # Opt-in performance flags (core `field` / `<block>.<field>`), default off.
 _PERF_FLAGS_OFF = {
@@ -80,10 +85,12 @@ def test_tile_numerics_classes_from_evidence():
     for k in ("gqa.pair_kv", "gqa.kv_ering", "gqa.gqa_qv"):
         assert numerics[k] == "exact", k
 
+
 def test_exact_flip_list_covers_registry():
     exact = {k for k, v in _library_numerics().items() if v == "exact"}
     # kv_scatter_vec_ns only affects the non-paged path (tested separately).
     assert exact == {f for _, f, _, _, _ in EXACT_FLIPS} | {"gqa.kv_scatter_vec_ns"}
+
 
 def test_tiles_field_defaults_turn_perf_flags_off():
     t = mk.Tiles()
@@ -93,3 +100,17 @@ def test_tiles_field_defaults_turn_perf_flags_off():
     d = mk.default_tiles(8)
     for k, v in _PERF_FLAGS_OFF.items():
         assert tile_field(d, k) == v, k
+
+
+def test_core_spec_mentions_no_block_or_cache_names():
+    """`exec_spec.py` and `spec.py` are core: no block or pool name in them."""
+    for module in ("exec_spec.py", "spec.py"):
+        path = Path(exec_spec.__file__).parent / module
+        text = path.read_text(encoding="utf-8")
+        for name in _NON_CORE_NAMES:
+            hits = [
+                f"{i}: {line.strip()}"
+                for i, line in enumerate(text.splitlines(), 1)
+                if re.search(name, line, flags=re.IGNORECASE)
+            ]
+            assert not hits, (module, name, hits)
