@@ -66,6 +66,9 @@ def load_staging(path, torch, unpack, dequant):
         "_staged_tensors",
         "_staged_views",
         "enable_prepared_upload",
+        "_reserve_upload",
+        "_activate_upload",
+        "record_upload_consumers",
         "prepare_embeddings",
         "start_prepare_embeddings",
         "finish_prepare_embeddings",
@@ -93,6 +96,7 @@ def load_staging(path, torch, unpack, dequant):
         torch=torch,
         dataclass=dataclass,
         PendingRowExchange=object,
+        PreparedEngramUpload=object,
         get_current_vllm_config_or_none=lambda: None,
         logger=logging.getLogger(__name__),
         _INVALID_SCALE=255,
@@ -146,24 +150,30 @@ def check_staging(path, torch, device, prepared):
     for tokens in (4, 1, 3, 4, 1, 3):
         ids = torch.randint(64, (tokens, cols))
         staging.prepare_embeddings(ids)
-        actual = consume(tokens).cpu()
+        result = consume(tokens)
+        staging.record_upload_consumers([result])
+        actual = result.cpu()
         expected = dequant(weight[ids], scales[ids], block)
         assert torch.equal(actual, expected), (tokens, prepared)
         pair = (id(staging._staged_tensors(tokens)), id(staging._active_raw))
-        if tokens in identities:
+        if tokens in identities and not prepared:
             assert identities[tokens] == pair
         identities[tokens] = pair
         raw_words = tokens * cols * dim // 4
-        padding = staging._host_packed_buf.view(torch.int32)[raw_words:].view(
-            torch.uint8
+        packed = (
+            staging._active_upload.host_words
+            if prepared
+            else staging._host_packed_buf.view(torch.int32)
         )
+        padding = packed[raw_words:].view(torch.uint8)
         assert torch.all(padding[tokens * cols : tokens * 4] == 255)
     return {
         "prepared": prepared,
         "buckets": list(identities),
         "iterations": 6,
         "exact_equal": True,
-        "cached_tensor_and_view_identity": True,
+        "cached_tensor_and_view_identity": not prepared,
+        "double_buffered": prepared,
         "scale_padding_checked": True,
     }
 
@@ -315,6 +325,31 @@ def main():
             checks.append(True)
         case["repeated_compiled_consumer_equal"] = checks
 
+        # Keep consumers asynchronous while uploading the next step to the
+        # other slot. Validate every result only after several slot reuses.
+        from torch_tpu._internal import sync
+
+        slots = [Upload(words, device), Upload(words, device)]
+        outputs = []
+        references = []
+        for iteration in range(8):
+            slot = slots[iteration % 2]
+            indices.random_(rows)
+            gather_pack()
+            references.append(consumer(packed.view(tokens, words // tokens)))
+            slot.acquire().copy_(packed)
+            slot.start()
+            slot.activate()
+            output = compiled(slot.device.view(tokens, words // tokens))
+            sync.synchronize(tensors=[output], wait=False)
+            slot.record_consumers([output])
+            outputs.append(output)
+        for output, reference in zip(outputs, references, strict=True):
+            assert torch.equal(output.cpu(), reference), (tokens, "pipeline")
+        case["pipelined_compiled_consumers_equal"] = len(outputs)
+        del slots, outputs, references
+        save()
+
         candidate.host_words.copy_(packed)
         methods = {
             "copy_": lambda: baseline.copy_(packed),
@@ -325,7 +360,7 @@ def main():
                 candidate.device, candidate.host_buffer, unsafe_skip_buffer_lock=False
             ).h2d(),
             "prepared_api": candidate.transfer.h2d,
-            "prepared_upload_with_copy_and_fence": lambda: candidate.copy_from(packed),
+            "prepared_upload_with_copy": lambda: candidate.copy_from(packed),
             "host_gather_pack": gather_pack,
         }
         for fn in methods.values():
@@ -379,7 +414,7 @@ def main():
                     "copy_",
                     "raw_api",
                     "prepared_api",
-                    "prepared_upload_with_copy_and_fence",
+                    "prepared_upload_with_copy",
                 ):
                     for _ in range(5):
                         with torch.profiler.record_function("engram_upload/" + name):

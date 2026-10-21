@@ -39,6 +39,7 @@ logger = init_logger(__name__)
 class HostEngramStaging:
     num_tokens: int
     exchange: PendingRowExchange | None = None
+    upload: "PreparedEngramUpload | None" = None
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -620,7 +621,8 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
-        self._prepared_uploads: dict[int, PreparedEngramUpload] | None = None
+        self._prepared_uploads: dict[int, list[PreparedEngramUpload]] | None = None
+        self._active_upload: PreparedEngramUpload | None = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -670,12 +672,41 @@ class Engram(upstream.Engram):
     def enable_prepared_upload(self) -> None:
         """Opt into raw DMA before any consumer runs.
 
-        This path fences the whole device before each overwrite.
+        Each bucket has two slots, protected by its consumer outputs.
         """
         if self._staged_raw is None:
             raise ValueError("Prepared upload requires host-offloaded Engram")
         if self._prepared_uploads is None:
             self._prepared_uploads = {}
+
+    def _reserve_upload(self, num_tokens: int) -> "PreparedEngramUpload":
+        from .host_transfer import PreparedEngramUpload
+
+        assert self._prepared_uploads is not None
+        assert self._staged_raw is not None
+        uploads = self._prepared_uploads.get(num_tokens)
+        if uploads is None:
+            cols = self.embed_tokens.part_n_hash_cols
+            dim = self.embed_tokens.weight.shape[-1]
+            blocks = dim // self.embed_tokens.block_size
+            words = num_tokens * (cols * dim // 4 + -(-(cols * blocks) // 4))
+            uploads = [
+                PreparedEngramUpload(words, self._staged_raw.device) for _ in range(2)
+            ]
+            self._prepared_uploads[num_tokens] = uploads
+            logger.info(
+                "[DSV41] prepared_dma Engram bucket: tokens=%d slots=2 "
+                "logical_bytes=%d physical_bytes=%d layout=%s",
+                num_tokens,
+                words * 4,
+                uploads[0].host_buffer.size_bytes,
+                uploads[0].layout,
+            )
+        return next(upload for upload in uploads if upload is not self._active_upload)
+
+    def record_upload_consumers(self, tensors: list[torch.Tensor]) -> None:
+        if self._active_upload is not None:
+            self._active_upload.record_consumers(tensors)
 
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
@@ -718,6 +749,21 @@ class Engram(upstream.Engram):
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
         if remainder or num_tokens > self._host_raw.shape[0]:
             raise ValueError("Engram hashes exceed the configured DP staging slots")
+        if self._prepared_uploads is not None and dp_size == 1:
+            upload = self._reserve_upload(num_tokens)
+            packed = upload.acquire().view(torch.uint8)
+            cols, dim = self._host_raw.shape[1:]
+            blocks = dim // self.embed_tokens.block_size
+            raw_bytes = num_tokens * cols * dim
+            scale_bytes = num_tokens * cols * blocks
+            raw = packed[:raw_bytes].view(num_tokens, cols, dim)
+            scale = packed[raw_bytes : raw_bytes + scale_bytes].view(
+                num_tokens, cols, blocks
+            )
+            packed[raw_bytes + scale_bytes :].fill_(_INVALID_SCALE)
+            self.embed_tokens.gather_raw(hash_ids, raw, scale)
+            upload.start()
+            return HostEngramStaging(num_tokens, upload=upload)
         if dp_size > 1:
             # Lookup and redistribution stay on CPU. A device all-gather
             # here would materialize DP copies of every replica's rows.
@@ -746,6 +792,9 @@ class Engram(upstream.Engram):
     def finish_prepare_embeddings(self, staging: HostEngramStaging) -> None:
         """Wait for local token rows and upload them before their consumer graph."""
         num_tokens = staging.num_tokens
+        if staging.upload is not None:
+            self._activate_upload(num_tokens, staging.upload)
+            return
         if staging.exchange is not None:
             raw, scales = staging.exchange.wait()
             self._host_raw[:num_tokens].copy_(raw)
@@ -767,24 +816,17 @@ class Engram(upstream.Engram):
         if self._prepared_uploads is None:
             self._staged_tensors(num_tokens).copy_(packed)
         else:
-            from .host_transfer import PreparedEngramUpload
-
-            upload = self._prepared_uploads.get(num_tokens)
-            if upload is None:
-                assert self._staged_raw is not None
-                upload = PreparedEngramUpload(packed.numel(), self._staged_raw.device)
-                self._prepared_uploads[num_tokens] = upload
-                self._staged_by_tokens[num_tokens] = upload.device
-                self._staged_views_by_tokens.pop(num_tokens, None)
-                logger.info(
-                    "[DSV41] prepared_dma Engram bucket: tokens=%d "
-                    "logical_bytes=%d physical_bytes=%d layout=%s",
-                    num_tokens,
-                    packed.numel() * 4,
-                    upload.host_buffer.size_bytes,
-                    upload.layout,
-                )
+            upload = self._reserve_upload(num_tokens)
             upload.copy_from(packed)
+            self._activate_upload(num_tokens, upload)
+            return
+        self._active_raw = self._staged_views(num_tokens)
+
+    def _activate_upload(self, num_tokens: int, upload: "PreparedEngramUpload") -> None:
+        upload.activate()
+        self._active_upload = upload
+        self._staged_by_tokens[num_tokens] = upload.device
+        self._staged_views_by_tokens.pop(num_tokens, None)
         self._active_raw = self._staged_views(num_tokens)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:

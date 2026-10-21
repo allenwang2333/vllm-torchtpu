@@ -3,6 +3,7 @@
 """Experimental fixed-buffer upload for packed host Engram rows."""
 
 import ctypes
+from typing import Any
 
 import torch
 from torch_tpu._internal.compile import tpu_torch_compile
@@ -13,15 +14,14 @@ class PreparedEngramUpload:
     """Own a validated raw host/device pair for one packed token bucket.
 
     The device tensor must never receive a torch mutation after construction.
-    ``copy_from`` fences previous consumers before changing its physical bytes.
-    This prototype uses a device-wide fence until a consumer event is available.
+    The caller records the materialized outputs of the last consumer graph.
+    Reuse waits for those outputs, never for unrelated device work.
     """
 
     def __init__(self, num_words: int, device: torch.device) -> None:
         probe = torch.arange(num_words, dtype=torch.int32, device="cpu")
         probe.bitwise_xor_(0x13579BDF)
         self.device = probe.to(device)
-        torch.accelerator.synchronize()
         self.layout = tpu_torch_compile.get_device_layout_if_materialized(self.device)
         if self.layout is None:
             raise RuntimeError("Engram raw upload requires a materialized layout")
@@ -49,10 +49,44 @@ class PreparedEngramUpload:
                 "Engram raw physical order differs from packed int32; "
                 "use the copy_ upload path"
             )
+        self.pending: Any = None
+        self.consumers: list[torch.Tensor] = []
+        self.needs_consumer = False
+
+    def acquire(self) -> torch.Tensor:
+        """Return writable host storage after both previous readers finish."""
+        if self.needs_consumer:
+            raise RuntimeError("Record the Engram consumer before reusing its buffer")
+        self.wait()
+        if self.consumers:
+            from torch_tpu._internal import sync
+
+            sync.synchronize(tensors=self.consumers, wait=True)
+            self.consumers = []
+        return self.host_words
+
+    def start(self) -> None:
+        self.pending = self.transfer.h2d_async()
+
+    def wait(self) -> None:
+        if self.pending is not None:
+            self.pending.wait()
+            self.pending = None
+
+    def activate(self) -> None:
+        self.wait()
+        self.needs_consumer = True
+
+    def record_consumers(self, tensors: list[torch.Tensor]) -> None:
+        if self.needs_consumer:
+            if not tensors:
+                raise ValueError("Engram reuse needs a consumer graph output")
+            self.consumers = tensors
+            self.needs_consumer = False
 
     def copy_from(self, host_words: torch.Tensor) -> None:
         if host_words.shape != self.host_words.shape:
             raise ValueError("Engram raw upload must use its exact token bucket")
-        torch.accelerator.synchronize()
-        self.host_words.copy_(host_words)
-        self.transfer.h2d()
+        self.acquire().copy_(host_words)
+        self.start()
+        self.wait()
