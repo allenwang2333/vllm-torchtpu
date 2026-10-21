@@ -275,6 +275,7 @@ def make(E):
     MAXP_OK = E.max_pages <= 256
     SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
     LSE_TILE = getattr(tiles, "a2a_lse", "lanes") == "tile"
+    HPAD = max(8, -(-cfg.HR // 8) * 8)          # lse tile rows per owner (kernel.build: the same rule)
 
     def T_():
         return E.scal[0]
@@ -1179,13 +1180,13 @@ def make(E):
         stg[1, 0:NH, :] = jnp.broadcast_to(lse, (NH, 128))
         lane_r = lax.broadcasted_iota(I32, (R, 128), 1)
         if LSE_TILE:
-            # L4 C1: owner d's lse tile = rows d * 8 + hh of `lsend`, lane = row t (one [8, 128] f32 tile per peer
-            # instead of 128 lse lanes in every payload row); the payload row is P alone
+            # L4 C1: owner d's lse tile = rows d * HPAD + hh of `lsend`, lane = row t (one [HPAD, 128] f32 tile per
+            # peer instead of 128 lse lanes in every payload row); the payload row is P alone
             tl = (t_ + 1) % TMAX if fault == "f_lse_tile_row" else t_
             for hh in range(HR):
-                cur = scr["lsend"][pl.ds(hh, R, stride=8), :]
-                scr["lsend"][pl.ds(hh, R, stride=8), :] = jnp.where(lane_r == tl, stg[1, pl.ds(hh, R, stride=HR), :],
-                                                                     cur)
+                cur = scr["lsend"][pl.ds(hh, R, stride=HPAD), :]
+                scr["lsend"][pl.ds(hh, R, stride=HPAD), :] = jnp.where(lane_r == tl,
+                                                                        stg[1, pl.ds(hh, R, stride=HR), :], cur)
             blk = P                                                                                      # [R, OH]
         else:
             L16 = jnp.full((R, 128), -jnp.inf, F32)

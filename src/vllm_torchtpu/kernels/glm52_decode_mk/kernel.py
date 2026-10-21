@@ -325,8 +325,9 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     assert RW == 0 or (LSE_TILE and RW % 8 == 0 and TMAX % RW == 0), ("a2a_rw needs a2a_lse='tile', 8 | rw | TMAX",
                                                                       RW, TMAX)
     NCH = TMAX // RW if RW else 1
+    HPAD = max(8, -(-HR // 8) * 8)                   # lse tile rows per owner (heads padded to the f32 sublane tile)
     if LSE_TILE:
-        assert R * 8 <= 128 and TMAX <= 128 and HR <= 8, ("lse tile: R * 8 rows, TMAX lanes", R, TMAX, HR)
+        assert R * HPAD <= 128 and TMAX <= 128, ("lse tile: R * HPAD rows, TMAX lanes", R, HPAD, TMAX)
     OWX = OH if LSE_TILE else OW                     # A2A payload row (u32 lanes)
     assert tiles.replay in ("", "a2a", "ar"), tiles.replay
     n_r = {"": 0, "a2a": 1, "ar": 2}[tiles.replay]
@@ -407,10 +408,10 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     }
     for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
         scratch[f"ar1_{CO.AR_NAMES[i]}"] = sp
-    if LSE_TILE:                                 # rows d * 8 + hh (owner d, head hh), lanes = rows t
+    if LSE_TILE:                                 # rows d * HPAD + hh (owner d, head hh), lanes = rows t
         scratch["lsend"] = pltpu.VMEM((128, 128), F32)
         scratch["lrecv"] = pltpu.VMEM((128, 128), F32)
-        scratch["lse_t"] = pltpu.VMEM((128, 128), F32)    # lrecv transposed: row t, lane s * 8 + hh
+        scratch["lse_t"] = pltpu.VMEM((128, 128), F32)    # lrecv transposed: row t, lane s * HPAD + hh
     if RW:
         scratch["a2a_n"] = pltpu.SMEM((1,), I32)          # chunks of this layer's A2A already started
     if tiles.shadow_a2a:
@@ -780,7 +781,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 def lse_of(s_):
                     if LSE_TILE:                     # lanes hh < HR = source s_'s heads (lanes >= HR are unused)
                         x_ = scr["lse_t"][pl.ds(r0, MCH), :]
-                        sh_ = (128 - 8 * s_) % 128
+                        sh_ = (128 - HPAD * s_) % 128
                         return pltpu.roll(x_, sh_, 1) if sh_ else x_
                     return lax.bitcast_convert_type(scr["orecv"][s_, pl.ds(r0, MCH), OH:OH + 128], F32)
                 shift = jnp.full((MCH, 128), -jnp.inf, F32)
@@ -1015,8 +1016,8 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                     if not LSE_TILE:                 # the stage-A exchange, verbatim
                         exchange(lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i], "a_send", "a_recv")
                     else:
-                        r8 = pl.multiple_of(me * 8, 8)
-                        scr["lrecv"][pl.ds(r8, 8), :] = scr["lsend"][pl.ds(r8, 8), :]
+                        r8 = pl.multiple_of(me * HPAD, 8)
+                        scr["lrecv"][pl.ds(r8, HPAD), :] = scr["lsend"][pl.ds(r8, HPAD), :]
                         if "coll" not in skip:
                             if RW:
                                 for c_ in range(NCH):            # the chunks not started inside the attention loop
@@ -1026,13 +1027,14 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                             else:
                                 CO.start_all(R, me, lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i],
                                              scr["a_send"], scr["a_recv"])
-                            CO.start_all(R, me, lambda d: scr["lsend"].at[pl.ds(d * 8, 8)],
-                                         lambda i: scr["lrecv"].at[pl.ds(pl.multiple_of(i * 8, 8), 8)],
+                            CO.start_all(R, me, lambda d: scr["lsend"].at[pl.ds(d * HPAD, HPAD)],
+                                         lambda i: scr["lrecv"].at[pl.ds(pl.multiple_of(i * HPAD, 8), HPAD)],
                                          scr["a_send"], scr["a_recv"])
                             rw_ = RW or TMAX
                             CO.wait_pieces(R, me, [(scr["osend"].at[0, pl.ds(0, rw_)],
                                                     scr["orecv"].at[0, pl.ds(0, rw_)], NCH),
-                                                   (scr["lsend"].at[pl.ds(0, 8)], scr["lrecv"].at[pl.ds(0, 8)], 1)],
+                                                   (scr["lsend"].at[pl.ds(0, HPAD)], scr["lrecv"].at[pl.ds(0, HPAD)],
+                                                    1)],
                                            scr["a_send"], scr["a_recv"], scope=sc if tiles.trace else None)
                     if tiles.shadow_a2a and "coll" not in skip:   # TIMING-ONLY: the same bytes again, unconsumed
                         CO.exchange(R, me, lambda d: scr["osend"].at[d], lambda i: scr["orecv"].at[i],
@@ -1308,7 +1310,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 moe_layers=moe_layers, full_layers=full_l, eshapes=eshapes, n_fixed=n_fixed,
                 # L4 drivers (M6) and the timing-only replay operands (appended after the caches)
                 a2a=dict(lse=tiles.a2a_lse, rw=RW, chunks=NCH, payload_lanes=OWX,
-                         bytes_per_peer=TMAX * OWX * 4 + (128 * 8 * 4 if LSE_TILE else 0),
+                         bytes_per_peer=TMAX * OWX * 4 + (128 * HPAD * 4 if LSE_TILE else 0),
                          starts_per_peer=NCH + (1 if LSE_TILE else 0), shadow=bool(tiles.shadow_a2a)),
                 n_rec=n_r, rec_shapes=({"a2a": [((L, HR, M, KL), "float32")],
                                         "ar": [((L, M, H), "float32"), ((L, M, H), "float32")]}.get(tiles.replay, [])))
