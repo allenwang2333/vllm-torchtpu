@@ -279,11 +279,50 @@ generated code sizes stay unchanged. Operator-only MoE medians are
 0.369390 to 0.369348 ms (biased) and 0.292022 to 0.289723 ms (uniform).
 The small time change does not justify changing the production weight loader.
 
-A further compact-HBM/three-slot prototype halted during execution before
-correctness checks or profiling completed. Static inspection found a missing
-modulo-three mapping in its DMA slot index. The corrected prototype is being
-retested in `exp-bazj9i3rq6`; the failed execution supplies no performance result.
-Neither prototype is in the production dispatch.
+A further compact-HBM/three-slot prototype initially halted before correctness
+checks or profiling completed. Static inspection found a missing modulo-three
+mapping in its DMA slot index. After that fix, `exp-bazj9i3rq6` completed both
+seeds with bit-exact outputs. Whole-layer device time excluding entry barriers
+was 0.53768 to 0.54127 ms for biased routing and 0.45957 to 0.45732 ms for uniform
+routing. The third prefetch slot did not establish a useful gain. This was a
+prototype indexing error; the failed execution is not evidence of a hardware
+fault and supplies no performance result.
+
+The same experiment tested consuming each 512-column gate/up pair through the
+activation before computing the next pair, retaining the original 256-column
+dots, K-block addition order and BF16 row-quantization reductions. All output
+bits matched at biased seed 1039 and uniform seed 1040, but whole-layer device
+time excluding entry barriers was 0.48145 to 0.48312 ms and 0.45931 to 0.45903 ms,
+respectively. Compiled argument, output and temporary storage were unchanged;
+generated code grew by 5120 bytes. Neither this fusion nor either compact-HBM
+prototype is in production dispatch.
+
+An exploratory G1024 requantization in `exp-bazj9i3rq6` reduced the number of
+per-block scale operations but required padding the intermediate width from
+2560 to 3072. The original VMEM accounting then selected one weight slot;
+the profile's kernel name confirmed `nb1`. Compacting gate/up weights and
+accounting for their actual staged width restored two slots. The conservative
+VMEM estimate was 65748992 bytes against a 65766686-byte budget.
+
+| Routing / seed | G512 reference (ms) | Padded G1024 (ms) | Compact G1024 (ms) |
+| --- | ---: | ---: | ---: |
+| Biased / 1041 | 0.55982 | 0.66395 | 0.54881 |
+| Uniform / 1042 | 0.45970 | 0.62287 | 0.45388 |
+
+These are complete EP8 device-module medians excluding entry barriers, with
+the same two-height ladder. Quantization and compaction occur outside timing.
+Compact and padded G1024 outputs match bit-for-bit, but both differ from G512:
+relative L2 errors are 0.11498 and 0.11503; maximum absolute errors are 0.10229
+and 0.10547, respectively. These inputs requantize synthetic G512 weights and
+are **not a model-quality evaluation**. Compact G1024's compiled arguments use
+964411392 bytes versus 970702848 for G512; temporary/output storage is unchanged.
+The 1–2% isolated gain does not justify promoting the approximate quantization
+and changed weight layout. G1024 remains outside production dispatch; no claim
+of quality neutrality or serving improvement is made.
+
+The corrected three-slot, gate/up activation and G1024 experiments have a
+combined source/HLO/result archive at
+`exp-bazj9i3rq6` / `results/final-micro-evidence.tgz`.
 
 Candidate storage, dense-tail, DMA-window, routing-window and gather experiments
 above ran in `exp-qg29pd6unq` after its serving process exited. The initial
