@@ -951,3 +951,45 @@ A separate reinspection of `exp-gjb1967wya` finds four full-context index
 selection conditionals totaling 3.213629 ms per forward. They contain the
 2.671015 ms of score kernels already reported, plus top-k and preparation;
 these inclusive branch times must not be added to their contained operators.
+
+## MoE communication compiler flags
+
+`exp-padazu1xvk` (`art-4lqp0wb45u`, source `883fed02`) compared all-gather
+SparseCore offload thresholds of zero (the serving default), 1 MiB and 64 MiB.
+Each policy used a fresh process, the pinned runtime, EP8, 288 local tokens,
+P-state 7, dynamic SMEM negotiation and enhanced launch barriers. All-reduce's
+threshold stayed at 64 MiB. Two biased `sqrtsoftplus` inputs used seeds
+1083/1084, correction bias, gate bias 2 and routed scale 1.5. Policy order was
+reversed for the second seed; each process recorded 31 host samples and five
+separate profile repetitions. Full FP32-cast BF16 output hashes matched across
+all three policies for each seed; every output was finite.
+
+| Seed | Threshold | Device module (ms) | Minus entry barriers (ms) | Host median (ms) |
+| --- | --- | ---: | ---: | ---: |
+| 1083 | Zero | 0.520761 | 0.439372 | 0.905439 |
+| 1083 | 1 MiB | 0.517347 | 0.429744 | 0.907004 |
+| 1083 | 64 MiB | 0.532950 | 0.457215 | 0.892510 |
+| 1084 | Zero | 0.465749 | 0.407834 | 0.877564 |
+| 1084 | 1 MiB | 0.461152 | 0.398057 | 0.876026 |
+| 1084 | 64 MiB | 0.508395 | 0.433410 | 0.866740 |
+
+Compiled HLO places the small routing-payload all-gather on TensorCore at
+1 MiB while retaining the FP8 activation all-gather on SparseCore. The interval
+before the expert kernel, excluding entry barriers, drops from 113.95 to
+104.03 us and from 113.58 to 104.44 us. Expert-kernel and combine-tail times
+are nearly unchanged. This supports a small dispatch improvement; host timing
+does not establish a throughput gain. A full-serving test is still required.
+The benchmark launcher accepts `--all-gather-offload-min-bytes 1048576` and
+records that setting; zero remains its default.
+
+A fourth policy enabled concurrent SparseCore offloading, offload queuing,
+latency-hiding layer scheduling and dependent-collective scheduling, using flags
+from the [MaxText tuning guide](https://maxtext.readthedocs.io/en/maxtext-v0.2.5/guides/optimization/benchmark_and_performance.html).
+Both attempts failed compilation because the latency-hiding layer scheduler
+requires the SparseCore collective aggregator. No timing exists for that policy.
+The experiment therefore ended with failure status after preserving the six
+completed comparisons; it is not a wholly successful sweep.
+
+Source, HLO, runtime versions, output checks and device events are preserved in
+`results/moe-compiler-flags-evidence.tgz`, 1002313 bytes, verified SHA-256
+`7f468c3643c4dce755f838d8cfa385cefee34090cbf110919a4dae0df525191b`.

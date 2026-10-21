@@ -107,6 +107,11 @@ No cache directory or GCS cache mount is needed. The launcher no longer accepts
 `--cache-dir` or `--cache-mode`; use a separate cache experiment for reuse tests.
 
 Profiles are enabled only by `--profile` and written directly under `--out/profile`.
+Compiler communication experiments can set `--all-gather-offload-min-bytes`;
+the launcher records the value in `manifest.json` and applies it before libtpu
+initializes. Its default is zero, matching the existing serving configuration.
+For example, `--all-gather-offload-min-bytes 1048576` keeps all-gathers smaller
+than 1 MiB off SparseCore. This is an explicit experiment, not a tuned default.
 No `ARTIFACT_LOCAL_DIR` or shared scratch directory is required. Do not enable compiler
 dumps during timed startup, and never pool profiled and unprofiled rounds.
 
