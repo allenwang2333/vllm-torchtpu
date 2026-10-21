@@ -185,7 +185,7 @@ def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
             components=kwargs["components"],
         )
 
-    monkeypatch.setattr(pooled_qsa, "streamindex_topk", transport)
+    monkeypatch.setattr(decode_indexer, "streamindex_topk", transport)
     actual = pooled_qsa.select_blocks(
         jnp.zeros((8, 4, 128), jnp.bfloat16),
         jnp.zeros((3, 128, 1, 4, 256), jnp.float8_e4m3fn),

@@ -55,7 +55,8 @@ def _write_main_cache_universal(pool, rows, page, logical, valid):
     tile = 128
 
     if len(rows) % tile or pool.shape[1] % tile:
-        return pool.at[page, logical % pool.shape[1]].set(rows, mode="drop")
+        safe_page = jnp.where(valid, page, pool.shape[0])
+        return pool.at[safe_page, logical % pool.shape[1]].set(rows, mode="drop")
 
     offsets = logical % pool.shape[1]
     pages_by_tile = page.reshape(-1, tile)
@@ -272,6 +273,13 @@ def write_main_cache(
     )
 
 
+def _compressed_rows(ratio):
+    # Each128-original-token logical block must contain complete BF16 pairs.
+    if ratio < 1 or ratio & (ratio - 1) or 128 % ratio or (128 // ratio) % 2:
+        raise ValueError("QSA ratio must divide128 into an even number of BF16 groups")
+    return 128 // ratio
+
+
 def write_compressed(pool, keys, complete, req, logical, starts, context, table, ratio):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
@@ -279,6 +287,9 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     BF16 row needs a read/modify/write; the last completion in each pair owns
     that write and includes both new rows when both completed this step.
     """
+    _compressed_rows(ratio)
+    if len(keys) == 0:
+        return pool
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     pairs_per_page = math.prod(pool.shape[1:-1]) // packing
@@ -464,10 +475,14 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     pair = pair.astype(jnp.int32)
     write = write.astype(jnp.int32)
     mask = mask.astype(jnp.int32)
-    # The compiler prefetches the rows operand into SMEM. A 4K-token step
-    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
-    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
-    max_rows = max(1, (512 * 1024) // bytes_per_token)
+    # Scalar prefetch contains index, active and two mask words per query;
+    # values use the VMEM BlockSpec above. Match the shared metadata reserve,
+    # retaining half of SMEM for pipeline/compiler state.512 bounds scan work,
+    # not a chip capacity or the size of the BF16 values operand.
+    scalar_budget = (pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024) // 2
+    max_rows = scalar_budget // (4 * jnp.dtype(jnp.int32).itemsize)
+    if max_rows < 1:
+        raise ValueError("QSA pair metadata exceeds the scalar-prefetch budget")
     chunk_size = min(len(keys), 512, 1 << (max_rows.bit_length() - 1))
     if len(keys) <= chunk_size:
         view = update(view, pair, write, mask, values)
@@ -502,7 +517,7 @@ def select_blocks(
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
     width = pool.shape[-1]
-    rows = 128 // ratio
+    rows = _compressed_rows(ratio)
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     physical_pages = (
         math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
@@ -580,7 +595,9 @@ def pooled_qsa_step(
         logical,
         valid,
     )
-    ring_rows = math.ceil(compress_ratio / 8) * 8
+    # The persistent ring/tag ABI pads request rows to eight logical lanes;
+    # VMEM padding of those typed views is independently handled by lowering.
+    ring_rows = (compress_ratio + 7) // 8 * 8
     ring_elements = ring_rows * raw.shape[-1]
     ring, tags = read_ring_and_tags(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
