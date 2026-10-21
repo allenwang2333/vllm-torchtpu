@@ -253,6 +253,8 @@ class _PrefixAffinityRouter:
         peak_prefill_tok_s: float = 42000.0,
         dram_load_tok_s: float = 280000.0,
         mk_ceiling_reqs: float = 40.0,
+        quad_attn_coeff: float = 0.0,
+        peak_prefill_eff_tok_s: float = 0.0,
     ) -> None:
         self.n = n
         self.chunk = max(256, chunk)
@@ -265,6 +267,19 @@ class _PrefixAffinityRouter:
         self.peak_prefill_tok_s = max(1000.0, peak_prefill_tok_s)
         self.dram_load_tok_s = max(10000.0, dram_load_tok_s)
         self.mk_ceiling_reqs = max(1.0, mk_ceiling_reqs)
+        # PR #2243 (Nan Wei): price a prefill by its quadratic attention cost,
+        # u + k * (u * p + u^2 / 2) linear-equivalent tokens for u new tokens
+        # behind p cached ones. The rate in those units is higher than the
+        # linear peak by the mean effective/uncached ratio of the trace.
+        self.quad_attn_coeff = max(0.0, float(quad_attn_coeff))
+        self.peak_prefill_eff_tok_s = (
+            float(peak_prefill_eff_tok_s)
+            if peak_prefill_eff_tok_s > 0
+            else self.peak_prefill_tok_s
+        )
+        self.inflight_eff_tokens: list[float] = [0.0] * n
+        self._req_eff_tokens: dict[str, tuple[int, float]] = {}
+        self.quad_flips = 0
 
         self._lock = threading.Lock()
         self.hbm_lru: list[OrderedDict[bytes, None]] = [
@@ -392,11 +407,66 @@ class _PrefixAffinityRouter:
                 while len(dram) > self.dram_max_blocks:
                     dram.popitem(last=False)
 
+    def effective_tokens(self, uncached_tokens: int, cached_tokens: int = 0) -> float:
+        """Quadratic FLOPs-equivalent prefill cost of ``uncached_tokens`` behind
+        ``cached_tokens`` of resident prefix (PR #2243)."""
+        u = max(0, int(uncached_tokens))
+        if u <= 0:
+            return 0.0
+        p = max(0, int(cached_tokens))
+        return float(u) + self.quad_attn_coeff * float(u) * (float(p) + float(u) / 2.0)
+
+    def _pick_prefill(
+        self,
+        hs: list[bytes],
+        est_ttft_s: list[float],
+        eff_cache_frac: list[float],
+        matched_toks: list[int],
+        q_reqs: list[int],
+        load_toks: list[float],
+    ) -> tuple[int, bool, bool]:
+        """(rank, is_sticky, spilled) under the sticky rule and the TTFT model."""
+        best_cache_rank = max(
+            range(self.n),
+            key=lambda r: (
+                round(eff_cache_frac[r], 4),
+                -round(est_ttft_s[r], 3),
+                -q_reqs[r],
+                -self.placed[r],
+                -r,
+            ),
+        )
+        min_ttft = min(est_ttft_s)
+        min_reqs = min(q_reqs)
+        has_warm_prefix = (
+            bool(hs)
+            and matched_toks[best_cache_rank] >= 2560
+            and eff_cache_frac[best_cache_rank] >= self.min_frac
+        )
+        if (
+            has_warm_prefix
+            and q_reqs[best_cache_rank] <= min_reqs + self.slack
+            and est_ttft_s[best_cache_rank] <= min_ttft + _env_float("PROXY_PREFILL_STICKY_TTFT_SLACK_S", 8.0)
+        ):
+            return best_cache_rank, True, False
+        rank = min(
+            range(self.n),
+            key=lambda r: (
+                round(est_ttft_s[r], 3),
+                load_toks[r],
+                q_reqs[r],
+                self.placed[r],
+                r,
+            ),
+        )
+        return rank, False, has_warm_prefix
+
     def route_prefill(
         self,
         hs: list[bytes] | None,
         total_tokens: int = 4096,
         scraper: _BackendMetricsScraper | None = None,
+        req_id: str | None = None,
     ) -> tuple[int, bool, int, int]:
         """llm-d Prefill Profile: 2-tier cache affinity + token-load TTFT cost model."""
         hs = hs or []
@@ -412,6 +482,9 @@ class _PrefixAffinityRouter:
             uncached_toks: list[int] = [0] * self.n
             dram_toks: list[int] = [0] * self.n
             q_reqs: list[int] = [0] * self.n
+            use_quad = self.quad_attn_coeff > 0.0
+            est_quad_s: list[float] = [0.0] * self.n
+            eff_toks: list[float] = [0.0] * self.n
 
             for r in range(self.n):
                 hbm_hits, dram_hits = self._match_pod_prefix(r, hs)
@@ -445,47 +518,36 @@ class _PrefixAffinityRouter:
                     d_tok / self.dram_load_tok_s
                 )
                 est_ttft_s[r] = queue_wait_s + exec_s
+                if use_quad:
+                    eff_toks[r] = self.effective_tokens(u_tok, h_tok + d_tok)
+                    est_quad_s[r] = (
+                        (self.inflight_eff_tokens[r] / self.peak_prefill_eff_tok_s)
+                        + (self.inflight_dram_tokens[r] / self.dram_load_tok_s)
+                        + (reqs_r * 0.015)
+                        + eff_toks[r] / self.peak_prefill_eff_tok_s
+                        + d_tok / self.dram_load_tok_s
+                    )
 
-            best_cache_rank = max(
-                range(self.n),
-                key=lambda r: (
-                    round(eff_cache_frac[r], 4),
-                    -round(est_ttft_s[r], 3),
-                    -q_reqs[r],
-                    -self.placed[r],
-                    -r,
-                ),
-            )
-            min_ttft = min(est_ttft_s)
-            min_reqs = min(q_reqs)
-
-            has_warm_prefix = (
-                bool(hs)
-                and matched_toks[best_cache_rank] >= 2560
-                and eff_cache_frac[best_cache_rank] >= self.min_frac
-            )
-            if (
-                has_warm_prefix
-                and q_reqs[best_cache_rank] <= min_reqs + self.slack
-                and est_ttft_s[best_cache_rank] <= min_ttft + _env_float("PROXY_PREFILL_STICKY_TTFT_SLACK_S", 8.0)
-            ):
-                rank = best_cache_rank
-                is_sticky = True
+            lin_load = [float(x) for x in self.inflight_uncached_tokens]
+            if use_quad:
+                rank, is_sticky, spilled = self._pick_prefill(
+                    hs, est_quad_s, eff_cache_frac, matched_toks, q_reqs,
+                    self.inflight_eff_tokens,
+                )
+                lin_rank, _, _ = self._pick_prefill(
+                    hs, est_ttft_s, eff_cache_frac, matched_toks, q_reqs, lin_load
+                )
+                if lin_rank != rank:
+                    self.quad_flips += 1
+            else:
+                rank, is_sticky, spilled = self._pick_prefill(
+                    hs, est_ttft_s, eff_cache_frac, matched_toks, q_reqs, lin_load
+                )
+            if spilled:
+                self.spilled += 1
+            if is_sticky:
                 self.sticky += 1
             else:
-                if has_warm_prefix:
-                    self.spilled += 1
-                rank = min(
-                    range(self.n),
-                    key=lambda r: (
-                        round(est_ttft_s[r], 3),
-                        self.inflight_uncached_tokens[r],
-                        q_reqs[r],
-                        self.placed[r],
-                        r,
-                    ),
-                )
-                is_sticky = False
                 self.cold += 1
 
             u_chosen = uncached_toks[rank]
@@ -493,6 +555,10 @@ class _PrefixAffinityRouter:
             self.inflight[rank] += 1
             self.inflight_uncached_tokens[rank] += u_chosen
             self.inflight_dram_tokens[rank] += d_chosen
+            if use_quad:
+                self.inflight_eff_tokens[rank] += eff_toks[rank]
+                if req_id is not None:
+                    self._req_eff_tokens[req_id] = (rank, eff_toks[rank])
             self.placed[rank] += 1
             self._record_pod_blocks(rank, hs)
 
@@ -504,6 +570,8 @@ class _PrefixAffinityRouter:
                     f"cold={self.cold} spilled={self.spilled} placed={self.placed} "
                     f"inflight_reqs={self.inflight} "
                     f"inflight_uncached_toks={self.inflight_uncached_tokens} "
+                    f"quad_attn_coeff={self.quad_attn_coeff:g} quad_flips={self.quad_flips} "
+                    f"inflight_eff_toks={[int(x) for x in self.inflight_eff_tokens]} "
                     f"hbm_blocks={[len(x) for x in self.hbm_lru]} "
                     f"dram_blocks={[len(x) for x in self.dram_lru]}",
                     flush=True,
@@ -511,10 +579,21 @@ class _PrefixAffinityRouter:
             return rank, is_sticky, u_chosen, d_chosen
 
     def done_prefill(
-        self, rank: int, uncached_tokens: int = 0, dram_tokens: int = 0
+        self,
+        rank: int,
+        uncached_tokens: int = 0,
+        dram_tokens: int = 0,
+        req_id: str | None = None,
     ) -> None:
         with self._lock:
             self.inflight[rank] = max(0, self.inflight[rank] - 1)
+            if req_id is not None and req_id in self._req_eff_tokens:
+                _, eff = self._req_eff_tokens.pop(req_id)
+                self.inflight_eff_tokens[rank] = max(
+                    0.0, self.inflight_eff_tokens[rank] - eff
+                )
+            if self.inflight[rank] == 0:
+                self.inflight_eff_tokens[rank] = 0.0
             self.inflight_uncached_tokens[rank] = max(
                 0, self.inflight_uncached_tokens[rank] - uncached_tokens
             )
@@ -669,6 +748,9 @@ class _PrefixAffinityRouter:
                 "inflight": list(self.inflight),
                 "inflight_uncached_tokens": list(self.inflight_uncached_tokens),
                 "inflight_dram_tokens": list(self.inflight_dram_tokens),
+                "inflight_eff_tokens": list(self.inflight_eff_tokens),
+                "quad_attn_coeff": self.quad_attn_coeff,
+                "quad_flips": self.quad_flips,
                 "sticky": self.sticky,
                 "cold": self.cold,
                 "spilled": self.spilled,
@@ -934,6 +1016,19 @@ async def lifespan(app: FastAPI):
             dram_max_blocks=prefill_dram_blocks,
             peak_prefill_tok_s=_env_float("PROXY_PEAK_PREFILL_TOK_S", default_peak_prefill_tok_s),
             dram_load_tok_s=_env_float("PROXY_DRAM_LOAD_TOK_S", 280000.0),
+            quad_attn_coeff=_env_float("PROXY_PREFILL_QUAD_ATTN_COEFF", 0.0),
+            # Mean effective/uncached ratio ~2.1 on the AgentX mix (prefix ~89K,
+            # ~6K uncached per request; pp8load j-6e24352e) at k = 1.23e-5.
+            peak_prefill_eff_tok_s=_env_float(
+                "PROXY_PEAK_PREFILL_EFF_TOK_S",
+                2.1 * _env_float("PROXY_PEAK_PREFILL_TOK_S", default_peak_prefill_tok_s),
+            ),
+        )
+        print(
+            "PERF PROXY llmd_prefill_router init "
+            f"quad_attn_coeff={app.state.prefill_router.quad_attn_coeff:g} "
+            f"peak_prefill_eff_tok_s={app.state.prefill_router.peak_prefill_eff_tok_s:g}",
+            flush=True,
         )
     else:
         app.state.prefill_router = None
@@ -1230,7 +1325,9 @@ async def _handle_completions(api: str, request: Request):
                     _,
                     prefill_uncached_toks,
                     prefill_dram_toks,
-                ) = router.route_prefill(prefill_hs, est_tokens, scraper)
+                ) = router.route_prefill(
+                    prefill_hs, est_tokens, scraper, req_id=request_id
+                )
                 prefill_client_info = request.app.state.prefill_clients[prefill_idx]
             else:
                 prefill_client_info = get_next_client(request.app, "prefill")
@@ -1263,7 +1360,10 @@ async def _handle_completions(api: str, request: Request):
             finally:
                 if router is not None and prefill_idx is not None:
                     router.done_prefill(
-                        prefill_idx, prefill_uncached_toks, prefill_dram_toks
+                        prefill_idx,
+                        prefill_uncached_toks,
+                        prefill_dram_toks,
+                        req_id=request_id,
                     )
 
             t_prefill_recv = time.time()
