@@ -45,16 +45,29 @@ The V2 adapter can pass prequantized FP8 activations and FP32 row scales explici
 to the routed MoE kernel, skipping local `rowquant_fp8` inside `quantize_local`.
 
 Shifted mHC produces normalized BF16 values together with the routed-MoE FP8
-representation (`moe_q`, `moe_scale`) in its epilogue. Router gates and shared
-experts retain BF16; an external gate supplies actual router logits, while a
-runner-owned gate computes them once inside the runner.
+representation (`moe_q`, `moe_scale`) in its epilogue. Router gates retain BF16;
+an external gate supplies actual router logits, while a runner-owned gate computes
+them once inside the runner.
 Routed MoE preserves its original quantization arithmetic: FP32 scale (`amax / 448`),
 BF16 reciprocal multiplication, and zero/nonfinite handling. Dispatch accepts the
 routed representation directly, preserving token layout, routing exchange, expert
 calculation, and output combine.
 
-Both activation variants are built at weight-loading time and cached per distinct
-closure configuration, not registered anew for every layer. They share routing,
+Shared gate/up projections with runtime e4m3fn weights and FP32 per-output-channel
+scales reuse the same FP8 values and row scales, without another activation
+quantization. The matmul accumulates/scales in FP32 and restores the original
+output dtype before SwiGLU. Down projections still quantize their own post-SwiGLU
+inputs. Unsupported shared projections and explicitly different shared inputs
+retain their existing BF16 entry path; routed padding never changes the shared
+projection's input width.
+
+Shared reuse adopts the producer's rounding and zero/nonfinite handling rather
+than the old shared-entry quantizer's arithmetic. It is not bitwise equivalent to
+the previous shared path, so full-model accuracy must be checked as well as the
+matmul contract.
+
+Both routed-MoE activation variants are built at weight-loading time and cached
+per distinct closure configuration, not registered anew for every layer. They share routing,
 replica groups and `logical_intermediate_size`, so FP8 input does not discard the
 MXFP4 trailing-padding contract.
 

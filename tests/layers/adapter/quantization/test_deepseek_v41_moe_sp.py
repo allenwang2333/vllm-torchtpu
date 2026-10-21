@@ -15,12 +15,17 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
+from vllm_torchtpu.layers.adapter import linear_common
 from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as runner_mod
 from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 from vllm_torchtpu.layers.adapter.quantization import deepseek_v41 as mod
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
 
 def _moe(*, sp, hash_table, naive):
@@ -155,6 +160,111 @@ def _prequantized_moe(monkeypatch, *, internal_gate, method_type, padded=False):
     object.__setattr__(moe, "gate", gate)
     object.__setattr__(moe, "experts", runner)
     return moe
+
+
+def _fp8_shared_mlp(monkeypatch):
+    """Run the production MLP/linear math through JAX on CPU, without a TPU bridge."""
+
+    def run_jax(fn, *args):
+        dtypes = {
+            torch.bfloat16: jnp.bfloat16,
+            torch.float32: jnp.float32,
+            torch.float8_e4m3fn: jnp.float8_e4m3fn,
+        }
+        arrays = [
+            jnp.asarray(arg.float().numpy(), dtype=dtypes[arg.dtype]) for arg in args
+        ]
+        result = fn(*arrays)
+        return torch.from_numpy(np.asarray(result, dtype=np.float32).copy()).to(
+            torch.bfloat16
+        )
+
+    def prequantized_op(output_dtype):
+        assert output_dtype == torch.bfloat16
+        return lambda *args: run_jax(
+            lambda *arrays: linear_common._quantized_matmul_prequantized_jax(
+                *arrays, output_dtype=jnp.bfloat16
+            ),
+            *args,
+        )
+
+    monkeypatch.setattr(
+        linear_common, "_get_quantized_matmul_prequantized_op", prequantized_op
+    )
+    monkeypatch.setattr(
+        linear_common,
+        "_get_quantized_matmul_op",
+        lambda: lambda *args: run_jax(linear_common._quantized_matmul_jax, *args),
+    )
+
+    class GateUp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "weight",
+                torch.tensor(
+                    [[1, -1, 2, 0], [0, 1, 1, -1], [-1, 0, 0, 1]],
+                    dtype=torch.float8_e4m3fn,
+                ),
+            )
+            self.register_buffer("weight_scale", torch.tensor([0.5, 1.0, 0.25, 0.5]))
+            self.gather_output = False
+            self.quant_method = object.__new__(VllmFp8LinearMethodTPU)
+
+        def forward(self, x):
+            return self.quant_method.apply(self, x), None
+
+    class Down(torch.nn.Module):
+        def forward(self, x):
+            weight = x.new_tensor([[1, 0, -1], [0, 2, 1]])
+            return x @ weight, None
+
+    shared = DeepseekV4MLP.__new__(DeepseekV4MLP)
+    torch.nn.Module.__init__(shared)
+    shared.gate_up_proj = GateUp()
+    shared.act_fn = lambda x: torch.nn.functional.silu(x[..., :2]) * x[..., 2:]
+    shared.down_proj = Down()
+    return shared
+
+
+@pytest.mark.parametrize("padded", [False, True])
+@pytest.mark.parametrize("distinct_shared_input", [False, True])
+def test_shared_fp8_reuse_preserves_input_identity_and_routed_padding(
+    monkeypatch, padded, distinct_shared_input
+):
+    moe = _prequantized_moe(
+        monkeypatch,
+        internal_gate=True,
+        method_type=mod.VllmDeepseekV4Mxfp4MoEMethod,
+        padded=padded,
+    )
+    shared = _fp8_shared_mlp(monkeypatch)
+    moe.experts._shared_experts = SimpleNamespace(_layer=shared)
+    hidden = torch.tensor([[1, 4, 2], [-2, -3, 1]], dtype=torch.bfloat16)
+    q = torch.tensor([[2, -1, 3], [4, 1, -2]], dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]])
+    ids = torch.tensor([2, 5], dtype=torch.int32)
+    separate = hidden + 1 if distinct_shared_input else None
+    output = moe.experts.forward_prequantized(
+        hidden,
+        None,
+        input_ids=ids,
+        shared_experts_input=separate,
+        hidden_states_q=q,
+        hidden_states_scale=scale,
+    )
+    if distinct_shared_input:
+        shared_expected = shared(separate)
+    else:
+        projected = (
+            (q.float() @ shared.gate_up_proj.weight.float())
+            * scale
+            * shared.gate_up_proj.weight_scale
+        ).to(torch.bfloat16)
+        activated = torch.nn.functional.silu(projected[..., :2]) * projected[..., 2:]
+        shared_expected = activated @ hidden.new_tensor([[1, 0, -1], [0, 2, 1]])
+    routed = (q.float() * scale * torch.tensor([[3], [7]])).to(torch.bfloat16)
+    torch.testing.assert_close(output, shared_expected + routed * 2, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("internal_gate", [False, True])

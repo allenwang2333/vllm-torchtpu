@@ -174,7 +174,7 @@ class VllmMoERunner(MoERunner):
         hidden_states_q: torch.Tensor | None = None,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run explicit FP8 routed inputs, retaining BF16 gate/shared inputs.
+        """Run explicit FP8 inputs for routed and compatible shared experts.
 
         Adapted from vLLM v0.31.1rc0 ``forward`` / ``_forward_impl``: their
         custom-op and quant-method seams cannot carry q/scale side operands.
@@ -190,6 +190,7 @@ class VllmMoERunner(MoERunner):
         from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
             VllmDeepseekV4Mxfp4MoEMethod,
         )
+        from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
         method = self._quant_method
         if (hidden_states_q is None) != (hidden_states_scale is None):
@@ -209,6 +210,17 @@ class VllmMoERunner(MoERunner):
             raise ValueError(
                 "prequantized inputs do not support routed input transforms"
             )
+        shared_layer = (
+            self._shared_experts._layer if self._shared_experts is not None else None
+        )
+        reuse_shared_quantization = (
+            hidden_states_q is not None
+            and (shared_experts_input is None or shared_experts_input is hidden_states)
+            and isinstance(shared_layer, DeepseekV4MLP)
+            and shared_layer.supports_prequantized_input()
+        )
+        # Routed padding must not change the shared expert's original input width.
+        shared_input_q = hidden_states_q
         if shared_experts_input is None and self._shared_experts is not None:
             shared_experts_input = hidden_states
         original_width = hidden_states.shape[-1]
@@ -235,11 +247,16 @@ class VllmMoERunner(MoERunner):
             hidden_states, router_logits = self._maybe_dispatch(
                 hidden_states, router_logits
             )
-            shared_output = (
-                self._shared_experts._layer(shared_experts_input)
-                if self._shared_experts is not None
-                else None
-            )
+            shared_output = None
+            if shared_layer is not None:
+                if reuse_shared_quantization:
+                    shared_output = shared_layer.forward_prequantized(
+                        shared_input_q,
+                        hidden_states_scale,
+                        output_dtype=shared_experts_input.dtype,
+                    )
+                else:
+                    shared_output = shared_layer(shared_experts_input)
             if hidden_states_q is not None:
                 if isinstance(method, VllmDeepseekV4Mxfp4MoEMethod):
                     fused_output = method._forward_monolithic_tpu(
