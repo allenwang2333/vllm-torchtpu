@@ -199,9 +199,24 @@ complete within 300 seconds after the baseline variant. Only that benchmark
 process was terminated; this does not establish the cause of the stall.
 The subsequent writeback-overlap comparison retained eight reads.
 
-Dense FP8 GEMM fusion is a subsequent experiment. CPU Pallas interpretation
-matches the reference on a small case; this is not TPU numerical or performance
-validation, and no GEMM replacement is enabled by this branch.
+Dense FP8 GEMM fusion was measured in `exp-sh81ry5nm6` at commit `0e742279`,
+with the same pinned TPU runtime and seed 1028. All 57 baseline/candidate cases
+were bit-exact, including signed zero. The table compares the reference with the
+fastest Pallas candidate for each observed shape at 288 rows. Times are device
+module medians excluding entry barriers, from five ordered profile repetitions.
+
+| K | N | Reference (us) | Best Pallas (us) | Candidate |
+| --- | --- | --- | --- | --- |
+| 5120 | 1792 | 9.113 | 12.473 | Fused quantization, M=288/N=256 |
+| 1280 | 32768 | 26.748 | 30.552 | Fused quantization, M=288/N=2048 |
+| 8192 | 5120 | 25.608 | 24.849 | Fused quantization, M=288/N=1024 |
+| 5120 | 4608 | 17.719 | 19.126 | Fused quantization, M=288/N=512 |
+| 2304 | 5120 | 11.107 | 12.235 | Fused quantization, M=288/N=1024 |
+
+Four shapes regressed. The remaining 0.759 us isolated gain has no second-seed
+or serving validation and does not justify a dispatch change. Some synchronized
+host medians improved by 1–4 us despite slower device execution; those host
+differences are not evidence of a faster kernel. No GEMM replacement is enabled.
 
 ```bash
 python scripts/dsv41_bench/bench_dense_fp8.py \
