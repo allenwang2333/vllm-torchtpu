@@ -235,7 +235,7 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
-    gather_and_attention_chunk_size = 128
+    gather_and_attention_chunk_size = 64
     attention_kernel_batch_size = 16
     # small chunks override:
     if q.shape[0] <= 128:
