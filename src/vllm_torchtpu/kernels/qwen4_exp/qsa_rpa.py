@@ -23,6 +23,9 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    TopKBackend,
+)
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _token_metadata,
@@ -279,6 +282,8 @@ def qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    *,
+    topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     if len(qgate) == 0:
         return (
@@ -326,6 +331,7 @@ def qsa_step(
         req,
         compress_ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        topk_backend=topk_backend,
     )
     # Keep the persistent owner in RPA's native dtype. Full-cache uint8/FP8
     # bitcast-converts lower to HBM reads/writes even when layouts match.
@@ -360,3 +366,7 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
             jnp.arange(len(blocks)), count * compress_ratio + tail
         ].set(jnp.where(token < lengths, token, -1))
     return selected
+
+
+# Keep protocol objects out of the native Torch POD schema.
+qsa_step = functools.partial(qsa_step, topk_backend=None)

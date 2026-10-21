@@ -13,6 +13,7 @@
 # limitations under the License.
 """QSA over one donated pool, with independent group-native block tables."""
 
+import functools
 import math
 
 import jax
@@ -21,6 +22,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+)
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
@@ -496,8 +501,11 @@ def select_blocks(
     *,
     ratio,
     block_topk,
+    topk_backend: TopKBackend | None = None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
+    if topk_backend is None:
+        topk_backend = SparseCoreTopK()
     width = pool.shape[-1]
     rows = 128 // ratio
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
@@ -530,6 +538,7 @@ def select_blocks(
             decode_req_batch_size=8 if batch >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            topk_backend=topk_backend,
         )
 
     if len(query) > len(context):
@@ -560,6 +569,7 @@ def select_blocks(
             enable_early_exit=True,
             chunk_tokens=chunk_tokens,
             components=qsa_indexing(ratio - 1),
+            topk_backend=topk_backend,
         )
 
     pages_per_query = table.shape[1] * logical_pages
@@ -610,6 +620,8 @@ def pooled_qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    *,
+    topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -681,6 +693,7 @@ def pooled_qsa_step(
         context,
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        topk_backend=topk_backend,
     )
     output, pool = qsa_attention(
         q,
@@ -700,3 +713,7 @@ def pooled_qsa_step(
         output.reshape(len(q), -1),
         selected_tokens(blocks, lengths, token_topk, compress_ratio),
     )
+
+
+# Keep protocol objects out of the native Torch POD schema.
+pooled_qsa_step = functools.partial(pooled_qsa_step, topk_backend=None)

@@ -20,6 +20,10 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+)
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 
 
@@ -37,9 +41,19 @@ def decode_query_chunk_size(pages_per_query: int) -> int:
     return min(512, 1 << (queries.bit_length() - 1))
 
 
-@functools.partial(jax.jit, static_argnames=("compress_ratio", "block_topk"))
+@functools.partial(
+    jax.jit, static_argnames=("compress_ratio", "block_topk", "topk_backend")
+)
 def select_decode_blocks(
-    indexq, compressed, lengths, table, request_ids, *, compress_ratio=4, block_topk=512
+    indexq,
+    compressed,
+    lengths,
+    table,
+    request_ids,
+    *,
+    compress_ratio=4,
+    block_topk=512,
+    topk_backend: TopKBackend | None = None,
 ):
     """Return int32[B, block_topk] completed-group IDs with a -1 suffix.
 
@@ -87,6 +101,8 @@ def select_decode_blocks(
     if block_topk < 16 or block_topk > 4096 or block_topk % 16:
         raise ValueError("block_topk must be a multiple of 16 in [16, 4096]")
 
+    if topk_backend is None:
+        topk_backend = SparseCoreTopK()
     cache = compressed.reshape(compressed.shape[0], page_size // 2, 2, -1)
     chunk_size = min(batch, decode_query_chunk_size(table.shape[1]))
 
@@ -107,6 +123,7 @@ def select_decode_blocks(
             decode_req_batch_size=8 if size >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            topk_backend=topk_backend,
         )
 
     if batch <= chunk_size:
