@@ -5,8 +5,8 @@ This branch is upstream `infx-qwen35-agentx-disagg-hillclimbing` at `e1c7027a7` 
 ## Read this first: what has and has not been tested
 
 - **This merged tree has not been curve-measured.** Each curve point in the table below was measured on its own source tree, which the table names. Two of those source trees (bands D to H) sit on a different base than upstream. Treat this branch as "the same code changes, applied to upstream", not as "the tree the numbers came from".
-- **Unit tests:** see "Unit tests" at the end of this file.
-- **GSM8K gate:** pending; the result will be added here. Gate job: not launched yet.
+- **Unit tests:** 242 passed, 3 failed, in the server image on CPU. The 3 failures are pre-existing: they fail identically on upstream. See "Unit tests" at the end of this file.
+- **GSM8K gate:** pending; the result will be added here. Gate job: `j-e0de41ff-119a-4e47-ae4b`, 1P1D EVAL_ONLY on the **standard** `agentx-397b-pd-baseline` recipe (cloud-devkit-recipes master `22ec9222`), with `--map-dir` = this tree at `78a677720` and the env of the o6q gate `j-bff2f5c9` (97.57%).
 
 ## What is in the branch
 
@@ -607,4 +607,37 @@ cdk job create agentx-397b-pd-baseline \
 
 ## Unit tests
 
-The unit tests are running now; the results will be added here.
+All tests ran on CPU (`JAX_PLATFORMS=cpu`) inside the curve's server image (`vllm-torchtpu-dev@sha256:ba3be4a9...`) under docker, with this tree mapped as `/workspace/vllm-torchtpu`, the way the recipe overlays it. The same list then ran on an upstream checkout (`e1c7027a7`) for comparison.
+
+| Test file | Origin | This branch | Upstream |
+|---|---|---|---|
+| tests/disagg/test_toy_proxy_admission.py | PR #2243 (+1 test) | 12 passed | 11 passed |
+| tests/platforms/test_pp_chunks_config.py | PR #2243 | 8 passed | 8 passed |
+| tests/test_pp_chunk_scheduler.py | PR #2243 (+2) | 36 passed | 34 passed |
+| tests/test_pp_chunks.py | PR #2243 (+2) | 25 passed | 23 passed |
+| tests/test_prefill_only_padding.py | crash fix v3 | 3 passed | absent |
+| tests/disagg/test_llmd_router_quad.py | llm-d quad (1215a7a) | 4 passed | absent |
+| tests/disagg/test_toy_proxy_llmd_dispatch.py | llmd dispatch (this merge) | 10 passed | absent |
+| tests/disagg/test_llmd_proxy_std_recipe_env.py | PROXY_<name> fallback (this merge) | 19 passed | absent |
+| tests/runner/test_runner_stage_timing_default.py | R5 + mode switch (this merge) | 10 passed | absent |
+| tests/kernels/test_batched_rpa_prefill_blocks.py | TPU_RPA_PREFILL_BLOCKS | 8 passed | absent |
+| tests/kernels/test_batched_rpa_config.py | existing | 10 passed | 10 passed |
+| tests/kernels/test_qwen35_megakernel_buckets.py | MK 112-row port (+17) | 33 passed, **3 failed** | 16 passed, **3 failed** |
+| tests/test_prefix_aware_scheduler.py | existing | 37 passed | 37 passed |
+| tests/test_single_step_prefill.py | existing | 8 passed | 8 passed |
+| tests/test_paw_sort_waiting.py | existing | 8 passed | 8 passed |
+| tests/test_kv_prefetch_scheduler.py | existing | 11 passed | 11 passed |
+
+**Total on this branch: 242 passed, 3 failed.**
+
+- **The 3 failures fail identically on upstream**, so this merge did not cause them: `test_fused_pool_io_bucket_selection_and_hlo_guard`, `test_fused_pool_io_fallback_rebuilds_only_fused_buckets`, `test_build_bucket_op_names_and_hlo_fallback`. In each, the test's `fake_step` stub does not accept the `out_rows=` keyword that `vllm_adapter.py` passes.
+- **Mutation checks.** Each check broke the code, confirmed the test fails, then restored it. A no-op control run passed 46/46. Every mutation below was caught:
+  - R5 default reverted: 2 failed.
+  - Mode `on` ignored: 2 failed.
+  - llmd dispatch predicate off: 5 failed.
+  - Dispatch removed from `__main__`: 1 failed.
+  - PROXY_<name> fallback off: 6 failed.
+  - One sizing variable un-wired: 1 failed.
+  - llm-d quad path off: 2 failed.
+  - Fix v3 trim condition off: 2 failed.
+- No TPU kernel or serving test ran here; the GSM8K gate covers the serving path.
