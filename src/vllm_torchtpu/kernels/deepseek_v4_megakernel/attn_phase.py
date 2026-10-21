@@ -87,6 +87,7 @@ class Dims:
     max_ctx: int
     kinds: tuple[str, ...] = ("csa", "hca")  # layer kinds present
     heads: int = 128  # attended query heads per query row (StepGeometry.attn_heads)
+    strict_causal: bool = False  # StepGeometry.strict_causal
 
     @property
     def compressed(self):  # any HCA / CSA layer: their buffers are needed
@@ -163,7 +164,8 @@ def table_layout(d: Dims):
 
 def dims_of(geom) -> Dims:
     return Dims(q=geom.q, B=geom.B, RP=geom.RP, max_ctx=geom.max_ctx,
-                kinds=tuple(sorted(set(geom.layer_kinds))), heads=geom.attn_heads)
+                kinds=tuple(sorted(set(geom.layer_kinds))), heads=geom.attn_heads,
+                strict_causal=geom.strict_causal)
 
 
 def window_config(d: Dims, kind: str = "") -> core.WindowConfig:
@@ -856,7 +858,8 @@ class _Phase:
         nblk = jnp.maximum(core.cdiv(npages, IDX_BLK), 1)
         dsp = self.disp["indexer_k"]
         t8 = lax.broadcasted_iota(jnp.int32, (8, 1), 0)
-        row_len = jnp.where(t8 < T, jnp.minimum(n, (self.pos(r, 0) + t8) // CSA_RATIO + 1), 0)
+        row_len = jnp.where(t8 < T, attn_csa.visible_rows(n, self.pos(r, 0) + t8, d.strict_causal,
+                                                          CSA_RATIO), 0)
 
         def start(b, slot):
             def pg(ref, p):
@@ -910,7 +913,8 @@ class _Phase:
             wait(0, 0)
         # top-k
         lens = jnp.broadcast_to(row_len, (8, 128))
-        max_len = jnp.minimum(n, (self.pos(r, T - 1)) // CSA_RATIO + 1)  # row lengths grow with t
+        # row lengths grow with t
+        max_len = attn_csa.visible_rows(n, self.pos(r, T - 1), d.strict_causal, CSA_RATIO)
         nscan = jnp.maximum((max_len + tc_topk.SCAN_ALIGN - 1) // tc_topk.SCAN_ALIGN, 1)
         # columns past the row lengths (stale VMEM included) are never read by topk_group
         if DEBUG_SCORES is not None:

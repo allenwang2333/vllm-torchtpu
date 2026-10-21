@@ -139,6 +139,7 @@ def indexer_scores_reference(
     *,
     ratio=4,
     page_size=256,
+    strict_causal=False,
 ):
     """Indexer logits as `streamindex_topk` scores a verify window.
 
@@ -159,7 +160,7 @@ def indexer_scores_reference(
             acc = acc + jnp.maximum(st[h], 0.0) * weights[r, :, h : h + 1]
         acc = acc * scale[None, :]
         pos = int(seq_lens[r]) - q_len + np.arange(q_len)
-        vis = np.minimum(n, pos // ratio + 1)
+        vis = np.minimum(n, (pos + 1) // ratio if strict_causal else pos // ratio + 1)
         acc = jnp.where(np.arange(n)[None, :] < vis[:, None], acc, -jnp.inf)
         scores.append(jnp.pad(acc, ((0, 0), (0, n_max - n)), constant_values=-jnp.inf))
         lens.append(vis)

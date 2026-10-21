@@ -114,6 +114,7 @@ class StepKernelConfig:
     # static expert placement (moe_phase.placement_tables): "" none, "perm"
     # (moe_w["held"]), "replicas" (also moe_w["copy"])
     moe_placement: str = ""
+    strict_causal: bool = False  # StepGeometry.strict_causal
 
     @property
     def n_debug_outputs(self) -> int:
@@ -189,7 +190,7 @@ class StepKernelConfig:
             n_experts=cfg.n_experts, moe_inter=cfg.moe_inter,
             lease_bytes=cfg.n_banks * cfg.max_tile_bytes, max_ctx=self.max_ctx,
             num_hash_layers=self.num_hash_layers, attn_heads=self.NA,
-            attn_tp=self.attn_tp,
+            attn_tp=self.attn_tp, strict_causal=self.strict_causal,
         )  # fmt: skip
 
     def ar_spec(self) -> AR.AllReduceSpec:

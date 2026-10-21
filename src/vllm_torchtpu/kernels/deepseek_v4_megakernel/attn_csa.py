@@ -47,6 +47,13 @@ NN = core.NN
 # ------------------------------------------------------------------ indexer
 
 
+def visible_rows(n, pos, strict_causal, ratio=4):
+    """Compressed rows a query at `pos` may select of the `n` stored: with
+    `strict_causal` only the groups complete at `pos`, else also the group
+    `pos` is in (`streamindex_topk._effective_row_lengths`)."""
+    return jnp.minimum(n, (pos + 1) // ratio if strict_causal else pos // ratio + 1)
+
+
 @dataclasses.dataclass(frozen=True)
 class IndexerConfig:
     max_req: int
@@ -58,6 +65,7 @@ class IndexerConfig:
     ratio: int = 4
     page: int = 256  # compressed rows per indexer page
     blk_pages: int = 8
+    strict_causal: bool = False  # visible_rows
 
     @property
     def groups(self) -> int:  # word rows per token record: keys + scale
@@ -138,7 +146,7 @@ def index_scores(
             scr.wb[h] = jnp.broadcast_to(w[:, h : h + 1], (8, cfg.blk_rows))
         n = n_rows(r)
         t = lax.broadcasted_iota(jnp.int32, (8, 1), 0)
-        row_len = jnp.minimum(n, (seq_lens[r] - cfg.q_len + t) // cfg.ratio + 1)
+        row_len = visible_rows(n, seq_lens[r] - cfg.q_len + t, cfg.strict_causal, cfg.ratio)
         nb = jnp.maximum(1, core.cdiv(n, cfg.blk_rows))
 
         def blk_body(b, g):
@@ -174,6 +182,7 @@ def indexer_scores(
     *,
     max_len: int,
     blk_pages: int = 8,
+    strict_causal: bool = False,
     interpret=False,
     vmem_limit_bytes: int = 60 * 1024 * 1024,
 ):
@@ -186,7 +195,8 @@ def indexer_scores(
     blk_rows = blk_pages * page
     n_cols = core.cdiv(max_len // ratio, blk_rows) * blk_rows
     cfg = IndexerConfig(max_req=R, pages_per_req=idx_table.shape[1], n_cols=n_cols, q_len=T,
-                        n_heads=Hi, head_dim=D, page=page, blk_pages=blk_pages)
+                        n_heads=Hi, head_dim=D, page=page, blk_pages=blk_pages,
+                        strict_causal=strict_causal)
     q_hm = jnp.pad(q_idx.transpose(0, 2, 1, 3), ((0, 0), (0, 0), (0, 8 - T), (0, 0)))
     w = jnp.pad(weights.astype(jnp.float32), ((0, 0), (0, 8 - T), (0, 0)))
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
@@ -211,7 +221,7 @@ def indexer_scores(
         idx_words,
     )
     pos = seq_lens[:, None] - T + jnp.arange(T)[None, :]
-    row_lens = jnp.minimum(seq_lens[:, None] // ratio, pos // ratio + 1).astype(jnp.int32)
+    row_lens = visible_rows(seq_lens[:, None] // ratio, pos, strict_causal, ratio).astype(jnp.int32)
     return scores[:, :T], row_lens
 
 

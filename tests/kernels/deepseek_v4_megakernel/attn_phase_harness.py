@@ -243,7 +243,8 @@ def group_heads(inputs, weights, attn_heads, h0):
 
 
 def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=False,
-               served_dtypes=False, reps=1, lease_bytes=0, attn_heads=128, h0=0):
+               served_dtypes=False, reps=1, lease_bytes=0, attn_heads=128, h0=0,
+               strict_causal=False):
     """(function, operands) of the phase's standalone pallas_call. With
     `served_dtypes` the uint8-served arrays are passed as uint8 slabs (device
     only: the phase bitcasts them in-kernel). `lease_bytes` (device only): the
@@ -252,7 +253,8 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
     R = len(ls.seq_lens)
     num_req = R if num_req is None else num_req
     geom = SP.StepGeometry(R=16, T=16, q=Q, B=R, layer_kinds=ls.kinds, max_ctx=ls.max_ctx,
-                           lease_bytes=lease_bytes, attn_heads=attn_heads)
+                           lease_bytes=lease_bytes, attn_heads=attn_heads,
+                           strict_causal=strict_causal)
     weights = ls.weights
     if attn_heads != 128:
         inputs, weights = group_heads(inputs, weights, attn_heads, h0)
@@ -335,9 +337,9 @@ def build_call(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk
 
 
 def run_phase(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=False,
-              attn_heads=128, h0=0):
+              attn_heads=128, h0=0, strict_causal=False):
     fn, ops = build_call(ls, kind, layer, inputs, num_req, interpret, debug_topk,
-                         attn_heads=attn_heads, h0=h0)
+                         attn_heads=attn_heads, h0=h0, strict_causal=strict_causal)
     n_c = len(ls.arrays)
     res = fn(*ops)
     AP.DEBUG_TOPK = AP.DEBUG_SCORES = AP.DEBUG_LENS = None
@@ -346,7 +348,7 @@ def run_phase(ls, kind, layer, inputs, num_req=None, interpret=True, debug_topk=
     return list(res[:n_c]), res[n_c]
 
 
-def reference(ls, kind, layer, inputs):
+def reference(ls, kind, layer, inputs, strict_causal=False):
     """Expected (caches, out rows [R, Q, 128, 512] f32)."""
     R = len(ls.seq_lens)
     arrays = [np.asarray(a).copy() for a in ls.arrays]
@@ -398,7 +400,7 @@ def reference(ls, kind, layer, inputs):
     qi, wi = attn_ref.indexer_q_reference(inputs["idx_q"][:, :Q], inputs["idx_w"][:, :Q, :64],
                                           w["idx_cos_sin"], pos)
     sc, rl = attn_ref.indexer_scores_reference(qi, wi, jnp.asarray(arrays[ai("indexer_k")]),
-                                               tb("indexer_k"), seq)
+                                               tb("indexer_k"), seq, strict_causal=strict_causal)
     topk = attn_ref.topk_reference(sc, rl, AP.TOPK)
     out = attn_ref.csa_reference(
         q, inputs["kv"][:, :Q], swa_words, jnp.asarray(ls.swa_table[layer]),
@@ -419,7 +421,7 @@ def reference_with_topk(ls, layer, inputs, exp_caches, topk):
         ls.weights["attn_sink"][layer], sm_scale=AP.SM_SCALE)
 
 
-def stock_topk_equal(ls, layer, inputs, exp_caches, topk):
+def stock_topk_equal(ls, layer, inputs, exp_caches, topk, strict_causal=False):
     """Rows whose kernel top-k equals stock rope_quant + streamindex_topk (device)."""
     from bench_attn_device import stock_indexer
     from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
@@ -434,5 +436,6 @@ def stock_topk_equal(ls, layer, inputs, exp_caches, topk):
     q8, qs = rope_quant(inputs["idx_q"][:, :Q].reshape(R * Q, 64, 128), pos.reshape(-1),
                         ls.weights["idx_cos_sin"], quant_dtype=jnp.float8_e4m3fn)
     w = inputs["idx_w"][:, :Q, :64].reshape(R * Q, 64) * (128 ** -0.5) * (64 ** -0.5) * qs.reshape(R * Q, 64)
-    stk = np.asarray(stock_indexer(q8, w, u8, seq, jnp.asarray(ls.tables[("indexer_k", layer)])))
+    stk = np.asarray(stock_indexer(q8, w, u8, seq, jnp.asarray(ls.tables[("indexer_k", layer)]),
+                                   strict_causal=strict_causal))
     return int(np.sum(np.all(stk.reshape(R, Q, -1) == np.asarray(topk), axis=-1)))

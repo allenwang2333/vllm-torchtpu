@@ -35,6 +35,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import attn_core
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import kernel_interface as KI
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import step_kernel as SK
@@ -157,6 +158,7 @@ def kernel_config(
     """`dense` overrides the DSv4-Pro dense geometry (reduced-width tests)."""
     spec = cfg.model
     dense = dataclasses.replace(dense or WM.dense_config(spec), rows=bucket.rows)
+    kw.setdefault("strict_causal", envs.TPU_STREAMIDX_STRICT_CAUSAL)
     return SK.StepKernelConfig(
         dense=dense,
         q=bucket.q,

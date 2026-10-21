@@ -195,7 +195,7 @@ def bench_hca(R, H, ctx, check, rng):
 # ------------------------------------------------------------------ CSA bench
 
 
-def stock_indexer(q2, w2, idx_u8, seq_lens, table, *, return_scores=False):
+def stock_indexer(q2, w2, idx_u8, seq_lens, table, *, return_scores=False, strict_causal=False):
     """`_indexer_jax` after rope_quant (deepseek_v4_indexer.py), SAL layout."""
     R = seq_lens.shape[0]
     cu = jnp.arange(R + 1, dtype=jnp.int32) * C.Q_LEN
@@ -204,7 +204,7 @@ def stock_indexer(q2, w2, idx_u8, seq_lens, table, *, return_scores=False):
         page_indices=table.reshape(-1), cu_q_lens=cu, distribution=jnp.array([0, R, R], jnp.int32),
         k=1024, compression_ratio=C.CSA_RATIO, num_kv_pages_per_block=(32, 32, 16),
         num_queries_per_block=(1, 128, 128), decode_req_batch_size=1, uniform_q_len=C.Q_LEN,
-        kv_layout="seq_along_lane", return_scores=return_scores)
+        kv_layout="seq_along_lane", return_scores=return_scores, strict_causal=strict_causal)
 
 
 def stock_csa(q2, sw_cache, new_kv2, nope, rope, topk2, swa_table, csa_table, seq_lens, sinks,
