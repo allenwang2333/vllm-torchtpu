@@ -29,8 +29,7 @@ from .backend import check_ckpt_bounds, kernel_debug_check, resolve_active_seqs
 from .config import cache_exec
 from .layout import LANES, PoolLayout
 
-# Pallas kernel name (unchanged from the Qwen3.5-only module so TPU traces and
-# profiles stay comparable); `GATHER_KERNEL_NAME` is a substring of it.
+# Pallas kernel name (`GATHER_KERNEL_NAME` is a substring of it).
 _PALLAS_NAME = "qwen3_5_gather_gdn_states"
 
 
@@ -69,7 +68,7 @@ def gather_gdn_states(
       interpret: Override `ex.interpret`.
 
     Returns:
-      `(conv, rec)` matching `GDNBlock.states(g, ex)` per-rank shapes.
+      `(conv, rec)` per-rank recurrent and causal-conv state tensors.
     """
     layout.validate(ex)
     if interpret is None:

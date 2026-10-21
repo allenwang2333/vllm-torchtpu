@@ -34,7 +34,12 @@ def rup(n: int, k: int) -> int:
 
 
 def rnd(x: jax.Array) -> jax.Array:
-    """Round float32 tensor through bfloat16 back to float32."""
+    """Round float32 tensor through bfloat16 back to float32.
+
+    Used throughout normalization, rotary embedding, and activation helpers to
+    mirror the op-by-op bfloat16 rounding of the PyTorch reference so the
+    megakernel stays bit-exact with it.
+    """
     return x.astype(BF16).astype(F32)
 
 
@@ -73,7 +78,11 @@ def rms_zc(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
 def rope_partial(
     x: jax.Array, cos: jax.Array, sin: jax.Array, rot_dim: int
 ) -> jax.Array:
-    """Partial rotary positional embedding on the leading `rot_dim` columns."""
+    """Partial rotary positional embedding on the leading `rot_dim` columns.
+
+    Intermediate products and sums are rounded through bfloat16 (`rnd`) to
+    match the op-by-op bfloat16 rounding of the reference rotary embedding.
+    """
     half = rot_dim // 2
     x1, x2, rest = x[:, :half], x[:, half:rot_dim], x[:, rot_dim:]
     return jnp.concatenate(
@@ -87,7 +96,11 @@ def rope_partial(
 
 
 def silu_mul(gate: jax.Array, up: jax.Array) -> jax.Array:
-    """SwiGLU activation `rnd(silu(gate)) * up` rounded to BF16."""
+    """SwiGLU activation `rnd(silu(gate)) * up` rounded to BF16.
+
+    `silu(gate)` is rounded to bfloat16 before multiplying by `up` to match
+    `F.silu(x[..., :d]) * x[..., d:]` evaluated on bfloat16 tensors.
+    """
     return (rnd(jax.nn.silu(gate)) * up).astype(BF16)
 
 

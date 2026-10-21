@@ -14,7 +14,7 @@
 """`make_pool_backend(layout)` plus the shared pool checks.
 
 `check_ckpt_bounds` is the single host-side checkpoint-slot bounds check, used by
-the pool kernels, the host packers and the pooled-step cache pipes.
+the pool kernels, the host packers and the paged-pool callers.
 """
 
 from __future__ import annotations
@@ -146,8 +146,8 @@ def can_pool_gather(
 ) -> bool:
     """Whether verify bucket `ex` can gather recurrent state in-kernel (`GPR`).
 
-    Depends only on the pool layout and the recurrent block's chunking
-    (`rec_chunk(ex)`, e.g. `GDNBlock.chunk_rows`; `None`: no in-kernel gather):
+    Depends only on the pool layout and the recurrent chunking callback
+    (`rec_chunk(ex) -> (chunk_rows, ring_buffers)`; `None`: no in-kernel gather):
     `GPR` needs the chunked verify path and a conv window that fits the K half
     of one pool page as `(rows, 4, page_size)` fp8 rows.
     """

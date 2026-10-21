@@ -33,8 +33,7 @@ from .scatter_ctx import ScatterGeom, ScatterKernel
 from .scatter_kv import kv_cols, scatter_kv
 from .scatter_sched import ckpt_prologue, scatter_ckpt_states
 
-# Pallas kernel name (unchanged from the Qwen3.5-only module so TPU traces and
-# profiles stay comparable); `SCATTER_KERNEL_NAME` is a substring of it.
+# Pallas kernel name (`SCATTER_KERNEL_NAME` is a substring of it).
 _PALLAS_NAME = "qwen3_5_scatter_pool_states"
 
 

@@ -26,9 +26,9 @@ Numerics classes (enforced, not just labels), relative to the reference
 profile: the default profile of the profile's model (`Profile.model`), or the
 `default` profile when the model declares none (or `model` is None):
 - `exact`: must reproduce the reference profile bit-exactly.
-- `approx`: changes numerics (e.g. `kv_sub`, `route_vec`, `dense_acc_pair`,
-  head-major GDN, hierarchical all-reduce variants, fused pool I/O); must pass
-  the accuracy ladder.
+- `approx`: changes numerics (e.g. `dense_acc_pair`, `dmm_unroll`,
+  hierarchical all-reduce variants, fused pool I/O); must pass the accuracy
+  ladder.
 
 Every tile knob (core `Tiles` fields and each block's `Tunables`) and pool-I/O
 mode declares its class (`exec_spec.tile_numerics()`, `pool.POOL_IO_NUMERICS`).
@@ -74,23 +74,24 @@ class Profile:
     """Named bundle of execution tuning (tiles, flags, buckets, pool I/O)."""
 
     name: str
-    model: str | None = None  # `ModelSpec.name` this profile targets (None: any)
+    model: str | None = None  # Model name this profile targets (None: any)
     numerics: Literal["exact", "approx"] = "exact"
     # Tile rule. None: the rule of `model`'s default profile (`tile_rule`), or
     # with no model (or one without a default profile) the library default
-    # (`profiles/default.py`), left unresolved by `exec_for` so the kernel
-    # builder fits it to the model's VMEM budget (`vmem.fit_default_tiles`).
+    # (`profiles/default.py`), left unresolved by `exec_for` so ring depths may
+    # be refined at build time to fit the VMEM budget.
     tiles: TileRule | None = None
     buckets: tuple[int, ...] | None = None  # T=1 decode buckets (None: adapter default)
     verify_buckets: tuple[int, ...] | None = None  # T>1 buckets (None: adapter default)
-    # Experimental 1-launch fused pool I/O: False | True | "auto" (see
-    # `cache_experimental.should_fuse_pool_io`). Requires pool donation.
+    # Single-launch fused pool I/O: False | True | "auto" (bucket-dependent
+    # policy using `fused_pool_io_max_b` and `fused_pool_io_min_b_hi`). Requires
+    # pool donation.
     fused_pool_io: bool | str = False
     fused_pool_io_max_b: int = 24
     fused_pool_io_min_b_hi: int = 56
-    # In-kernel GDN gather (GPR): False (split) | None (auto: WIDE verify buckets
-    # where eligible; exact) | True (every bucket where eligible, never a T=1
-    # bucket; approx, see `pool.POOL_IO_NUMERICS`).
+    # In-kernel recurrent gather (GPR): False (split) | None (auto: WIDE verify
+    # buckets where eligible; exact) | True (every bucket where eligible, never
+    # a T=1 bucket; approx, see `pool.POOL_IO_NUMERICS`).
     pool_gather: bool | None = False
     baseline: Baseline | None = None
     description: str = ""
@@ -166,7 +167,7 @@ class Profile:
         """Return this profile's tiles for a bucket of `B` rows on `R` ranks.
 
         For the library default rule (`tile_rule() is None`) these are the
-        tiles before the kernel builder's VMEM fit.
+        tiles before build-time VMEM refinement.
         """
         rule = self.tile_rule()
         return (default_tiles if rule is None else rule)(B, moe_tp=moe_tp, R=R)
@@ -177,16 +178,16 @@ class Profile:
         Explicit settings on `base` win (expert / test overrides), the profile
         fills the rest:
         - `tiles`: `base.tiles` if set, else the profile's tile rule
-          (`tile_rule`; left `None` for the library default rule, which the
-          kernel builder fits to the model's VMEM budget);
+          (`tile_rule`; left `None` for the library default rule, which may be
+          refined at build time to fit the VMEM budget);
         - `pool_gather`: the `CacheExec.pool_gather` of `base` unless it is the
           library default
           `False` ("no explicit choice"), else the profile's: `None` -> auto,
           `True` -> `"eligible"` (gather wherever the pool backend can, e.g.
           never on a `T=1` bucket). Pass `pool_gather="split"` to force split
           under a GPR profile.
-        Fused pool I/O is resolved by the caller through `should_fuse_pool_io`
-        because it also depends on the pool backend.
+        Fused pool I/O is resolved by the caller because it also depends on the
+        pool backend.
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = base.tiles
@@ -206,7 +207,7 @@ class Profile:
 
 
 _REGISTRY: dict[str, Profile] = {}
-# `ModelSpec.name` -> name of the model's default profile.
+# Model name -> name of the model's default profile.
 _MODEL_DEFAULTS: dict[str, str] = {}
 _BUILTINS_LOADED = False
 
@@ -229,10 +230,10 @@ def approx_features(profile: Profile) -> tuple[str, ...]:
     The reference is `model_default_profile(profile.model)`; a model default
     profile is its own reference (no features). A tile field counts when the
     two tile rules give it different values on any bucket of the grid (`B` in
-    1..64, `R` in {1, 2, 4, 8, 16}, EP and TP MoE) and the knob is `approx` in
-    `exec_spec.tile_numerics()` (block knobs as `tiles.<block>.<field>`); a pool-I/O
-    mode the profile turns on and the reference
-    does not counts per `POOL_IO_NUMERICS`.
+    1..64, `R` in {1, 2, 4, 8, 16}, `moe_tp` in {False, True}) and the knob is
+    `approx` in `exec_spec.tile_numerics()` (block knobs as
+    `tiles.<block>.<field>`); a pool-I/O mode the profile turns on and the
+    reference does not counts per `POOL_IO_NUMERICS`.
     """
     if profile.model_default:
         return ()
@@ -304,7 +305,7 @@ def register_profile(profile: Profile, *, replace: bool = False) -> Profile:
 
 
 def model_default_profile(model: str | None) -> Profile:
-    """The default profile of `model` (`ModelSpec.name`), else `default`."""
+    """The default profile of `model`, else `default`."""
     name = _MODEL_DEFAULTS.get(model) if model is not None else None
     return _REGISTRY[name] if name is not None else DEFAULT_PROFILE
 
