@@ -6,7 +6,8 @@ The 35 ms main-model forward and 14000 output tokens/chip/s targets remain
 unmet. The serving measurements below cover an FP4 MoE height ladder for the
 observed EP8 geometry and a joint request/scorer configuration for the
 48-request full-context indexer, whole-batch router selection, WO_A row chunks
-and the normalized mHC output placement.
+and the normalized mHC output placement. An optional calibrated expert
+placement reaches 41.635 ms in the latest full-serving run, still above target.
 
 ## Configuration and provenance
 
@@ -32,6 +33,7 @@ JAX/JAXLIB 0.11.2 and libtpu 0.0.50, with vLLM revision
 | FP4 ladder + indexer + router | `7b971e97` | `exp-qg29pd6unq` / `results/router-tuned` |
 | Previous + WO_A | `2881d570` | `exp-btjh485722` / `results/woa-tuned` |
 | Previous + mHC VMEM output | `7bf96de9` | `exp-qfs10zulj7` / `results/mhc-vmem-tuned` |
+| Previous + optional expert placement | `d1cecfb3` | `exp-gjb1967wya` / `results/expert-placement` |
 
 The FP4 run's top-level runtime source and actual checkout are `c6ffd0fa`;
 its copied nested source metadata still names the base. The first combined
@@ -74,7 +76,8 @@ may overlap other work, so they must not be summed as a critical-path estimate.
 
 HBM values are rounded startup server-log statistics, not sampled runtime
 peaks. The joint indexer increases its isolated executable's temporary HBM by
-12 MiB (42390016 to 54658304 bytes). These changes do not repack model weights.
+12 MiB (42390016 to 54658304 bytes). Weight formats are unchanged; the optional
+expert placement moves logical experts between ranks.
 Startup includes loading, compilation and warmup; it is not a weight-load
 benchmark. Prefill, mixed batches and model-quality benchmarks were not run
 for these changes.
@@ -481,7 +484,7 @@ with the source-aligned placements, seed 1076, and a four-way comparison:
 All 160 output checks were bit-exact. The smaller height regressed overall
 and is not integrated. Thirty layers saved more than 5 us under the placement
 change; their isolated savings total 1.075717 ms. Layer selection uses this
-timing sweep, so further serving measurements remain necessary. The verified
+timing sweep; the serving run below measures the resulting policy. The verified
 `results/actual-route-sweep-evidence.tgz` is 9814079 bytes with SHA-256
 `210db553d1d8ec7b3ddab9cbbb243d80bc9846b43df2471ef018ce98330c965c`.
 
@@ -506,10 +509,53 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
 ```
 
 The runtime integration checks configuration, loader, bridge and model factory
-behavior on the pinned runtime. Full type checking adds no errors against the
-same-source baseline (57 existing errors become 54). Full-serving performance
-and output validation are pending;
-the microbenchmark sum is not a main-model forward time.
+behavior on the pinned runtime: 258 tests passed, including a rerun after fixing
+an outdated mock's upstream signature. Full type checking adds no errors against
+the same-source baseline (57 existing errors become 54). The microbenchmark
+sum is not a main-model forward time.
+
+The full run `exp-gjb1967wya`, source `d1cecfb3`, passed all three formal
+windows and its separate profile. Six profile steps contain 180 mapped and
+60 original main-model MoE calls, confirming the intended 30/10 layer split.
+
+| Metric | Previous mHC run | Selective placement |
+| --- | ---: | ---: |
+| Main-model device forward, ms | 42.608259 | 41.635182 |
+| Forward minus entry barriers, ms | 41.727823 | 40.492454 |
+| Host step median, ms | 52.724 / 52.465 / 52.254 | 50.194 / 50.321 / 50.124 |
+| Fixed-acceptance output tokens/chip/s | 6318 / 6349 / 6375 | 6637 / 6620 / 6646 |
+| Observed accepted+bonus tokens/chip/s | 7118 / 7200 / 7146 | 7604 / 7429 / 7400 |
+| Main-model MoE inclusive event time/step, ms | 15.152258 | 13.625933 |
+| Startup HBM per logical device, GiB range | 48.98–49.04 | 49.01–49.04 |
+| Server launch to health ready, seconds | 1042.219 | 1032.965 |
+
+The six forward sums are 44.791704, 42.023947, 65.717492, 41.246417,
+41.063629 and 41.063926 ms. The outlier remains in the measurement.
+Entry barriers have a 1.138549 ms median. The 0.973077 ms forward reduction
+is a measured improvement; neither the 35 ms nor 14000 output tokens/chip/s
+target is met. Inclusive operator means are not additive critical-path costs.
+
+Full-serving outputs are not bitwise-equivalent evidence. The previous run
+itself reproduced only 40/384 complete greedy texts between rounds 1/2 and
+1/3. The new run reproduces 31 and 34; same-round old/new comparisons match
+32, 35 and 37. Of 21 requests identical across all three baseline rounds,
+10, 14 and 16 match the candidate rounds. Median common-prefix lengths are
+440.5–492 characters across versions, versus 450.5–460 within the baseline.
+These data do not establish model-quality neutrality or its absence; quality
+benchmarking remains outstanding. The placement stays explicit and defaults off.
+
+Verified `art-6n8hvcpmag` serving evidence is
+`results/expert-placement/serving-evidence.tgz`, 5393737 bytes, SHA-256
+`a431a5793622cf5cac740be8c02453c6285e87b7d6f753ac0e9d34ff7a58f955`.
+
+After serving stopped, the same job tested replacing only the FP8 arrival-row
+gather in MoE combine with the existing SparseCore `ragged_gather_v2`, using
+a same-width FP8/int8 bitcast and unchanged FP32 slot reduction. Both complete
+EP8 outputs were bit-exact, but device medians regressed: biased seed 1077
+0.496310 to 0.561177 ms; uniform seed 1078 0.459336 to 0.527027 ms.
+This candidate is rejected. The verified `results/sc-combine-evidence.tgz`
+is 687544 bytes, SHA-256
+`a20a36cea86bb94f832d87d22e521bdf69841db82eae96acddc317cfc4e5c132`.
 
 Verified archives in `art-hhm1zvix50`:
 
