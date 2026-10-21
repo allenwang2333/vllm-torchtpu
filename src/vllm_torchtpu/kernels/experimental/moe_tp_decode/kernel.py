@@ -30,6 +30,11 @@ inside the kernel, so no XLA all-reduce follows:
 
 Rows >= n_valid come out exactly +0; n_valid also picks the all-reduce path,
 which sets how many rows travel (all_reduce: zero, fold, trim, full).
+
+Stacked experts (`layer` given): w13 / w2 / s13 / s2 carry a leading layer
+axis ([L, E, ...], one tensor for every MoE layer of the model) and the
+kernel reads row `layer` of them in place (a scalar-prefetched index on the
+HBM refs): the same bytes as the per-layer tensors, no slice copy.
 """
 
 import functools
@@ -276,8 +281,15 @@ def _kernel(
     topk,
     routed_scale,
     ar_spec,
+    stacked=False,
 ):
     all_reduce.prologue(ar_spec)
+    if stacked:
+        # This layer's row of the stacked expert tensors, read in place.
+        layer = meta_ref[2]
+        w1_hbm, w2_hbm, s1_hbm, s2_hbm = (
+            ref.at[layer] for ref in (w1_hbm, w2_hbm, s1_hbm, s2_hbm)
+        )
     m, h = x_ref.shape
     i = w2_hbm.shape[1]
     nb = _NUM_BUFFERS
@@ -457,6 +469,7 @@ def moe_tp_decode(
     shared_s13,
     shared_w2,
     shared_s2,
+    layer=None,
     *,
     routed_scale: float,
     topk: int,
@@ -476,6 +489,9 @@ def moe_tp_decode(
       s13, s2: [E, 1, 1, 2I] / [E, 1, 1, D] f32 per-output-channel scales.
       shared_w13, shared_w2: [D, 2Fs] / [Fs, D] fp8, this rank's slice of the
         shared expert; shared_s13, shared_s2: [2Fs] / [D] f32 scales.
+      layer: None (per-layer w13 / w2 / s13 / s2 as above), or an int32 scalar:
+        the four tensors are stacked over the model's MoE layers ([L, E, ...])
+        and the kernel reads their row `layer` in place.
       routed_scale: routed_scaling_factor, exact in bf16.
       topk: experts per token.
       n_ranks: TP ranks.
@@ -491,7 +507,8 @@ def moe_tp_decode(
     if not exact_in_bf16(routed_scale):
         raise ValueError(f"routed_scale {routed_scale!r} is not exact in bf16")
     m, h = x.shape
-    experts, i, _ = w2.shape
+    stacked = layer is not None
+    experts, i, _ = w2.shape[-3:]
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
@@ -509,12 +526,13 @@ def moe_tp_decode(
     if e_pad != num_experts:
         scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
         bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
-    meta = jnp.stack(
-        [
-            jnp.asarray(n_valid, jnp.int32).reshape(()),
-            jnp.asarray(rank, jnp.int32).reshape(()),
-        ]
-    )
+    meta = [
+        jnp.asarray(n_valid, jnp.int32).reshape(()),
+        jnp.asarray(rank, jnp.int32).reshape(()),
+    ]
+    if stacked:
+        meta.append(jnp.asarray(layer, jnp.int32).reshape(()))
+    meta = jnp.stack(meta)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
@@ -524,6 +542,7 @@ def moe_tp_decode(
             topk=topk,
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
+            stacked=stacked,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -557,7 +576,8 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks),
+        name=kernel_name(experts, m, h, i, shared_inter, n_ranks)
+        + ("-stk" if stacked else ""),
     )(
         meta,
         x,

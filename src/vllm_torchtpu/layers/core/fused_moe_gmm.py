@@ -195,6 +195,7 @@ def gmm_wrapper(
     fuse_act=None,
     preferred_element_type=None,
     rhs_quant_dtype=None,
+    rhs_layer=None,
 ):
     # fp4 weights: keep bf16 activations. Quantizing activations to fp8 collapses
     # fp4 accuracy (error compounds across MoE layers) with no decode speedup
@@ -215,6 +216,7 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=not is_fp4_weight,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
 
 
@@ -429,12 +431,15 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    rhs_layer: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    `rhs_layer` (int32[1]): the weights are layer-stacked and both GMMs read
+    that row in place (gmm_v2's rhs_layer).
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
 
@@ -448,9 +453,11 @@ def moe_gmm(
         zero_initialize=False,
         fuse_act=activation,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+    # w2 [E, I, D] (or layer-stacked [L, E, I, D]): I is the second-minor dim.
+    gmm1_res = gmm1_res[:, : w2.shape[-2] * packing_factor]
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -465,6 +472,7 @@ def moe_gmm(
         zero_initialize=False,
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=rhs_layer,
     )
     # The destination-major kernel packs source indices into 20 bits and
     # processes 16-lane SparseCore tiles.
@@ -607,6 +615,7 @@ def fused_moe_func(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
+    stack_row: jax.Array | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -626,21 +635,35 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    ``stack_row`` (int32 [1] or [1, 1], or None): the weights, scales and
+    biases carry a leading layer axis (one tensor for every MoE layer,
+    ``[L, E, ...]``) and this call runs layer ``stack_row`` of them, read in
+    place by both GMMs (gmm_v2's ``rhs_layer``) with no slice copy. The result
+    equals this function on that layer's own tensors. Not with EP, packed
+    weights or the dense-expert path.
     """
 
+    stacked = stack_row is not None
+    lead = 1 if stacked else 0
+    if stacked:
+        if use_ep or rhs_quant_dtype is not None or w1_bias is not None:
+            raise ValueError("fused_moe_func: stack_row needs TP, unpacked, biasless")
+        stack_row = jnp.asarray(stack_row, jnp.int32).reshape(1)
+
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
-    # expected by gmm_v2.
-    if w1_scale is not None and w1_scale.ndim == 3:
-        w1_scale = jnp.expand_dims(w1_scale, 2)
-    if w2_scale is not None and w2_scale.ndim == 3:
-        w2_scale = jnp.expand_dims(w2_scale, 2)
+    # expected by gmm_v2 (per layer: a stacked scale has one more leading dim).
+    if w1_scale is not None and w1_scale.ndim == 3 + lead:
+        w1_scale = jnp.expand_dims(w1_scale, 2 + lead)
+    if w2_scale is not None and w2_scale.ndim == 3 + lead:
+        w2_scale = jnp.expand_dims(w2_scale, 2 + lead)
 
     num_tokens, hidden_size = hidden_states.shape
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
     # regime from the block size: block-16 -> W4A16, block >= MXU -> W4A8.
-    _, padded_hidden_size, _ = w1.shape
+    num_local_experts, padded_hidden_size, _ = w1.shape[lead:]
     packing_factor = get_packing_factor(w1.dtype, rhs_quant_dtype)
     padded_hidden_size *= packing_factor
 
@@ -668,6 +691,11 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
+    if stacked and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD:
+        raise ValueError(
+            "fused_moe_func: stack_row with TPU_MOE_DENSE_EXPERT_THRESHOLD "
+            f"{_DENSE_EXPERT_THRESHOLD} (the dense-expert kernel takes per-layer weights)"
+        )
     if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
         hidden_states,
         w1,
@@ -696,7 +724,7 @@ def fused_moe_func(
         hidden_states,
         topk_ids,
         topk_weights,
-        local_num_experts=w1.shape[0],
+        local_num_experts=num_local_experts,
         topk=topk,
         use_ep=use_ep,
         use_sparse_core=use_sparse_core,
@@ -724,5 +752,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        rhs_layer=stack_row,
     )
     return x[:num_tokens, :hidden_size]

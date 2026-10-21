@@ -5,8 +5,11 @@ L5: the same-harness twin A/B; WHITEBOARD.v3 §6.5).
 
 Port of glm5_mk_dcp's adapter (vllm_adapter.py @ d41e70f6d; its rebased copy ran on main 9ffdb1eb4 in G0, j-31f97434)
 to this kernel's operand plan and deployment: TP = DCP = world, DP 1, **EP off** (TP16 MoE: the served routed experts are
-main's moe_tp_decode TP layout w13 [E, H, 2I/R], w2 [E, I/R, H], s13 [E, 1, 1, 2I/R], s2 [E, 1, 1, H], passed per layer,
-zero-copy = the served operand form), **qrep 0** (the served q_b_proj is column-parallel: this rank's HR heads and their
+main's moe_tp_decode TP layout w13 [E, H, 2I/R], w2 [E, I/R, H], s13 [E, 1, 1, 2I/R], s2 [E, 1, 1, H]; served stacked
+(L3-c experts, default): at load the armed target layers' experts move into one tensor per kind [Lm, E, ...]
+(`moe_tp_decode.stack_experts`: no second copy, the stock MoE op reads its row of the same stacks in place) and the
+kernel takes them as its stacked expert operands (`.at[mpos]`, no per-unit operand cascade); else per layer, zero-copy,
+through the Lm-leaf cascade), **qrep 0** (the served q_b_proj is column-parallel: this rank's HR heads and their
 scale slice are taken as they are), MTP verify rows. Enabled by GLM52_DECODE_MK=1.
 
 Runner contract (runner/tpu_runner.py): `maybe_create` at load_model, `bind_caches` + `warmup` at capture_model,
@@ -44,6 +47,8 @@ Env:
 - GLM52_DECODE_MK_LOG_EVERY=n  engagement log cadence (decisions; 0 = first-of-reason lines only);
 - GLM52_DECODE_MK_PERLAYER_MAX_L=10  the largest model served from per-layer caches (the 10-layer twin compiled);
 - GLM5_MKD_STACK_C             unset: stacked caches when the megakernel is built; "0" keeps per-layer caches.
+- GLM52_DECODE_MK_STACK_E      unset / "1": stack the routed experts when the megakernel is built (L3-c experts);
+                               "0" keeps the per-layer expert tensors (the Lm-leaf operand cascade).
 """
 
 import dataclasses
@@ -169,6 +174,12 @@ def _attn_module(self_attn):
         if hasattr(m, "W_UK_T") and hasattr(m, "W_UV") and hasattr(m, "kv_cache"):
             return m
     raise Unsupported("no MLA attention module with W_UK_T / W_UV / kv_cache")
+
+
+def _mtd():
+    """layers/adapter/moe_tp_decode (lazy: it imports torch_tpu and vLLM's parallel state)."""
+    from vllm_torchtpu.layers.adapter import moe_tp_decode
+    return moe_tp_decode
 
 
 def _routed(mlp):
@@ -297,11 +308,12 @@ N_FIX = 10     # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], 
                # rank i32[1], smalls (per rank)
 
 
-def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
+def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False, stack_e=False):
     """The SPMD step program, jax only (also lowered by the lane's AOT script, stageB/L5-twin-harness/aot_l5.py):
     shard_map over the one-axis R-rank mesh of (metadata + rope table from wrapper.py -> megakernel -> writer).
-    Inputs: N_FIX fixed (8 replicated + smalls per rank), then the dense stacks, the per-layer served expert tensors
-    and the caches, all sharded on dim 0 (= this rank's own tensors). Caches: `stacked` -> the runner's stacked groups
+    Inputs: N_FIX fixed (8 replicated + smalls per rank), then the dense stacks, the served expert tensors (stack_e:
+    the 4 layer-stacked tensors [Lm, E, ...]; else 4 per MoE layer) and the caches, all sharded on dim 0 (= this rank's
+    own tensors). Caches: `stacked` -> the runner's stacked groups
     [n_layers / G, nb, ...] as they are (the kernel's group operands); else per-layer [nb, ...], each reshaped to the
     kernel's one-layer group [1, ...] inside the body (a bitcast). Outputs: out [M, H] bf16 and the written caches.
     -> (smap, in_specs, out_specs, info)."""
@@ -311,7 +323,7 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups, stacked=False):
     from . import wrapper as W
     from .writer import build_writer
 
-    call, info = K.build(cfg, max_pages=max_pages, nb=nb, nbi=nbi, tiles=tiles, stack_e=False, groups=groups)
+    call, info = K.build(cfg, max_pages=max_pages, nb=nb, nbi=nbi, tiles=tiles, stack_e=stack_e, groups=groups)
     writer, winfo = build_writer(cfg, max_pages=max_pages, nb=nb, nbi=nbi, groups=groups)
     assert len(info["c_names"]) == len(winfo["c_names"])
     n_d, n_e, n_c = len(info["dkinds"]), len(info["e_names"]), len(info["c_names"])
@@ -445,6 +457,8 @@ class Glm52DecodeMK:
         self.tiles_by_rows = {t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers)) for t in self.rows}
         self.pool_pages = check_pool(mml, {t: tl.pool for t, tl in self.tiles_by_rows.items()}, page=cfg.page, R=R,
                                      ilv=cfg.ILV)
+        with torch.no_grad():
+            self._stack_experts()                                     # last load-time step: every check above passed
         self.caches = None
         self._steps = {}
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
@@ -494,13 +508,18 @@ class Glm52DecodeMK:
         if cfg.is_moe(l):
             d["gate"] = self._gate_kn(l)
             rt = _routed(mlp)
-            d["ew13"], d["ew2"] = rt.w13_weight, rt.w2_weight
-            d["es13"], d["es2"] = rt.w13_weight_scale_inv, rt.w2_weight_scale_inv
-            for k_, shp in (("ew13", (cfg.E, H, 2 * cfg.IR)), ("ew2", (cfg.E, cfg.IR, H)),
-                            ("es13", (cfg.E, 1, 1, 2 * cfg.IR)), ("es2", (cfg.E, 1, 1, H))):
-                _need(tuple(d[k_].shape) == shp, f"layer {l} {k_}: {tuple(d[k_].shape)} != {shp} (TP16 layout)")
-            for k_ in ("ew13", "ew2", "es13", "es2"):
-                _need(_owns_storage(d[k_]), f"layer {l} {k_}: a view operand (would be re-materialized per call)")
+            d["rt"] = rt
+            stk = _mtd().expert_stacks(rt)
+            if stk is not None:                                       # already stacked (a re-created megakernel)
+                d["stack"] = stk
+            else:
+                d["ew13"], d["ew2"] = rt.w13_weight, rt.w2_weight
+                d["es13"], d["es2"] = rt.w13_weight_scale_inv, rt.w2_weight_scale_inv
+                for k_, shp in (("ew13", (cfg.E, H, 2 * cfg.IR)), ("ew2", (cfg.E, cfg.IR, H)),
+                                ("es13", (cfg.E, 1, 1, 2 * cfg.IR)), ("es2", (cfg.E, 1, 1, H))):
+                    _need(tuple(d[k_].shape) == shp, f"layer {l} {k_}: {tuple(d[k_].shape)} != {shp} (TP16 layout)")
+                for k_ in ("ew13", "ew2", "es13", "es2"):
+                    _need(_owns_storage(d[k_]), f"layer {l} {k_}: a view operand (would be re-materialized per call)")
             se = mlp.shared_experts
             d["sh13"] = _kn(se.gate_up_proj.weight, H, 2 * cfg.ISR, "shared.gate_up_proj")
             d["sh2"] = _kn(se.down_proj.weight, cfg.ISR, H, "shared.down_proj")
@@ -529,10 +548,54 @@ class Glm52DecodeMK:
                 _need(_dt(t) == _dt(dsh[k][1]), f"{k}[{l}]: dtype {t.dtype} != {dsh[k][1]}")
             self._dense_kind[k] = len(dense)
             dense.append(_own(torch.stack(ts)))                       # load-time stacked copy
+        moe = LY.layers_of(cfg, "gate")
+        stk = [per[l].get("stack") for l in moe]
+        if any(s is not None for s in stk):                           # stacked by an earlier build
+            _need(all(s is not None for s in stk), "experts partly stacked")
+            for j, (ts, row) in enumerate(stk):
+                _need(row == j and all(a is b for a, b in zip(ts, stk[0][0])),
+                      f"MoE layer #{j}: stack row {row} / stack tensors differ")
+            self._check_expert_stacks(stk[0][0])
+            self.stack_e = True
+            return dense, list(stk[0][0])
         experts = []
-        for l in LY.layers_of(cfg, "gate"):                           # served tensors, per layer, zero-copy
+        for l in moe:                                                 # served tensors, per layer, zero-copy
             experts += [per[l]["ew13"], per[l]["ew2"], per[l]["es13"], per[l]["es2"]]
+        self.stack_e = False
         return dense, experts
+
+    def _check_expert_stacks(self, stacks) -> None:
+        cfg, H, Lm = self.cfg, self.cfg.H, len(LY.layers_of(self.cfg, "gate"))
+        for t, shp in zip(stacks, ((Lm, cfg.E, H, 2 * cfg.IR), (Lm, cfg.E, cfg.IR, H), (Lm, cfg.E, 1, 1, 2 * cfg.IR),
+                                   (Lm, cfg.E, 1, 1, H))):
+            _need(tuple(t.shape) == shp, f"expert stack {tuple(t.shape)} != {shp}")
+            _need(_owns_storage(t), "an expert stack is a view operand")
+
+    def _stack_experts(self) -> None:
+        """L3-c experts: move the routed experts into the stacked operand form (moe_tp_decode.stack_experts) unless
+        GLM52_DECODE_MK_STACK_E=0 or a precondition fails (then the per-layer form stays, logged)."""
+        self.expert_stack = None
+        if self.stack_e:
+            self.expert_stack = {"form": "stacked (pre-existing)"}
+            return
+        if os.environ.get("GLM52_DECODE_MK_STACK_E", "1") == "0":
+            self.expert_stack = {"form": "per-layer (GLM52_DECODE_MK_STACK_E=0)"}
+            return
+        moe = LY.layers_of(self.cfg, "gate")
+        try:
+            rep = _mtd().stack_experts([self._per_layer[l]["rt"] for l in moe])
+        except ValueError as e:
+            logger.warning("GLM-5.2 decode megakernel: experts stay per layer (%s)", e)
+            self.expert_stack = {"form": f"per-layer ({e})"}
+            return
+        stk = [_mtd().expert_stacks(self._per_layer[l]["rt"]) for l in moe]
+        self._check_expert_stacks(stk[0][0])
+        for l in moe:                                                 # drop the per-layer references
+            for k_ in ("ew13", "ew2", "es13", "es2"):
+                self._per_layer[l].pop(k_, None)
+        self.experts = list(stk[0][0])
+        self.stack_e = True
+        self.expert_stack = dict(rep, form="stacked")
 
     def _build_smalls(self) -> torch.Tensor:
         cfg = self.cfg
@@ -697,8 +760,9 @@ class Glm52DecodeMK:
         _need(not views, f"view cache operands {views} (re-materialized by torch_tpu on every call)")
         self.caches, self.groups, self.nb, self.nbi = caches, G, nb, nbi
         self.cache_form, self.cache_views = form, views
-        logger.info("GLM-5.2 decode megakernel: %d dense + %d expert (served per-layer) + %d cache operands, cache form "
-                    "%s, groups %s, %d blocks (idx %d), max_pages %d", len(self.dense), len(self.experts), len(caches),
+        logger.info("GLM-5.2 decode megakernel: %d dense + %d expert (%s) + %d cache operands, cache form "
+                    "%s, groups %s, %d blocks (idx %d), max_pages %d", len(self.dense), len(self.experts),
+                    "stacked" if getattr(self, "stack_e", False) else "served per-layer", len(caches),
                     form, G, nb, nbi, self.max_pages)
         for t in self.rows:
             self._steps[t] = self._build_op(self.cfgs[t])
@@ -714,7 +778,8 @@ class Glm52DecodeMK:
         n_d, n_e, n_c = len(self.dense), len(self.experts), len(self.caches)
         smap, in_specs, out_specs, info = build_spmd(cfg, self.mesh, max_pages=self.max_pages, nb=self.nb,
                                                      nbi=self.nbi, tiles=self.tiles_by_rows[cfg.TMAX],
-                                                     groups=self.groups, stacked=self.cache_form == "stacked")
+                                                     groups=self.groups, stacked=self.cache_form == "stacked",
+                                                     stack_e=getattr(self, "stack_e", False))
         assert list(info["dkinds"]) == list(self._dense_kind), (info["dkinds"], list(self._dense_kind))
         assert len(info["e_names"]) == n_e, (len(info["e_names"]), n_e)
         assert len(info["c_names"]) == n_c
@@ -905,6 +970,7 @@ class Glm52DecodeMK:
                 "L": self.cfg.L, "fresh_layers": LY.layers_of(self.cfg, "iwq"),
                 "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip], "n_dense": len(self.dense),
                 "n_experts": len(self.experts), "n_caches": len(self.caches or []), "nb": getattr(self, "nb", None),
+                "stack_e": getattr(self, "stack_e", False), "expert_stack": getattr(self, "expert_stack", None),
                 "max_pages": self.max_pages, "pool_pages": getattr(self, "pool_pages", None), "trace": self.tiles.trace,
                 "levers": list(self.levers), "calls": self.calls,
                 "cache_views": getattr(self, "cache_views", None), "k_scales": sorted(set(self.k_scales)),

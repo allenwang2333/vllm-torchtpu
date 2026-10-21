@@ -919,6 +919,26 @@ def kernel_main(
         zero_out_end(out_ref, cast(jax.Array, semaphore_ref), zero_size, dims=cfgs.dims)
 
 
+def kernel_main_stacked(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    rhs_layer_ref: jax.Array,  # int32[1]
+    lhs_ref: jax.Array,  # [size_m, size_k]
+    rhs_ref: WeightsRef,  # [num_layers, size_group, size_k, size_n]
+    *refs,
+    cfgs: GmmConfigs,
+):
+    """kernel_main on row rhs_layer_ref[0] of layer-stacked rhs tensors.
+
+    The weight, scale and bias refs carry a leading layer axis; indexing it
+    here, on the HBM refs, makes every DMA of the pipeline read that layer's
+    bytes in place, so the result equals kernel_main on that layer's tensors.
+    """
+    layer = rhs_layer_ref[0]
+    rhs_ref = jax.tree.map(lambda x: x.at[layer], rhs_ref)
+    kernel_main(lhs_group_sizes_ref, group_offset_ref, lhs_ref, rhs_ref, *refs, cfgs=cfgs)
+
+
 def calculate_tiling(
     dims: Dimensions,
     lhs_cfgs: InputConfigs,
@@ -1294,6 +1314,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    rhs_layer: jax.Array | None = None,  # int32[1]
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1319,6 +1340,10 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        rhs_layer: Optional int32[1]. rhs, rhs_scale and rhs_bias then carry a
+            leading layer axis ([num_layers, size_group, ...]) and the kernel
+            reads their row rhs_layer[0] in place (no slice copy); the result
+            equals gmm_v2 on that row.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1344,11 +1369,22 @@ def gmm_v2(
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
+    stacked = rhs_layer is not None
+    if stacked:
+        if rhs_quant_dtype is not None:
+            raise ValueError("gmm_v2: rhs_layer does not take packed rhs carriers")
+        rhs_layer = jnp.asarray(rhs_layer, jnp.int32).reshape(1)
+
+    def _row(x):  # one layer's shape: what the kernel sees after indexing
+        if not stacked or x is None:
+            return x
+        return jax.ShapeDtypeStruct(x.shape[1:], x.dtype)
+
     cfgs = make_gmm_configs(
         lhs,
-        rhs,
-        rhs_scale,
-        rhs_bias,
+        _row(rhs),
+        _row(rhs_scale),
+        _row(rhs_bias),
         group_sizes,
         group_offset,
         tile_info=tile_info,
@@ -1417,11 +1453,12 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+    scalars = (group_sizes, group_offset) + ((rhs_layer,) if stacked else ())
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        functools.partial(kernel_main_stacked if stacked else kernel_main, cfgs=cfgs),
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=len(scalars),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),
                 WeightsRef(
@@ -1440,4 +1477,4 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+    )(*scalars, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]

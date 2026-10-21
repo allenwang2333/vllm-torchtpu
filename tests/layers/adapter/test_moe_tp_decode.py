@@ -143,6 +143,7 @@ class _Harness:
         self.layers = {}
         self.all_reduces = 0
         self.op_calls = []
+        self.stk_calls = []
         self.selftest_calls = 0
         self.selftest_failures = []
         self.logs = []
@@ -175,6 +176,10 @@ class _Harness:
     def op(self, x, *operands):
         self.op_calls.append((x, *operands))
         return (x.float() * 3).to(x.dtype)
+
+    def op_stk(self, x, *operands):
+        self.stk_calls.append((x, *operands))
+        return (x.float() * 5).to(x.dtype)
 
 
 class _Log:
@@ -229,7 +234,11 @@ def harness(monkeypatch):
         lambda: moe_tp_decode._Topology(mesh=SimpleNamespace(size=16), mesh_index=0),
     )
     monkeypatch.setattr(moe_tp_decode, "_gather", lambda obj: [obj])
-    monkeypatch.setattr(moe_tp_decode, "_get_op", lambda mesh, statics: h.op)
+    monkeypatch.setattr(
+        moe_tp_decode,
+        "_get_op",
+        lambda mesh, statics, stacked=False: h.op_stk if stacked else h.op,
+    )
 
     def selftest(topo, buckets, device):
         h.selftest_calls += 1
@@ -429,3 +438,121 @@ def test_failed_selftest_raises_and_arms_nothing(harness):
         moe_tp_decode.arm(model)
     runner = model.layers[0]
     assert not _armed(runner) and runner.shared_experts is not None
+
+
+# ---- stacked experts (L3-c: the GLM-5.2 decode megakernel's stacked operands)
+
+
+def _bits(t):
+    return t.detach().contiguous().view(torch.uint8) if t.dtype == FP8 else t.detach()
+
+
+def _snapshot(layers):
+    return [{n: _bits(getattr(r.routed_experts, n)).clone() for n in moe_tp_decode._EXPERT_PARAMS} for r in layers]
+
+
+def test_stack_experts_moves_routed_tensors_into_one_stack_per_kind(harness):
+    model = harness.model({}, {}, {})
+    assert moe_tp_decode.arm(model) == 3
+    runners = list(model.layers)
+    before = _snapshot(runners)
+    layers = [r.routed_experts for r in runners]
+
+    rep = moe_tp_decode.stack_experts(layers)
+
+    stacks = [getattr(layers[0], b) for b in moe_tp_decode._STACK_BUFFERS]
+    for row, layer in enumerate(layers):
+        for name, buf, st in zip(moe_tp_decode._EXPERT_PARAMS, moe_tp_decode._STACK_BUFFERS, stacks):
+            assert getattr(layer, name) is None and name not in dict(layer.named_parameters())
+            assert getattr(layer, buf) is st and buf in layer._non_persistent_buffers_set
+            assert torch.equal(_bits(st[row]), before[row][name])  # the same bytes, row by row
+        assert layer._moe_tp_decode_row.tolist() == [[row]]
+        assert moe_tp_decode.expert_stacks(layer)[1] == row
+        assert getattr(layer.quant_method, moe_tp_decode._OP_ATTR) == harness.op_stk
+    assert [list(t.shape) for t in stacks] == [
+        [3, E, H, 2 * INTER], [3, E, INTER, H], [3, E, 1, 1, 2 * INTER], [3, E, 1, 1, H]]
+    assert rep["stacked_bytes"] == rep["per_layer_bytes"] == sum(
+        b.numel() * b.element_size() for d in before for b in d.values())
+    assert "stacked the routed experts of 3 layers" in harness.logs[-1]
+
+
+def test_stacked_layer_hands_the_op_the_stacks_and_its_row(harness):
+    model = harness.model({}, {})
+    moe_tp_decode.arm(model)
+    runners = list(model.layers)
+    moe_tp_decode.stack_experts([r.routed_experts for r in runners])
+    x = _x()
+
+    out = runners[1](hidden_states=x, router_logits=x)
+
+    assert not harness.op_calls and len(harness.stk_calls) == 1
+    assert torch.equal(out, (x.float() * 5).to(x.dtype))
+    layer = runners[1].routed_experts
+    _, scores, bias, pad_mask, w13, w2, s13, s2, sw13, ss13, sw2, ss2, rank, row = harness.stk_calls[0]
+    assert (w13, w2, s13, s2) == tuple(getattr(layer, b) for b in moe_tp_decode._STACK_BUFFERS)
+    assert sw13 is layer._moe_tp_decode_sw13 and ss2 is layer._moe_tp_decode_ss2
+    assert rank.tolist() == [[0]] and row.tolist() == [[1]]
+    assert torch.equal(bias, layer.e_score_correction_bias)
+
+
+def test_stack_experts_refuses_and_changes_nothing(harness, monkeypatch):
+    model = harness.model({}, {}, {"scoring_func": "softmax"})
+    moe_tp_decode.arm(model)  # layer 2 refused (softmax)
+    runners = list(model.layers)
+    layers = [r.routed_experts for r in runners]
+    before = _snapshot(runners)
+
+    def unchanged():
+        for r, b in zip(runners, before):
+            for n in moe_tp_decode._EXPERT_PARAMS:
+                assert torch.equal(_bits(getattr(r.routed_experts, n)), b[n])
+            assert moe_tp_decode.expert_stacks(r.routed_experts) is None
+
+    with pytest.raises(ValueError, match="not armed"):
+        moe_tp_decode.stack_experts(layers)
+    unchanged()
+    layers[1].w2_weight = torch.nn.Parameter(layers[1].w2_weight[:, :, : H // 2].clone(), requires_grad=False)
+    with pytest.raises(ValueError, match="shape / dtype differ"):
+        moe_tp_decode.stack_experts(layers[:2])
+    with pytest.raises(ValueError, match="no layers"):
+        moe_tp_decode.stack_experts([])
+    from vllm_torchtpu.layers.core import fused_moe_gmm
+
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 64)
+    with pytest.raises(ValueError, match="DENSE_EXPERT_THRESHOLD"):
+        moe_tp_decode.stack_experts(layers[:1])
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 0)
+    moe_tp_decode.stack_experts(layers[:1])
+    with pytest.raises(ValueError, match="already stacked"):
+        moe_tp_decode.stack_experts(layers[:1])
+
+
+def test_failed_stacking_restores_the_per_layer_form(harness, monkeypatch):
+    model = harness.model({}, {})
+    moe_tp_decode.arm(model)
+    runners = list(model.layers)
+    layers = [r.routed_experts for r in runners]
+    before = _snapshot(runners)
+    real = torch.stack
+    calls = []
+
+    def flaky(ts):
+        calls.append(1)
+        if len(calls) == 3:  # the third kind (w13 scales) fails, after two kinds moved
+            raise RuntimeError("RESOURCE_EXHAUSTED (test)")
+        return real(ts)
+
+    monkeypatch.setattr(torch, "stack", flaky)
+    with pytest.raises(ValueError, match="per-layer form kept"):
+        moe_tp_decode.stack_experts(layers)
+    monkeypatch.setattr(torch, "stack", real)
+    for r, b in zip(runners, before):
+        layer = r.routed_experts
+        assert moe_tp_decode.expert_stacks(layer) is None
+        assert getattr(layer.quant_method, moe_tp_decode._OP_ATTR) == harness.op
+        for n in moe_tp_decode._EXPERT_PARAMS:
+            assert isinstance(getattr(layer, n), torch.nn.Parameter)
+            assert torch.equal(_bits(getattr(layer, n)), b[n])
+    x = _x()
+    runners[0](hidden_states=x, router_logits=x)
+    assert len(harness.op_calls) == 1 and not harness.stk_calls
