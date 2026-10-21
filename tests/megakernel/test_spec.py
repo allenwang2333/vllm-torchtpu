@@ -93,25 +93,48 @@ def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
         unroll: bool = False
         NUMERICS = {"tile_k": "approx", "unroll": "exact"}
 
+    @dataclasses.dataclass(frozen=True)
+    class _CustomDebug:
+        force_path: bool = False
+
     class _CustomBlock(Block):
         name = "test_spec_custom_block"
         Tunables = _CustomTunables
+        Debug = _CustomDebug
 
     assert exec_spec.tunables_class("test_spec_custom_block") is _CustomTunables
     blk = _CustomBlock()
     ex = ExecSpec(B=4, T=1, R=2)
     assert blk.tunables(ex) == _CustomTunables()
+    assert blk.debug_flags(ex) == _CustomDebug()
     ex_override = ExecSpec(
         B=4,
         T=1,
         R=2,
         tiles=Tiles().with_blocks({"test_spec_custom_block": {"tile_k": 256}}),
+        debug=exec_spec.DebugOptions(
+            blocks={"test_spec_custom_block": _CustomDebug(force_path=True)}
+        ),
     )
     assert blk.tunables(ex_override).tile_k == 256
+    assert blk.debug_flags(ex_override).force_path is True
+    with pytest.raises(TypeError, match="_CustomDebug"):
+        blk.debug_flags(
+            ExecSpec(
+                B=4,
+                T=1,
+                R=2,
+                debug=exec_spec.DebugOptions(
+                    blocks={"test_spec_custom_block": _CustomTunables(tile_k=256)}
+                ),
+            )
+        )
 
     plain = Block()
     with pytest.raises(AssertionError, match="declares no Tunables"):
         plain.tunables(ex)
+    with pytest.raises(AssertionError, match="declares no Debug"):
+        plain.debug_flags(ex)
     assert plain.weights(None, ex) == []
     assert plain.states(None, ex) == []
     assert plain.outputs(None, ex) == []

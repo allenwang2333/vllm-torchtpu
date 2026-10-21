@@ -296,8 +296,7 @@ class ExecSpec:
     debug: DebugOptions = DebugOptions()
     # Optional extension object for cache-specific execution settings (None when
     # using plain states without page tables; one equal to its own defaults is
-    # stored as None). Core execution config never reads it; the kernel builder
-    # reads it, through the cache package, to pick the page-table refs.
+    # stored as None). Core execution config never reads it.
     cache: Any = None
 
     def __post_init__(self) -> None:
