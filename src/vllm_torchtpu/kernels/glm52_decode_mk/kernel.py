@@ -110,6 +110,7 @@ class Tiles:
                                  # interp_alias.install() instead of separate typed buffers (alias=False: typed)
     # ---- stage-B lane L1 (WHITEBOARD.v3 §6.1); every default is the stage-A program ----
     thr_unroll: int = 1          # L1-U: threshold count loop, tiles per iteration
+    thr_swar: bool = False       # L1-S: 4-bit round counts from a packed 8-bit digit histogram (exact)
     thr_merge: int = 0           # L1-M: one merged count exchange per round when the wave's Sigma np <= thr_merge
                                  # (0: never; >= pool: always, and the per-group form is not compiled)
     rec_thr: bool = False        # timing harness only: export b_row[2:5] / own_uv / b_req / b_greq per fresh layer

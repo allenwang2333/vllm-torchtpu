@@ -282,6 +282,8 @@ def make(E):
     MAXP_OK = E.max_pages <= 256
     SCAN_UNROLL = int(tiles.scan_unroll)        # per-lane tile counts <= 256: exact bf16 MXU lane sums
     THR_U = max(1, int(tiles.thr_unroll))       # L1-U: count-loop tiles per iteration (1 = stage A)
+    THR_SWAR = bool(getattr(tiles, "thr_swar", False))   # L1-S: 4-bit counts from packed 8-bit digit histograms
+    SW_CH = 248                                 # SWAR flush period (tiles): an 8-bit counter gains <= 1 per tile
     MSLOT = 32                                  # L1-M: lanes per group in the merged count payload
     # L1-M dispatch: merged exchange when the wave's rank-0 page count <= thr_merge (0: never = stage A; >= POOL:
     # always, the per-group form is not compiled). L1-W: thr_switch >= POOL compiles only the 4-bit body.
@@ -593,12 +595,71 @@ def make(E):
             par = r % 2
             ks = list(range(0, KMAX + 1)) if last else list(range(1, NK + 1))
 
+            def swar_tots(pref, en, sh, pbase, npb, ks):
+                """L1-S (DW = 4): per-row counts #(key >= pref + k << sh) for k in ks, from a 16-bin histogram of the
+                in-bracket digit (four i32 words of 8-bit counters, flushed every SW_CH tiles) plus the above-bracket
+                count: count_k = above + sum_{j >= k} bin_j. Exactly stage A's compare counts, en / wrap included."""
+                cpref = jnp.where(en, pref ^ INT_MIN, INT_MAX)
+                cu = pref + shl(jnp.int32(16), sh)
+                wrap = (cu ^ INT_MIN) < (pref ^ INT_MIN)                             # bracket end past 2^32
+                cend = jnp.where(en & ~wrap, cu ^ INT_MIN, INT_MAX)
+                one = jnp.ones((8, 128), I32)
+                z = jnp.zeros((8, 128), I32)
+
+                def tile_parts(t_):
+                    ab = t_ >= cend
+                    inb = (t_ >= cpref) & ~ab
+                    d = shr(t_ - cpref, sh)                       # in-bracket digit in [0, 16)
+                    inc = jnp.where(inb, shl(one, shl(d & 3, 3)), 0)
+                    wi = shr(d, 2)
+                    return [jnp.where(wi == w_, inc, 0) for w_ in range(4)] + [ab.astype(I32)]
+
+                def tsum(xs):
+                    while len(xs) > 1:
+                        xs = [xs[j] + xs[j + 1] for j in range(0, len(xs) - 1, 2)] + ([xs[-1]] if len(xs) % 2 else [])
+                    return xs[0]
+
+                def chunk(c, carry):
+                    bins, abt = list(carry[:16]), carry[16]
+                    lo = c * SW_CH
+                    hi = jnp.minimum(npb, lo + SW_CH)
+                    nfull = (hi - lo) // THR_U
+
+                    def tbu(i, st):
+                        base = pbase + lo + i * THR_U
+                        parts = [tile_parts(scr["b_keys"][base + u]) for u in range(THR_U)]
+                        return tuple(st[j] + tsum([pp[j] for pp in parts]) for j in range(5))
+
+                    def tb1(i, st):
+                        parts = tile_parts(scr["b_keys"][pbase + i])
+                        return tuple(st[j] + parts[j] for j in range(5))
+                    st = lax.fori_loop(0, nfull, tbu, (z, z, z, z, z))
+                    st = lax.fori_loop(lo + nfull * THR_U, hi, tb1, st)
+                    for j in range(16):
+                        bins[j] = bins[j] + (shr(st[j >> 2], 8 * (j & 3)) & 0xFF)
+                    return tuple(bins) + (abt + st[4],)
+                nch = (npb + SW_CH - 1) // SW_CH
+                fin = lax.fori_loop(0, nch, chunk, tuple(z for _ in range(17)))
+                if MAXP_OK:
+                    sums = lane_sum_small(jnp.concatenate(list(fin), axis=0))           # [8 * 17, 128]
+                    bt = [sums[8 * i:8 * i + 8, 0:1] for i in range(17)]
+                else:
+                    bt = [jnp.sum(a, axis=1, keepdims=True) for a in fin]
+                S = [None] * 17
+                S[16] = bt[16]
+                for j in range(15, -1, -1):
+                    S[j] = S[j + 1] + bt[j]
+                return [S[k] for k in ks]
+
             def per_req(b, payload):
                 t0, nq, pbase, npb = req[b, 7], req[b, 8], req[b, 4], req[b, 3]
                 pref = rows4(1, t0)
                 mode = rows4(0, t0)
                 trow = t0 + (sub8 % 4)
                 en = (mode == 2) & (sub8 % 4 < nq) & (trow >= 8 * gi) & (trow < 8 * gi + 8)
+                if THR_SWAR and DW == 4:         # L1-S: digit histogram in packed 8-bit counters (exact)
+                    tots = swar_tots(pref, en, sh, pbase, npb, ks)
+                    return place(tots, ks, t0, nq, payload)
                 cs = []
                 for k in ks:
                     cu = pref + shl(jnp.int32(k), sh) if k else pref
@@ -635,6 +696,11 @@ def make(E):
                     tots = [sums[8 * i:8 * i + 8, 0:1] for i in range(len(ks))]
                 else:
                     tots = [jnp.sum(a, axis=1, keepdims=True) for a in accs]
+                return place(tots, ks, t0, nq, payload, mb)
+
+            def place(tots, ks, t0, nq, payload, mb=None):
+                if mb is None:
+                    mb = jnp.zeros((8, 128), I32)
                 for k, tot in zip(ks, tots):
                     tot = tot + pltpu.roll(tot, 4, 0)
                     mb = jnp.where(lane8 == (k if off is None else k + off), tot, mb)
