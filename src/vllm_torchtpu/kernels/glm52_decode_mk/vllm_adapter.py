@@ -160,7 +160,8 @@ def index_pattern(has_indexer: list[bool], freq0: int, skip0: int) -> tuple[int,
     raise Unsupported(f"indexer pattern {has_indexer} is not max(l - skip + 1, 0) % freq == 0 for any (freq, skip)")
 
 
-N_FIX = 9      # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated), smalls
+N_FIX = 10     # pos [TMAX], seq [S], qsl [S+1], bt [S, W], cs rows [TMAX, DR], h0 [M, H], ltab, dtab (replicated),
+               # rank i32[1], smalls (per rank)
 
 
 def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups):
@@ -171,7 +172,6 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups):
     bitcast), all sharded on dim 0 (= this rank's own tensors). Outputs: out [M, H] bf16 and the written caches.
     -> (smap, in_specs, out_specs, info)."""
     import jax
-    from jax import lax
     from jax.sharding import PartitionSpec as P
 
     from . import wrapper as W
@@ -183,15 +183,15 @@ def build_spmd(cfg, mesh, *, max_pages, nb, nbi, tiles, groups):
     n_d, n_e, n_c = len(info["dkinds"]), len(info["e_names"]), len(info["c_names"])
     TMAX = cfg.TMAX
     rep, sh = P(), P(AXIS)
-    in_specs = (rep,) * (N_FIX - 1) + (sh,) + (sh,) * (n_d + n_e) + (sh,) * n_c
+    in_specs = (rep,) * (N_FIX - 2) + (sh, sh) + (sh,) * (n_d + n_e) + (sh,) * n_c
     out_specs = (sh,) + (sh,) * n_c
 
     def body(*a):
-        pos, seq, qsl, btv, csr, h0, ltab_, dtab_, smalls = a[:N_FIX]
+        pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls = a[:N_FIX]
         dw = a[N_FIX:N_FIX + n_d]
         ew = a[N_FIX + n_d:N_FIX + n_d + n_e]
         cs = a[N_FIX + n_d + n_e:]
-        r = lax.axis_index(AXIS).astype(jax.numpy.int32)
+        r = rank[0]          # an operand, not lax.axis_index: partition-id does not lower in torch_tpu's export
         scal, rmeta, qmeta, bt, bti, rvec = W.metadata(cfg, TMAX, pos, seq, qsl, btv, nb, nbi, max_pages, r)
         tab = W.rope_table(cfg, csr)
         c1 = [c[None] for c in cs]                       # [1, ...]: the kernel's one-layer cache group
@@ -492,6 +492,7 @@ class Glm52DecodeMK:
         dev = self.smalls.device
         ltab = torch.tensor(info["ltab"], dtype=torch.int32).to(dev)
         dtab = torch.tensor(info["dtab"], dtype=torch.int32).to(dev)
+        rank_t = torch.tensor([self.rank], dtype=torch.int32).to(dev)
         n_fix = N_FIX
         n_in = n_fix + n_d + n_e + n_c
         args = [f"x{i}" for i in range(n_in)]
@@ -510,12 +511,12 @@ class Glm52DecodeMK:
 
         @torch.library.custom_op(name, mutates_args=())
         def op(pos: torch.Tensor, seq: torch.Tensor, qsl: torch.Tensor, btv: torch.Tensor, csr: torch.Tensor,
-               h0: torch.Tensor, ltab_: torch.Tensor, dtab_: torch.Tensor, smalls: torch.Tensor,
+               h0: torch.Tensor, ltab_: torch.Tensor, dtab_: torch.Tensor, rank: torch.Tensor, smalls: torch.Tensor,
                weights: list[torch.Tensor], caches: list[torch.Tensor]) -> list[torch.Tensor]:
-            return list(flat(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, smalls, *weights, *caches))
+            return list(flat(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls, *weights, *caches))
 
         @op.register_fake
-        def _(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, smalls, weights, caches):
+        def _(pos, seq, qsl, btv, csr, h0, ltab_, dtab_, rank, smalls, weights, caches):
             return ([torch.empty((M, cfg.H), dtype=torch.bfloat16, device=h0.device)]
                     + [torch.empty_like(c) for c in caches])
 
@@ -538,7 +539,7 @@ class Glm52DecodeMK:
             pc = torch.clamp(p * valid.to(i32), 0, n_pos - 1)
             csr = cos_sin[pc.long()].to(torch.bfloat16).float()                  # [TMAX, DR], bf16 values
             h0 = self.backbone.embed_tokens(fit(ids.reshape(-1), TMAX)).float()
-            outs = op(p, seq_lens.to(i32), qsl.to(i32), btv, csr, h0, ltab, dtab, smalls, list(weights),
+            outs = op(p, seq_lens.to(i32), qsl.to(i32), btv, csr, h0, ltab, dtab, rank_t, smalls, list(weights),
                       list(caches))
             for dst, src in zip(caches, outs[1:1 + len(caches)]):
                 dst.copy_(src)
