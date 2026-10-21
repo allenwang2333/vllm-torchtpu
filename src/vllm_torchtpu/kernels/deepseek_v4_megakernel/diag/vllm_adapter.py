@@ -200,6 +200,17 @@ class ParityConfig:
     every: int  # on every `every`-th eligible served step
     warmup_budget: int  # parity calls on pre-serving (warm-up) steps
     tol: float  # rows above this relative L2 are counted as over_tol
+    # the two forwards compared, in run order, cycled over the parity calls;
+    # ("stock", "mk") is the check, ("mk", "mk") and ("stock", "stock") the
+    # method's floor
+    pairs: tuple[tuple[str, str], ...] = (("stock", "mk"),)
+
+    def __post_init__(self) -> None:
+        for p in self.pairs:
+            if len(p) != 2 or not set(p) <= {"stock", "mk"}:
+                raise ValueError(f"parity pair must be two of stock / mk, got {p}")
+        if not self.pairs:
+            raise ValueError("no parity pair")
 
 
 # ParityProbe per-row float fields; the aux rel-L2 rows follow
@@ -265,11 +276,14 @@ class ParityProbe:
             raise ValueError(f"parity stride must be >= 1, got {cfg.every}")
         head = cfg.head
         self.rank, self.head, self.tol = rank, head, cfg.tol
+        self.pairs = cfg.pairs
+        self.pair = cfg.pairs[0]  # of the selected step
+        self._selected = 0
         self.budget = (cfg.warmup_budget, cfg.served_budget)
         self.every = (1, cfg.every)
         self.eligible = [0, 0]
         self.calls = [0, 0]
-        self.agg = [self._new_agg() for _ in PHASES]
+        self.agg = {}  # (phase, pair) -> totals
 
         def rows(h_s, aux_s, h_m, aux_m, w):
             return parity_rows(h_s, aux_s, h_m, aux_m, w, head.vocab_start,
@@ -289,6 +303,8 @@ class ParityProbe:
         if self.calls[phase] >= self.budget[phase] or k % self.every[phase]:
             return False
         self.calls[phase] += 1
+        self.pair = self.pairs[self._selected % len(self.pairs)]
+        self._selected += 1
         return True
 
     def warm(self, hidden: torch.Tensor, aux: Sequence[torch.Tensor]) -> None:
@@ -296,7 +312,8 @@ class ParityProbe:
         self._rows(hidden, list(aux), hidden, list(aux), self.head.weight)
 
     def compare(self, phase, tag, out_stock, out_mk, real_rows: int) -> None:
-        """`out_*`: (hidden, aux list | None) as the runner reads them."""
+        """`out_*`: (hidden, aux list | None) as the runner reads them, of the
+        pair's first and second forward."""
         (h_s, aux_s), (h_m, aux_m) = out_stock, out_mk
         aux_s, aux_m = list(aux_s or []), list(aux_m or [])
         if len(aux_s) != len(aux_m) or h_s.shape != h_m.shape:
@@ -315,7 +332,7 @@ class ParityProbe:
         agree = sum(x == y for x, y in zip(ir["s_tok"], ir["m_tok"]))
         bad_s = sum(x > 0 for x in ir["bad_stock"])
         bad_m = sum(x > 0 for x in ir["bad_mk"])
-        a = self.agg[phase]
+        a = self.agg.setdefault((phase, self.pair), self._new_agg())
         a["calls"] += 1
         a["compared"] += int(n > 0)
         a["rows"] += n
@@ -330,7 +347,8 @@ class ParityProbe:
         rows["aux_rel_l2"] = [[round(v, 5) for v in vs] for vs in aux_rel]
         _emit(
             self.rank,
-            f"parity {PHASES[phase]} #{self.calls[phase]} {tag} rows {n}: "
+            f"parity {PHASES[phase]} #{self.calls[phase]} {tag} rows {n} "
+            f"{'_'.join(self.pair)}: "
             f"rel_l2 max {max(rel, default=0):.4g} mean "
             f"{sum(rel) / max(n, 1):.4g}; max_abs_diff "
             f"{max(fr['max_abs_diff'], default=0):.4g} (max_abs_stock "
@@ -342,10 +360,11 @@ class ParityProbe:
         _emit(self.rank, self.summary(phase))
 
     def summary(self, phase: int) -> str:
-        a = self.agg[phase]
+        a = self.agg.get((phase, self.pair), self._new_agg())
         return (
-            f"parity summary {PHASES[phase]}: calls {a['calls']} (with rows "
-            f"{a['compared']}), rows {a['rows']}, max rel_l2 {a['max_rel_l2']:.4g}, "
+            f"parity summary {PHASES[phase]} {'_'.join(self.pair)}: calls "
+            f"{a['calls']} (with rows {a['compared']}), rows {a['rows']}, max rel_l2 "
+            f"{a['max_rel_l2']:.4g}, "
             f"max_abs_diff {a['max_abs_diff']:.4g}, over_tol({self.tol}) rows "
             f"{a['over_tol_rows']}, bad rows stock {a['bad_rows_stock']} mk "
             f"{a['bad_rows_mk']}, shard top1 agree {a['shard_top1_agree']}/{a['rows']}"

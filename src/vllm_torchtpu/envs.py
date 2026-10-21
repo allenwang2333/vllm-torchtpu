@@ -165,6 +165,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_PARITY_EVERY: int = 1
     VLLM_TPU_DSV4_MK_PARITY_WARMUP: int = 0
     VLLM_TPU_DSV4_MK_PARITY_TOL: float = 0.1
+    VLLM_TPU_DSV4_MK_PARITY_PAIR: str = "stock,mk"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -1114,6 +1115,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_MK_PARITY_EVERY": env_int("VLLM_TPU_DSV4_MK_PARITY_EVERY", 1),
     "VLLM_TPU_DSV4_MK_PARITY_WARMUP": env_int("VLLM_TPU_DSV4_MK_PARITY_WARMUP", 0),
     "VLLM_TPU_DSV4_MK_PARITY_TOL": env_float("VLLM_TPU_DSV4_MK_PARITY_TOL", 0.1),
+    # The two forwards a parity step compares, in run order: "stock,mk" (the
+    # check), or "mk,mk" / "stock,stock" / "mk,stock" (controls); several
+    # pairs separated by ";" take turns over the parity calls.
+    "VLLM_TPU_DSV4_MK_PARITY_PAIR": env_str("VLLM_TPU_DSV4_MK_PARITY_PAIR", "stock,mk"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),

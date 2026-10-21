@@ -724,6 +724,9 @@ def _parity_config(model: Any) -> SD.ParityConfig | None:
         every=envs.VLLM_TPU_DSV4_MK_PARITY_EVERY,
         warmup_budget=envs.VLLM_TPU_DSV4_MK_PARITY_WARMUP,
         tol=envs.VLLM_TPU_DSV4_MK_PARITY_TOL,
+        pairs=tuple(
+            tuple(p.split(",")) for p in envs.VLLM_TPU_DSV4_MK_PARITY_PAIR.split(";")
+        ),
     )
 
 
@@ -1770,19 +1773,31 @@ class DSv4Megakernel:
         stock_forward: Callable,
         *inputs: Any,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
-        """Stock forward, then the megakernel step, on the same inputs; the
-        megakernel's output is served. Both write the step's own cache slots
-        (KV, compressor states, indexer records); the megakernel writes last,
-        so the served caches are as after the megakernel alone."""
-        out_stock = stock_forward(*inputs)
-        _sync(None)  # the stock writes land before the kernel reads the caches
-        out = self._run(decision, *inputs)
+        """The parity pair's two forwards on the same inputs (by default the
+        stock forward, then the megakernel step), each synced before the next.
+        The pair's megakernel output is served (the second of two; a
+        stock-stock pair is followed by a served megakernel step). Every
+        forward writes only the step's own cache slots (KV, compressor states,
+        indexer records) and the megakernel writes them before reading them,
+        so each sees the caches as if it ran alone and, when the megakernel
+        runs last, the served caches are as after the megakernel alone (not
+        so for the "mk,stock" control)."""
+        pair = self._parity.pair
+        served = 1 if pair[1] == "mk" else 0 if pair[0] == "mk" else None
+        outs = []
+        for i, path in enumerate(pair):
+            if path == "stock":
+                outs.append(stock_forward(*inputs))
+            else:
+                outs.append(self._run(decision, *inputs, count=i == served))
+            _sync(None)  # this forward's cache writes land before the next reads
+        out = self._run(decision, *inputs) if served is None else outs[served]
         if not decision.idle:
             self._parity.compare(
                 self.phase,
                 f"step {self.trace.step} {decision.bucket.key}",
-                out_stock,
-                out,
+                outs[0],
+                outs[1],
                 self._local_real_rows,
             )
         return out
@@ -1794,12 +1809,14 @@ class DSv4Megakernel:
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None,
         intermediate_tensors: Any,
+        count: bool = True,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """`count`: feed the non-finite counter (a parity step counts only the
+        served run)."""
         if inputs_embeds is not None or intermediate_tensors is not None:
             raise AssertionError("megakernel step with embeddings or PP tensors")
         bucket = decision.bucket
         assert bucket is not None and self.caches is not None
-        first = None
         if decision.idle:
             ops = self._idle_operands[bucket]
         else:
@@ -1828,8 +1845,8 @@ class DSv4Megakernel:
                 self.weights,
                 self.caches.arrays,
             )
-        if self._nonfinite is not None:
-            if first is None:
+        if count and self._nonfinite is not None:
+            if decision.idle:
                 self._nonfinite.count_idle(self.phase)
             else:
                 self._nonfinite.count(self.phase, hidden, aux,
@@ -1907,7 +1924,9 @@ class DSv4Megakernel:
         if self._nonfinite is not None:
             self._nonfinite.log(self.phase)
         if self._parity is not None:
-            self._emit(self._parity.summary(self.phase))
+            for pair in self._parity.pairs:
+                self._parity.pair = pair
+                self._emit(self._parity.summary(self.phase))
         self.serving = True
 
     def reset_stats(self) -> None:

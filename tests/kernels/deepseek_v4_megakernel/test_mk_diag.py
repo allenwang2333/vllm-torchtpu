@@ -376,8 +376,8 @@ def test_parity_runs_stock_then_kernel_and_serves_the_kernel(make, monkeypatch, 
     assert all(syncs[n] is None for _, n in events)
     assert all(torch.equal(t, b + 5) for t, b in zip(mk.caches.arrays, before))
     err = capsys.readouterr().err
-    steps = re.findall(r"parity (\S+) #(\d) step \d+ mk_q3_t16 rows 6: rel_l2 max "
-                       r"(\S+) ", err)  # fmt: skip
+    steps = re.findall(r"parity (\S+) #(\d) step \d+ mk_q3_t16 rows 6 stock_mk: "
+                       r"rel_l2 max (\S+) ", err)  # fmt: skip
     norm = np.sqrt(2**2 + 2**2 + 0.5**2)  # the stock row (id 2, position 2)
     assert [(p, n) for p, n, _ in steps] == [
         ("pre-serving", "1"),
@@ -386,7 +386,7 @@ def test_parity_runs_stock_then_kernel_and_serves_the_kernel(make, monkeypatch, 
     ]
     assert all(float(r) == pytest.approx(0.5 / norm, rel=1e-3) for *_, r in steps)
     assert err.count("shard top1 agree 6/6; over_tol 1 ") == 3  # 0.17 > tol 0.1
-    assert "parity summary served: calls 2 (with rows 2), rows 12" in err
+    assert "parity summary served stock_mk: calls 2 (with rows 2), rows 12" in err
 
 
 def test_parity_on_an_idle_rank_pairs_the_stock_forward_and_logs_nothing(make, capsys):
@@ -402,7 +402,7 @@ def test_parity_on_an_idle_rank_pairs_the_stock_forward_and_logs_nothing(make, c
     assert d.run and d.idle and d.parity
     zeros = torch.zeros(8, dtype=torch.int32)
     mk.forward(stock, zeros, zeros, None, None)
-    assert calls == [1] and syncs == [None]
+    assert calls == [1] and syncs == [None, None]  # after each of the pair
     assert "parity served" not in capsys.readouterr().err
 
 
@@ -424,3 +424,52 @@ def test_parity_refuses_ab_and_warmup_compiles_the_diagnostics(make):
     # every runner row count the bucket reaches
     assert warmed == [("nf", 12), ("parity", 8), ("parity", 16)] * 2
     assert {"update", "rows"} <= set(names)
+
+
+@pytest.mark.parametrize("pair", [("mk", "mk"), ("stock", "stock"), ("mk", "stock")])
+def test_parity_control_pairs(make, monkeypatch, capsys, pair):
+    """Controls: the same path twice gives the comparison's floor (0 on CPU);
+    the megakernel output is served and counted once."""
+    mk, _, syncs = make(parity=_parity_cfg(pairs=(pair,)), nonfinite_stats=True)
+    md = _metadata(mk, 2)
+    monkeypatch.setattr(VA, "_current_attn_metadata", lambda: md)
+    ids = torch.arange(8, dtype=torch.int32) + 1
+    stock_calls = []
+
+    def stock(input_ids, positions, embeds, inter):
+        stock_calls.append(1)
+        h = torch.zeros(8, H)
+        h[:, 0] = input_ids.float()
+        h[:, 1] = positions.float() + 1  # differs from the kernel's output
+        return h, [h * (a + 2) for a in range(len(AUX))]
+
+    before = [t.clone() for t in mk.caches.arrays]
+    mk.serving = True
+    assert _decide(mk, 8).parity
+    hidden, _ = mk.forward(stock, ids, ids, None, None)
+    np.testing.assert_array_equal(hidden[:6, 1].numpy(), ids[:6].numpy())  # kernel's
+    assert len(stock_calls) == pair.count("stock")
+    kernel_runs = max(pair.count("mk"), 1)
+    assert all(
+        torch.equal(t, b + kernel_runs) for t, b in zip(mk.caches.arrays, before)
+    )
+    assert syncs == [None, None]
+    assert mk._nonfinite.busy[1] == 1
+    err = capsys.readouterr().err
+    tag = "_".join(pair)
+    if pair[0] == pair[1]:
+        assert f"rows 6 {tag}: rel_l2 max 0 mean 0;" in err
+    else:
+        assert f"rows 6 {tag}: rel_l2 max 0 " not in err
+    with pytest.raises(ValueError):
+        _parity_cfg(pairs=(("mk", "draft"),))
+
+
+def test_parity_pairs_take_turns():
+    cfg = _parity_cfg(served_budget=5, pairs=(("stock", "mk"), ("mk", "mk")))
+    p = SD.ParityProbe(0, cfg, lambda f: f)
+    got = []
+    for _ in range(5):
+        assert p.select(1)
+        got.append(p.pair)
+    assert got == [("stock", "mk"), ("mk", "mk")] * 2 + [("stock", "mk")]
