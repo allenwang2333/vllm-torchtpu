@@ -97,6 +97,11 @@ PATCHES = (
         "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
         _ENGINE,
     ),
+    Patch(
+        "vllm_torchtpu.core.mamba_checkpoint_retention:"
+        "patch_mamba_checkpoint_retention",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
