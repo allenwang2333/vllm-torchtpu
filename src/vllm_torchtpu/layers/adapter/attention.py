@@ -2090,12 +2090,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     _cp_mla_attention.prebuild_ragged_all_to_all(
                         self.dcp_size, SEND_PAD_ROWS - 1
                     )
-                    if envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE:
-                        _cp_mla_attention.prebuild_send_merge(self.dcp_size)
                     if envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK:
                         _cp_mla_attention.prebuild_send_unpack(self.dcp_size)
-                    if envs.TPU_DCP_MLA_SEND_DENSE:
-                        _cp_mla_attention.prebuild_send_dense(self.dcp_size)
                     if envs.TPU_DCP_MLA_SEND_GROUP_ROWS > 0:
                         _cp_mla_attention.prebuild_send_group(
                             self.dcp_size, envs.TPU_DCP_MLA_SEND_GROUP_ROWS

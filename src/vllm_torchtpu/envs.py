@@ -41,10 +41,8 @@ if TYPE_CHECKING:
     TPU_VOCAB_EMBED_I32_BOUNDS: bool = True
     TPU_MOE_TP_DECODE_HBM_OPERANDS: str = "drafter"
     TPU_DCP_MLA_SEND_LAYOUT: bool = True
-    TPU_DCP_MLA_SEND_LAYOUT_MERGE: bool = False
     TPU_DCP_MLA_SEND_LAYOUT_UNPACK: bool = True
     TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS: int = 0
-    TPU_DCP_MLA_SEND_DENSE: bool = False
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 8
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = True
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
@@ -589,12 +587,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # no XLA retile / concat runs between the kernel and the all-to-all. Same
     # bits sent, same merge.
     "TPU_DCP_MLA_SEND_LAYOUT": env_bool("TPU_DCP_MLA_SEND_LAYOUT", default=True),
-    # With TPU_DCP_MLA_SEND_LAYOUT: run the receive side (ragged exchange,
-    # lse word unpack and the merge) as one JAX op over the received buffer
-    # instead of torch ops on its views. Same arithmetic, op for op.
-    "TPU_DCP_MLA_SEND_LAYOUT_MERGE": env_bool(
-        "TPU_DCP_MLA_SEND_LAYOUT_MERGE", default=False
-    ),
     # With TPU_DCP_MLA_SEND_LAYOUT: the exchange and the unpack of the
     # received buffer (slices + bitcasts, no arithmetic) as one JAX op, the
     # merge arithmetic unchanged in torch. Same bits.
@@ -609,16 +601,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS", 0
     ),
-    # With TPU_DCP_MLA_SEND_LAYOUT: exchange the kernel's send buffer with a
-    # dense all-to-all of whole destination blocks (one JAX op, with the
-    # unpack) instead of the ragged real-rows one, and zero the received
-    # partial rows past the real tokens' as the ragged exchange leaves them.
-    # XLA's ragged all-to-all runs on a row-contiguous [rows, 2, 256] copy of
-    # the kernel's tiled buffer and copies the result back; the dense one
-    # takes the tiled blocks as they are. Same bits on every row the merge
-    # reads, same merge.
-    "TPU_DCP_MLA_SEND_DENSE": env_bool("TPU_DCP_MLA_SEND_DENSE", default=False),
-    # With TPU_DCP_MLA_SEND_LAYOUT (and not TPU_DCP_MLA_SEND_DENSE): run the
+    # With TPU_DCP_MLA_SEND_LAYOUT: run the
     # ragged exchange over groups of this many rows (8 or 16: whole (8,128)
     # tiles of the int16 buffer, so XLA keeps the kernel's tiled layout
     # instead of copying it to and from [rows, 2, 256]), from the group
@@ -635,8 +618,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every destination block from the (8,128) tile row holding the lse word
     # row to the block's end, received partial rows past the real ones zeroed
     # as the ragged exchange leaves them. Same bits on every row the merge
-    # reads, same merge. Takes precedence over TPU_DCP_MLA_SEND_DENSE /
-    # TPU_DCP_MLA_SEND_GROUP_ROWS on those buckets. Peers are addressed by
+    # reads, same merge. Takes precedence over TPU_DCP_MLA_SEND_GROUP_ROWS on
+    # those buckets. Peers are addressed by
     # (lane, rank) as data, so it needs the lane operand the indexer's
     # TPU_DCP_INDEXER_SMALL_AG already lifts on every bucket (with
     # TPU_SC_TOPK_DCP_MERGE_FLAT and TPU_DCP_RANK_OPERAND); otherwise off.

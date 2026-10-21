@@ -14,7 +14,7 @@ and lse (prologue on) and the kernel-written send buffer of the same step. On
 through `merge_lse_partials_scatter_heads` (a2a + PACK + REAL_ROWS) and the
 send buffer through `merge_send_layout` (one ragged a2a from row
 SEND_PAD_ROWS - 1), eager and compiled, with the torch merge and with
-TPU_DCP_MLA_SEND_LAYOUT_MERGE (exchange + merge as one JAX op): every row
+TPU_DCP_MLA_SEND_LAYOUT_UNPACK (exchange + unpack as one JAX op): every row
 must agree bit for bit.
 Positive control: the send buffer with its lse word row's lo halves zeroed
 must fail the same check.
@@ -82,17 +82,11 @@ def _check(rank, cp_mla, path):
                     return cp_mla.merge_send_layout(s, qsl, tokens)
 
                 wrap = mm._compile if how == "compiled" else (lambda f: f)
-                cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE = False
                 want = wrap(inc)(
                     o.contiguous().to("tpu"), lr.contiguous().to("tpu")
                 ).cpu()
                 got = wrap(new)(s.contiguous().to("tpu")).cpu()
                 ctl = wrap(new)(bad.contiguous().to("tpu")).cpu()
-                # TPU_DCP_MLA_SEND_LAYOUT_MERGE: exchange + merge as one JAX op.
-                cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE = True
-                got_j = wrap(new)(s.contiguous().to("tpu")).cpu()
-                ctl_j = wrap(new)(bad.contiguous().to("tpu")).cpu()
-                cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_MERGE = False
                 # TPU_DCP_MLA_SEND_LAYOUT_UNPACK: exchange + unpack as one JAX
                 # op, torch merge.
                 cp_mla.envs.TPU_DCP_MLA_SEND_LAYOUT_UNPACK = True
@@ -110,17 +104,11 @@ def _check(rank, cp_mla, path):
                     "control_n_diff": int(
                         (ctl.view(torch.int16) != want.view(torch.int16)).sum()
                     ),
-                    "jax_n_diff": int(
-                        (got_j.view(torch.int16) != want.view(torch.int16)).sum()
-                    ),
                     "unpack_n_diff": int(
                         (got_u.view(torch.int16) != want.view(torch.int16)).sum()
                     ),
                     "unpack_control_n_diff": int(
                         (ctl_u.view(torch.int16) != want.view(torch.int16)).sum()
-                    ),
-                    "jax_control_n_diff": int(
-                        (ctl_j.view(torch.int16) != want.view(torch.int16)).sum()
                     ),
                 }
             except Exception as exc:  # noqa: BLE001 - reported to the parent
@@ -169,7 +157,6 @@ def _run_worker(result_dir: Path, path: str) -> None:
         dcp_mod.get_dcp_group = lambda: group
         cp_mla.prebuild_ragged_all_to_all(world)
         cp_mla.prebuild_ragged_all_to_all(world, SEND_PAD_ROWS - 1)
-        cp_mla.prebuild_send_merge(world)
         cp_mla.prebuild_send_unpack(world)
         result["check"] = _check(rank, cp_mla, path)
     except BaseException as exc:  # noqa: BLE001
@@ -225,8 +212,6 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
                     n_diff=0,
                     ctl=0,
                     nonzero=False,
-                    jax=0,
-                    jax_ctl=0,
                     unpack=0,
                     unpack_ctl=0,
                 ),
@@ -236,8 +221,6 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
             t["elements"] += c["elements"]
             t["n_diff"] += c["n_diff"]
             t["ctl"] += c["control_n_diff"]
-            t["jax"] += c["jax_n_diff"]
-            t["jax_ctl"] += c["jax_control_n_diff"]
             t["nonzero"] |= c["nonzero_real"]
     for key, t in sorted(total.items()):
         print(f"SENDMERGE {key}: {t}")
@@ -246,9 +229,6 @@ def test_send_layout_merge_on_real_collectives(tmp_path):
         assert t["ctl"] > 0, ("dropped lse lo halves not caught", key, t)
         assert t["unpack"] == 0, ("TPU_DCP_MLA_SEND_LAYOUT_UNPACK not bitwise", key, t)
         assert t["unpack_ctl"] > 0, ("unpack control not caught", key, t)
-        # TPU_DCP_MLA_SEND_LAYOUT_MERGE is experimental (not bitwise on
-        # synthetic data): reported, not asserted.
-        assert t["jax_ctl"] > 0, ("jax merge control not caught", key, t)
 
 
 if __name__ == "__main__":

@@ -231,9 +231,7 @@ def _merge_send_every_rank(sends, real, tokens):
         mock.patch.object(cp_mla, "_ragged_all_to_all", ragged),
         mock.patch.object(cp_mla, "get_dcp_group", lambda: local.group),
         mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_SMALL_A2A", False),
-        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_DENSE", False),
         mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_GROUP_ROWS", 0),
-        mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_LAYOUT_MERGE", False),
         mock.patch.object(cp_mla.envs, "TPU_DCP_MLA_SEND_LAYOUT_UNPACK", False),
         concurrent.futures.ThreadPoolExecutor(world) as pool,
     ):
@@ -397,9 +395,9 @@ def test_sparse_mla_dcp_send_op_schema(rank):
     "world,tokens,per", [(16, 16, 4), (16, 32, 4), (8, 16, 8), (8, 32, 8)]
 )
 def test_jax_merge_matches_torch_merge(world, tokens, per):
-    """TPU_DCP_MLA_SEND_LAYOUT_MERGE's jnp merge == `_merge_received` compiled
-    by torch on one device, bit for bit, at the mirror (W=16) and twin (W=8)
-    geometries -- the multichip check covers only W=8."""
+    """`merge_received_jax` (the fused small all-to-all's merge) ==
+    `_merge_received` compiled by torch on one device, at the mirror (W=16) and
+    twin (W=8) geometries."""
     prologue._require_tpu()
     import torch
     import torch_tpu  # noqa: F401
@@ -440,6 +438,5 @@ def test_jax_merge_matches_torch_merge(world, tokens, per):
     print(
         f"W={world} T={tokens} L={per}: jax vs torch merge diffs {diffs} / {got_t.size}"
     )
-    # Known not bitwise (TPU_DCP_MLA_SEND_LAYOUT_MERGE stays experimental):
-    # report, and only bound the drift.
+    # Known not bitwise: report, and only bound the drift.
     assert diffs[cp_mla.MERGE_JAX_VARIANTS[0]] <= max(8, got_t.size // 10000), diffs
