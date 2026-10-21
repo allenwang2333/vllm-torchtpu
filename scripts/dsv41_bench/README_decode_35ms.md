@@ -329,13 +329,42 @@ The NPZ/JSON pairs contain selected logical IDs, positions and request IDs
 copied together after a real decode forward. Captures marked
 `actual_stage_input_tensors` also freeze encoder and decoder input positions
 before their respective calls; both must match every indexer's recorded
-positions. Preserve speculative host metadata separately, since its inferred
-positions can differ from the actual stage inputs. The analyzer verifies
+positions. Preserve speculative host metadata separately and use the
+independent stage tensors to verify query positions. The analyzer verifies
 checksums, query boundaries and compressed-context bounds before measuring per-request
 unions. It compares sets rather than top-k column positions and never merges
 logical IDs across requests or indexers. Reported row-traffic reductions are
 ideal bounds for the captured selections, not kernel or serving speedups.
 Synchronous capture copies invalidate performance measurements for that run.
+
+A QK-only union preflight in `exp-rz9rsw9am2` used synthetic selections,
+queries and BF16 keys, not real decode captures. Each of 48 requests had six
+64-head queries selecting 512 rows apiece, with a union of 832 rows padded to
+1024. Union construction and cache packing were outside timing. The reference
+used the current CSA QK's two 256-feature accumulation steps on two MXUs,
+with independent query accumulators; the candidate stacked all 384 query/head
+rows and restored the original per-query column order outside Pallas.
+
+| Seed | Independent QK (us) | Joint QK with external reorder (us) |
+| --- | ---: | ---: |
+| 1066 | 84.413 | 252.704 |
+| 1068 | 84.374 | 254.377 |
+| 1069 | 84.693 | 253.263 |
+
+All complete QK output bits matched. Times cover all 48 requests and exclude
+entry barriers, using P-state 7 and five ordered device repetitions. The
+candidate computes a larger score matrix before selecting its columns;
+compiled temporary storage increased from zero to 227901024 bytes. Even
+with precomputed unions, external reorder was slower and is not adopted.
+These results say nothing about full-attention or serving speedups.
+
+The fused-reorder prototype has no timing result: after making gather indices
+explicitly broadcast and removing a functional scatter, the pinned compiler
+rejected its 512-column gather with `Multiple source vregs along gather dimension`.
+This is an implementation/compiler constraint, not a hardware impossibility.
+Source, HLO, numerical checks and device-event summaries are preserved at
+`results/csa-union-qk-preflight-evidence.tgz` in `art-oksvnsji4r`, SHA-256
+`0da662c10e3f9c6f62b816549a13e3f74150cee3063b21cf9f5ac4c6697227a5`.
 
 The following prototypes remain outside the production path. Unless labeled
 otherwise, times are complete device-module medians after subtracting identified
