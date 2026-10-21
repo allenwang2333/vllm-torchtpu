@@ -28,6 +28,11 @@ def test_cache_exec_pool_gather_default_is_split():
         "pool_gather_eligible": "approx",
     }
     assert mk.ExecSpec().cache is None
+    # A `CacheExec` equal to its defaults is the same as no cache extension.
+    assert mk.ExecSpec(cache=mk.CacheExec()) == mk.ExecSpec()
+    assert hash(mk.ExecSpec(cache=mk.CacheExec())) == hash(mk.ExecSpec())
+    assert mk.with_cache(mk.ExecSpec(), paged_kv=False).cache is None
+    assert mk.ExecSpec(cache=mk.CacheExec(paged_kv=True)) != mk.ExecSpec()
     assert mk.cache_exec(mk.ExecSpec()).pool_gather is False
     assert not mk.CacheExec(paged_kv=True).GPR
     for val in pool.POOL_GATHER_VALUES:

@@ -110,13 +110,15 @@ class Block:
     A block with its own knobs sets `Tunables` to a frozen dataclass (fields
     with defaults plus a `NUMERICS` class attribute); defining the subclass
     registers it under `name`, and the block reads its values with
-    `self.tunables(ex)`.
+    `self.tunables(ex)`. Debug-only flags go in a separate frozen dataclass
+    `Debug`, read with `self.debug_flags(ex)` from `ExecSpec.debug.blocks`.
     """
 
     name: str = "block"
     reduction: Literal["allreduce", "none", "custom"] = "allreduce"
     input_norm: str | None = None
     Tunables: ClassVar[type | None] = None
+    Debug: ClassVar[type | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -132,6 +134,19 @@ class Block:
         """This block's `Tunables` in `ex`'s tiles (class defaults when unset)."""
         assert self.Tunables is not None, f"block {self.name!r} declares no Tunables"
         return ex.resolved_tiles.block(self.name, self.Tunables)
+
+    def debug_flags(self, ex: ExecSpec) -> Any:
+        """This block's `Debug` flags in `ex.debug.blocks` (defaults when unset)."""
+        assert self.Debug is not None, f"block {self.name!r} declares no Debug"
+        val = ex.debug.blocks.get(self.name)
+        if val is None:
+            return self.Debug()
+        if not isinstance(val, self.Debug):
+            raise TypeError(
+                f"DebugOptions.blocks[{self.name!r}] must be a "
+                f"{self.Debug.__name__}, got {type(val).__name__}"
+            )
+        return val
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
         return []

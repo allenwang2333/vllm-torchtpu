@@ -90,16 +90,27 @@ def test_profile_numerics_are_derived_and_enforced():
     # Qwen3.5 profiles are measured against `qwen35-baseline`, not `default`.
     c30 = mk.get_profile("qwen35-candidate30")
     feats = set(profile_mod.approx_features(c30))
-    assert {
-        "tiles.gqa.kv_sub",
+    # Exactly its approx-class knobs; exact-class flags it turns on
+    # (`pair_kv`, `kv_ering`, `gqa_qv`, `rel_fetch`, `nkv`, ...) are not listed.
+    assert feats == {
+        "tiles.dense_acc_pair",
+        "tiles.dmm_unroll",
+        "tiles.gdn.conv_stage",
         "tiles.gdn.gdn_head_major",
+        "tiles.gqa.gq_pack",
+        "tiles.gqa.kv_sub",
+        "tiles.hier",
+        "tiles.moe.ecopy_opt",
         "tiles.moe.moe_unroll",
-    } <= feats
-    # Exact-class flags the profile turns on are not listed.
-    assert not feats & {"tiles.gqa.pair_kv", "tiles.gqa.kv_ering", "tiles.gqa.gqa_qv"}
+        "tiles.moe.pipe_ep",
+        "tiles.moe.r2_direct_store",
+        "tiles.moe.route_vec",
+        "tiles.moe.topk_lanes",
+        "tiles.nbe",
+    }
     fused = mk.get_profile("qwen35-candidate30-fused")
     assert fused.numerics == "approx" and fused.fused_pool_io == "auto"
-    assert "fused_pool_io" in profile_mod.approx_features(fused)
+    assert set(profile_mod.approx_features(fused)) == feats | {"fused_pool_io"}
 
     # A profile declared exact that turns on an approx feature is rejected.
     def _kv_sub_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
@@ -117,6 +128,42 @@ def test_profile_numerics_are_derived_and_enforced():
         )
 
     assert mk.Profile(name="sched-only", tiles=_sched_rule).numerics == "exact"
+
+
+def test_model_profile_without_tiles_inherits_the_model_default_rule(monkeypatch):
+    """`Profile(model=m, tiles=None)` runs (and is measured against) the tile
+    rule of `m`'s default profile, not the library default rule."""
+    monkeypatch.setattr(profile_mod, "_REGISTRY", dict(profile_mod._REGISTRY))
+    monkeypatch.setattr(
+        profile_mod, "_MODEL_DEFAULTS", dict(profile_mod._MODEL_DEFAULTS)
+    )
+
+    def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> mk.Tiles:
+        return mk.default_tiles(B, R=R).with_blocks({"gqa": {"kv_sub": 1024}})
+
+    ref = mk.register_profile(
+        mk.Profile(
+            name="tile-rule-ref",
+            model="tile_rule_model",
+            tiles=_ref_rule,
+            model_default=True,
+        )
+    )
+    # Same pool-I/O mode, no tiles: exact relative to the model's default.
+    p = mk.Profile(name="tile-rule-user", model="tile_rule_model", buckets=(8,))
+    assert p.tile_rule() is _ref_rule and p.numerics == "exact"
+    assert profile_mod.approx_features(p) == ()
+    assert p.tiles_for(8, R=2) == ref.tiles_for(8, R=2)
+    ex = p.exec_for(mk.ExecSpec(R=2), B=8, T=1)
+    assert ex.tiles == _ref_rule(8, R=2)
+    # Without a model (or a model with no default profile): the library rule,
+    # left for the kernel builder's VMEM fit.
+    for q in (
+        mk.Profile(name="tile-rule-any"),
+        mk.Profile(name="tile-rule-other", model="no_default_model"),
+    ):
+        assert q.tile_rule() is None
+        assert q.exec_for(mk.ExecSpec(R=2), B=8, T=1).tiles is None
 
 
 def test_overrides_relabel_and_never_silently_stay_exact():
@@ -402,7 +449,8 @@ _GPR_AUTO = mk.get_profile(_QWEN35_DEFAULT).with_overrides(pool_gather=None)
     [
         (_GPR_ELIGIBLE, 8),
         (_GPR_ELIGIBLE, 16),
-        # Auto GPR at B=24 is also pinned by the golden harness (def_t4_b24_gpr).
+        # The golden harness also pins GPR at B=24, there with an explicit
+        # `pool_gather=True` (def_t4_b24_gpr).
         pytest.param(_GPR_AUTO, 24, marks=pytest.mark.slow),
     ],
 )

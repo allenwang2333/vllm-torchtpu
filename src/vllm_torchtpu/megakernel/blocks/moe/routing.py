@@ -34,7 +34,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     MR, R = ex.MR, ex.R
     E, ECOPY, ER, EXTRA, NBE, TE = mp.E, mp.ECOPY, mp.ER, mp.EXTRA, mp.NBE, mp.TE
     choice = p8
-    if m.tun.forced_routing:
+    if m.dbg.forced_routing:
         rs = l_idx % 2
         pltpu.make_async_copy(
             ctx.extra["rbias"].at[0], scr["rb"].at[rs], scr["rb_sem"].at[rs]

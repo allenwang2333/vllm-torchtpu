@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...ops import F32, I32
-from .params import MoEParams, MoETunables
+from .params import MoEDebug, MoEParams
 
 
 @dataclass(frozen=True)
@@ -37,7 +37,7 @@ class MoEEmit:
     ctx: Any
     ex: Any
     mp: MoEParams
-    tun: MoETunables
+    dbg: MoEDebug
     W: Any
     scr: Any
     stream: Any
@@ -53,7 +53,7 @@ class MoEEmit:
     FLT_MIN: float
 
     @classmethod
-    def build(cls, ctx: Any, mp: MoEParams, tun: MoETunables) -> MoEEmit:
+    def build(cls, ctx: Any, mp: MoEParams, dbg: MoEDebug) -> MoEEmit:
         """Collect `ctx`'s refs and trace the shared iotas (in emit order)."""
         ex = ctx.ex
         stream = ctx.stream
@@ -67,7 +67,7 @@ class MoEEmit:
             ctx=ctx,
             ex=ex,
             mp=mp,
-            tun=tun,
+            dbg=dbg,
             W=ctx.W,
             scr=ctx.scr,
             stream=stream,

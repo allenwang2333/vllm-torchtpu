@@ -22,7 +22,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..ops import BF16, FP8, U32, rup
+from ..ops import BF16, FP8, U32
 from .backend import kernel_debug_check
 from .config import cache_exec
 from .layout import LANES, PoolLayout
@@ -48,15 +48,16 @@ def prepare_ckpt(
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
         taps = layout.conv_taps
-        HR = rup(taps + T, 8)
         ssm_u32_rows = (vh * KD) // 2
         conv_rows = (taps * QKV) // LANES
         conv_rows_pad = ((conv_rows + 15) // 16) * 16
         qkv_128 = QKV // LANES
-        assert T == 1 or (4 * qkv_128) % 16 != 0 or 4 + T <= HR, (
-            f"T={T} exceeds direct_conv window HR={HR}"
-        )
-        min_direct_rows = 4 + T if (4 * qkv_128) % 16 == 0 else taps + T
+        # The direct path reads `taps + 1` rows per token (the last one masked
+        # to zero) when they fill the padded window exactly, else `taps` rows
+        # padded with zero rows; it falls back to the packed copy when the
+        # caller's conv tensor is too short.
+        tail_row = (taps + 1) * qkv_128 == conv_rows_pad
+        min_direct_rows = taps + 1 + T if tail_row else taps + T
         direct_conv = (
             T > 1
             and conv.ndim == 4
@@ -102,7 +103,7 @@ def prepare_ckpt(
     else:
         vh = KD = VD = QKV = 0
         ssm_u32_rows = conv_rows = conv_rows_pad = qkv_128 = 0
-        direct_conv = False
+        direct_conv = tail_row = False
         conv_buf_dt = BF16
         ckpt_is_3d = False
         ckpt_t_off = 0
@@ -119,6 +120,7 @@ def prepare_ckpt(
         conv_rows_pad=conv_rows_pad,
         qkv_128=qkv_128,
         direct_conv=direct_conv,
+        conv_tail_row=direct_conv and tail_row,
         ckpt_is_3d=ckpt_is_3d,
         ckpt_t_off=ckpt_t_off,
         ckpt_ndim=ckpt_indices.ndim if has_gdn else 0,
@@ -180,16 +182,12 @@ def start_scatter_seq(
     rec_pages, rec_u32_cap, conv_page = sg.rec_pages, sg.rec_u32_cap, sg.conv_page
     conv_page_rows, use_conv_partial, vh = sg.conv_page_rows, sg.use_conv_partial, sg.vh
     KD, VD, taps, ssm_u32_rows = sg.KD, sg.VD, sg.taps, sg.ssm_u32_rows
-    conv_rows, conv_rows_pad, qkv_128 = sg.conv_rows, sg.conv_rows_pad, sg.qkv_128
-    direct_conv = sg.direct_conv
+    conv_rows, conv_rows_pad = sg.conv_rows, sg.conv_rows_pad
+    direct_conv, conv_tail_row = sg.direct_conv, sg.conv_tail_row
 
     @pl.when(is_active(kc, s))
     def _():
-        conv_bf16: Any = (
-            conv_buf[slot, 0].astype(BF16)
-            if (direct_conv and (4 * qkv_128) % 16 == 0)
-            else None
-        )
+        conv_bf16: Any = conv_buf[slot, 0].astype(BF16) if conv_tail_row else None
         for t in range(T):
             s_km = rec_buf[slot, pl.ds(t * vh, vh)]
             u32_val = pltpu.bitcast(s_km.reshape(vh * KD, VD), U32)
@@ -210,10 +208,10 @@ def start_scatter_seq(
                 )[:ssm_u32_rows, :] = u32_val
 
             if direct_conv:
-                if (4 * qkv_128) % 16 == 0:
+                if conv_tail_row:
                     w4 = jnp.where(
                         w4_row_iota < taps,
-                        conv_bf16[1 + t : 5 + t, :],
+                        conv_bf16[1 + t : 2 + taps + t, :],
                         jnp.bfloat16(0.0),
                     )
                     conv_taps = w4.reshape(conv_rows_pad, LANES)

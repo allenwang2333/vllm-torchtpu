@@ -71,6 +71,9 @@ class ScatterGeom:
     conv_rows_pad: int = 0
     qkv_128: int = 0
     direct_conv: bool = False
+    # Direct path reading `conv_taps + 1` rows per token (exactly the padded
+    # window); False: `conv_taps` rows plus zero padding.
+    conv_tail_row: bool = False
     ckpt_is_3d: bool = False
     ckpt_t_off: int = 0
     ckpt_ndim: int = 0
@@ -117,6 +120,7 @@ class ScatterKernel:
         NATT, NS, QKV, h4, page_size = sg.NATT, sg.NS, sg.QKV, sg.h4, sg.page_size
         has_gdn, act_mode, n_smem, n_hbm = sg.has_gdn, sg.act_mode, sg.n_smem, sg.n_hbm
         direct_conv, s_names, G_PER_ATT = sg.direct_conv, sg.s_names, sg.G_PER_ATT
+        taps = sg.taps
         smem_refs = refs[NATT : NATT + n_smem]
         pos_ref, kv_pages_ref = smem_refs[0], smem_refs[1]
         ckpt_ref: Any = smem_refs[2] if has_gdn else None
@@ -142,7 +146,7 @@ class ScatterKernel:
         v_cols_buf: Any = scr["v_cols_buf"] if NS > 1 else None
         lane_iota = lax.broadcasted_iota(I32, (h4, page_size), 1)
         w4_row_iota: Any = (
-            lax.broadcasted_iota(I32, (4, QKV), 0) if direct_conv else None
+            lax.broadcasted_iota(I32, (taps + 1, QKV), 0) if direct_conv else None
         )
         total_gdn = NATT * G_PER_ATT
         CP_ROWS = sg.conv_rows_pad // 2

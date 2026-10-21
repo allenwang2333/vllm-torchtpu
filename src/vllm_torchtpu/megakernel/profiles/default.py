@@ -18,11 +18,21 @@ the flat-ring all-reduce (`hier=0`) and the chip's VMEM / SMEM budgets. It does
 not branch on the batch size, the rank count or the model; ring depths may be
 refined at build time to fit the VMEM budget when `ExecSpec.tiles` is left
 `None`.
+
+`default_tiles` sizes for `chip` (default: TPU v7x, the only chip the
+megakernel is validated on) and never queries devices: profiles evaluate it at
+import time, before any JAX backend may be initialized. When unset tiles are
+fitted at build time, the budgets come from `chip_budget()`: the `ChipBudget`
+of the first JAX device's `device_kind`, or v7x for any kind not in
+`CHIP_BUDGETS` (including CPU interpret runs).
 """
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
+
+import jax
 
 from ..exec_spec import Tiles
 
@@ -39,6 +49,23 @@ class ChipBudget:
 # TPU v7x: 64 MiB VMEM per core, 2 MiB kept free for compiler-internal scratch.
 TPU_V7X = ChipBudget(name="tpu_v7x", vmem_mib=62, smem_mib=1)
 DEFAULT_CHIP = TPU_V7X
+# `jax.Device.device_kind` -> budget, for the chips the megakernel runs on.
+CHIP_BUDGETS: dict[str, ChipBudget] = {"TPU7x": TPU_V7X}
+
+
+@functools.cache
+def _first_device_kind() -> str:
+    return jax.devices()[0].device_kind
+
+
+def chip_budget(device_kind: str | None = None) -> ChipBudget:
+    """Budget of `device_kind` (default: the first JAX device's), else v7x.
+
+    Without `device_kind` this initializes the JAX backend; call it only where
+    the kernel is about to be built.
+    """
+    kind = _first_device_kind() if device_kind is None else device_kind
+    return CHIP_BUDGETS.get(kind, DEFAULT_CHIP)
 
 
 def default_tiles(
@@ -54,4 +81,11 @@ def default_tiles(
     return Tiles(hier=0, vmem_mib=chip.vmem_mib, smem_mib=chip.smem_mib)
 
 
-__all__ = ["DEFAULT_CHIP", "TPU_V7X", "ChipBudget", "default_tiles"]
+__all__ = [
+    "CHIP_BUDGETS",
+    "DEFAULT_CHIP",
+    "TPU_V7X",
+    "ChipBudget",
+    "chip_budget",
+    "default_tiles",
+]

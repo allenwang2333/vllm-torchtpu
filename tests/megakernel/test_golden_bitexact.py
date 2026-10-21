@@ -276,6 +276,7 @@ def test_golden_bitexact(name: str):
     gold = all_gold[name]
     assert got["hid"] == gold["hid"], (name, "hidden", got["hid"], gold["hid"])
     assert got["pools"] == gold["pools"], (name, "pools", got["pools"], gold["pools"])
+    assert got["gpr"] == gold["gpr"], (name, "gpr", got["gpr"], gold["gpr"])
 
 
 def test_golden_covers_every_case():

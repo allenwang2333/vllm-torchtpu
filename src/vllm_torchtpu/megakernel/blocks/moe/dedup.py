@@ -253,7 +253,7 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
         new = seen != stamp
         if not mp.moe_tp:
             new = jnp.logical_and(new, lax.div(e, ER) == me)
-        if m.tun.row_mask:
+        if m.dbg.row_mask:
             on = ctx.extra["moe_rows"][b] != 0
             new = jnp.logical_and(new, on)
             scr["seen"][hi, lo] = jnp.where(on, stamp, seen)

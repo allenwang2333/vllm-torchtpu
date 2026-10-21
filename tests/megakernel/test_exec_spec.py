@@ -26,9 +26,12 @@ import pytest
 
 from vllm_torchtpu.megakernel import exec_spec
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.profiles import default as default_profile
 from vllm_torchtpu.megakernel.profiles.default import (
     DEFAULT_CHIP,
+    TPU_V7X,
     ChipBudget,
+    chip_budget,
     default_tiles,
 )
 
@@ -115,6 +118,28 @@ def test_exec_spec_imports_only_ops_and_profiles():
                 assert set(roots) <= {"ops", "profiles"}, roots
 
 
+@dataclasses.dataclass(frozen=True)
+class _OtherOptions:
+    width: int = 128
+
+
+def test_block_maps_check_entry_types():
+    """`Tiles.blocks` takes only the block's registered `Tunables` class;
+    `DebugOptions.blocks` any frozen dataclass, both canonical."""
+    with pytest.raises(TypeError, match="_TestTunables"):
+        Tiles(blocks={_TEST_BLOCK: _OtherOptions(width=256)})
+    with pytest.raises(TypeError, match="with_blocks"):
+        Tiles(blocks={_TEST_BLOCK: {"width": 256}})
+    dbg = exec_spec.DebugOptions(blocks={_TEST_BLOCK: _OtherOptions(width=256)})
+    assert dbg.blocks[_TEST_BLOCK].width == 256
+    assert (
+        exec_spec.DebugOptions(blocks={_TEST_BLOCK: _OtherOptions()})
+        == exec_spec.DebugOptions()
+    )
+    with pytest.raises(TypeError, match="DebugOptions.blocks"):
+        exec_spec.DebugOptions(blocks={_TEST_BLOCK: {"width": 256}})
+
+
 def test_default_tile_rule_is_model_agnostic():
     """One tile set for every bucket, rank count and TP flag; chip budgets."""
     ref = default_tiles(1)
@@ -129,6 +154,19 @@ def test_default_tile_rule_is_model_agnostic():
                 assert exec_spec.default_tiles(B, moe_tp=moe_tp, R=R) == ref
     small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
     assert default_tiles(8, chip=small).vmem_mib == 16
+
+
+def test_chip_budget_follows_device_kind_with_v7x_fallback(monkeypatch):
+    assert chip_budget("TPU7x") is TPU_V7X
+    assert chip_budget("TPU v5 lite") is DEFAULT_CHIP is TPU_V7X
+    assert chip_budget() is DEFAULT_CHIP  # CPU interpret runs: the v7x fallback
+    small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
+    monkeypatch.setitem(
+        default_profile.CHIP_BUDGETS, default_profile._first_device_kind(), small
+    )
+    assert chip_budget() is small
+    # The tile rule itself never queries devices (profiles run it at import).
+    assert default_tiles(8) == default_tiles(8, chip=DEFAULT_CHIP)
 
 
 def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():

@@ -162,19 +162,62 @@ def test_layout_validate_rejects_unvalidated_geometry():
 
 
 def test_layout_validate_checks_in_kernel_conv_windows():
-    """GPR and fused stage the whole verify conv window in the conv page."""
+    """GPR stages the verify conv window in the K half of the conv page (128
+    bf16 rows), fused pool I/O in the whole conv page (256 rows)."""
     lay = replace(_layout(3), kh=8, vh=8)  # 24 conv rows of 128 lanes per rank
     split = mk.with_cache(_exec(R=1, B=6, T=6), paged_kv=True)
     lay.validate(split)  # split path: 3 taps fit
-    lay.validate(
-        mk.with_cache(replace(split, B=4, T=4), pool_gather=True)
-    )  # 8 * 24 = 192 rows
     with pytest.raises(mk.MegakernelConfigError, match="in-kernel gather"):
-        lay.validate(mk.with_cache(split, pool_gather=True))  # 16 * 24 = 384 rows
+        lay.validate(
+            mk.with_cache(replace(split, B=4, T=4), pool_gather=True)
+        )  # 8 * 24 = 192 rows
+    narrow = replace(_layout(3), kh=4, vh=4)  # 12 conv rows per rank
+    narrow.validate(
+        mk.with_cache(replace(split, B=4, T=4), pool_gather=True)
+    )  # 8 * 12 = 96 rows
+    with pytest.raises(mk.MegakernelConfigError, match="in-kernel gather"):
+        narrow.validate(mk.with_cache(split, pool_gather=True))  # 16 * 12 rows
+    narrow.validate(
+        mk.with_cache(replace(split, B=4, T=4), fused_pool_io=True)
+    )  # 16 * 12 = 192 rows
     with pytest.raises(mk.MegakernelConfigError, match="fused pool I/O"):
         lay.validate(
             mk.with_cache(replace(split, B=1, T=1), fused_pool_io=True)
         )  # 16 * 24 rows
+
+
+@pytest.mark.parametrize("kh", [2, 4, 6, 8])
+@pytest.mark.parametrize("T", [2, 4, 5, 6, 8])
+def test_layout_validate_and_can_pool_gather_agree_on_gpr_conv_window(kh: int, T: int):
+    lay = replace(_layout(3), kh=kh, vh=kh)
+    ex = mk.with_cache(_exec(R=1, B=8 * T, T=T), pool_gather=True)
+    fits = lay.gpr_conv_fits(T, R=1)
+    assert pool.can_pool_gather(lay, ex, lambda _ex: (8 * T, 2)) == fits
+    if fits:
+        lay.validate(ex)
+    else:
+        with pytest.raises(mk.MegakernelConfigError, match="in-kernel gather"):
+            lay.validate(ex)
+
+
+def test_make_pool_backend_supports_pool_gather_only_with_rec_chunk():
+    lay = _layout(3)
+    assert not mk.make_pool_backend(lay).supports_pool_gather
+    assert mk.make_pool_backend(lay, rec_chunk=lambda ex: (8, 2)).supports_pool_gather
+    assert not mk.make_pool_backend(
+        lay, rec_chunk=lambda ex: (8, 2), supports_pool_gather=False
+    ).supports_pool_gather
+    with pytest.raises(mk.MegakernelConfigError, match="rec_chunk"):
+        mk.make_pool_backend(lay, supports_pool_gather=True)
+
+
+def test_gqa_pool_layout_must_match_the_pool_backend_layout():
+    spec, ex = _gpr_spec_and_exec()
+    lay = spec.cache_backend.layout
+    mk.planner.plan(spec, ex)
+    wrong = replace(spec, cache_backend=mk.make_pool_backend(replace(lay, kvh=2)))
+    with pytest.raises(mk.MegakernelConfigError, match="pool backend layout"):
+        mk.planner.plan(wrong, mk.with_cache(ex, pool_gather=False))
 
 
 def _gpr_spec_and_exec() -> tuple[mk.ModelSpec, mk.ExecSpec]:
@@ -410,6 +453,42 @@ def _check_scatter(
             else:
                 exp_taps = conv_np[:, s, 1 + t : 4 + t]
             np.testing.assert_array_equal(np.asarray(out["conv"][0, :, s, t]), exp_taps)
+
+
+def test_scatter_direct_conv_window_when_the_caller_conv_is_short():
+    """At `T=5` the caller's `rup(3 + T, 8)` conv rows are one short of the
+    `taps + 1 + T` rows of the exact-window direct path (12 lane-rows per rank):
+    the scatter falls back to the packed copy instead of failing."""
+    lay = replace(_layout(1, num_pools=1), kh=4, vh=4)
+    assert lay.qkv_per_rank(1) // 128 == 12
+    _check_scatter(lay, _exec(R=1, B=10, T=5), 3, seed=96)
+
+
+@pytest.mark.parametrize("T", [2, 5])
+def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
+    """24 lane-rows per rank (e.g. full Qwen3.5 at R=4) has no exact `taps + 1`
+    row window of its 80 padded conv rows, so the direct path reads `taps`
+    rows. Traced for TPU (`interpret=False`): on CPU interpret this width also
+    fills the recurrent pages exactly, which XLA:CPU fails to compile."""
+    lay = replace(_layout(1, num_pools=1), kh=8, vh=8)
+    qkv = lay.qkv_per_rank(1)
+    assert qkv // 128 == 24
+    ex = replace(_exec(R=1, B=2 * T, T=T), interpret=False)
+    pt, ckpt, _ = _tables(lay, ex, 3)
+    vh, NS = lay.vh_per_rank(1), ex.NS
+    args = (
+        (jnp.zeros((NUM_PAGES, *lay.kv_page_shape), FP8),),
+        jnp.arange(ex.B, dtype=jnp.int32),
+        pt,
+        jnp.zeros((1, ex.MR, lay.hd), FP8),
+        jnp.zeros((1, ex.MR, lay.hd), FP8),
+        jnp.zeros((1, NS, 8 * ((3 + T + 7) // 8), qkv), jnp.float32),
+        jnp.zeros((1, ex.B * vh, lay.KD, lay.VD), jnp.bfloat16),
+    )
+    jaxpr = jax.make_jaxpr(
+        lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
+    )(*args)
+    assert "qwen3_5_scatter_pool_states" in str(jaxpr)
 
 
 @pytest.mark.parametrize("T", [1, 2])

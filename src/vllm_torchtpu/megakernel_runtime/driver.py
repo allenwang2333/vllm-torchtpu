@@ -378,14 +378,17 @@ def parse_megakernel_config(raw: Any = None, runner: Any = None) -> dict[str, An
         _apply_dict(kv_dict)
 
     _apply_profile_defaults(cfg, explicit)
+    cfg["explicit"] = frozenset(explicit)
     return cfg
 
 
 def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
     """Fill profile-owned keys from `cfg["profile"]` unless set explicitly.
 
-    With no named profile the keys keep their library defaults, which equal
-    the model default profiles' settings (split pool I/O, no GPR).
+    With no named profile the keys keep their library defaults;
+    `MegakernelDriver.maybe_create` passes only the explicit ones
+    (`explicit_profile_settings`), so the model's default profile decides the
+    rest.
     """
     if cfg["profile"] is None:
         return
@@ -406,6 +409,31 @@ def _apply_profile_defaults(cfg: dict[str, Any], explicit: set[str]) -> None:
         cfg["buckets"] = parse_mk_buckets(prof.buckets)
     if not cfg["verify_buckets_explicit"] and prof.verify_buckets is not None:
         cfg["verify_buckets"] = parse_mk_verify_buckets(prof.verify_buckets)
+
+
+def explicit_profile_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Profile-owned driver arguments from `cfg`: the value where the user set
+    the key, else None.
+
+    None lets `MegakernelDriver` take the setting from the effective profile
+    (the named one, else the model's default profile) instead of the library
+    defaults `parse_megakernel_config` fills in.
+    """
+    explicit = cfg.get("explicit", frozenset())
+    out: dict[str, Any] = {
+        "buckets": tuple(cfg["buckets"]) if cfg["buckets_explicit"] else None,
+        "verify_buckets": (
+            tuple(cfg["verify_buckets"]) if cfg["verify_buckets_explicit"] else None
+        ),
+    }
+    for key in (
+        "fused_pool_io",
+        "fused_pool_io_max_b",
+        "fused_pool_io_min_b_hi",
+        "pool_gather",
+    ):
+        out[key] = cfg[key] if key in explicit else None
+    return out
 
 
 def resolve_driver_profile(
@@ -1180,8 +1208,10 @@ class MegakernelDriver:
                 r_cnt,
             )
             return None
-        buckets = tuple(cfg["buckets"])
-        verify_buckets = tuple(cfg["verify_buckets"])
+        # Profile-owned settings the user didn't set stay None, so the driver
+        # takes them from the effective profile.
+        owned = explicit_profile_settings(cfg)
+        buckets, verify_buckets = owned["buckets"], owned["verify_buckets"]
         if hasattr(runner, "speculative_config"):
             spec_cfg = getattr(runner, "speculative_config", None)
             num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
@@ -1198,7 +1228,7 @@ class MegakernelDriver:
                 "verify_buckets_explicit", False
             ):
                 verify_buckets = ()
-        if not buckets and not verify_buckets:
+        if buckets == () and verify_buckets == ():
             logger.info("Megakernel disabled (both bucket lists empty).")
             return None
 
@@ -1211,10 +1241,10 @@ class MegakernelDriver:
             verify_buckets=verify_buckets,
             reshard_ep_to_tp=reshard,
             profile=cfg["profile"],
-            fused_pool_io=cfg["fused_pool_io"],
-            fused_pool_io_max_b=int(cfg["fused_pool_io_max_b"]),
-            fused_pool_io_min_b_hi=int(cfg["fused_pool_io_min_b_hi"]),
-            pool_gather=cfg["pool_gather"],
+            fused_pool_io=owned["fused_pool_io"],
+            fused_pool_io_max_b=owned["fused_pool_io_max_b"],
+            fused_pool_io_min_b_hi=owned["fused_pool_io_min_b_hi"],
+            pool_gather=owned["pool_gather"],
             ab=bool(cfg["ab"]),
             stats_period_s=float(cfg["stats_period_s"]),
             compile_hlo_check=bool(cfg["compile_hlo_check"]),

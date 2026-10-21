@@ -27,8 +27,9 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
-from ..ops import I32, rup
+from ..ops import I32
 from .config import PoolBackend, cache_exec
 from .layout import PoolLayout
 
@@ -170,13 +171,7 @@ def can_pool_gather(
     nrb = min(bufs, nch)
     if nch > 1 and nrb < 2:
         return False
-    hr = rup(layout.conv_taps + ex.T, 8)
-    conv_bytes = hr * layout.qkv_per_rank(ex.R) * 2
-    row_bytes = 4 * layout.page_size
-    if conv_bytes % row_bytes != 0:
-        return False
-    gconv_rows = conv_bytes // row_bytes
-    return gconv_rows <= layout.kv_page_shape[1]
+    return layout.gpr_conv_fits(ex.T, ex.R)
 
 
 def make_pool_backend(
@@ -185,14 +180,23 @@ def make_pool_backend(
     check: Callable[[ExecSpec], None] | None = None,
     rec_chunk: RecChunk | None = None,
     supports_fused_io: bool = True,
-    supports_pool_gather: bool = True,
+    supports_pool_gather: bool | None = None,
 ) -> PoolBackend:
     """Build the `PoolBackend` (gather / scatter callbacks) for `layout`.
 
     `check(ex)`, if given, runs before each gather / scatter launch (e.g. the
     model geometry's `check`). `rec_chunk` enables in-kernel gather (see
-    `can_pool_gather`).
+    `can_pool_gather`); `supports_pool_gather` defaults to whether it is set,
+    and `True` without `rec_chunk` raises `MegakernelConfigError`.
     """
+    if supports_pool_gather is None:
+        supports_pool_gather = rec_chunk is not None
+    elif supports_pool_gather and rec_chunk is None:
+        raise MegakernelConfigError(
+            "make_pool_backend(supports_pool_gather=True) needs rec_chunk (the "
+            "recurrent block's chunking, e.g. GDNBlock.chunk_rows): without it "
+            "in-kernel gather is never eligible"
+        )
     # Local imports: the kernels import the shared checks from this module.
     from .gather import gather_gdn_states
     from .scatter import scatter_pool_states

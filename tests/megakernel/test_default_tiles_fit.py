@@ -23,6 +23,7 @@ from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import exec_spec as exec_spec_mod
 from vllm_torchtpu.megakernel import vmem
 from vllm_torchtpu.megakernel.models import qwen35
+from vllm_torchtpu.megakernel.profiles import default as default_chip
 
 # Every model in `models/`, tiny and full configs.
 MODEL_CONFIGS = {
@@ -82,6 +83,26 @@ def test_kernel_build_fits_unset_tiles():
     _, info = mk.build(spec, ex)
     assert info["exec"].tiles == vmem.fit_default_tiles(spec, ex).tiles
     assert info["vmem_scratch_bytes"] <= info["exec"].tiles.vmem_mib * (1 << 20)
+
+
+def test_fit_sizes_default_tiles_for_the_device_chip(monkeypatch):
+    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    ex = mk.ExecSpec(B=8, T=1, R=8, ctx=4096)
+    chip = default_chip.ChipBudget(name="test_chip", vmem_mib=62, smem_mib=2)
+    monkeypatch.setitem(
+        default_chip.CHIP_BUDGETS, default_chip._first_device_kind(), chip
+    )
+    assert vmem.fit_default_tiles(spec, ex).tiles.smem_mib == 2
+
+
+def test_plan_and_build_scratch_fit_unset_tiles_like_build():
+    spec = qwen35.qwen35_spec(qwen35.FULL_EP)
+    ex = mk.ExecSpec(B=64, T=1, R=8, ctx=4096)
+    fitted = vmem.fit_default_tiles(spec, ex)
+    assert fitted.tiles != mk.default_tiles(64, R=8)  # the fit shrinks a ring
+    core_plan, _ = vmem.build_scratch(spec, ex)  # unfitted rings would overflow
+    assert core_plan.vmem_bytes == vmem.build_scratch(spec, fitted)[0].vmem_bytes
+    assert mk.planner.plan(spec, ex) == mk.planner.plan(spec, fitted)
 
 
 def test_fit_raises_instead_of_returning_an_over_budget_plan(monkeypatch):

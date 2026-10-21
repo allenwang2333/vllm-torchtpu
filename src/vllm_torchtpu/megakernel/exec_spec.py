@@ -84,26 +84,33 @@ def registered_tunables() -> dict[str, type]:
     return dict(_TUNABLES)
 
 
-class TunablesMap(Mapping[str, Any]):
-    """Immutable, hashable `{block name: Tunables}` mapping (`Tiles.blocks`).
+class BlockOptionsMap(Mapping[str, Any]):
+    """Immutable, hashable `{block name: frozen dataclass}` mapping.
 
-    Entries equal to their class defaults are dropped, so tiles that leave a
+    Entries equal to their class defaults are dropped, so maps that leave a
     block at its defaults compare equal however they were built.
     """
 
     __slots__ = ("_items",)
+    # Owner and fix hint shown in error messages.
+    _WHAT = "DebugOptions.blocks"
+    _HINT = ""
 
     def __init__(self, items: Mapping[str, Any] | None = None) -> None:
         pairs = []
         for name, val in dict(items or {}).items():
             if not dataclasses.is_dataclass(val) or isinstance(val, type):
                 raise TypeError(
-                    f"Tiles.blocks[{name!r}] must be a Tunables instance, got "
-                    f"{type(val).__name__} (use Tiles.with_blocks for field dicts)"
+                    f"{self._WHAT}[{name!r}] must be a dataclass instance, got "
+                    f"{type(val).__name__}{self._HINT}"
                 )
+            self._check(name, val)
             if val != type(val)():
                 pairs.append((name, val))
         self._items: tuple[tuple[str, Any], ...] = tuple(sorted(pairs))
+
+    def _check(self, name: str, val: Any) -> None:
+        """Hook: raise `TypeError` if `val` is not a valid entry for `name`."""
 
     def __getitem__(self, key: str) -> Any:
         for name, val in self._items:
@@ -121,12 +128,29 @@ class TunablesMap(Mapping[str, Any]):
         return hash(self._items)
 
     def __eq__(self, other: object) -> bool:
-        if isinstance(other, TunablesMap):
+        if isinstance(other, BlockOptionsMap):
             return self._items == other._items
         return isinstance(other, Mapping) and dict(self._items) == dict(other)
 
     def __repr__(self) -> str:
-        return f"TunablesMap({dict(self._items)!r})"
+        return f"{type(self).__name__}({dict(self._items)!r})"
+
+
+class TunablesMap(BlockOptionsMap):
+    """`{block name: Tunables}` (`Tiles.blocks`): a `BlockOptionsMap` whose
+    entries must be instances of the block's registered `Tunables` class."""
+
+    __slots__ = ()
+    _WHAT = "Tiles.blocks"
+    _HINT = " (use Tiles.with_blocks for field dicts)"
+
+    def _check(self, name: str, val: Any) -> None:
+        cls = _TUNABLES.get(name)
+        if cls is not None and not isinstance(val, cls):
+            raise TypeError(
+                f"Tiles.blocks[{name!r}] must be a {cls.__name__}, got "
+                f"{type(val).__name__}{self._HINT}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +268,14 @@ class DebugOptions:
 
     skip: frozenset[str] = frozenset()  # Named execution phases to skip during ablation
     scopes: int | bool = False  # Emit per-phase jax.named_scope annotations
+    # Per-block debug flags (frozen dataclasses keyed by block name). Kept out
+    # of `Tiles`, so setting them leaves `ExecSpec.tiles=None` (and its
+    # build-time VMEM refinement) intact.
+    blocks: Mapping[str, Any] = BlockOptionsMap()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.blocks, BlockOptionsMap):
+            object.__setattr__(self, "blocks", BlockOptionsMap(self.blocks))
 
 
 @dataclass(frozen=True)
@@ -254,14 +286,28 @@ class ExecSpec:
     T: int = 1  # Tokens per sequence (>1 for MTP verify)
     R: int = 8  # Tensor-parallel / expert-parallel ranks
     ctx: int = 2048  # Max KV sequence length
-    stack_e: bool = False  # True: 4D stacked expert weights; False: per-layer 3D
+    # True: 4D stacked expert weights; False: per-layer 3D. The one block
+    # weight-layout choice kept in core: the kernel builder, weight packing and
+    # the expert ring all depend on it, not just the block that owns experts.
+    stack_e: bool = False
     interpret: Any = False  # Run Pallas in CPU interpret mode (bool or InterpretParams)
     # None -> default_tiles(B, R=R), which may be refined at build time to fit VMEM
     tiles: Tiles | None = None
     debug: DebugOptions = DebugOptions()
     # Optional extension object for cache-specific execution settings (None when
-    # using plain states without page tables). Core execution config never reads it.
+    # using plain states without page tables; one equal to its own defaults is
+    # stored as None). Core execution config never reads it; the kernel builder
+    # reads it, through the cache package, to pick the page-table refs.
     cache: Any = None
+
+    def __post_init__(self) -> None:
+        cx = self.cache
+        if (
+            dataclasses.is_dataclass(cx)
+            and not isinstance(cx, type)
+            and cx == type(cx)()
+        ):
+            object.__setattr__(self, "cache", None)
 
     @property
     def resolved_tiles(self) -> Tiles:

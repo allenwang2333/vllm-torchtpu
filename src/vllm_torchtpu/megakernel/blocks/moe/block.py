@@ -29,7 +29,7 @@ from ...ops import BF16, F32, FP8, I32, rnd, rup
 from ...spec import Block, ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
 from .experts import expert, experts_piped, experts_piped_ep
-from .params import MoEParams, MoETunables
+from .params import MoEDebug, MoEParams, MoETunables
 from .routing import route
 
 
@@ -40,15 +40,16 @@ class MoEBlock(Block):
     reduction = "allreduce"
     input_norm: str | None = "post_norm"
     Tunables = MoETunables
+    Debug = MoEDebug
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
         """Debug routing inputs: `rbias` (HBM, `forced_routing`) and `moe_rows`
         (SMEM `[B]` int32 row mask, `row_mask`)."""
-        tt: MoETunables = self.tunables(ex)
+        dbg: MoEDebug = self.debug_flags(ex)
         out = []
-        if tt.forced_routing:
+        if dbg.forced_routing:
             out.append(ExtraInput("rbias", "hbm"))
-        if tt.row_mask:
+        if dbg.row_mask:
             out.append(ExtraInput("moe_rows", "smem", (ex.B,), I32))
         return out
 
@@ -132,7 +133,9 @@ class MoEBlock(Block):
         n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
         lazy_moe = tiles.lazy and n_moe <= tiles.nbd
         ecopy = not g.moe_tp and g.e_slots > er
-        assert not (tt.row_mask and ecopy), "row_mask: identity expert placement only"
+        assert not (self.debug_flags(ex).row_mask and ecopy), (
+            "row_mask: identity expert placement only"
+        )
         return MoEParams(
             H=g.H,
             E=g.E,
@@ -196,7 +199,7 @@ class MoEBlock(Block):
             )
             if mp.ecopy_opt == 1:
                 scr["ulist"] = pltpu.SMEM((nb_picks,), I32)
-        if self.tunables(ex).forced_routing:
+        if self.debug_flags(ex).forced_routing:
             scr["rb"] = pltpu.VMEM((2, ex.M, mp.E), F32)
             scr["rb_sem"] = pltpu.SemaphoreType.DMA((2,))
         return scr
@@ -217,7 +220,7 @@ class MoEBlock(Block):
                 scr["ecopy"].at[0],
                 scr["ec_sem"].at[0],
             ).start()
-        if self.tunables(ex).forced_routing:
+        if self.debug_flags(ex).forced_routing:
             pltpu.make_async_copy(
                 ctx.extra["rbias"].at[0], scr["rb"].at[0], scr["rb_sem"].at[0]
             ).start()
@@ -253,7 +256,7 @@ class MoEBlock(Block):
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
         mp: MoEParams = ctx.block_params(self.name)
-        m = MoEEmit.build(ctx, mp, self.tunables(ex))
+        m = MoEEmit.build(ctx, mp, self.debug_flags(ex))
         stream, scr, sc = m.stream, m.scr, m.sc
         MR, MB = ex.MR, ex.MB
         H, E, ISR = mp.H, mp.E, mp.ISR

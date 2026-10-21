@@ -23,11 +23,12 @@ from typing import Any
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from . import pool_alias
+from . import exec_spec, pool_alias
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, FP8, rup
 from .planner import Plan, extra_inputs, plan
+from .profiles.default import chip_budget
 from .spec import ModelSpec, ScratchReq
 
 U8 = jnp.uint8
@@ -214,7 +215,12 @@ def build_scratch(
     ex: ExecSpec,
     p: Plan | None = None,
 ) -> tuple[CorePlan, dict[str, Any]]:
-    """Build `CorePlan` and allocate all core and block VMEM scratch buffers."""
+    """Build `CorePlan` and allocate all core and block VMEM scratch buffers.
+
+    `ex.tiles=None` uses the default tiles fitted to the model's VMEM budget,
+    as `kernel.build` does (`fit_default_tiles`).
+    """
+    ex = fit_default_tiles(model_spec, ex)
     if p is None:
         p = plan(model_spec, ex)
     g = model_spec.config
@@ -494,14 +500,15 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
 
     No-op when `ex.tiles` is set (explicit and profile tiles are never changed;
     an over-budget plan raises in `build_scratch`). Otherwise starts from
-    `default_tiles(B, R)` and, while the planned VMEM scratch exceeds
+    `default_tiles(B, R)` sized for the device's chip (`chip_budget()`) and,
+    while the planned VMEM scratch exceeds
     `vmem_mib`, drops one slot from the larger allocated weight ring (dense
     `nbd` or expert `nbe`), down to `MIN_RING_DEPTH`. Raises
     `MegakernelConfigError` if the plan does not fit even then.
     """
     if ex.tiles is not None:
         return ex
-    t = ex.resolve_tiles(model_spec.config)
+    t = exec_spec.default_tiles(ex.B, R=ex.R, chip=chip_budget())
     budget = t.vmem_mib * 1024 * 1024
     while True:
         probe = dataclasses.replace(

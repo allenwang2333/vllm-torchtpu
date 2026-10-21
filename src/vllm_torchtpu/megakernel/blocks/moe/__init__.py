@@ -14,7 +14,13 @@
 """MoE block package: `MoEBlock` and its parameters / tunables."""
 
 from .block import MoEBlock
-from .params import MoEParams, MoETunables
+from .params import MoEDebug, MoEParams, MoETunables
 from .topk import topk_rows_on_lanes
 
-__all__ = ["MoEBlock", "MoEParams", "MoETunables", "topk_rows_on_lanes"]
+__all__ = [
+    "MoEBlock",
+    "MoEDebug",
+    "MoEParams",
+    "MoETunables",
+    "topk_rows_on_lanes",
+]

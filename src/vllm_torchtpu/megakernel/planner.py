@@ -171,7 +171,16 @@ def _discover_schedule(
 
 
 def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
-    """Derive weight tile sizes, stream schedules, smalls layout, and metadata."""
+    """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
+
+    `ex.tiles=None` plans the default tiles fitted to the model's VMEM budget,
+    as `kernel.build` does (`vmem.fit_default_tiles`).
+    """
+    if ex.tiles is None:
+        # Local import: `vmem` builds on this module.
+        from .vmem import fit_default_tiles
+
+        ex = fit_default_tiles(model_spec, ex)
     g = model_spec.config
     tiles = ex.resolve_tiles(g)
     (

@@ -134,7 +134,23 @@ class GQABlock(Block):
         }
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
+        if cache_exec(ex).paged_kv:
+            self._check_pool_layout(plan)
         return derive_params(g, ex, plan, self.tunables(ex))
+
+    def _check_pool_layout(self, plan: Any) -> None:
+        """`pool_layout` must give the same pool pages as the model's pool
+        backend layout, which the cache pipes allocate and fill."""
+        pb = plan.model_spec.cache_backend
+        lay = None if pb is None else pb.layout
+        if self.pool_layout is None or lay is None:
+            return
+        mine, theirs = tuple(self.pool_layout.kv_page_shape), tuple(lay.kv_page_shape)
+        if mine != theirs:
+            raise MegakernelConfigError(
+                f"GQABlock pool_layout pages {mine} differ from the pool backend "
+                f"layout's {theirs} on ModelSpec {plan.model_spec.name!r}"
+            )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         ap: GQAParams = plan.block_params[self.name]

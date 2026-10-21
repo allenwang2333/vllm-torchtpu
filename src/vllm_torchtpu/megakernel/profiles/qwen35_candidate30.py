@@ -33,6 +33,7 @@ from ..blocks.gdn import GDNBlock
 from ..blocks.gqa import GQABlock
 from ..blocks.moe import MoEBlock
 from ..exec_spec import Tiles
+from ..models.qwen35_profile import QWEN35_MODEL_NAME
 from ..profile import Baseline, Profile, register_profile
 
 _GQA, _GDN, _MOE = GQABlock.name, GDNBlock.name, MoEBlock.name
@@ -119,7 +120,7 @@ _DESCRIPTION = (
 PROFILE = register_profile(
     Profile(
         name="qwen35-candidate30",
-        model="qwen3_5",
+        model=QWEN35_MODEL_NAME,
         numerics="approx",
         tiles=candidate30_tiles,
         fused_pool_io=False,

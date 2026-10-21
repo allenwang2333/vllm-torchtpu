@@ -46,6 +46,9 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .exec_spec import ExecSpec, Tiles, tile_numerics
+
+# Profiles own the pool-I/O mode, so they depend on the pool package's config
+# (its numerics classes and the `CacheExec.pool_gather` a profile resolves).
 from .pool.config import POOL_IO_NUMERICS, cache_exec, with_cache
 from .profiles.default import default_tiles
 
@@ -73,9 +76,10 @@ class Profile:
     name: str
     model: str | None = None  # `ModelSpec.name` this profile targets (None: any)
     numerics: Literal["exact", "approx"] = "exact"
-    # Tile rule. None: the library default (`profiles/default.py`), left
-    # unresolved by `exec_for` so the kernel builder fits it to the model's
-    # VMEM budget (`vmem.fit_default_tiles`).
+    # Tile rule. None: the rule of `model`'s default profile (`tile_rule`), or
+    # with no model (or one without a default profile) the library default
+    # (`profiles/default.py`), left unresolved by `exec_for` so the kernel
+    # builder fits it to the model's VMEM budget (`vmem.fit_default_tiles`).
     tiles: TileRule | None = None
     buckets: tuple[int, ...] | None = None  # T=1 decode buckets (None: adapter default)
     verify_buckets: tuple[int, ...] | None = None  # T>1 buckets (None: adapter default)
@@ -146,23 +150,35 @@ class Profile:
         exact = self.numerics == "exact" and not approx_features(cand)
         return dataclasses.replace(cand, numerics="exact" if exact else "approx")
 
+    def tile_rule(self) -> TileRule | None:
+        """This profile's tile rule (None: the library default rule).
+
+        A profile targeting a model with `tiles=None` inherits the rule of that
+        model's default profile, the reference its numerics are measured
+        against.
+        """
+        if self.tiles is not None or self.model is None or self.model_default:
+            return self.tiles
+        ref = model_default_profile(self.model)
+        return None if ref is self else ref.tiles
+
     def tiles_for(self, B: int, *, R: int, moe_tp: bool = False) -> Tiles:
         """Return this profile's tiles for a bucket of `B` rows on `R` ranks.
 
-        For the library default rule (`tiles=None`) these are the tiles before
-        the kernel builder's VMEM fit.
+        For the library default rule (`tile_rule() is None`) these are the
+        tiles before the kernel builder's VMEM fit.
         """
-        rule = default_tiles if self.tiles is None else self.tiles
-        return rule(B, moe_tp=moe_tp, R=R)
+        rule = self.tile_rule()
+        return (default_tiles if rule is None else rule)(B, moe_tp=moe_tp, R=R)
 
     def exec_for(self, base: ExecSpec, *, B: int, T: int, g: Any = None) -> ExecSpec:
         """Specialize `base` for bucket `(T, B)` under this profile.
 
         Explicit settings on `base` win (expert / test overrides), the profile
         fills the rest:
-        - `tiles`: `base.tiles` if set, else the profile's tile rule (left
-          `None` for the library default rule, which the kernel builder fits
-          to the model's VMEM budget);
+        - `tiles`: `base.tiles` if set, else the profile's tile rule
+          (`tile_rule`; left `None` for the library default rule, which the
+          kernel builder fits to the model's VMEM budget);
         - `pool_gather`: the `CacheExec.pool_gather` of `base` unless it is the
           library default
           `False` ("no explicit choice"), else the profile's: `None` -> auto,
@@ -174,7 +190,7 @@ class Profile:
         """
         moe_tp = bool(getattr(g, "moe_tp", False)) if g is not None else False
         tiles = base.tiles
-        if tiles is None and self.tiles is not None:
+        if tiles is None and self.tile_rule() is not None:
             tiles = self.tiles_for(B, R=base.R, moe_tp=moe_tp)
         base_gather = cache_exec(base).pool_gather
         if base_gather is not False:

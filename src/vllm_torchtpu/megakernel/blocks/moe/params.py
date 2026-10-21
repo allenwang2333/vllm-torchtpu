@@ -77,10 +77,6 @@ class MoETunables:
     route_vec: bool = False
     topk_lanes: bool = False  # Batcher odd-even top-k on lanes for E >= 128
     moe_unroll: bool = False  # Unrolled expert tile loops + grouped expert refills
-    # Debug: route from an external `rbias` HBM input / mask rows with an
-    # external `moe_rows` SMEM input (`MoEBlock.extra_inputs`).
-    forced_routing: bool = False
-    row_mask: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -94,6 +90,20 @@ class MoETunables:
         "route_vec": "approx",  # vectorized routing policy
         "topk_lanes": "approx",  # Batcher odd-even lane top-k
         "moe_unroll": "approx",  # unrolled expert tiles (not exact on TPU, bisect)
-        "forced_routing": "approx",  # replaces the router's routing
-        "row_mask": "approx",  # replaces the routed rows
     }
+
+
+@dataclass(frozen=True)
+class MoEDebug:
+    """`MoEBlock` debug flags (`DebugOptions.blocks["moe"]`), not tuning knobs.
+
+    Each flag adds a kernel input (`MoEBlock.extra_inputs`): `forced_routing`
+    routes from an external `rbias` HBM input `[L, M, E]` per rank instead of
+    the router's probabilities (the expert weights still come from the
+    router); `row_mask` builds the routed-expert list only from the rows whose
+    `moe_rows` SMEM entry (`[B]` int32) is non-zero (every row still adds its
+    weighted output of the experts in that list).
+    """
+
+    forced_routing: bool = False
+    row_mask: bool = False

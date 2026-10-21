@@ -47,6 +47,7 @@ from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache  # noqa: 
 from vllm_torchtpu.megakernel_runtime.driver import (  # noqa: E402
     MegakernelDriver,
     MKABCalibrator,
+    explicit_profile_settings,
     parse_megakernel_config,
     parse_mk_buckets,
     parse_mk_verify_buckets,
@@ -449,6 +450,34 @@ def test_bucket_parsing_and_selection() -> None:
     assert select_bucket(5, buckets) == 8
     with pytest.raises(ValueError, match="exceeds max bucket"):
         select_bucket(9, buckets)
+
+
+def test_driver_passes_only_explicit_profile_settings() -> None:
+    """Profile-owned keys the user didn't set reach the driver as None, so the
+    effective profile (named, else the model default) decides them."""
+    owned = (
+        "buckets",
+        "verify_buckets",
+        "fused_pool_io",
+        "fused_pool_io_max_b",
+        "fused_pool_io_min_b_hi",
+        "pool_gather",
+    )
+    for raw in ("1", "profile=qwen35-candidate30"):
+        got = explicit_profile_settings(parse_megakernel_config(raw=raw))
+        assert got == dict.fromkeys(owned), raw
+    got = explicit_profile_settings(
+        parse_megakernel_config(
+            raw="profile=qwen35-candidate30,buckets=8:16,pool_gather=0,"
+            "fused_pool_io_max_b=16"
+        )
+    )
+    assert got == {
+        **dict.fromkeys(owned),
+        "buckets": (8, 16),
+        "pool_gather": False,
+        "fused_pool_io_max_b": 16,
+    }
 
 
 def test_resolve_driver_profile_and_fused_ir_rule() -> None:

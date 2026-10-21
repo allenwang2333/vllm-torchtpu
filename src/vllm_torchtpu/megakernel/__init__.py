@@ -38,6 +38,7 @@ from .blocks import (
     GQABlock,
     GQAParams,
     MoEBlock,
+    MoEDebug,
     MoEParams,
 )
 from .cache import (
@@ -137,6 +138,7 @@ __all__ = [
     "MegakernelConfigError",
     "MegakernelLayoutError",
     "MoEBlock",
+    "MoEDebug",
     "MoEParams",
     "ModelSpec",
     "PallasWriter",

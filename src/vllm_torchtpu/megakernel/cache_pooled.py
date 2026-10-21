@@ -182,7 +182,7 @@ def make_pooled_step(
         ckpt_indices: jax.Array | None,
         read_offsets: jax.Array | None,
         active_wrapped: Any,
-        *rb_tuple: Any,
+        *extra_tuple: Any,
     ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         return raw_step(
             b,
@@ -194,7 +194,7 @@ def make_pooled_step(
             ckpt_indices,
             read_offsets,
             active_wrapped,
-            *rb_tuple,
+            *extra_tuple,
         )
 
     _jitted_step = jax.jit(
@@ -213,7 +213,7 @@ def make_pooled_step(
             ckpt_indices,
             read_offsets,
             active_seqs,
-            rb_tuple,
+            extra_tuple,
         ) = parse_call_args(b, states_or_raw, rest)
         if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
             act_m, act_arr = _resolve_active_seqs_mode(
@@ -236,7 +236,7 @@ def make_pooled_step(
             ckpt_indices,
             read_offsets,
             active_seqs,
-            *rb_tuple,
+            *extra_tuple,
         )
         if is_dict:
             assert states_dict is not None
@@ -254,7 +254,7 @@ def make_pooled_step(
             ckpt_indices,
             read_offsets,
             active_seqs,
-            rb_tuple,
+            extra_tuple,
         ) = parse_call_args(b, states_or_raw, rest)
         return _jitted_step.lower(
             pos,
@@ -265,7 +265,7 @@ def make_pooled_step(
             ckpt_indices,
             read_offsets,
             active_seqs,
-            *rb_tuple,
+            *extra_tuple,
         )
 
     return _PooledStepFn(_call, _lower, info)
@@ -292,7 +292,7 @@ def parse_call_args(
         ckpt_indices = states.get("ckpt_indices")
         read_offsets = states.get("read_offsets")
         active_seqs = _wrap_active_seqs(states.get("active_seqs"))
-        rb_tuple = tuple(rest[:n_extra])
+        extra_tuple = tuple(rest[:n_extra])
         return (
             True,
             states,
@@ -301,7 +301,7 @@ def parse_call_args(
             ckpt_indices,
             read_offsets,
             active_seqs,
-            rb_tuple,
+            extra_tuple,
         )
 
     raw_pools = tuple(states_or_raw)
@@ -315,7 +315,7 @@ def parse_call_args(
         read_offsets = None
         tail = rest[1:]
 
-    rb_tuple = tuple(tail[:n_extra])
+    extra_tuple = tuple(tail[:n_extra])
     active_seqs = _wrap_active_seqs(tail[n_extra] if len(tail) > n_extra else None)
 
     return (
@@ -326,5 +326,5 @@ def parse_call_args(
         ckpt_indices,
         read_offsets,
         active_seqs,
-        rb_tuple,
+        extra_tuple,
     )

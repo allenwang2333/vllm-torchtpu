@@ -65,8 +65,8 @@ LANES = 128
 # TPU; `PoolLayout.validate` rejects anything else instead of guessing.
 # - `hd == 256`, `page_size == 128`, `kvh == 1`: KV page `(2, 64, 4, 128)` and
 #   one `(K, V)` head pair per rank and page (`GQABlock` paged reads).
-# - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: `GDNBlock` derives
-#   its in-kernel slot stride as `max(4, ...) + 1` independently of the layout.
+# - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
+#   geometry the pool kernels have run with on TPU.
 # - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
 #   and the GDN conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`) hard-code
 #   the 3-tap window.
@@ -183,6 +183,23 @@ class PoolLayout:
         """bf16 rows of `LANES` lanes in one conv page (`page_bytes // 256`)."""
         return self.page_bytes // (LANES * 2)
 
+    def gpr_conv_rows(self, T: int, R: int) -> int | None:
+        """`(rows, 4, page_size)` fp8 page rows of the in-kernel gather (GPR)
+        conv window `(rup(conv_taps + T, 8), QKV)` per rank, or None when the
+        window does not fill whole rows. GPR copies only the K half of the conv
+        page (`kv_page_shape[1]` rows), so the window must fit there."""
+        hr = rup(self.conv_taps + T, 8)
+        conv_bytes = hr * self.qkv_per_rank(R) * jnp.dtype(self.conv_dtype).itemsize
+        row_bytes = self.kv_page_shape[2] * self.page_size
+        if conv_bytes % row_bytes != 0:
+            return None
+        return conv_bytes // row_bytes
+
+    def gpr_conv_fits(self, T: int, R: int) -> bool:
+        """Whether the GPR conv window fits the K half of one conv page."""
+        rows = self.gpr_conv_rows(T, R)
+        return rows is not None and rows <= self.kv_page_shape[1]
+
     # ---------------------------------------------------------------- per rank
     def kh_per_rank(self, R: int) -> int:
         return self.kh // R
@@ -287,18 +304,22 @@ class PoolLayout:
             f"page ({self.conv_page_rows} rows)",
         )
         # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
-        # window (fused: at least 16 rows) in the conv page.
+        # window: GPR in the K half of the conv page (as `can_pool_gather`
+        # checks), fused pool I/O (at least 16 rows) in the whole conv page.
         qkv_rows = self.qkv_per_rank(R) // LANES
         hr = rup(self.conv_taps + ex.T, 8)
-        for on, path, rows in (
-            (cache_exec(ex).GPR, "in-kernel gather (GPR)", hr * qkv_rows),
-            (cache_exec(ex).FUSED, "fused pool I/O", max(16, hr) * qkv_rows),
-        ):
-            _need(
-                not on or rows <= self.conv_page_rows,
-                f"{path} conv window ({rows} rows at T={ex.T}) exceeds one conv "
-                f"page ({self.conv_page_rows} rows)",
-            )
+        _need(
+            not cache_exec(ex).GPR or self.gpr_conv_fits(ex.T, R),
+            f"in-kernel gather (GPR) conv window ({hr * qkv_rows} rows at "
+            f"T={ex.T}) exceeds the K half of one conv page "
+            f"({self.conv_page_rows // 2} rows)",
+        )
+        rows = max(16, hr) * qkv_rows
+        _need(
+            not cache_exec(ex).FUSED or rows <= self.conv_page_rows,
+            f"fused pool I/O conv window ({rows} rows at T={ex.T}) exceeds one "
+            f"conv page ({self.conv_page_rows} rows)",
+        )
 
 
 __all__ = [

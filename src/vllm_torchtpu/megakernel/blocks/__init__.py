@@ -19,7 +19,7 @@ from .gdn import (
     GDNParams,
 )
 from .gqa import GQABlock, GQAParams
-from .moe import MoEBlock, MoEParams
+from .moe import MoEBlock, MoEDebug, MoEParams
 
 __all__ = [
     "GDNBlock",
@@ -28,5 +28,6 @@ __all__ = [
     "GQABlock",
     "GQAParams",
     "MoEBlock",
+    "MoEDebug",
     "MoEParams",
 ]

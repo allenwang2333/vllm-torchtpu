@@ -45,7 +45,7 @@ def run_local(
     page_table: jax.Array,
     ckpt_indices: jax.Array | None,
     read_offsets: jax.Array | None,
-    rb_tuple: tuple[Any, ...],
+    extra_tuple: tuple[Any, ...],
     active_seqs: Any,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     """One rank's step: unpack weights, run the kernel, write the pools back."""
@@ -120,7 +120,7 @@ def run_local(
             if act_mode_l == "ref":
                 st_map_f["active_seqs"] = active_mask_l
         s_args_f = [st_map_f[k] for k in p_l.s_names]
-        out_vals_f = call_l(pos, hidden, *w, *s_args_f, *rb_tuple)
+        out_vals_f = call_l(pos, hidden, *w, *s_args_f, *extra_tuple)
         if not isinstance(out_vals_f, (tuple, list)):
             out_vals_f = (out_vals_f,)
         out_map_f = dict(zip(p_l.o_names, out_vals_f))
@@ -159,7 +159,7 @@ def run_local(
         pt_key: page_table,
     }
     s_args = [st_map[k] for k in s_names]
-    out_vals = call(pos, hidden, *w, *s_args, *rb_tuple)
+    out_vals = call(pos, hidden, *w, *s_args, *extra_tuple)
     if not isinstance(out_vals, (tuple, list)):
         out_vals = (out_vals,)
     out_map = dict(zip(o_names, out_vals))
@@ -199,7 +199,7 @@ def raw_step(
     ckpt_indices: jax.Array | None,
     read_offsets: jax.Array | None,
     active_wrapped: Any,
-    *rb_tuple: Any,
+    *extra_tuple: Any,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     """Shard the pooled step's arguments and run `run_local` per rank."""
     mesh, ex_paged, extras, has_rec = b.mesh, b.ex_paged, b.extras, b.has_rec
@@ -212,7 +212,7 @@ def raw_step(
         for k in weights
     }
     raw_spec = tuple(P("tp") for _ in raw_pools)
-    rb_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
+    extra_specs = tuple(P("tp") if x.memory_space == "hbm" else P() for x in extras)
 
     meta: dict[str, Any] = {pt_key: page_table}
     meta_specs: dict[str, Any] = {
@@ -249,7 +249,7 @@ def raw_step(
         w_l: Any,
         raw_l: Any,
         meta_l: dict[str, Any],
-        *rb_l: Any,
+        *extra_l: Any,
     ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
         return run_local(
             b,
@@ -260,14 +260,14 @@ def raw_step(
             meta_l[pt_key],
             meta_l.get("ckpt_indices"),
             meta_l.get("read_offsets"),
-            rb_l,
+            extra_l,
             meta_l.get("active_seqs"),
         )
 
     return jax.shard_map(
         local_pos,
         mesh=mesh,
-        in_specs=(P(), P("tp"), ws, raw_spec, meta_specs) + rb_specs,
+        in_specs=(P(), P("tp"), ws, raw_spec, meta_specs) + extra_specs,
         out_specs=(P("tp"), raw_spec),
         check_vma=False,
-    )(pos, hidden, weights, raw_pools, meta, *rb_tuple)
+    )(pos, hidden, weights, raw_pools, meta, *extra_tuple)
