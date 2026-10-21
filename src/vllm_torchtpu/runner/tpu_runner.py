@@ -153,6 +153,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+from vllm_torchtpu.runner.step_timing_log import StepTimingLog
 from vllm_torchtpu.runner.tpu_pooling import (
     StaticPoolerChunkOutput,
     StaticPoolerSpec,
@@ -1075,6 +1076,14 @@ class TPUModelRunner(GPUModelRunner):
 
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._step_timing_log = (
+            StepTimingLog(
+                self.parallel_config.data_parallel_rank,
+                envs.TPU_STEP_TIMING_LOG_STEPS,
+            )
+            if envs.TPU_STEP_TIMING_LOG_STEPS
+            else None
+        )
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -2650,7 +2659,10 @@ class TPUModelRunner(GPUModelRunner):
         # Wait even when there is nothing to roll back: both callers drop these
         # results afterwards, and on non-output TP ranks they can be the only
         # owner of the in-flight D2H copy (#985).
+        wait_start = time.perf_counter()
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
+        if self._step_timing_log is not None:
+            self._step_timing_log.result_wait(time.perf_counter() - wait_start)
         assert pre_next_tokens_cpu is not None
 
         pre_next_tokens_cpu = pre_next_tokens_cpu[: len(pre_req_ids)]
@@ -3627,10 +3639,13 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int64,
             device="cpu",
         )
+        sync_start = time.perf_counter()
         torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
         )
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
+        if self._step_timing_log is not None:
+            self._step_timing_log.dp_sync(bucket, time.perf_counter() - sync_start)
         # Spec-decode draft forwards size themselves off the step's DP-wide
         # max per-chunk request count (see DFlashProposer), riding this same
         # all-reduce instead of paying the theoretical max bucket or a
@@ -3739,6 +3754,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self._step_timing_log is not None:
+            self._step_timing_log.step_start()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
