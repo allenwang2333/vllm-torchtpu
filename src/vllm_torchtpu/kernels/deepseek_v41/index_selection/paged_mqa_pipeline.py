@@ -49,7 +49,6 @@ class BufferPlan:
     page_count: int
     mxu_size: int
     q_dtype: jnp.dtype = jnp.dtype(jnp.bfloat16)
-    paired: bool = False
 
     @property
     def key_slots(self) -> int:
@@ -72,18 +71,10 @@ class BufferPlan:
         return (
             pltpu.VMEM((2 * c.query_tile, self.heads, DIM), self.q_dtype),
             pltpu.VMEM((c.key_buffers, c.key_tile // 128 * 33, ROW_WORDS), jnp.int32),
-            pltpu.VMEM(
-                (1, 2, (self.page_count // 2 + 1) * 128)
-                if self.paired
-                else (2, c.query_tile, c.key_tile),
-                jnp.float32,
-            ),
-            pltpu.SMEM(
-                (2, 4, self.page_count) if self.paired else (2, self.page_count),
-                jnp.int32,
-            ),
+            pltpu.VMEM((2, c.query_tile, c.key_tile), jnp.float32),
+            pltpu.SMEM((2, self.page_count), jnp.int32),
             pltpu.SemaphoreType.DMA((c.key_buffers,)),
-            pltpu.SemaphoreType.DMA((1 if self.paired else 2, c.query_tile)),
+            pltpu.SemaphoreType.DMA((2, c.query_tile)),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.VMEM((c.issue_depth * self.groups, 1, self.mxu_size), jnp.float32),
             pltpu.VMEM((c.issue_depth * self.groups, 1, self.mxu_size), jnp.float32),
@@ -124,22 +115,12 @@ class BufferPlan:
             + scale_bytes
             + (
                 size((tokens, self.heads), jnp.float32)
-                + size(
-                    (tokens, 4, self.page_count)
-                    if self.paired
-                    else (key_groups, self.page_count),
-                    jnp.int32,
-                )
+                + size((key_groups, self.page_count), jnp.int32)
             )
         )
 
     def smem_bytes(self, tokens: int, key_groups: int) -> int:
-        return (
-            (8 if self.paired else 2) * self.page_count
-            + tokens * (2 if self.paired else 1)
-            + key_groups
-            + 1
-        ) * 4
+        return (2 * self.page_count + tokens + key_groups + 1) * 4
 
     def mrb_bytes_per_mxu(self) -> int:
         return (
@@ -229,11 +210,9 @@ class Pipeline:
     def step(self, ops: "MQAOps", tile, *, initial: bool) -> None:
         ops.wait_keys(tile)
 
-        if not self.plan.paired:
-
-            @pl.when(tile >= 2)
-            def release_output():
-                ops.publish(tile - 2, wait=True)
+        @pl.when(tile >= 2)
+        def release_output():
+            ops.publish(tile - 2, wait=True)
 
         pending = (
             tile + self.plan.config.key_buffers - 1 < ops.live_tiles + ops.next_tiles
@@ -247,15 +226,9 @@ class Pipeline:
         def finish():
             self.emit_tile(ops, tile, prefetch=False)
 
-        if not self.plan.paired:
-            ops.publish(tile)
+        ops.publish(tile)
 
     def drain(self, ops: "MQAOps") -> None:
-        if self.plan.paired:
-            ops.publish(0)
-            ops.publish(0, wait=True)
-            return
-
         @pl.when(ops.live_tiles > 0)
         def finish():
             ops.publish(ops.live_tiles - 1, wait=True)

@@ -28,9 +28,6 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.paged_mqa_pipeline impor
     QueryState,
     QueryTile,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.paired_mqa_metadata import (
-    paired_mqa_metadata,
-)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     PagedMQAConfig,
 )
@@ -43,7 +40,6 @@ class MQAOps:
     state: QueryState
     plan: BufferPlan
     lengths: Ref
-    candidate_counts: Ref | None
     q: Ref
     weights: Ref
     pool: tuple[Ref, ...]
@@ -88,12 +84,7 @@ class MQAOps:
         return (self.state.key_slot + tile) % self.plan.config.key_buffers
 
     def load_page_table(self, query: QueryTile, slot: int | jax.Array) -> None:
-        row = (
-            jnp.minimum(query.start, self.q.shape[0] - 1)
-            if self.plan.paired
-            else query.key_group
-        )
-        pltpu.sync_copy(self.page_table.at[row], self.pages.at[slot])
+        pltpu.sync_copy(self.page_table.at[query.key_group], self.pages.at[slot])
 
     def begin_query(self, following: QueryTile) -> None:
         c = self.plan.config
@@ -102,13 +93,6 @@ class MQAOps:
             row = jnp.minimum(following.start + local, self.q.shape[0] - 1)
             next_limit = jnp.maximum(
                 next_limit, jnp.where(local < following.count, self.lengths[row], 0)
-            )
-        if self.plan.paired:
-            next_limit = jnp.where(
-                following.count > 0,
-                self.candidate_counts[jnp.minimum(following.start, self.q.shape[0] - 1)]
-                * self.page_records,
-                0,
             )
         self.next_tiles = pl.cdiv(
             jnp.minimum(next_limit, self.plan.page_count * self.page_records),
@@ -126,9 +110,6 @@ class MQAOps:
             if self.q_scale is not None:
                 row_scales.append(self.q_scale[row])
             limit = jnp.maximum(limit, length)
-        if self.plan.paired:
-            limit = self.candidate_counts[self.state.query.start] * self.page_records
-            self.scores[0] = jnp.full(self.scores.shape[1:], -jnp.inf, jnp.float32)
         self.live_tiles = pl.cdiv(
             jnp.minimum(limit, self.plan.page_count * self.page_records), c.key_tile
         )
@@ -207,11 +188,11 @@ class MQAOps:
                     transfer.start()
 
     def load_page(self, tile, i, metadata_slot, slot):
-        index = tile * (self.plan.config.key_tile // self.page_records) + i
         page = jnp.clip(
-            self.pages[metadata_slot, 0, index]
-            if self.plan.paired
-            else self.pages[metadata_slot, index],
+            self.pages[
+                metadata_slot,
+                tile * (self.plan.config.key_tile // self.page_records) + i,
+            ],
             0,
             self.total_pages - 1,
         )
@@ -253,20 +234,18 @@ class MQAOps:
 
     def publish(self, tile, wait: bool = False, *, slot=None) -> None:
         slot = tile % 2 if slot is None else slot
-        if self.plan.paired:
-            slot = 0
-        size = self.out.shape[-1] if self.plan.paired else self.plan.config.key_tile
-        start = 0 if self.plan.paired else tile * size
         for local in range(self.plan.config.query_tile):
 
             @pl.when(local < self.count)
             def copy(local=local):
                 transfer = pltpu.make_async_copy(
-                    self.scores.at[slot, local, pl.ds(0, size)],
+                    self.scores.at[slot, local],
                     self.out.at[
                         self.state.query.start + local,
                         0,
-                        pl.ds(start, size),
+                        pl.ds(
+                            tile * self.plan.config.key_tile, self.plan.config.key_tile
+                        ),
                     ],
                     self.write_sem.at[slot, local],
                 )
@@ -339,49 +318,18 @@ class MQAOps:
         values = jnp.concatenate(parts, axis=0)[: self.plan.config.query_tile]
         start = tile * self.plan.config.key_tile + fragment * size
         position = start + jnp.arange(size)
-        masks, positions = [], []
+        masks = []
         for i in range(0, size, self.page_records):
-            index = (start + i) // self.page_records
-            page = (
-                self.pages[self.metadata_slot, 0, index]
-                if self.plan.paired
-                else self.pages[self.metadata_slot, index]
-            )
-            if self.plan.paired:
-                positions.append(
-                    self.pages[self.metadata_slot, 1, index] * self.page_records
-                    + jnp.arange(min(self.page_records, size))
-                )
+            page = self.pages[self.metadata_slot, (start + i) // self.page_records]
             valid = ((page >= 0) & (page < self.total_pages)).astype(jnp.int32)
             masks.append(jnp.broadcast_to(valid, (min(self.page_records, size),)))
-        if self.plan.paired:
-            position = jnp.concatenate(positions)
         valid_page = jnp.concatenate(masks)
         valid = (valid_page[None, :] != 0) & (
             position[None, :] < self.row_lengths[:, None]
         )
-        values = jnp.where(valid, values, -jnp.inf)
-        if self.plan.paired:
-            for local in range(2):
-                for page in range(size // self.page_records):
-                    destination = self.pages[
-                        self.metadata_slot, 2 + local, start // self.page_records + page
-                    ]
-                    # Absent memberships write only to a VMEM sink, never HBM.
-                    destination = jnp.where(
-                        destination >= 0,
-                        destination,
-                        self.out.shape[-1] // self.page_records,
-                    )
-                    self.scores[
-                        0,
-                        local,
-                        pl.ds(destination * self.page_records, self.page_records),
-                    ] = values[
-                        local, page * self.page_records : (page + 1) * self.page_records
-                    ]
-        else:
-            self.scores[tile % 2, :, pl.ds(fragment * size, size)] = values
+        self.scores[tile % 2, :, pl.ds(fragment * size, size)] = jnp.where(
+            valid, values, -jnp.inf
+        )
 
     def fill_padding(self) -> None:
         tiles = self.plan.page_count * self.page_records // self.plan.config.key_tile
@@ -417,7 +365,6 @@ def _next_query_tile(query: QueryTile, offsets: Ref, tile_size: int) -> QueryTil
 def _kernel(
     offsets,
     lengths,
-    candidate_counts,
     q,
     weights,
     pool,
@@ -443,7 +390,6 @@ def _kernel(
             state,
             pipeline.plan,
             lengths,
-            candidate_counts,
             q,
             weights,
             pool,
@@ -484,7 +430,6 @@ def paged_mqa_logits(
     q_scale: jax.Array | None = None,
     k_scale: jax.Array | tuple[jax.Array, jax.Array] | None = None,
     config: PagedMQAConfig | None = None,
-    candidates: jax.Array | None = None,
 ) -> jax.Array:
     """Score native paged index keys, returning FP32 [T, page_count * page_records].
 
@@ -502,13 +447,9 @@ def paged_mqa_logits(
         q_scale: FP32 [T,H] dequantization scales for FP8 Q; one per D128 row.
         k_scale: Must be None; FP32 K scales are embedded in each packed page.
         config: Internal DMA and query tiles; larger groups use more tiles.
-        candidates: Optional INT32 [T,C] sorted unique logical pages with -1
-            tail padding. Adjacent queries within each offset interval share
-            their union; output is [T,C*128] in original candidate-slot order.
 
-    Without candidates, this scores the dense paged context. Candidate metadata
-    merges page IDs only; K stays in the original pool. Groups are contiguous
-    query intervals and candidate IDs must be sorted before this call.
+    This is dense paged MQA. Candidate-consuming sparse MQA keeps its separate
+    compact-score contract. No union or second key cache is constructed here.
     QK accumulates in FP32; raw ReLU results are rounded to BF16 before scales.
     Q scales are folded into weights; K scales follow head reduction.
     Three BF16 weight components approximate FP32 weighting; bitwise equivalence
@@ -552,20 +493,6 @@ def paged_mqa_logits(
         )
     ):
         raise ValueError("Expected FP8 Q and page-aligned packed FP8 K/scale banks")
-    if tokens == 0:
-        return jnp.empty(
-            (0, width if candidates is None else candidates.shape[1] * page_records),
-            jnp.float32,
-        )
-    candidate_counts = None
-    if candidates is not None:
-        if candidates.shape[0] != tokens:
-            raise ValueError("Candidates must have one row per query")
-        metadata = paired_mqa_metadata(candidates, block_table, query_start_loc)
-        block_table, candidate_counts = metadata
-        page_count = block_table.shape[-1]
-        width = page_count * page_records
-    output_width = width if candidates is None else candidates.shape[1] * page_records
     if tokens == 0 or width == 0:
         return jnp.empty((tokens, width), jnp.float32)
     info = pltpu.get_tpu_info()
@@ -580,9 +507,7 @@ def paged_mqa_logits(
             key_tile=key_tile,
             issue_depth=max(1, min(defaults.issue_depth, key_tile // mxu_size)),
         )
-    if candidates is not None:
-        config = replace(config, query_tile=2, query_group=2)
-    query_tile = min(config.query_tile, tokens) if candidates is None else 2
+    query_tile = min(config.query_tile, tokens)
     query_group = min(config.query_group, query_tile)
     key_tile = min(config.key_tile, width)
     depth = config.issue_depth
@@ -605,7 +530,6 @@ def paged_mqa_logits(
         page_count,
         mxu_size,
         q.dtype,
-        paired=candidates is not None,
     )
     if info:
         plan.validate(info, tokens, key_groups)
@@ -621,9 +545,9 @@ def paged_mqa_logits(
     return pl.pallas_call(
         kernel,
         # The unit axis makes each row contiguous for individual output DMAs.
-        out_shape=jax.ShapeDtypeStruct((tokens, 1, output_width), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((tokens, 1, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=2,
             grid=(1,),
             in_specs=(
                 hbm,
@@ -643,13 +567,5 @@ def paged_mqa_logits(
         ),
         name="paged_mqa_logits",
     )(
-        query_start_loc,
-        lengths,
-        candidate_counts,
-        q,
-        weights,
-        banks,
-        block_table,
-        q_scale,
-        scales,
-    ).reshape(tokens, output_width)
+        query_start_loc, lengths, q, weights, banks, block_table, q_scale, scales
+    ).reshape(tokens, width)
