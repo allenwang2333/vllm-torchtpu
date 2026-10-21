@@ -123,6 +123,7 @@ def _check_lifecycle(
     index_dim=128,
     ratio=4,
     budget=2048,
+    padded_requests=0,
 ):
     rng = np.random.default_rng(313)
 
@@ -241,6 +242,12 @@ def _check_lifecycle(
             context = jnp.zeros_like(context)
             slots = jnp.array([1, 0] + [-1] * 6, jnp.int32)
             producer = (*producer[:8], jnp.zeros_like(pos), producer[9])
+        if not decode and padded_requests:
+            extra = padded_requests - len(context)
+            starts = jnp.pad(starts, (0, extra), constant_values=prefill_count)
+            context = jnp.pad(context, (0, extra))
+            slots = jnp.pad(slots, (0, extra), constant_values=-1)
+            tt = jnp.pad(tt, ((0, extra), (0, 0)))
         metadata = (starts, context, slots, tt, tt)
         expected = reference_fn(*producer, *reference_state, *metadata)
         flat_trig = trig.reshape(trig.shape[0], -1)
@@ -331,3 +338,11 @@ def test_empty_step_preserves_native_owners(fp8):
         np.testing.assert_array_equal(actual, expected)
     assert result[4].shape == (0, 768)
     assert result[5].shape == (0, 2051)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("tokens", [4, 8, 16])
+def test_multitoken_prefill_with_idle_request_capacity(fp8, tokens):
+    """T<R, T==R and T>R preserve the same causal lifecycle oracle."""
+    _check_lifecycle(fp8, 126, tokens, heads=1, hq=3, padded_requests=8)

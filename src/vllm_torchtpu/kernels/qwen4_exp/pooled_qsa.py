@@ -21,13 +21,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
-    SparseCoreTopK,
     TopKBackend,
 )
-from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
-from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_index_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
     _token_metadata,
@@ -504,8 +501,6 @@ def select_blocks(
     topk_backend: TopKBackend | None = None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
-    if topk_backend is None:
-        topk_backend = SparseCoreTopK()
     width = pool.shape[-1]
     rows = 128 // ratio
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
@@ -520,81 +515,18 @@ def select_blocks(
             -1
         )
 
-    def select_chunk(q, lens, pages):
-        batch = len(q)
-        expanded = expand_pages(pages).reshape(batch, -1)
-        return streamindex_topk(
-            jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1]))),
-            jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
-            cache,
-            lens,
-            expanded.reshape(-1),
-            jnp.arange(batch + 1, dtype=jnp.int32),
-            jnp.full((3,), batch, jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=256 // rows,
-            num_queries_per_block=1,
-            decode_req_batch_size=8 if batch >= 8 else 4,
-            enable_early_exit=True,
-            components=qsa_indexing(),
-            topk_backend=topk_backend,
-        )
-
-    if len(query) > len(context):
-        # Present prefill as its native ragged request batch. The previous path
-        # treated every query as a one-token decode sequence, so every row
-        # reloaded the same KV history and ran an M=1 score matmul. BQ128 reuses
-        # each KV tile across neighboring queries; chunking overlaps chunk g's
-        # SparseCore top-k with chunk g+1's TensorCore scoring.
-        query_lens = starts[1:] - starts[:-1]
-        num_seqs = jnp.max(
-            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
-        )
-        seq_lens = context + query_lens
-        chunk_tokens = 512 if len(query) % 512 == 0 else None
-        return streamindex_topk(
-            jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
-            jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
-            cache,
-            seq_lens,
-            expand_pages(table),
-            starts,
-            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=(256 // rows,) * 3,
-            num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=8,
-            enable_early_exit=True,
-            chunk_tokens=chunk_tokens,
-            components=qsa_indexing(ratio - 1),
-            topk_backend=topk_backend,
-        )
-
-    pages_per_query = table.shape[1] * logical_pages
-    chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
-    if len(query) <= chunk_size:
-        return select_chunk(query, lengths, table[req])
-
-    padding = (-len(query)) % chunk_size
-    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
-    lens = jnp.pad(lengths, (0, padding))
-    request_ids = jnp.pad(req, (0, padding))
-    chunks = (
-        q.reshape(-1, chunk_size, *q.shape[1:]),
-        lens.reshape(-1, chunk_size),
-        request_ids.reshape(-1, chunk_size),
+    return select_index_blocks(
+        query,
+        cache,
+        lengths,
+        expand_pages(table).reshape(len(table), -1),
+        req,
+        starts=starts,
+        context=context,
+        ratio=ratio,
+        block_topk=block_topk,
+        topk_backend=topk_backend,
     )
-    _, selected = jax.lax.scan(
-        lambda carry, inputs: (
-            carry,
-            select_chunk(inputs[0], inputs[1], table[inputs[2]]),
-        ),
-        None,
-        chunks,
-    )
-    return selected.reshape(-1, block_topk)[: len(query)]
 
 
 def pooled_qsa_step(
@@ -715,5 +647,6 @@ def pooled_qsa_step(
     )
 
 
-# Keep protocol objects out of the native Torch POD schema.
+# Bind the protocol object outside the Torch schema: jax_op accepts only POD
+# static arguments. Factories may bind a different immutable backend with partial.
 pooled_qsa_step = functools.partial(pooled_qsa_step, topk_backend=None)

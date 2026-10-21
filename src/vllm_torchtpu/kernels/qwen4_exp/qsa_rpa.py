@@ -196,7 +196,11 @@ def qsa_attention(
     k_scale=1.0,
     v_scale=1.0,
 ):
-    """Use query-block reuse for prefill and the existing small-step RPA path."""
+    """Use query-block reuse for large buckets, per-query RPA otherwise.
+
+    T<=request capacity can include multi-token prefill. Each row still uses
+    its own request table, selected groups and causal length on that route.
+    """
     if len(query) > len(starts) - 1:
         from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
             block_sparse_gqa_attention,
@@ -331,6 +335,8 @@ def qsa_step(
         req,
         compress_ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        starts=starts,
+        context=context,
         topk_backend=topk_backend,
     )
     # Keep the persistent owner in RPA's native dtype. Full-cache uint8/FP8
@@ -368,5 +374,6 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     return selected
 
 
-# Keep protocol objects out of the native Torch POD schema.
+# Bind the protocol object outside the Torch schema: jax_op accepts only POD
+# static arguments. Factories may bind a different immutable backend with partial.
 qsa_step = functools.partial(qsa_step, topk_backend=None)
