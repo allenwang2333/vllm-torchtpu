@@ -2559,16 +2559,6 @@ class Eagle3Proposer:
             )
             with set_model_tag("eagle_head"):
                 tok = self._draft_propose_token(first_pass_carry)
-            # TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST (benchmark replay only): the
-            # step-0 snapshot propose() takes after its first pass, so the
-            # restores below copy the same bytes a served propose does.
-            saved_topk = None
-            if (
-                envs.TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST
-                and self._share_mtp_indices
-                and not runner._dp_lockstep_enabled()
-            ):
-                saved_topk = self._mtp_compact_and_save(self._topk_row_ids(p))
             # Mirror the K-1 loop steps: forward @p -> lm head @p. Under
             # IndexShare, _forward_draft routes these to the loop-step program
             # exactly as a real propose does, so this rank runs the same
@@ -2597,11 +2587,7 @@ class Eagle3Proposer:
                     loop_query_start_loc=loop_qsl,
                     loop_request_distribution=loop_reqdist,
                     shared_topk_indices=(
-                        (
-                            saved_topk[0]
-                            if saved_topk is not None
-                            else self._mtp_topk_buffers[0][:p].clone()
-                        )
+                        self._mtp_topk_buffers[0][:p].clone()
                         if self._mtp_fused_indexshare
                         else None
                     ),
@@ -2610,9 +2596,6 @@ class Eagle3Proposer:
                     synchronize_tensors(fused[-1])
                     continue
             for step in range(1, K):
-                if saved_topk is not None:
-                    # propose()'s separate path restores before every step.
-                    self._mtp_restore_topk(saved_topk)
                 last_hidden, _ = self._forward_draft(
                     chunk=chunk,
                     input_ids=loop_input_ids,

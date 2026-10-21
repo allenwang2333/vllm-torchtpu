@@ -107,16 +107,11 @@ def test_flag_off_keeps_the_eager_paths(monkeypatch):
 
 
 def test_flag_defaults(monkeypatch):
-    """TPU_MTP_TOPK_INPLACE is on by default since trial 6; the replay-fidelity
-    flag (microbenchmarks only) stays off."""
+    """TPU_MTP_TOPK_INPLACE is on by default since trial 6."""
     import vllm_torchtpu.envs as envs
 
-    for name, default in (
-        ("TPU_MTP_TOPK_INPLACE", True),
-        ("TPU_MTP_DUMMY_DRAFT_INDEXSHARE_HOST", False),
-    ):
-        monkeypatch.delenv(name, raising=False)
-        assert getattr(envs, name) is default
+    monkeypatch.delenv("TPU_MTP_TOPK_INPLACE", raising=False)
+    assert envs.TPU_MTP_TOPK_INPLACE is True
 
 
 def _require_tpu():
