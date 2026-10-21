@@ -358,13 +358,52 @@ compiled temporary storage increased from zero to 227901024 bytes. Even
 with precomputed unions, external reorder was slower and is not adopted.
 These results say nothing about full-attention or serving speedups.
 
-The fused-reorder prototype has no timing result: after making gather indices
+The initial fused-reorder prototype had no timing result: after making gather indices
 explicitly broadcast and removing a functional scatter, the pinned compiler
 rejected its 512-column gather with `Multiple source vregs along gather dimension`.
 This is an implementation/compiler constraint, not a hardware impossibility.
 Source, HLO, numerical checks and device-event summaries are preserved at
 `results/csa-union-qk-preflight-evidence.tgz` in `art-oksvnsji4r`, SHA-256
 `0da662c10e3f9c6f62b816549a13e3f74150cee3063b21cf9f5ac4c6697227a5`.
+
+The subsequent calibration in `exp-imdae3ecob` failed its sampling threshold:
+host metadata triggered capture before every actual request had generated
+44 tokens. This was a collector assertion, not an attention failure. Four
+rejected diagnostics (ranks 0, 1, 5 and 6, forward 26) were recovered after
+checking their original checksums, current encoder/decoder input equality,
+six consecutive positions per request, all eight indexers' position/request
+buffers and inactive buffer tails. Their shortest generated contexts were
+40–42 tokens. This is one early full-shape forward on four ranks, not the
+planned 16 steady captures. Unknown compressed-cache prefixes remain null.
+
+Across 1536 request/indexer samples, the six-query union had median 1365.5,
+90th percentile 1701 and maximum 2513 rows. There were no duplicate selected
+IDs within a query. The ideal row-read reduction was 54.78%; this excludes
+union formation, packing, padding, extra computation and score reordering.
+Verified diagnostics are in `results/kv-rejected-evidence.tgz` in
+`art-5gs7huyhse` (6992062 bytes, SHA-256
+`24a53a5c62e0543a021f009a1c6101c708e09a098b8addd7521462b87f692a63`).
+
+Two QK-only probes used these actual selected IDs with synthetic BF16 Q/K.
+The fused variant replaced each unsupported 512-column source gather with
+four supported 128-column gathers and restored the original column order
+inside Pallas. Both candidates matched every reference output bit:
+
+| Capture / indexer | Independent QK (us) | External reorder (us) | Fused reorder (us) |
+| --- | ---: | ---: | ---: |
+| Rank 0 / layer 2 / seed 1066 | 84.467 | 338.495 | 367.950 |
+| Rank 6 / layer 36 / seed 1067 | 84.659 | 337.664 | 419.821 |
+
+Each measurement covers 48 requests, six queries, 64 heads and 512 selected
+keys, at P-state 7 with five ordered device repetitions and entry barriers
+subtracted. Both cases padded the union to 2048 rows. Fused reorder reduced
+compiled temporary storage from 454393440 to 786432 bytes, but remained
+slower than independent QK even with union construction and cache packing
+outside timing. Neither candidate is adopted. This is not a full-CSA or
+serving measurement. Source, HLO, exactness checks and event summaries are
+in `results/csa-union-qk-early-evidence.tgz` in the same artifact
+(113826 bytes, SHA-256
+`d8683c6f96491a55a30e519defd20fac40c5d06120bbb3872e0e243a791d8665`).
 
 The following prototypes remain outside the production path. Unless labeled
 otherwise, times are complete device-module medians after subtracting identified
