@@ -49,7 +49,6 @@ def test_rewrite_semantics_and_fallback():
     g = {
         "torch": torch,
         "_h5b_original_apply_mutations": lambda o, u: orig_calls.append(1),
-        "_h5b_on": [True],
     }
     exec(compile(src, "<t>", "exec"), g)
     fn = g["_apply_mutations"]
@@ -71,10 +70,6 @@ def test_rewrite_semantics_and_fallback():
     upd_rg[1] = torch.ones(3, requires_grad=True)  # a source that requires grad
     fn(orig, upd_rg)
     assert orig_calls == [1, 1]
-    orig_calls.pop()
-    g["_h5b_on"][0] = False  # runtime switch off: the original epilogue
-    fn(orig, upd)
-    assert orig_calls == [1, 1] and torch.equal(orig[3], torch.zeros(3))
 
 
 def _backend():

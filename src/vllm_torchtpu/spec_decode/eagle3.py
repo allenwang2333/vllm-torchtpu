@@ -1506,7 +1506,7 @@ class Eagle3Proposer:
                 )
                 assert knr is not None
                 qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), c.num_reqs)
-                if envs.TPU_H2D_REUSE_STEADY and getattr(runner, "_h2d_reuse_on", True):
+                if envs.TPU_H2D_REUSE_STEADY:
                     # Functions of (knr, num_reqs) only, read-only in the loop
                     # draft programs: reuse the last upload while they repeat.
                     loop_qsl_per_chunk.append(

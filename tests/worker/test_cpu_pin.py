@@ -173,25 +173,6 @@ def test_pinner_failure_is_quiet_and_sticky(monkeypatch, tmp_path):
     assert calls == []
 
 
-def test_pinner_unpin_and_repin(monkeypatch, tmp_path):
-    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
-    p = cpu_pin.WorkerCpuPinner(True, 1, 8, skip=2, sweep_s=0)
-    p.maybe_pin()
-    n = len(calls)
-    p.set_active(False)
-    full = set(range(64))
-    # every thread, the serving one included, back to the original affinity
-    assert {pid for pid, _ in calls[n:]} == set(task) and all(
-        c == full for _, c in calls[n:]
-    )
-    m = len(calls)
-    p.maybe_pin()  # inactive: nothing
-    assert len(calls) == m
-    p.set_active(True)  # re-places every thread, serving thread last
-    assert calls[-1] == (0, p.serving_cpus)
-    assert {pid for pid, _ in calls[m:-1]} == {100, 101, 102}
-
-
 def test_reserved_block_covers_every_host_device(tmp_path, monkeypatch):
     """TPU_LOCAL_RANK_OFFSET: two servers on one host see LOCAL_WORLD_SIZE 2 and
     4; the reserved block follows the host's vfio group count instead, so one
@@ -205,22 +186,3 @@ def test_reserved_block_covers_every_host_device(tmp_path, monkeypatch):
     )  # server B (offset 2), rank 3
     b._pin(999)
     assert not (a.other_cpus & b.serving_cpus) and not (b.other_cpus & a.serving_cpus)
-
-
-def test_unpin_restores_each_threads_own_mask_and_survives_dead_threads(
-    monkeypatch, tmp_path
-):
-    calls, me, task, masks, dead = _patched_pinner(monkeypatch, tmp_path)
-    masks[101] = {7, 8}  # a thread that had its own affinity before
-    p = cpu_pin.WorkerCpuPinner(True, 1, 8, skip=2, sweep_s=0)
-    p.maybe_pin()
-    n = len(calls)
-    p.set_active(False)
-    restored = dict(calls[n:])
-    assert restored[101] == {7, 8} and restored[100] == set(range(64))
-    p.set_active(True)
-    dead.add(me)  # the old serving thread exits; a new one takes over
-
-    monkeypatch.setattr(cpu_pin.threading, "get_native_id", lambda: 4242)
-    p.maybe_pin()
-    assert p.serving_tid == 4242 and not p._failed

@@ -128,7 +128,6 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
 from vllm_torchtpu.runner import utils as runner_utils
-from vllm_torchtpu.runner.host_sched_diag import HostSchedDiag
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
     MMEncoderManager,
@@ -1079,9 +1078,6 @@ class TPUModelRunner(GPUModelRunner):
         self._stage_timing = RunnerStageTiming(
             profiler_rank, enabled=self._stage_timing_has_consumer()
         )
-        self._host_sched_diag = HostSchedDiag(
-            profiler_rank, envs.TPU_HOST_SCHED_DIAG_STEPS
-        )
         if envs.TPU_FOREACH_MUTATION_EPILOGUE:
             from vllm_torchtpu.compilation import foreach_epilogue
 
@@ -1091,9 +1087,7 @@ class TPUModelRunner(GPUModelRunner):
 
             aot_guard_skip.install()
         self._host_levers_pending = bool(
-            envs.TPU_AOT_SKIP_GUARD_CHECK
-            or envs.TPU_FOREACH_MUTATION_EPILOGUE
-            or (envs.TPU_HOST_LEVER_ALTERNATE and envs.TPU_HOST_SCHED_DIAG_STEPS > 0)
+            envs.TPU_AOT_SKIP_GUARD_CHECK or envs.TPU_FOREACH_MUTATION_EPILOGUE
         )
         self._cpu_pinner = WorkerCpuPinner(
             envs.TPU_WORKER_CPU_PIN,
@@ -1104,47 +1098,16 @@ class TPUModelRunner(GPUModelRunner):
 
     def _host_levers_first_step(self) -> None:
         """One-time host-lever setup on the first execute_model (after warmup
-        has compiled every forward): guard-check skip, lever alternation,
-        epilogue rewrite count."""
+        has compiled every forward): guard-check skip, epilogue rewrite count."""
         self._host_levers_pending = False
         if envs.TPU_AOT_SKIP_GUARD_CHECK:
             self._skip_aot_guard_checks()
-        if envs.TPU_HOST_LEVER_ALTERNATE and envs.TPU_HOST_SCHED_DIAG_STEPS > 0:
-            levers = {x.strip() for x in envs.TPU_HOST_LEVER_ALTERNATE.split(",")}
-            self._lever_alt = {"levers": levers - {""}, "state": True}
-            logger.warning(
-                "TPU_HOST_LEVER_ALTERNATE: %s every %d steps",
-                sorted(self._lever_alt["levers"]),
-                envs.TPU_HOST_SCHED_DIAG_STEPS,
-            )
         if envs.TPU_FOREACH_MUTATION_EPILOGUE:
             from vllm_torchtpu.compilation import foreach_epilogue
 
             logger.warning(
                 "TPU_FOREACH_MUTATION_EPILOGUE: %s", dict(foreach_epilogue.STATS)
             )
-
-    def _set_host_levers(self, on: bool) -> None:
-        """TPU_HOST_LEVER_ALTERNATE: switch the listed host levers off/on
-        (each only acts when its own flag is on)."""
-        alt = self._lever_alt
-        alt["state"] = on
-        levers = alt["levers"]
-        if "pin" in levers:
-            self._cpu_pinner.set_active(on)
-            if on:
-                self._cpu_pinner.maybe_pin()
-        if "guard" in levers and envs.TPU_AOT_SKIP_GUARD_CHECK:
-            from vllm_torchtpu.compilation import aot_guard_skip
-
-            for fn in aot_guard_skip.FNS:
-                fn._guard_check_enabled = not on
-        if "foreach" in levers and envs.TPU_FOREACH_MUTATION_EPILOGUE:
-            from vllm_torchtpu.compilation import foreach_epilogue
-
-            foreach_epilogue.ON[0] = on
-        if "h2d" in levers:
-            self._h2d_reuse_on = on
 
     def _skip_aot_guard_checks(self) -> int:
         """TPU_AOT_SKIP_GUARD_CHECK: disable the guard check of every AOT-compiled
@@ -3725,14 +3688,6 @@ class TPUModelRunner(GPUModelRunner):
             pinner.maybe_pin()
         if getattr(self, "_host_levers_pending", False):
             self._host_levers_first_step()
-        diag = getattr(self, "_host_sched_diag", None)
-        if diag is not None:
-            alt = getattr(self, "_lever_alt", None)
-            line = diag.tick(
-                suffix=f" alt={int(alt['state'])}" if alt is not None else ""
-            )
-            if line is not None and alt is not None:
-                self._set_host_levers(not alt["state"])
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -7796,7 +7751,7 @@ class TPUModelRunner(GPUModelRunner):
             self._sampler_need_top_k = bool((top_k_cpu > 0).any())
             self._sampler_need_top_p = bool((top_p_cpu < 1.0).any())
 
-        if envs.TPU_H2D_REUSE_STEADY and getattr(self, "_h2d_reuse_on", True):
+        if envs.TPU_H2D_REUSE_STEADY:
             # The three are read-only inputs of the sampler programs and their
             # values repeat while the batch's requests do.
             return (
