@@ -71,7 +71,8 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "rope_off_by_one", "dcp_owner", "stale_indexshare",
                        "f_ichunk", "f_slotreuse", "f_hitcap", "f_xrace", "f_nope",
                        "f_alias_poison",      # alias layout only (Mosaic, or interpret via interp_alias)
-                       "f_alias_poison_red", "f_stale_is_alias")   # own_uv placed in the alias (+ poison)
+                       "f_alias_poison_red", "f_stale_is_alias",   # own_uv placed in the alias (+ poison)
+                       "f_ar_earlyread")      # AR#1 sums its slots before waiting them (delay-exposed race)
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -575,14 +576,14 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             pre = "ar1_" if (which == 1 or fault == "f_xrace") else "ar2_"
             return {n: scr[pre + n] for n in CO.AR_NAMES} if R > 1 else {}
 
-        def all_reduce(partial_f32, which, drop_last=False):
+        def all_reduce(partial_f32, which, drop_last=False, early_read=False):
             """bf16 partial [M, H] (rows >= T zeroed, moe_tp_decode all_reduce._masked) -> rank-order f32 sum ->
             bf16 values as f32."""
             buf = scr["arbuf"]
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
             if "coll" not in skip:
                 with sc(f"X_ar{which}"):
-                    CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last)
+                    CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last, early_read=early_read)
             return buf[...].astype(F32)
 
         def exchange(src_fn, dst_fn, ss, rs, wait=True):
@@ -954,7 +955,8 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 a = matmul("wo", g_uv + 1, scr["xq"])
                 part1 = bf(a * sx3 * sm(slot, "o_proj_s"))
             delay_here(l)                                    # F-DELAY: skew into the layer's AR#1
-            attn = all_reduce(part1, 1, drop_last=(fault == "missing_rank_partial"))
+            attn = all_reduce(part1, 1, drop_last=(fault == "missing_rank_partial"),
+                              early_read=(fault == "f_ar_earlyread"))
             scr["attn"][...] = attn
             if debug:
                 dput(d_attn.at[l], scr["attn"])

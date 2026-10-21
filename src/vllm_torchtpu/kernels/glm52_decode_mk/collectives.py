@@ -50,9 +50,12 @@ def _recv_all(R, me, dst_of, recv_sem):
         pltpu.make_async_copy(dst_of(t), dst_of(t), recv_sem.at[t]).wait_recv()
 
 
-def all_reduce(R, me, buf, rows, cols, s, drop_last=False):
+def all_reduce(R, me, buf, rows, cols, s, drop_last=False, early_read=False):
     """In-place all-reduce of buf ([rows, cols] bf16 VMEM). s: dict(zip(AR_NAMES, scratch)).
-    drop_last (FAULT control `missing_rank_partial`): rank R-1's partial is left out of the f32 sum."""
+    drop_last (FAULT control `missing_rank_partial`): rank R-1's partial is left out of the f32 sum.
+    early_read (FAULT control `f_ar_earlyread`, a delay-exposed race): the reduce-scatter slots are summed BEFORE
+    their receives are waited, so a late peer's slot still holds the previous layer's partial (the barrier-free
+    slot reuse this protocol must never expose); the waits follow, keeping the semaphores balanced."""
     if R == 1:
         if drop_last:
             buf[...] = jnp.zeros(buf.shape, buf.dtype)
@@ -70,7 +73,8 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False):
     own.start()
     rs = _send_all(R, me, chunk, slot, s["rs_send"], s["rs_recv"])
     own.wait()
-    _recv_all(R, me, slot, s["rs_recv"])
+    if not early_read:
+        _recv_all(R, me, slot, s["rs_recv"])
     acc = s["recv"][0, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
     for q in range(1, R):
         v = s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)].astype(F32)
@@ -78,6 +82,8 @@ def all_reduce(R, me, buf, rows, cols, s, drop_last=False):
             v = jnp.zeros_like(v)
         acc = acc + v
     red[...] = acc.astype(red.dtype)
+    if early_read:                                # the sum is materialised before the receives are waited
+        _recv_all(R, me, slot, s["rs_recv"])
     own_ag = pltpu.make_async_copy(red, chunk(me), s["loc"].at[1])
     own_ag.start()
     ag = _send_all(R, me, lambda t: red, chunk, s["ag_send"], s["ag_recv"])

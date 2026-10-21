@@ -63,7 +63,9 @@ NN = (((1,), (0,)), ((), ()))
 
 FAULTS = ("", "digit", "tierank", "nofix", "kscale", "page", "ropeseg", "sharedsem",
           # composed-kernel oracle faults (glm_ref names where the semantics match)
-          "causal_mask", "page_off_by_one", "kv_read_before_write", "scale_twice", "topk_swap")
+          "causal_mask", "page_off_by_one", "kv_read_before_write", "scale_twice", "topk_swap",
+          # delay-exposed race control: count-exchange payloads read before their receives are waited
+          "f_cx_earlyread")
 # layer-transient buffers: produced and consumed between layer entry and routing (WHITEBOARD.v1 §5.3 / §7.1)
 ALIASED = ("b_keys", "b_memb", "b_pre", "b_xacc", "b_xcc", "g_nope", "g_rope", "kvb", "qb", "qrb", "b_sbuf",
            "att_acc")
@@ -615,15 +617,20 @@ def make(E):
         def finish(gi, r, last):
             sh = 32 - DW * (r + 1)
             par = r % 2
+            early = fault == "f_cx_earlyread"    # FAULT: read the peers' payloads before waiting their receives
+            if early:
+                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
             cx_finish(gi, par)
             if "coll" in skip:                   # removal arm (timing only): pretend every rank counted like me
                 for s_ in range(R):
                     @pl.when(me != s_)
                     def _(s_=s_):
                         scr["b_crecv"][gi, par, s_] = scr["b_crecv"][gi, par, me]
-            Gs = scr["b_crecv"][gi, par, 0]
+            if not early:
+                crecv = [scr["b_crecv"][gi, par, s_] for s_ in range(R)]
+            Gs = crecv[0]
             for s_ in range(1, R):
-                Gs = Gs + scr["b_crecv"][gi, par, s_]
+                Gs = Gs + crecv[s_]
             ge = (Gs >= KT) & (lane8 >= 1) & (lane8 <= NK)
             d = jnp.sum(ge.astype(I32), axis=1, keepdims=True)                     # (8, 1) digit
             if fault == "digit":
@@ -637,7 +644,7 @@ def make(E):
             Ts = Tu ^ INT_MIN
             ge_s, gt_s = [], []
             for s_ in range(R):
-                P_ = scr["b_crecv"][gi, par, s_]
+                P_ = crecv[s_]
                 ge_s.append(jnp.sum(jnp.where(lane8 == d, P_, 0), axis=1, keepdims=True))
                 gt_s.append(jnp.sum(jnp.where(lane8 == d + 1, P_, 0), axis=1, keepdims=True))
             n_gt = gt_s[0]
