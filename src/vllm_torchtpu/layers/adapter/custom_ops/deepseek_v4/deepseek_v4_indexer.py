@@ -20,8 +20,14 @@ import jax.numpy as jnp
 import torch
 import torch.nn as nn
 from jax.sharding import PartitionSpec as P
+from torch.distributed import _functional_collectives as funcol
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
@@ -31,6 +37,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     check_seq_along_lane_in_quad_pages,
+    merge_kv_split_topk,
     streamindex_topk,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
@@ -98,10 +105,95 @@ def _indexer_jax(
     uniform_q_len: int | None,
     kv_layout: str,
 ) -> jax.Array:
+    """Top-k indices i32[T, k]."""
+    return _indexer_impl(
+        q,
+        positions,
+        cos_sin_cache,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        None,
+        k=k,
+        compression_ratio=compression_ratio,
+        softmax_scale=softmax_scale,
+        n_head=n_head,
+        uniform_q_len=uniform_q_len,
+        kv_layout=kv_layout,
+    )
+
+
+def _indexer_split_jax(
+    q: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    split_rank: jax.Array,  # i32[1]
+    *,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    uniform_q_len: int | None,
+    kv_layout: str,
+    kv_split: int,
+) -> jax.Array:
+    """Rank `split_rank`'s share of the top-k (`streamindex_topk`'s
+    kv_split), i32[T, 2k] (indices, score bits), for `_merge_kv_split_jax`."""
+    return _indexer_impl(
+        q,
+        positions,
+        cos_sin_cache,
+        indexer_weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        split_rank[0],
+        k=k,
+        compression_ratio=compression_ratio,
+        softmax_scale=softmax_scale,
+        n_head=n_head,
+        uniform_q_len=uniform_q_len,
+        kv_layout=kv_layout,
+        kv_split=kv_split,
+    )
+
+
+def _indexer_impl(
+    q: jax.Array,
+    positions: jax.Array,
+    cos_sin_cache: jax.Array,
+    indexer_weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    split_rank: jax.Array | None,
+    *,
+    k: int,
+    compression_ratio: int,
+    softmax_scale: float,
+    n_head: int,
+    uniform_q_len: int | None,
+    kv_layout: str,
+    kv_split: int = 1,
+) -> jax.Array:
+    out_width = k if kv_split == 1 else 2 * k
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
-        return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+        return jnp.zeros((q.shape[0], out_width), dtype=jnp.int32)
     if kv_layout == "seq_along_lane":
         check_seq_along_lane_in_quad_pages(cache_kv.shape, q.shape[-1])
 
@@ -136,7 +228,7 @@ def _indexer_jax(
         # Fold the query quantization scales into the weights.
         weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
 
-        return streamindex_topk(
+        out = streamindex_topk(
             q=q_quant,
             indexer_weights=weights,
             cache_kv=cache_kv,
@@ -153,8 +245,20 @@ def _indexer_jax(
             kv_layout=kv_layout,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS
             or (q.shape[0] // 4 if q.shape[0] >= _FOUR_PIECE_MIN_TOKENS else None),
-            split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED,
+            split_mixed_blocks=envs.TPU_STREAMIDX_SPLIT_MIXED
+            and q.shape[0] >= envs.TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS,
+            # A kv-split share's rows fit one subcore, so its top-k takes the
+            # by-length pass. Compiled next to the merge's SparseCore top-k,
+            # shares from the cooperative (shared-memory) pass came back wrong
+            # on tpu7x while the same ops run one by one were right.
+            sc_topk_one_launch=envs.TPU_DSV4_SC_TOPK_ONE_LAUNCH and kv_split == 1,
+            sc_topk_coop_max_rows=(
+                envs.TPU_DSV4_SC_TOPK_COOP_MAX_ROWS if kv_split == 1 else 0
+            ),
+            kv_split=kv_split,
+            kv_split_rank=0 if split_rank is None else split_rank,
         )
+        return out if kv_split == 1 else jnp.concatenate(out, axis=1)
 
     return _indexer_local(
         q,
@@ -167,6 +271,58 @@ def _indexer_jax(
         cu_q_lens,
         distribution,
     )
+
+
+def _merge_kv_split_jax(
+    gathered: jax.Array, rank: jax.Array, *, k: int, kv_split: int
+) -> jax.Array:
+    """i32[kv_split * T, 2k] rank-major shares -> the unsplit top-k of token
+    block `rank[0]`, i32[T / kv_split, k] (all of i32[T, k] when T is not a
+    multiple of kv_split)."""
+    shares = gathered.reshape(kv_split, -1, 2 * k)
+    num_tokens = shares.shape[1]
+    if num_tokens % kv_split == 0:
+        rows = num_tokens // kv_split
+        shares = jax.lax.dynamic_slice_in_dim(shares, rank[0] * rows, rows, axis=1)
+    return merge_kv_split_topk(shares, k)
+
+
+def _merge_kv_split_a2a_jax(
+    exchanged: jax.Array, *, k: int, kv_split: int
+) -> jax.Array:
+    """i32[T, 2k] after the all-to-all (row block r = rank r's share of this
+    rank's token block) -> the unsplit top-k of this rank's block,
+    i32[T / kv_split, k]."""
+    return merge_kv_split_topk(exchanged.reshape(kv_split, -1, 2 * k), k)
+
+
+def tp_rank_as_data(group, device: torch.device) -> torch.Tensor:
+    """This rank's index in `group` as an i32[1] device value, so that every
+    rank compiles the same program."""
+    ids = torch.arange(group.world_size, dtype=torch.int32, device=device)
+    got = funcol.all_to_all_single(ids, None, None, group.device_group)
+    return funcol.wait_tensor(got)[:1]
+
+
+def merge_kv_split_shares(
+    share, merge_op, rank, kv_split: int, a2a_merge_op=None, group=None
+) -> torch.Tensor:
+    """Every TP rank's i32[T, 2k] share -> the unsplit i32[T, k] top-k.
+
+    With T a multiple of the group size, each rank merges only its own block
+    of T / TP tokens and the merged blocks are all-gathered: 1/TP of the
+    merge work. With `a2a_merge_op`, each rank receives just the shares of its
+    own block (an all-to-all over `group`) instead of every rank's whole share.
+    """
+    if a2a_merge_op is not None and share.shape[0] % kv_split == 0:
+        exchanged = funcol.wait_tensor(
+            funcol.all_to_all_single(share, None, None, group.device_group)
+        )
+        return tensor_model_parallel_all_gather(a2a_merge_op(exchanged), 0)
+    merged = merge_op(tensor_model_parallel_all_gather(share, 0), rank)
+    if share.shape[0] % kv_split:
+        return merged
+    return tensor_model_parallel_all_gather(merged, 0)
 
 
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
@@ -198,9 +354,22 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4IndexerCache = orig_cache
         object.__setattr__(self, "indexer_op", self._build_indexer_op())
+        # Every TP rank holds the whole indexer K cache and computes the same
+        # top-k. From TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS tokens on, each rank
+        # scores 1/TP of every sequence's positions and the ranks merge their
+        # top-k candidates (same indices, same order).
+        tp = get_tensor_model_parallel_world_size()
+        split_min = envs.TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS
+        object.__setattr__(self, "kv_split", tp if (split_min > 0 and tp > 1) else 1)
+        object.__setattr__(self, "kv_split_min_tokens", split_min)
+        if self.kv_split > 1:
+            object.__setattr__(
+                self, "indexer_split_ops", self._build_indexer_op(self.kv_split)
+            )
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
-    def _build_indexer_op(self):
+    def _build_indexer_op(self, kv_split: int = 1):
+        """The indexer op; with `kv_split` > 1, the (share, merge) op pair."""
         mesh = get_pallas_op_mesh()
         # Speculative verify windows all hold K + 1 tokens; the runner puts
         # them in `[distribution[0], distribution[1])`.
@@ -209,13 +378,14 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         kv_layout = indexer_kv_layout_name()
 
         wrapped_fn = functools.partial(
-            _indexer_jax,
+            _indexer_jax if kv_split == 1 else _indexer_split_jax,
             k=self.topk_tokens,
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
             uniform_q_len=uniform_q_len,
             kv_layout=kv_layout,
+            **({} if kv_split == 1 else {"kv_split": kv_split}),
         )
 
         _scale = (
@@ -228,6 +398,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
             f"{'' if uniform_q_len is None else f'_u{uniform_q_len}'}"
             f"_{kv_layout}"
+            f"{'' if kv_split == 1 else f'_split{kv_split}'}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:
@@ -250,15 +421,56 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 P(batch_axis),  # page_indices
                 P(),  # cu_q_lens
                 P(),  # distribution
+                *((P(),) if kv_split > 1 else ()),  # split rank
             ),
         )
+        out_width = self.topk_tokens * (1 if kv_split == 1 else 2)
 
         def _fake_indexer(q, *args, **kwargs):
             return torch.empty(
-                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
+                (q.shape[0], out_width), dtype=torch.int32, device=q.device
             )
 
         indexer_jax_op.register_fake(_fake_indexer)
+        if kv_split > 1:
+            merge_op = pallas.jax_op(
+                f"pallas::deepseek_v4_indexer_merge_k{self.topk_tokens}_s{kv_split}",
+                functools.partial(
+                    _merge_kv_split_jax, k=self.topk_tokens, kv_split=kv_split
+                ),
+                mesh=mesh,
+                input_partition_specs=(P(), P()),
+            )
+
+            def _fake_merge(gathered, rank):
+                num_tokens = gathered.shape[0] // kv_split
+                if num_tokens % kv_split == 0:
+                    num_tokens //= kv_split
+                return torch.empty(
+                    (num_tokens, self.topk_tokens),
+                    dtype=torch.int32,
+                    device=gathered.device,
+                )
+
+            merge_op.register_fake(_fake_merge)
+            a2a_merge_op = pallas.jax_op(
+                f"pallas::deepseek_v4_indexer_merge_a2a_k{self.topk_tokens}_s{kv_split}",
+                functools.partial(
+                    _merge_kv_split_a2a_jax, k=self.topk_tokens, kv_split=kv_split
+                ),
+                mesh=mesh,
+                input_partition_specs=(P(),),
+            )
+
+            def _fake_merge_a2a(exchanged):
+                return torch.empty(
+                    (exchanged.shape[0] // kv_split, self.topk_tokens),
+                    dtype=torch.int32,
+                    device=exchanged.device,
+                )
+
+            a2a_merge_op.register_fake(_fake_merge_a2a)
+            indexer_jax_op = (indexer_jax_op, merge_op, a2a_merge_op)
 
         _indexer_op_cache[op_name] = indexer_jax_op
         return indexer_jax_op
@@ -307,7 +519,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         idx_q_start_loc = attn_metadata.query_start_loc
         idx_req_dist = attn_metadata.request_distribution
 
-        return self.indexer_op(
+        args = (
             q,
             positions,
             rotary_emb.cos_sin_cache,
@@ -317,4 +529,16 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             idx_block_tables,
             idx_q_start_loc,
             idx_req_dist,
+        )
+        if self.kv_split == 1 or q.shape[0] < self.kv_split_min_tokens:
+            return self.indexer_op(*args)
+        share_op, merge_op, a2a_merge_op = self.indexer_split_ops
+        rank = tp_rank_as_data(get_tp_group(), q.device)
+        return merge_kv_split_shares(
+            share_op(*args, rank),
+            merge_op,
+            rank,
+            self.kv_split,
+            a2a_merge_op if envs.TPU_DSV4_INDEXER_KV_SPLIT_A2A else None,
+            get_tp_group(),
         )

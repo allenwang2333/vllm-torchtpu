@@ -108,8 +108,11 @@ def _mla_ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     batch_size: int = 1,
+    bkv_prefetch: str = "after_compute",
+    fast_dma: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
+    assert bkv_prefetch in ("after_compute", "after_wait")
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
     total_num_pages, num_slots, kv_packing, lkv_dim = cache_kv_hbm_ref.shape
@@ -215,7 +218,34 @@ def _mla_ragged_paged_attention_kernel(
             dma_bkv_sz = jnp.clip(kv_left, 0, bkv_sz)
             page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
-            if not wait:
+            if not wait and fast_dma:
+
+                def page_copy(i, sz):
+                    page = page_indices_ref[page_indices_offset + i]
+                    _async_copy(
+                        reshaped_cache_hbm_ref.at[pl.ds(page * page_size, sz)],
+                        bkv_vmem_ref.at[pl.ds(i * page_size, sz)],
+                        sem,
+                        False,
+                    )
+
+                # Whole blocks issue static-size copies with no per-page clamping;
+                # only a sequence's last block walks its (non-empty) pages
+                # dynamically, and a disabled or exhausted fetch issues nothing.
+                @pl.when(kv_left >= bkv_sz)
+                def _full_block():
+                    for i in range(bkv_p):
+                        page_copy(i, page_size)
+
+                @pl.when(jnp.logical_and(kv_left > 0, kv_left < bkv_sz))
+                def _last_block():
+                    def body(i, carry):
+                        page_copy(i, jnp.minimum(kv_left - i * page_size, page_size))
+                        return carry
+
+                    lax.fori_loop(0, cdiv(kv_left, page_size), body, 0)
+
+            elif not wait:
                 # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
                 # utilize static for loop instead of dynamic for loop.
                 # Loop through all pages in a block
@@ -516,8 +546,21 @@ def _mla_ragged_paged_attention_kernel(
                     batch_start_seq_idx, bq_idx, bkv_idx, bkv_sem_idx
                 )
 
+                def prefetch_next_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(
+                        next_seq_idx,
+                        next_bkv_idx,
+                        next_bkv_sem_idx,
+                        enabled=next_seq_idx < end_seq_idx,
+                    )
+
                 # Wait for cur bkv
                 wait_fetch_bkv(batch_start_seq_idx, bkv_idx, bkv_sem_idx)
+                # The other buffer was consumed by the previous block, so the next
+                # block's copies can overlap this block's compute.
+                if bkv_prefetch == "after_wait":
+                    prefetch_next_bkv()
 
                 # Load bkv into vreg. There is no need to mask out invalid k/v entries,
                 # because the score of invalid Q.K^T pairs are masked (to be zero) in
@@ -539,13 +582,8 @@ def _mla_ragged_paged_attention_kernel(
                 # the scalar work of the per-page copies is scheduled alongside the
                 # vector work instead of in a region of its own; past the last block
                 # the copies are empty.
-                sem_ids_ref[1] = next_bkv_sem_idx
-                start_fetch_bkv(
-                    next_seq_idx,
-                    next_bkv_idx,
-                    next_bkv_sem_idx,
-                    enabled=next_seq_idx < end_seq_idx,
-                )
+                if bkv_prefetch == "after_compute":
+                    prefetch_next_bkv()
                 return (kv_lens_to_attend_segment,)
 
             # Wait for cur bq if not ready yet
@@ -674,21 +712,11 @@ def prepare_swa_inputs(
         constant_values=0,
     )
     num_l_heads = align_to(num_q_heads, 128)
-    swa_l = jnp.pad(
-        swa_l,
-        (
-            (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
-        ),
-        constant_values=0,
-    )
-    swa_m = jnp.pad(
-        swa_m,
-        (
-            (0, 0),
-            (0, num_l_heads - actual_num_q_heads),
-        ),
-        constant_values=0,
+    # l/m may arrive already lane-padded (the SWA kernel's own buffers); the
+    # kernel reads only the first num_q_heads lanes.
+    swa_l, swa_m = (
+        jnp.pad(x, ((0, 0), (0, num_l_heads - x.shape[1])), constant_values=0)
+        for x in (swa_l, swa_m)
     )
     return swa_accumution, swa_l, swa_m
 
@@ -727,6 +755,8 @@ def prepare_outputs(
         "num_queries_per_block",
         "vmem_limit_bytes",
         "decode_batch_size",
+        "bkv_prefetch",
+        "fast_dma",
     ),
 )
 def mla_ragged_paged_attention(
@@ -751,6 +781,8 @@ def mla_ragged_paged_attention(
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_batch_size: int = 8,
+    bkv_prefetch: str = "after_compute",
+    fast_dma: bool = False,
 ) -> jax.Array:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -775,6 +807,11 @@ def mla_ragged_paged_attention(
         mixed) cases.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       decode_batch_size: number of decode sequences to be batched in one block.
+      bkv_prefetch: when the next kv block's copies are issued: "after_compute"
+        (behind the current block's compute) or "after_wait" (as soon as the
+        current block has landed, so the copies overlap its compute).
+      fast_dma: whole kv blocks issue static-size page copies; empty fetches
+        issue none.
 
     Returns:
       The output of attention.
@@ -940,6 +977,8 @@ def mla_ragged_paged_attention(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     batch_size=batch_size,
+                    bkv_prefetch=bkv_prefetch,
+                    fast_dma=fast_dma,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),

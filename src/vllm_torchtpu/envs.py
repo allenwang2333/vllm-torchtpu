@@ -59,9 +59,12 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
+    TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS: int = 0
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
+    TPU_SAMPLER_FUSED_CHAIN: bool = False
+    TPU_SAMPLER_GRAPH_RNG: bool = False
     DP_SCHED_ENABLED: bool = False
     TPU_PREFILL_GATE_MIN_CADENCES: int = 0
     TPU_PREFILL_GATE_LOG_STEPS: int = 1000
@@ -101,12 +104,23 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_MERGED_EXCHANGE: bool = False
+    MOE_FUSED_EP_V2_ONEHOT_SCATTER: bool = False
+    MOE_FUSED_EP_V2_PALLAS_PLAN: bool = False
+    MOE_FUSED_EP_V2_DECODE_COMBINE: bool = False
+    MOE_FUSED_EP_V2_PALLAS_RESTORE: bool = False
+    MOE_FUSED_EP_V2_FUSED_SELECT: bool = False
     TPU_EXPERT_PLACEMENT: str = ""
     MOE_EXPERT_COUNT_TAP_DIR: str = ""
     MOE_EXPERT_COUNT_TAP_EVERY: int = 1000
     MOE_FUSED_EP_SHARED_BEFORE_KERNEL: bool = False
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_SMALL_ALL_REDUCE: bool = False
+    TPU_SMALL_ALL_REDUCE_MAX_ROWS: int = 0
+    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
@@ -116,8 +130,24 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_STREAMIDX_SPLIT_MIXED: bool = False
+    TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS: int = 0
+    TPU_DSV4_SC_TOPK_ONE_LAUNCH: bool = False
+    TPU_DSV4_SC_TOPK_COOP_MAX_ROWS: int = 0
+    TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS: int = 0
+    TPU_DSV4_INDEXER_KV_SPLIT_A2A: bool = False
+    TPU_DSV4_CSA_GATHER_NO_PAD: bool = False
+    TPU_DSV4_CSA_MASKED_DENSE_MAX_KV: int = 0
+    TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS: int = 512
+    TPU_DSV4_HCA_MIXED_Q_BLOCK: int = 32
+    TPU_DSV4_HCA_MLA_PIPELINED: bool = False
+    TPU_DSV4_SWA_PADDED_LM: bool = False
+    TPU_DSV4_FUSED_QKV_ROPE: bool = False
+    TPU_DSPARK_VOCAB_PARALLEL_MARKOV: bool = False
+    TPU_DSPARK_SHARDED_CONTEXT_KV: bool = False
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     VLLM_TPU_DSV4_INDEXER_KV_LAYOUT: str = "has"
+    VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL: bool = False
+    VLLM_TPU_DSV4_MHC_FUSE_NORM: bool = False
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -182,11 +212,18 @@ if TYPE_CHECKING:
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE: bool = False
+    VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    VLLM_TPU_SEGMENT_TOKENIZE_VERIFY: bool = False
+    TPU_BLOCK_HASH_REUSE: bool = False
+    TPU_BLOCK_HASH_REUSE_MAX_TOKENS: int = 33554432
+    TPU_REQUEST_TIMING_LOG: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    TPU_LM_HEAD_HBM: str = ""
 
 
 def env_with_choices(
@@ -237,6 +274,10 @@ def env_with_choices(
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
 DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
+# DeepSeek-V4 per-core decode linears at TP8 (attention TP, shared expert TP).
+FP8_LINEAR_PALLAS_DEFAULT_SITES = (
+    "attn.fused_wqa_wkv,attn.wq_b,attn.wo_b,shared_experts.gate_up_proj"
+)
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -621,6 +662,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
     "USE_PHASED_PROFILER": env_bool("USE_PHASED_PROFILER"),
+    # Phased profiler: prefill-carrying phases start a capture only on steps
+    # padded to at least this many tokens (0 = any step).
+    "TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS": env_int(
+        "TPU_PHASED_PROFILER_PREFILL_MIN_TOKENS", 0
+    ),
     # Kernel-iteration mode: split the compiled graph at the Pallas custom
     # ops, keep kernel sources out of the compile-cache key, and enable the
     # /reload_kernel endpoint so kernel edits apply to a running server
@@ -634,6 +680,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    # Non-greedy, grammar-free spec-verify steps run the logits gathers, bonus
+    # sampling, per-token parameter gathers and the rejection sampler as one
+    # compiled program instead of about ten. Same uniforms, same tokens.
+    "TPU_SAMPLER_FUSED_CHAIN": env_bool("TPU_SAMPLER_FUSED_CHAIN"),
+    # With TPU_SAMPLER_FUSED_CHAIN: draw the chain's uniforms inside that
+    # program instead of as eager programs before it. Dynamo cannot take a
+    # torch.Generator, so the sampling generator becomes the device's default
+    # generator, seeded once from model_config.seed like the dedicated one; a
+    # compiled torch.rand on it yields the eager draw's bits, so the stream is
+    # unchanged as long as nothing else draws from the default generator.
+    "TPU_SAMPLER_GRAPH_RNG": env_bool("TPU_SAMPLER_GRAPH_RNG"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # DpPrefillGateScheduler: consecutive cadence-aligned steps that must exhaust
@@ -798,6 +855,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # Decode buckets of fused EP MoE v2 (kernels/fused_moe/v2/layer.py
+    # SMALL_BATCH_LOCAL_TOKENS): carry the routing exchange inside the
+    # activation all-gather (needs the sharded plan), and build the slab
+    # tables by TensorCore one-hot rather than SparseCore scatter, or build
+    # the whole routing plan in one Pallas call (needs the sharded plan), and
+    # sum the arrivals in one Pallas call rather than two SparseCore gathers.
+    "MOE_FUSED_EP_V2_MERGED_EXCHANGE": env_bool("MOE_FUSED_EP_V2_MERGED_EXCHANGE"),
+    "MOE_FUSED_EP_V2_ONEHOT_SCATTER": env_bool("MOE_FUSED_EP_V2_ONEHOT_SCATTER"),
+    "MOE_FUSED_EP_V2_PALLAS_PLAN": env_bool("MOE_FUSED_EP_V2_PALLAS_PLAN"),
+    "MOE_FUSED_EP_V2_DECODE_COMBINE": env_bool("MOE_FUSED_EP_V2_DECODE_COMBINE"),
+    # Gather the TP replicas' routed rows back with the small Pallas
+    # all-gather (kernels/experimental/small_collectives/all_gather.py).
+    "MOE_FUSED_EP_V2_PALLAS_RESTORE": env_bool("MOE_FUSED_EP_V2_PALLAS_RESTORE"),
+    # Fold the score-bias add and the row-routes mask into the top-k selector.
+    "MOE_FUSED_EP_V2_FUSED_SELECT": env_bool("MOE_FUSED_EP_V2_FUSED_SELECT"),
     # A JSON file naming, per MoE layer, which global experts each EP rank
     # holds and in what slot order (expert_placement.py). Empty: the
     # checkpoint's contiguous blocks.
@@ -833,6 +905,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
+    # Sum small bf16 TP all-reduces with the Pallas two-shot kernel
+    # (kernels/experimental/small_collectives) over the TP group's cores of the
+    # expert-parallel mesh, instead of XLA's all-reduce. Needs an EP mesh.
+    "TPU_SMALL_ALL_REDUCE": env_bool("TPU_SMALL_ALL_REDUCE"),
+    # Largest block, in rows, the kernel takes; XLA sums larger ones inside the
+    # same op. 0 keeps small_all_reduce_op.MAX_ROWS.
+    "TPU_SMALL_ALL_REDUCE_MAX_ROWS": env_nonnegative_int(
+        "TPU_SMALL_ALL_REDUCE_MAX_ROWS", 0
+    ),
+    # Per-channel FP8 dense linears at decode token counts (<= fp8_skinny.MAX_M rows)
+    # run as the weight-streaming Pallas kernel (kernels/quantized_matmul/
+    # fp8_skinny.py) instead of XLA's quantize + fp8 dot, on the layers named by
+    # TPU_FP8_LINEAR_PALLAS_SITES whose (K, N) has a measured tiling. Outputs differ
+    # from the XLA path (exact f32 accumulation): tolerance-tier numerics.
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    # Comma-separated layer-prefix suffixes, "."-bounded, e.g. "attn.wo_b".
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES", FP8_LINEAR_PALLAS_DEFAULT_SITES
+    ),
+    # Of the TPU_FP8_LINEAR_PALLAS sites, those whose kernel weight operand is
+    # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
+    # Same arithmetic, bit-identical outputs; placement only.
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
     # Extra token buckets added to the default list of buckets.
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
@@ -860,6 +955,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overlaps the second piece's scoring without scoring any extra q block.
     # Ignored when TPU_STREAMIDX_CHUNK_TOKENS chunks the call.
     "TPU_STREAMIDX_SPLIT_MIXED": env_bool("TPU_STREAMIDX_SPLIT_MIXED"),
+    # Smallest token bucket TPU_STREAMIDX_SPLIT_MIXED splits. Below it a batch
+    # without a mixed sequence would score and top-k an empty second piece.
+    "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS": env_int(
+        "TPU_STREAMIDX_SPLIT_MIXED_MIN_TOKENS", 0
+    ),
+    # Run the indexer's SparseCore top-k as one program: its by-length pass
+    # and the cooperative pass for rows too long for one subcore, which is
+    # otherwise a second launch even when no row needs it.
+    "TPU_DSV4_SC_TOPK_ONE_LAUNCH": env_bool("TPU_DSV4_SC_TOPK_ONE_LAUNCH"),
+    # Token buckets up to which the indexer's SparseCore top-k splits every
+    # row over a group of subcores (the cooperative pass) instead of giving
+    # each row one subcore: a decode batch holds a few long rows. 0 = off.
+    "TPU_DSV4_SC_TOPK_COOP_MAX_ROWS": env_int("TPU_DSV4_SC_TOPK_COOP_MAX_ROWS", 0),
+    # Token buckets from which the DSv4 indexer splits each sequence's
+    # compressed positions over the TP ranks (each scores its share of the
+    # replicated K cache, then the ranks merge their top-k). 0 = off.
+    "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS": env_int(
+        "TPU_DSV4_INDEXER_KV_SPLIT_MIN_TOKENS", 0
+    ),
+    # Indexer kv split: send each rank only the shares of its own token block
+    # (all-to-all) instead of all-gathering every rank's whole share.
+    "TPU_DSV4_INDEXER_KV_SPLIT_A2A": env_bool("TPU_DSV4_INDEXER_KV_SPLIT_A2A"),
+    # DSv4 CSA: size the SparseCore KV gather's per-subcore chunk so its output
+    # needs no padding rows, and hence no slice copy after it.
+    "TPU_DSV4_CSA_GATHER_NO_PAD": env_bool("TPU_DSV4_CSA_GATHER_NO_PAD"),
+    # CSA prefill: attend sequences whose compressed KV length is at most this
+    # many positions with the masked-dense kernel (`csa_masked_dense`) instead
+    # of the per-token sparse gather. 0 disables; else a multiple of 4096.
+    "TPU_DSV4_CSA_MASKED_DENSE_MAX_KV": env_int("TPU_DSV4_CSA_MASKED_DENSE_MAX_KV", 0),
+    # DSv4 HCA attention: query tokens per block in the prefill (mixed) pass.
+    # Bit-identical for any value; larger blocks re-read the KV less often.
+    "TPU_DSV4_HCA_MIXED_Q_BLOCK": env_int("TPU_DSV4_HCA_MIXED_Q_BLOCK", 32),
+    # Smallest token bucket compiled with the masked-dense route.
+    "TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS": env_int(
+        "TPU_DSV4_CSA_MASKED_DENSE_MIN_TOKENS", 512
+    ),
+    # DSv4 HCA attention: issue the next kv block's page copies as soon as the
+    # current block lands (overlapping its compute), as static-size copies.
+    # Same arithmetic, bit-identical.
+    "TPU_DSV4_HCA_MLA_PIPELINED": env_bool("TPU_DSV4_HCA_MLA_PIPELINED"),
+    # DSv4 HCA/CSA layers: the SWA kernel hands its softmax l/m to the
+    # compressed-KV kernel at its lane-padded width, from uninitialized buffers,
+    # instead of zero-filling them and slicing/re-padding (two XLA ops per layer).
+    # Real rows are bit-identical.
+    "TPU_DSV4_SWA_PADDED_LM": env_bool("TPU_DSV4_SWA_PADDED_LM"),
+    # DSv4 attention: q RMSNorm+RoPE and kv RoPE as one kernel (one launch and
+    # one cos/sin gather instead of two). Bit-identical.
+    "TPU_DSV4_FUSED_QKV_ROPE": env_bool("TPU_DSV4_FUSED_QKV_ROPE"),
+    # DSpark greedy drafting: shard the Markov head over the vocabulary and
+    # exchange per-rank (max, argmax) pairs instead of reading the replicated
+    # full-vocabulary weight at every draft position.
+    "TPU_DSPARK_VOCAB_PARALLEL_MARKOV": env_bool("TPU_DSPARK_VOCAB_PARALLEL_MARKOV"),
+    # DSpark context-KV step: each tensor-parallel rank computes its 1/tp of
+    # the replicated main_proj columns and all-gathers them, and one matmul
+    # computes only the KV columns of every draft layer's fused_wqa_wkv.
+    "TPU_DSPARK_SHARDED_CONTEXT_KV": env_bool("TPU_DSPARK_SHARDED_CONTEXT_KV"),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
@@ -884,6 +1035,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT": env_with_choices(
         "VLLM_TPU_DSV4_INDEXER_KV_LAYOUT", "has", ["has", "sal"]
     ),
+    # DeepSeek-V4 mHC: compute the post/comb gates (sigmoid, softmax and
+    # Sinkhorn) inside the Pallas pre / fused seam kernels instead of as an
+    # XLA epilogue of ~130 tiny ops per seam.
+    "VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL": env_bool("VLLM_TPU_DSV4_MHC_GATES_IN_KERNEL"),
+    # DeepSeek-V4 mHC: the pre / fused seam kernels also apply the
+    # sublayer's attn_norm / ffn_norm RMSNorm to the layer input they emit.
+    "VLLM_TPU_DSV4_MHC_FUSE_NORM": env_bool("VLLM_TPU_DSV4_MHC_FUSE_NORM"),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),
@@ -1097,6 +1255,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enables steady-state fast path token substitution (direct device slicing
     # and persistent index caching) in TPUModelRunner._apply_async_token_substitution.
     "VLLM_TPU_FAST_TOKEN_SUBSTITUTION": env_bool("VLLM_TPU_FAST_TOKEN_SUBSTITUTION"),
+    # API server: tokenize chat prompts piecewise between added tokens and
+    # cache message-body pieces across turns (segment_tokenize.py). Exact;
+    # raises for ineligible tokenizers.
+    "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
+    # Token budget of that cache (~12 B/token: id pointers plus piece text).
+    "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
+        "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Also run the full encode for every prompt and raise if the ids differ
+    # (validation runs only: it costs the full encode again).
+    "VLLM_TPU_SEGMENT_TOKENIZE_VERIFY": env_bool("VLLM_TPU_SEGMENT_TOKENIZE_VERIFY"),
+    # EngineCore: copy a new prompt's prefix-cache block hashes from the stored
+    # prompt sharing the longest token prefix (core/block_hash_reuse.py).
+    "TPU_BLOCK_HASH_REUSE": env_bool("TPU_BLOCK_HASH_REUSE"),
+    # Prompt tokens that store keeps (~8.5 B/token: ids plus hash references).
+    "TPU_BLOCK_HASH_REUSE_MAX_TOKENS": env_int(
+        "TPU_BLOCK_HASH_REUSE_MAX_TOKENS", 33554432
+    ),
+    # API server: log each finished request's TTFT split (request_timing_log.py).
+    "TPU_REQUEST_TIMING_LOG": env_bool("TPU_REQUEST_TIMING_LOG"),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
     # TODO: support the two cases that still take the per-step loop:
@@ -1126,6 +1304,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # The LM head (vocab-parallel `F.linear(x, W)`, W bf16 [vocab/tp, hidden] N-major)
+    # at <= 64 logits rows runs as a Pallas kernel that streams W from HBM through a
+    # 3-slot VMEM ring (kernels/lm_head_hbm.py; GLM-5.2 TP16 [9680, 6144] on tpu7x:
+    # ~36.6-37.3 us vs XLA's 44-47 us per call). Other row counts keep XLA's dot.
+    # "drafter": only an MTP/eagle draft's passes (the draft gets its own head object
+    # sharing the target's weight) -- drafts only, lossless for the target
+    # distribution. "all": also the target sampler's logits. NOT bit-identical: ~1-2
+    # in 10^4 logits differ from XLA's dot by 1-4 bf16 ulp (MXU accumulation order),
+    # so "all" needs an accuracy check. "" (default): off.
+    "TPU_LM_HEAD_HBM": env_str("TPU_LM_HEAD_HBM", ""),
 }
 
 

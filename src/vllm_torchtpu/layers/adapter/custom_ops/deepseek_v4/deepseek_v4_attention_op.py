@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_masked_dense
 from vllm_torchtpu.kernels.deepseek_v4.core_attention.mla import (
     mla_ragged_paged_attention,
 )
@@ -40,6 +41,10 @@ from vllm_torchtpu.utils import align_to
 logger = init_logger(__name__)
 
 BATCH_AXIS = None
+
+# Masked-dense CSA tiling, measured on tpu7x at T2048 with 16 heads per core.
+MASKED_DENSE_KV_PAGES_PER_BLOCK = 4
+MASKED_DENSE_QUERIES_PER_BLOCK = 64
 
 
 def _run_swa(
@@ -58,11 +63,13 @@ def _run_swa(
     swa_only: bool,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
+    padded_lm_out: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
     When a compressed-KV pass follows, the output is left unnormalized so
-    that pass can fold `swa_l` / `swa_m` into its own softmax accumulation.
+    that pass can fold `swa_l` / `swa_m` into its own softmax accumulation;
+    `padded_lm_out` hands those over lane-padded (see the kernel).
     """
     if sw_cache.shape[0] == 0:
         # Profiling-shape trace: no cache to attend over.
@@ -91,6 +98,7 @@ def _run_swa(
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
         chunk_prefill_size=verify_q_len,
+        padded_lm_out=padded_lm_out and not swa_only,
     )
 
 
@@ -118,12 +126,24 @@ def _attention_hca(
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
+    hca_mixed_q_block: int = 32,
+    hca_pipelined: bool = False,
+    swa_padded_lm: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
 
     `verify_q_len`: requests [distribution[0], distribution[1]) are speculative
     verify windows of exactly this many tokens; they run the kernels' static
     query-length pass instead of the mixed one.
+
+    `hca_mixed_q_block`: query tokens per block of the HCA kernel's mixed
+    (prefill) pass. Rows are independent and the KV blocking is unchanged, so
+    any value gives bit-identical results; larger blocks re-stream the KV less.
+
+    `hca_pipelined`: the HCA kernel copies the next kv block while computing on
+    the current one, with static-size page copies (same arithmetic).
+    `swa_padded_lm`: hand the SWA l/m to the next kernel lane-padded, without
+    the zero-fill and slice/pad copies (same arithmetic on real rows).
     """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
@@ -148,6 +168,7 @@ def _attention_hca(
         swa_only=swa_only,
         non_causal_block=non_causal_block,
         verify_q_len=verify_q_len,
+        padded_lm_out=swa_padded_lm,
     )
 
     if swa_only:
@@ -173,8 +194,15 @@ def _attention_hca(
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(32, 64, 64),
-        num_queries_per_block=(1, 32, 32),
+        # Small buckets keep 32: their mixed pass holds few query rows.
+        num_queries_per_block=(
+            1,
+            32,
+            hca_mixed_q_block if q.shape[0] >= 512 else 32,
+        ),
         chunk_prefill_size=verify_q_len,
+        bkv_prefetch="after_wait" if hca_pipelined else "after_compute",
+        fast_dma=hca_pipelined,
     )
     return output, updated_sw_cache
 
@@ -203,11 +231,19 @@ def _attention_csa(
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
     verify_q_len: int | None = None,
+    csa_gather_no_pad: bool = False,
+    masked_dense_max_kv: int = 0,
+    masked_dense_min_tokens: int = 512,
+    swa_padded_lm: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
 
     `verify_q_len` as in `_attention_hca`; the sparse gather is per token and
     reads only distribution[2].
+
+    `masked_dense_max_kv` > 0 (buckets of at least `masked_dense_min_tokens`):
+    the trailing sequences whose compressed KV length is at most that take
+    `csa_masked_dense`, the rest the sparse gather.
     """
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
@@ -230,6 +266,7 @@ def _attention_csa(
         swa_only=False,
         non_causal_block=non_causal_block,
         verify_q_len=verify_q_len,
+        padded_lm_out=swa_padded_lm,
     )
 
     if two_caches_same_buffer:
@@ -239,6 +276,28 @@ def _attention_csa(
     # top-k then completes behind the q projection and SWA, which do not need
     # it, instead of stalling the TensorCore before them.
     extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+
+    if masked_dense_max_kv > 0 and q.shape[0] >= masked_dense_min_tokens:
+        output = csa_masked_dense.split_attention(
+            q,
+            main_cache_kv,
+            main_cache_rope,
+            extra,
+            main_kv_lens,
+            main_page_indices,
+            main_cu_q_lens,
+            main_distribution,
+            attention_sinks,
+            swa_output,
+            swa_l,
+            swa_m,
+            sm_scale=sm_scale,
+            max_kv_len=masked_dense_max_kv,
+            num_kv_pages_per_block=MASKED_DENSE_KV_PAGES_PER_BLOCK,
+            num_queries_per_block=MASKED_DENSE_QUERIES_PER_BLOCK,
+            gather_no_pad=csa_gather_no_pad,
+        )
+        return output, updated_sw_cache
 
     output = sparse_ragged_paged_attention(
         q=q,
@@ -258,6 +317,7 @@ def _attention_csa(
         # chunk's attention); batches of 8 win throughout.
         gather_and_attention_chunk_size=32 if q.shape[0] <= 128 else 64,
         attention_kernel_batch_size=8,
+        gather_no_pad=csa_gather_no_pad,
     )
     return output, updated_sw_cache
 

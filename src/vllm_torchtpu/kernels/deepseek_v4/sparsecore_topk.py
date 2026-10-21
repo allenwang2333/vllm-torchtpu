@@ -50,6 +50,10 @@ MAX_SLICE_WORDS = 32 * 1024
 # Row buffer of the by-length path: one subcore's whole row, single 32-bit
 # words. Largest that fits the tile memory next to the other scratch.
 BY_LENGTH_SLOT_WORDS = 124 * 1024
+# Row buffer of `_sc_topk_one_launch`, by `return_scores`: smaller, as the
+# cooperative phase's scratch has to fit next to it in the same SparseCore
+# memory (measured: 124K words fails to allocate, as does 120K with scores).
+ONE_LAUNCH_SLOT_WORDS = {False: 120 * 1024, True: 116 * 1024}
 # Unroll factor for the loops that walk the whole resident slice.
 SCAN_UNROLL = 8
 
@@ -103,8 +107,11 @@ def _topk_body(
     local_idxs_hbm: Any = None,
     dyn_lengths_vmem: Any = None,
     row_words: int = 0,
+    payload_hbm: Any = None,
 ):
     dcp_merge = local_idxs_hbm is not None
+    # Winners are emitted as this array's entries instead of column numbers.
+    with_payload = payload_hbm is not None
     # Rows fetched by their own length into a `slice_len`-word buffer (p == 1).
     dyn = dyn_lengths_vmem is not None
     num_subcores = 16
@@ -220,6 +227,7 @@ def _topk_body(
         out_vmem: Any = None,
         keys_vmem: Any = None,
         local_idxs_vmem: Any = None,
+        payload_vmem: Any = None,
         *,
         w: Any = None,
         row_len: Any = None,
@@ -408,6 +416,8 @@ def _topk_body(
             if dcp_merge:
                 col_offset = local_idxs_vmem[pl.ds(i * LANES, LANES)]
                 sel = sel & (col_offset >= 0)
+            elif payload_vmem is not None:
+                col_offset = payload_vmem[pl.ds(base + i * LANES, LANES)]
             else:
                 col_offset = (
                     i * LANES + lane_iota if p == 1 else lo + i * LANES + lane_iota
@@ -683,6 +693,7 @@ def _topk_body(
                     rest_vmem[-1],
                     None,
                     rest_vmem[0] if dcp_merge else None,
+                    rest_vmem[0] if with_payload else None,
                 )
 
             out_specs = (
@@ -693,10 +704,13 @@ def _topk_body(
                 ),
             )
             extra_in = (local_idxs_hbm,) if dcp_merge else ()
+            extra_specs = out_specs if dcp_merge else ()
+            if with_payload:
+                extra_in, extra_specs = (payload_hbm,), in_specs[:1]
             pltpu.emit_pipeline(
                 pipeline_step_p1_idx,
                 grid=(num_waves,),
-                in_specs=(*in_specs, *out_specs) if dcp_merge else in_specs,
+                in_specs=(*in_specs, *extra_specs),
                 out_specs=out_specs,
             )(scores_hbm, lengths_hbm, *extra_in, out_hbm)
     else:
@@ -839,8 +853,12 @@ def _sc_topk_direct(
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    payload: jax.Array | None = None,  # i32[b, n]
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
+
+    With ``payload`` (``p == 1``, indices only), each winner is reported as
+    its ``payload`` entry instead of its column.
 
     When ``p == 1``, each subcore processes a full row independently.
     When ``p > 1``, groups of ``p`` subcores on the same SparseCore cooperatively
@@ -878,6 +896,12 @@ def _sc_topk_direct(
         lengths_in = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1))).reshape(-1)
 
     extra_inputs = ()
+    if payload is not None:
+        assert p == 1 and local_idxs is None and not return_scores
+        payload = payload.astype(jnp.int32)
+        if pad_b > 0 or pad_n > 0:
+            payload = jnp.pad(payload, ((0, pad_b), (0, pad_n)), constant_values=-1)
+        extra_inputs = (payload.reshape(-1),)
     if local_idxs is not None:
         local_words = local_idxs.astype(jnp.int32)
         if pad_b > 0:
@@ -937,11 +961,12 @@ def _sc_topk_direct(
         write_empty=write_empty,
         return_scores=return_scores,
     )
-    if local_idxs is not None:
+    if local_idxs is not None or payload is not None:
         orig_body = body_fn
+        extra_kw = "local_idxs_hbm" if payload is None else "payload_hbm"
 
-        def body_fn(scores, lengths, idx, *rest):
-            return orig_body(scores, lengths, *rest, local_idxs_hbm=idx)
+        def body_fn(scores, lengths, extra, *rest):
+            return orig_body(scores, lengths, *rest, **{extra_kw: extra})
 
     out = pl.kernel(
         body_fn,
@@ -1057,6 +1082,153 @@ def _sc_topk_by_length(
     return slots_2d
 
 
+def _sc_topk_one_launch(
+    words: jax.Array,  # i32[b, n] of f32 bits
+    k: int,
+    lengths: jax.Array,  # i32[b], clamped to n
+    *,
+    p: int,
+    write_empty: bool,
+    return_scores: bool,
+    scheduling_group_id: int | None,
+):
+    """`_sc_topk_by_length` then `_sc_topk_direct` in one SparseCore program.
+
+    Each phase runs the code its own kernel runs, on its own rows and into
+    its own outputs, so the selection is the same (the two select the same
+    columns in the same order, whichever takes a row); the cooperative phase
+    of a batch without long rows skips every wave, which saves the launch of
+    a second, idle, program. The phases share the row buffer, which the
+    cooperative phase needs only part of.
+    """
+    b, n = words.shape
+    sc = pltpu.get_tpu_info().sparse_core
+    assert sc is not None
+    cores = sc.num_cores * sc.num_subcores
+    slot_words = ONE_LAUNCH_SLOT_WORDS[return_scores]
+    is_long = lengths > slot_words
+
+    # By-length phase: one row per subcore, rows that fit `slot_words`.
+    waves_a = _cdiv(b, cores)
+    lengths_a = jnp.pad(jnp.where(is_long, 0, lengths), (0, waves_a * cores - b))
+    meta_a = _align_to(waves_a, LANES) + LANES
+    table_a = jnp.pad(
+        lengths_a.reshape(waves_a, cores).T, ((0, 0), (0, meta_a - waves_a))
+    ).reshape(-1)
+
+    # Cooperative phase: groups of p subcores per long row.
+    slice_len = n // p
+    waves_b = _cdiv(b, cores // p)
+    lengths_b = jnp.pad(jnp.where(is_long, lengths, 0), (0, waves_b * (cores // p) - b))
+    table_b = _coop_meta(lengths_b, n=n, p=p, num_waves=waves_b)
+    meta_b = table_b.shape[0] // cores
+    slots_b = _coop_slots(waves_b, slice_len)
+
+    slot_type = lambda rows: jax.ShapeDtypeStruct((rows * k,), jnp.int32)  # noqa: E731
+    out_type = (
+        slot_type(waves_a * cores),
+        slot_type(waves_a * cores) if return_scores else None,
+        slot_type(waves_b * cores // p),
+        slot_type(waves_b * cores // p) if return_scores else None,
+    )
+    scratch_types = (
+        pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32),  # rowbuf_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,  # keybuf
+        pltpu.VMEM((p * NUM_BUCKETS + LANES,), jnp.int32),  # peer_hist_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32),  # peer_idx_vmem
+        pltpu.VMEM((k + LANES,), jnp.int32) if return_scores else None,
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * NUM_BUCKETS,), jnp.int32),
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * LANES,), jnp.int32),
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32),
+        pltpu.VMEM_SHARED((2 * sc.num_subcores * k,), jnp.int32)
+        if return_scores
+        else None,
+        pltpu.VMEM((meta_b,), jnp.int32),  # meta_vmem
+        pltpu.VMEM((slot_words,), jnp.int32),  # row buffer of both phases
+        pltpu.SemaphoreType.DMA((slots_b,)),
+        pltpu.VMEM((meta_a,), jnp.int32),  # dyn_lengths_vmem
+    )
+
+    def body(scores_hbm, tab_a_hbm, tab_b_hbm, out_a, keys_a, out_b, keys_b, *sc_):
+        (glob, rowbuf, keybuf, peer_hist, peer_idx, peer_key, *shared) = sc_[:10]
+        meta_vmem, rows_vmem, sems, dyn_vmem = sc_[10:]
+        common = dict(b=b, n=n, k=k, return_scores=return_scores)
+        _topk_body(
+            scores_hbm,
+            tab_a_hbm,
+            out_a,
+            keys_a,
+            glob,
+            rowbuf,
+            keybuf,
+            *(None,) * 8,
+            rows_vmem,
+            sems,
+            p=1,
+            slice_len=slot_words,
+            num_waves=waves_a,
+            meta_words=meta_a,
+            write_empty=write_empty,
+            dyn_lengths_vmem=dyn_vmem,
+            row_words=n,
+            **common,
+        )
+        # Rows it does not own are never read, so it need not write them.
+        _topk_body(
+            scores_hbm,
+            tab_b_hbm,
+            out_b,
+            keys_b,
+            glob,
+            rowbuf,
+            keybuf,
+            peer_hist,
+            peer_idx,
+            peer_key,
+            *shared,
+            meta_vmem,
+            rows_vmem.at[pl.ds(0, slots_b * slice_len)],
+            sems,
+            p=p,
+            slice_len=slice_len,
+            num_waves=waves_b,
+            meta_words=meta_b,
+            write_empty=False,
+            **common,
+        )
+
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=sc.num_cores,
+        num_subcores=sc.num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    out = pl.kernel(
+        body,
+        out_type=out_type,
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True, needs_layout_passes=False
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        name=f"sc_topk_bylen_coop_b{b}_n{n}_k{k}_p{p}",
+    )(words.reshape(-1), table_a, table_b)
+    if scheduling_group_id is not None:
+        out = xla_metadata.set_xla_metadata(
+            out, _scheduling_group_id=scheduling_group_id
+        )
+    out_a, keys_a, out_b, keys_b = cast(tuple, out)
+    by_length = out_a.reshape(-1, k)[:b]
+    cooperative = out_b.reshape(-1, k)[:b]
+    if return_scores:
+        by_length = (by_length, keys_a.reshape(-1, k)[:b])
+        cooperative = (cooperative, keys_b.reshape(-1, k)[:b])
+    return jax.tree.map(
+        lambda c, s: jnp.where(is_long[:, None], c, s), cooperative, by_length
+    )
+
+
 def _pick_partition(b: int, n: int, k: int) -> int:
     """Picks the power-of-two partition factor P (1..16) per row to maximize
 
@@ -1090,6 +1262,8 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "one_launch",
+        "coop_max_rows",
     ),
 )
 def sparsecore_topk(
@@ -1100,6 +1274,8 @@ def sparsecore_topk(
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    one_launch: bool = False,
+    coop_max_rows: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -1110,6 +1286,15 @@ def sparsecore_topk(
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
+
+    ``one_launch``: when rows can be too long for one subcore, run the
+    by-length and cooperative passes as one SparseCore program
+    (`_sc_topk_one_launch`) instead of two.
+
+    ``coop_max_rows``: when ``b`` is at most this, every row takes the
+    cooperative path, split over ``p`` subcores by its own length, instead of
+    one subcore per row. A decode batch has only a handful of long rows, which
+    otherwise leave most subcores idle.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -1147,6 +1332,26 @@ def sparsecore_topk(
         else lax.bitcast_convert_type(scores, jnp.int32)
     )
     lengths = jnp.minimum(row_lengths, n)
+    if b <= coop_max_rows:
+        return _sc_topk_direct(
+            words,
+            k,
+            lengths,
+            p=p,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+        )
+    if one_launch and n > ONE_LAUNCH_SLOT_WORDS[return_scores] and n % (p * LANES) == 0:
+        return _sc_topk_one_launch(
+            words,
+            k,
+            lengths,
+            p=p,
+            write_empty=write_empty_rows,
+            return_scores=return_scores,
+            scheduling_group_id=scheduling_group_id,
+        )
     by_length = _sc_topk_by_length(
         words,
         k,
