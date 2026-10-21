@@ -27,6 +27,23 @@ ROUTER_BLOCK_ROWS: dict[RouterTuningKey, int] = {
 }
 
 
+# TPU7x / JAX 0.11.2: the masked ID sum removes a separate HBM gather.
+# Complete EP8 execution excluding entry barriers: 467.58 -> 450.57 us
+# and 491.58 -> 473.43 us, with bit-exact outputs at both seeds.
+FUSED_EXPERT_ID_MAP_KEYS = frozenset({RouterTuningKey("TPU7x", 288, 384, 6, True)})
+
+
+def use_fused_expert_id_map(key: RouterTuningKey) -> bool:
+    """Fuse the ID lookup only for the measured decode selector geometry."""
+    if key in FUSED_EXPERT_ID_MAP_KEYS:
+        return True
+    logger.warning_once(
+        "[fused_ep_moe_v2] No fused expert-map tuning for %s; using separate lookup",
+        key,
+    )
+    return False
+
+
 def get_router_block_rows(key: RouterTuningKey, max_default_rows: int) -> int:
     """Use a measured selector tile or the existing power-of-two divisor."""
     tile = ROUTER_BLOCK_ROWS.get(key)

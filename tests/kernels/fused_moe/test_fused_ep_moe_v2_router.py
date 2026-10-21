@@ -36,6 +36,9 @@ on eight TPUs. The decode tile regression below also checks Mosaic lowering
 when a TPU is available.
 """
 
+from dataclasses import replace
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 
@@ -108,6 +111,63 @@ def test_weights_come_from_the_second_table(rows, block_rows):
     ref_w, ref_i = _reference(scores, weights)
     np.testing.assert_array_equal(i, ref_i)
     np.testing.assert_array_equal(w, ref_w)
+
+
+@pytest.mark.parametrize("rows,block_rows", [(32, 32), (288, 288), (576, 288)])
+@pytest.mark.parametrize("separate_weights", [False, True])
+@pytest.mark.parametrize("map_dtype", [jnp.int32, jnp.uint32])
+def test_fused_expert_map_preserves_logical_ties_and_weight_bits(
+    rows, block_rows, separate_weights, map_dtype
+):
+    rng = np.random.default_rng(rows)
+    scores = rng.integers(0, 4, (rows, 384)).astype(np.float32)
+    scores[0], scores[1], scores[2] = np.nan, -np.inf, np.inf
+    weights = rng.normal(size=scores.shape).astype(np.float32)
+    weights[3] = np.copysign(np.zeros(384, np.float32), np.arange(384) % 2 - 0.5)
+    weight_scores = jnp.asarray(weights) if separate_weights else None
+    # Reverse physical IDs so a physical-index tie breaker would be wrong.
+    mapping = jnp.arange(383, -1, -1, dtype=map_dtype)
+    kwargs = dict(topk=6, block_rows=block_rows, weight_scores=weight_scores)
+    ref_w, logical_ids = router_ops.pallas_select(
+        jnp.asarray(scores), interpret=True, **kwargs
+    )
+    actual_w, physical_ids = router_ops.pallas_select(
+        jnp.asarray(scores), expert_id_map=mapping, interpret=True, **kwargs
+    )
+    np.testing.assert_array_equal(physical_ids, np.asarray(mapping)[logical_ids])
+    np.testing.assert_array_equal(
+        np.asarray(actual_w).view(np.uint32), np.asarray(ref_w).view(np.uint32)
+    )
+
+
+@pytest.mark.parametrize(
+    "mapping", [np.zeros(383, np.int32), np.zeros(384, np.float32)]
+)
+def test_fused_expert_map_rejects_invalid_shape_or_dtype(mapping):
+    with pytest.raises(ValueError, match="one integer per expert"):
+        router_ops.pallas_select(
+            jnp.zeros((32, 384)),
+            topk=6,
+            block_rows=32,
+            expert_id_map=jnp.asarray(mapping),
+            interpret=True,
+        )
+
+
+def test_fused_expert_map_dispatch_keeps_unmeasured_shapes(monkeypatch):
+    from vllm_torchtpu.kernels.fused_moe.v2 import tuned_block_sizes as tuning
+
+    monkeypatch.setattr(tuning, "logger", Mock())
+    key = tuning.RouterTuningKey("TPU7x", 288, 384, 6, True)
+    assert tuning.use_fused_expert_id_map(key)
+    for changed in (
+        replace(key, rows=2048),
+        replace(key, separate_weights=False),
+        replace(key, device_kind="TPU v6e"),
+        replace(key, experts=256),
+        replace(key, topk=8),
+    ):
+        assert not tuning.use_fused_expert_id_map(changed)
 
 
 @pytest.mark.parametrize("separate_weights", [False, True])

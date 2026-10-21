@@ -7,7 +7,9 @@ unmet. The serving measurements below cover an FP4 MoE height ladder for the
 observed EP8 geometry and a joint request/scorer configuration for the
 48-request full-context indexer, whole-batch router selection, WO_A row chunks
 and the normalized mHC output placement. An optional calibrated expert
-placement reaches 41.635 ms in the latest full-serving run, still above target.
+placement reaches 41.635 ms in its full-serving run, still above target. A later
+communication-threshold trial shows no useful improvement. Selector/map fusion
+has passed isolated EP8 checks but awaits a full-serving measurement.
 
 ## Configuration and provenance
 
@@ -79,8 +81,9 @@ peaks. The joint indexer increases its isolated executable's temporary HBM by
 12 MiB (42390016 to 54658304 bytes). Weight formats are unchanged; the optional
 expert placement moves logical experts between ranks.
 Startup includes loading, compilation and warmup; it is not a weight-load
-benchmark. Prefill, mixed batches and model-quality benchmarks were not run
-for these changes.
+benchmark. Prefill and mixed batches were not benchmarked for these changes.
+The later GSM8K comparison below isolates optional expert placement; it does
+not compare all accumulated changes against the original branch base.
 
 At the reference fixed acceptance of 3.47, a 35 ms complete step would yield
 9518 output tokens/chip/s; 14000 requires at most 23.794 ms. Counting all six
@@ -993,3 +996,129 @@ completed comparisons; it is not a wholly successful sweep.
 Source, HLO, runtime versions, output checks and device events are preserved in
 `results/moe-compiler-flags-evidence.tgz`, 1002313 bytes, verified SHA-256
 `7f468c3643c4dce755f838d8cfa385cefee34090cbf110919a4dae0df525191b`.
+
+The full-serving follow-up, `exp-v4y0rtvuqj` / `art-mq2e6ibq2f`, uses source
+`c5c1abe8` and the same optional placement map as `exp-gjb1967wya`. Its
+1 MiB threshold gives 41.625856 ms main forward versus 41.635182 ms previously,
+which does not establish a useful gain. Host step medians are 51.431451,
+51.439920 and 51.254165 ms; fixed-acceptance rates are 6477, 6476 and
+6499 tokens/physical-chip/s, below the previous 6637, 6620 and 6646.
+Observed accepted-plus-bonus rates are 7361, 7099 and 7242. Zero remains the
+default threshold. The separate profile, three formal rounds and startup
+audits all completed; neither performance target was reached.
+The profile covers all 40 main-model layers (30 mapped, ten original).
+Paired subtraction of entry barriers gives 40.554884 ms, compared with
+40.492454 ms previously; this diagnostic also shows no improvement. Resident
+HBM is 48.99–49.03 GiB/logical device and startup is 1025.946 seconds.
+The verified `results/hybrid-offload-serving-evidence.tgz` is 43997150 bytes,
+SHA-256 `b4703c0b3272841a8e1947b22f61c0fe3b62f32c8e74360ee4e36a6359a3c3ea`.
+
+The same job reran the scheduler sweep with its required sparse-core collective
+aggregator enabled, resolving the earlier compilation failure. All eight cases
+completed with bit-exact outputs. At seeds 1085/1086, adding scheduling flags
+changes barrier-subtracted device time from 468.386/554.657 to
+468.899/554.654 microseconds at the zero threshold, and from 458.370/544.667
+to 458.438/544.961 microseconds at 1 MiB. Inclusive module time and synchronized
+host latency do not show a consistent benefit. These scheduler flags are not
+promoted. The verified `results/moe-scheduler-v2-evidence.tgz` is 1338665 bytes,
+SHA-256 `ddca058f3490f817aa4b1ed4634fe080edcb095b27064d8b5e5abf1613e36e4a`.
+
+## Expert placement quality comparison
+
+`exp-cxneias4qy` / `art-ihfbeop646`, source `883fed02`, ran sequential
+baseline and optional-placement servers on the same rig. Each completed one
+formal C384 serving round, then two identical GSM8K repetitions before shutdown.
+The frozen test dataset has SHA-256
+`3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`.
+The fixed sample contains 256 questions selected with seed zero; the request
+hash is `d62c5beee42461673a41fa8f9914d8b3ce6c78b5d15b242f9d66a2d0130b55f6`.
+Both modes use zero-shot chat, temperature/generation seed zero, disabled
+thinking, concurrency 32 and a 2048-token output limit.
+
+| Mode | Round 1 correct | Round 2 correct | Failures / truncations |
+| --- | ---: | ---: | ---: |
+| Baseline | 248/256 | 248/256 | 0 / 0 |
+| Placement | 248/256 | 249/256 | 0 / 0 |
+
+Round 1 has identical numeric answers for all 256 questions. Round 2 loses
+no correct answers and gains question 93; that same question changes between
+the placement server's own repetitions. Full response texts match across modes
+for 238 and 237 questions; within-mode repeats match for 241 baseline and 238
+placement questions. Thus greedy text differences alone do not establish a
+quality regression. Exact paired McNemar p-values are 1.0 in both rounds.
+This sample shows no accuracy decrease, but does not prove equivalence or an
+accuracy improvement. The repeated generations are not 512 independent cases,
+and this is not the few-shot leaderboard protocol.
+
+The verified `results/placement-quality-evidence.tgz` is 39152627 bytes,
+SHA-256 `56b1c072c1c816a045e74aa6d471bec1eeac594022fe02e531eeb27ded27b961`.
+It includes the frozen data, per-question responses, manifests and evaluation
+source. The job completed successfully and was released after artifact checks.
+
+## Fusing the expert-ID map into selection
+
+After both quality servers stopped, the same job compared the separate ID
+lookup with two Pallas selector variants at biased seeds 1087/1088. The map
+is a dynamic replicated uint32 operand. Both variants preserve logical expert
+tie breaking and unbiased weights, and match every complete EP8 output bit.
+One packs logical/physical IDs into the integer tie key; the other uses the
+existing selection mask to reduce the physical ID. The latter is simpler and
+is selected for the measured TPU7x/288-row/384-expert/top-six/two-table key.
+Unmeasured shapes retain the separate lookup. Placement itself remains opt-in.
+
+| Seed / variant | Device module (ms) | Minus entry barriers (ms) | Host median (ms) |
+| --- | ---: | ---: | ---: |
+| 1087 / separate | 0.540629 | 0.467578 | 0.934679 |
+| 1087 / packed key | 0.547922 | 0.450633 | 0.925304 |
+| 1087 / masked sum | 0.547745 | 0.450574 | 0.924990 |
+| 1088 / separate | 0.576132 | 0.491581 | 0.948897 |
+| 1088 / packed key | 0.571791 | 0.473061 | 0.934506 |
+| 1088 / masked sum | 0.562066 | 0.473430 | 0.931703 |
+
+Each process used 31 shuffled host repetitions and five ordered profile
+repetitions with the serving compiler flags and zero all-gather threshold.
+Inclusive device time does not improve at both seeds: entry barriers remain
+in the table rather than being silently removed. Masked-sum temporary storage
+falls from 101496768 to 101431296 bytes and generated code from 4552192 to
+4528128 bytes; argument/output storage is unchanged.
+
+The verified `results/fused-selector-map-evidence.tgz` is 1016083 bytes,
+SHA-256 `337ec651c5cc968d0becfb2de7d68de017dff646e10a921c9d05f58175f85aa5`.
+A subsequent small integer-input probe confirms that one FP32 MXU accumulator
+can receive FP8 and BF16 updates in either order on the pinned compiler.
+It establishes primitive support only, not attention speed or quantization
+quality (`results/mixed-mxu-evidence.tgz`, 4575 bytes, SHA-256
+`12948ed37da0c84a7c65d566585d6de80b79f6a9149fad82fc0be2b7603b990b`).
+
+The production port was then checked in `exp-v4y0rtvuqj`, using base `c5c1abe8`
+plus the archived patch with SHA-256
+`5f2e508d93e71e6e2753dd72b0f09fbf302a5cda6e945c7f33ea5c942c4e5b7c`.
+The benchmark disables only the fused-map dispatch for its reference; both
+variants call the actual production layer with the same dynamic map and weights.
+At two new seeds, all full EP8 output bits match and the isolated gain persists:
+
+| Seed / variant | Device module (ms) | Minus entry barriers (ms) | Host median (ms) |
+| --- | ---: | ---: | ---: |
+| 1090 / separate | 0.523481 | 0.442158 | 0.869094 |
+| 1090 / fused | 0.484947 | 0.426389 | 0.860511 |
+| 1091 / separate | 0.597718 | 0.538179 | 0.974099 |
+| 1091 / fused | 0.571186 | 0.516672 | 0.957667 |
+
+The same 31-host/five-profile repetition protocol applies. Compiled HLO removes
+the separate `u32[288,6]` ID-map gather. Production generated code is 4527616
+bytes; temporary, argument and output storage agree with the
+prototype figures above. Both local and pinned-runtime CPU router tests pass
+28 cases, with four existing TPU-only tests skipped in CPU mode; the EP8
+benchmark separately exercises compiled TPU execution. Full-environment pyrefly
+reports the same 54 existing errors for base and candidate, with zero new errors.
+The first validation attempt stopped because the image lacked pytest; after
+installing pytest 8.4.2, the retry completed successfully. Both attempts' logs
+are retained. Changed-file pre-commit checks pass.
+
+The verified `results/selector-map-production-evidence.tgz` is 689830 bytes,
+SHA-256 `d3e166c196e3732cf38739dbe7f5e33363b0302c0d67a8b4a0cb0306eca6aaf9`.
+It includes the source patch, exact runner/compiler flags, checks, timings,
+HLO and extracted device events; raw profiles remain in the Falcon artifact.
+Full-serving validation of this fusion is still pending. Neither the isolated
+speedup nor the placement-only quality comparison establishes that the complete
+branch meets the two requested performance targets.

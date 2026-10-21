@@ -68,6 +68,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
 from vllm_torchtpu.kernels.fused_moe.v2.tuned_block_sizes import (
     RouterTuningKey,
     get_router_block_rows,
+    use_fused_expert_id_map,
 )
 
 # The scoring functions the router can apply to the gate logits. These
@@ -606,6 +607,7 @@ def fused_ep_moe_v2(
         histogram the routing plan reads alongside the gathered payload.
         """
         scores = _apply_scoring_fn(gate_l, scoring_fn)
+        fuse_id_map = False
         if hash_l is not None:
             # The selection was made by the caller's table, so the selector
             # does not run at all; the weights are still the scores at the
@@ -614,15 +616,16 @@ def fused_ep_moe_v2(
             topk_idx = hash_l.astype(jnp.int32)
             topk_weights = jnp.take_along_axis(scores, topk_idx, axis=-1)
         else:
-            select_rows = get_router_block_rows(
-                RouterTuningKey(
-                    device_kind=mesh.devices.flat[0].device_kind,
-                    rows=t_local,
-                    experts=e_total,
-                    topk=topk,
-                    separate_weights=score_bias_l is not None,
-                ),
-                MAX_ROUTING_BLOCK,
+            router_key = RouterTuningKey(
+                device_kind=mesh.devices.flat[0].device_kind,
+                rows=t_local,
+                experts=e_total,
+                topk=topk,
+                separate_weights=score_bias_l is not None,
+            )
+            select_rows = get_router_block_rows(router_key, MAX_ROUTING_BLOCK)
+            fuse_id_map = expert_id_map_l is not None and use_fused_expert_id_map(
+                router_key
             )
             topk_weights, topk_idx = pallas_select(
                 scores
@@ -631,8 +634,9 @@ def fused_ep_moe_v2(
                 topk=topk,
                 block_rows=select_rows,
                 weight_scores=None if score_bias_l is None else scores,
+                expert_id_map=expert_id_map_l if fuse_id_map else None,
             )
-        if expert_id_map_l is not None:
+        if expert_id_map_l is not None and not fuse_id_map:
             topk_idx = jnp.take(expert_id_map_l, topk_idx, axis=0)
         topk_idx = _relabel_expert_ids_to_mesh_order(
             topk_idx, g_local=g_local, mesh_ep_ranks=mesh_ep_ranks
