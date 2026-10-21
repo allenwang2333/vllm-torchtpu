@@ -52,6 +52,7 @@ from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
+    fused_moe_func_stacked,
     resolve_onehot_permute_threshold,
 )
 from vllm_torchtpu.logger import init_logger
@@ -309,26 +310,42 @@ def _tp_chain(
     total = jnp.where(jnp.isnan(total), total, jnp.maximum(total, _SUM_FLOOR))
     w = (w / total).astype(x.dtype)
     w = jnp.where(is_pad[:, None], jnp.zeros_like(w), w)
-    routed = fused_moe_func(
-        x,
-        w13,
-        w2,
-        s13,
-        s2,
-        None,
-        None,
-        w,
-        ids,
-        None,
-        topk=st.topk,
-        activation=st.activation,
-        use_ep=False,
-        use_sparse_core=st.use_sparse_core,
-        onehot_moe_permute_threshold=st.onehot_threshold,
-        rhs_quant_dtype=None,
-        skip_padded_tokens=True,  # admission requires TPU_MOE_SKIP_PADDED_TOKENS
-        stack_row=row,
-    )
+    if row is None:
+        routed = fused_moe_func(
+            x,
+            w13,
+            w2,
+            s13,
+            s2,
+            None,
+            None,
+            w,
+            ids,
+            None,
+            topk=st.topk,
+            activation=st.activation,
+            use_ep=False,
+            use_sparse_core=st.use_sparse_core,
+            onehot_moe_permute_threshold=st.onehot_threshold,
+            rhs_quant_dtype=None,
+            skip_padded_tokens=True,  # admission requires TPU_MOE_SKIP_PADDED_TOKENS
+        )
+    else:  # the same computation on row `row` of the layer-stacked tensors
+        routed = fused_moe_func_stacked(
+            x,
+            w13,
+            w2,
+            s13,
+            s2,
+            w,
+            ids,
+            row,
+            topk=st.topk,
+            activation=st.activation,
+            use_sparse_core=st.use_sparse_core,
+            onehot_moe_permute_threshold=st.onehot_threshold,
+            skip_padded_tokens=True,
+        )
     gate_up = xla_quantized_matmul(x, sw13, ss13)
     fs = sw2.shape[0]
     act = jax.nn.silu(gate_up[:, :fs].astype(jnp.float32)).astype(x.dtype)

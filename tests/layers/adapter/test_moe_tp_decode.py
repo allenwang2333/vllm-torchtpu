@@ -556,3 +556,20 @@ def test_failed_stacking_restores_the_per_layer_form(harness, monkeypatch):
     x = _x()
     runners[0](hidden_states=x, router_logits=x)
     assert len(harness.op_calls) == 1 and not harness.stk_calls
+
+
+def test_gmm_custom_op_still_registers_with_the_stacked_variant():
+    """The GMM custom op registers fused_moe_func's signature as a torch schema, which refuses
+    a kwarg-only tensor: the stacked variant must stay out of that signature (a stack_row
+    parameter there broke every boot of the stock path, j-8408d0de)."""
+    import inspect
+
+    from vllm_torchtpu.layers.adapter import fused_moe
+    from vllm_torchtpu.layers.core import fused_moe_gmm
+
+    assert "stack_row" not in inspect.signature(fused_moe_gmm.fused_moe_func).parameters
+    assert "stack_row" in inspect.signature(fused_moe_gmm.fused_moe_func_stacked).parameters
+    op = fused_moe._build_fused_moe_custom_op(
+        topk=TOPK, activation="silu", use_ep=False, skip_padded_tokens=True
+    )
+    assert "pallas::fused_moe_kernel_" in str(op)

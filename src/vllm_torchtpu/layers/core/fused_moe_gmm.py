@@ -585,19 +585,7 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "topk",
-        "activation",
-        "use_ep",
-        "use_sparse_core",
-        "onehot_moe_permute_threshold",
-        "rhs_quant_dtype",
-        "skip_padded_tokens",
-    ),
-)
-def fused_moe_func(
+def _fused_moe_impl(
     hidden_states: jax.Array,
     w1: jax.Array,
     w2: jax.Array,
@@ -617,31 +605,14 @@ def fused_moe_func(
     skip_padded_tokens: bool = False,
     stack_row: jax.Array | None = None,
 ) -> jax.Array:
-    """Run MoE with precomputed expert ids and weights.
-
-    For linear EP placement, ``experts_start`` is the first global expert id
-    owned by this shard, passed as a 0-d int32 array (real traced data, not a
-    Python int/compile-time constant -- every EP rank owns a different value,
-    and binding it as a constant would make each rank JIT-compile a
-    structurally different program under the same custom-op name, which
-    desyncs the in-graph EP collectives). The kernel remaps global ids to
-    local ids with an elementwise subtract and masks non-local experts.
-    ``use_ep`` is a static flag enabling EP routing (identical across ranks,
-    safe to bind as a compile-time constant); ``use_sparse_core`` is a static
-    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
-    pre-#193 plain-JAX path).
-
-    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
-    weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
-    containers are supported. Weights must be packed along the contracting dimension
-    (K-axis) in LSB-first order.
-
-    ``stack_row`` (int32 [1] or [1, 1], or None): the weights, scales and
-    biases carry a leading layer axis (one tensor for every MoE layer,
-    ``[L, E, ...]``) and this call runs layer ``stack_row`` of them, read in
-    place by both GMMs (gmm_v2's ``rhs_layer``) with no slice copy. The result
-    equals this function on that layer's own tensors. Not with EP, packed
-    weights or the dense-expert path.
+    """fused_moe_func's body; ``stack_row`` (int32 [1] / [1, 1] or None): the
+    weights, scales and biases carry a leading layer axis (one tensor for every
+    MoE layer, ``[L, E, ...]``) and this call runs layer ``stack_row`` of them,
+    read in place by both GMMs (gmm_v2's ``rhs_layer``) with no slice copy; the
+    result equals the per-layer call on that layer's own tensors. Not with EP,
+    packed weights or the dense-expert path. Kept out of fused_moe_func's
+    signature: the GMM custom op (layers/adapter/fused_moe.py) registers that
+    signature, and torch custom ops refuse a kwarg-only tensor argument.
     """
 
     stacked = stack_row is not None
@@ -755,3 +726,123 @@ def fused_moe_func(
         rhs_layer=stack_row,
     )
     return x[:num_tokens, :hidden_size]
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_ep",
+        "use_sparse_core",
+        "onehot_moe_permute_threshold",
+        "rhs_quant_dtype",
+        "skip_padded_tokens",
+    ),
+)
+def fused_moe_func(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array | None = None,
+    topk: int = 1,
+    activation: str = "silu",
+    use_ep: bool = False,
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """Run MoE with precomputed expert ids and weights.
+
+    For linear EP placement, ``experts_start`` is the first global expert id
+    owned by this shard, passed as a 0-d int32 array (real traced data, not a
+    Python int/compile-time constant -- every EP rank owns a different value,
+    and binding it as a constant would make each rank JIT-compile a
+    structurally different program under the same custom-op name, which
+    desyncs the in-graph EP collectives). The kernel remaps global ids to
+    local ids with an elementwise subtract and masks non-local experts.
+    ``use_ep`` is a static flag enabling EP routing (identical across ranks,
+    safe to bind as a compile-time constant); ``use_sparse_core`` is a static
+    flag selecting the #193 SparseCore ragged gather/gather-reduce (vs the
+    pre-#193 plain-JAX path).
+
+    For packed weights, `rhs_quant_dtype` is used to specify the logical dtype of the
+    weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
+    containers are supported. Weights must be packed along the contracting dimension
+    (K-axis) in LSB-first order.
+    """
+    return _fused_moe_impl(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "topk",
+        "activation",
+        "use_sparse_core",
+        "onehot_moe_permute_threshold",
+        "skip_padded_tokens",
+    ),
+)
+def fused_moe_func_stacked(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array,
+    w2_scale: jax.Array,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    stack_row: jax.Array,
+    topk: int = 1,
+    activation: str = "silu",
+    use_sparse_core: bool = True,
+    onehot_moe_permute_threshold: int = 0,
+    skip_padded_tokens: bool = False,
+) -> jax.Array:
+    """fused_moe_func (TP, no bias, unpacked) on layer ``stack_row`` of
+    layer-stacked weights ``[L, E, ...]``, read in place (_fused_moe_impl)."""
+    return _fused_moe_impl(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        None,
+        topk=topk,
+        activation=activation,
+        use_ep=False,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=None,
+        skip_padded_tokens=skip_padded_tokens,
+        stack_row=stack_row,
+    )
