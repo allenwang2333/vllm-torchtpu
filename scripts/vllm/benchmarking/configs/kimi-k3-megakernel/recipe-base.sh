@@ -38,6 +38,7 @@
 #                                 set; unset for the first
 #   RECIPE_STORE_SERVERS          1: the decode-host store servers (oct13, oct16)
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
+#   RECIPE_PREFILL_MOE_REDUCE_DTYPE  prefill MoE reduce ring dtype (bfloat16 default, float32)
 #   RECIPE_PREFILL_MAX_NUM_SEQS   the prefill's --max-num-seqs; optional, 4
 #   RECIPE_PREFILL_LONG_THRESHOLD the long prefill's --long-prefill-token-threshold; optional, 4096
 #
@@ -327,7 +328,8 @@ export TORCH_TPU_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
 export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/$_role/torch_tpu_tier3"
 if [ "$_role" = prefill ]; then
-  export TPU_K3_MOE_REDUCE_DTYPE=bfloat16
+  # The prefill MoE reduce ring dtype; a point may set RECIPE_PREFILL_MOE_REDUCE_DTYPE=float32.
+  export TPU_K3_MOE_REDUCE_DTYPE="${RECIPE_PREFILL_MOE_REDUCE_DTYPE:-bfloat16}"
   export TPU_RAIDEN_CONTROLLER_ADDRESS="$HEAD_IP:27340"
   export TPU_RAIDEN_RESHARD_PORT_BASE=27340
   export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27440
