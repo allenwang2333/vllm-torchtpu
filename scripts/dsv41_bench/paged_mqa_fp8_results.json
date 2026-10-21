@@ -1,0 +1,151 @@
+{
+  "experiment_id": "exp-nwtbchddrf",
+  "artifact_id": "art-k78d45ckq6",
+  "analysis_id": "an-ci857s11w5",
+  "shape": {
+    "groups": 48,
+    "queries_per_group": 6,
+    "heads": 32,
+    "dim": 128,
+    "capacity": 98304,
+    "effective_length": 98287,
+    "page_records": 128
+  },
+  "versions": {
+    "jax": "0.11.2",
+    "jaxlib": "0.11.2",
+    "libtpu": "0.0.50"
+  },
+  "timing": "mean of two seed medians, five XProf XLA Ops samples each; excludes output layout copy",
+  "results": {
+    "buffer6": {
+      "kernel_us": 913.5677895,
+      "seed_kernel_us": {
+        "2026": 913.505252,
+        "2027": 913.630327
+      },
+      "config": {
+        "issue_depth": 4,
+        "key_buffers": 6,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    },
+    "buffer8": {
+      "kernel_us": 1021.3019205,
+      "seed_kernel_us": {
+        "2026": 1021.208883,
+        "2027": 1021.394958
+      },
+      "config": {
+        "issue_depth": 4,
+        "key_buffers": 8,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    },
+    "castrelu": {
+      "kernel_us": 940.0646380000001,
+      "seed_kernel_us": {
+        "2026": 939.741596,
+        "2027": 940.38768
+      },
+      "config": {
+        "issue_depth": 4,
+        "key_buffers": 4,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    },
+    "control": {
+      "kernel_us": 943.6770329999999,
+      "seed_kernel_us": {
+        "2026": 943.955432,
+        "2027": 943.398634
+      },
+      "config": {
+        "issue_depth": 4,
+        "key_buffers": 4,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    },
+    "staged": {
+      "kernel_us": 1065.246211,
+      "seed_kernel_us": {
+        "2026": 1065.032413,
+        "2027": 1065.460009
+      },
+      "config": {
+        "issue_depth": 4,
+        "key_buffers": 4,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    },
+    "staged8": {
+      "kernel_us": 888.339248,
+      "seed_kernel_us": {
+        "2026": 887.998799,
+        "2027": 888.679697
+      },
+      "config": {
+        "issue_depth": 8,
+        "key_buffers": 4,
+        "key_tile": 16384,
+        "query_group": 8,
+        "query_tile": 6
+      }
+    }
+  },
+  "original_source_sha256": {
+    "logits_staged8.py": "d942b8dcbbdf50f4bdf3c77325441aec9a2bb922d635017b5c623b97b37ceb8e",
+    "pipeline_staged8.py": "c6f0e712a113cfc8cb11bba85615e4d3a8b21fbcff279e10f1ec17607037bb6b"
+  },
+  "fp32_epilogue_ablation": {
+    "experiment_id": "exp-f4z6frgpyy",
+    "artifact_id": "art-o1gfbko2sn",
+    "analysis_id": "an-m39u778h97",
+    "results": {
+      "staged8": {
+        "kernel_us": 897.6037289999999,
+        "module_us": 989.4046370000001,
+        "seed_kernel_us": {
+          "2026": 897.417842,
+          "2027": 897.789616
+        },
+        "relu_dtype": "bfloat16"
+      },
+      "vpu_bf16": {
+        "kernel_us": 1021.041379,
+        "module_us": 1113.247261,
+        "seed_kernel_us": {
+          "2026": 1021.216086,
+          "2027": 1020.866672
+        },
+        "relu_dtype": "bfloat16"
+      },
+      "vpu_fp32": {
+        "kernel_us": 892.060024,
+        "module_us": 984.1561005,
+        "seed_kernel_us": {
+          "2026": 891.627926,
+          "2027": 892.492122
+        },
+        "relu_dtype": "float32"
+      }
+    },
+    "validation": "12 native checks and 6 full-size checks passed",
+    "scope": "Same shape and versions as the previous experiment; mean of two seed medians. module_us includes layout conversion.",
+    "metadata_note": "The raw FP32 variant incorrectly inherits scale_order=after_relu_bf16 in benchmark metadata. Its actual path uses FP32 ReLU with Q scales folded into weights and K scales after reduction, without BF16 rounding."
+  },
+  "checkpoint_validation": {
+    "native_source_experiment_id": "exp-f4z6frgpyy",
+    "comparison": "Native implementation AST matches staged8 after excluding imports, docstrings, and exception messages."
+  }
+}

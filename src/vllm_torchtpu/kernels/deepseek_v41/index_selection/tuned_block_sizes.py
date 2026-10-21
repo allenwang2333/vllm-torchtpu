@@ -23,6 +23,39 @@ PUBLISH_CANDIDATE_SHAPES = frozenset({(7, 16384, 2048, 8)})
 
 
 @dataclass(frozen=True)
+class PagedMQAConfig:
+    """Paged-decode policy; explicit overrides support kernel tuning.
+
+    Four packed FP8 16384-key buffers occupy 8.25 MiB, including scales.
+    At eight queries / 32 heads and depth four, the QK and reduction rings
+    reserve 576 KiB of MRB per MXU.
+    """
+
+    query_tile: int = 8
+    key_tile: int = 16384
+    issue_depth: int = 4
+    query_group: int = 8
+    key_buffers: int = 4
+
+    def __post_init__(self):
+        if any(
+            type(value) is not int or value < 1
+            for value in (
+                self.query_tile,
+                self.key_tile,
+                self.issue_depth,
+                self.query_group,
+                self.key_buffers,
+            )
+        ):
+            raise ValueError(
+                "Paged MQA tiles and issue_depth must be positive integers"
+            )
+        if self.key_buffers < 2:
+            raise ValueError("Paged MQA needs at least two K buffers to overlap DMA")
+
+
+@dataclass(frozen=True)
 class PersistentScoreConfig:
     key_tile: int
     compute_tile: int
