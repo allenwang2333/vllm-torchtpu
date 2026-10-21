@@ -74,6 +74,39 @@ class TestTpuCompilerCache:
 
         assert disabled != enabled
 
+    def test_tpu_hash_covers_the_stacked_expert_form(self):
+        """moe_tp_decode.stack_experts changes the stock graphs' inputs at load time (no env
+        records it): a per-layer entry reused by a stacked boot failed with an arity mismatch
+        (j-eacbb2da). The form enters the key only when stacked."""
+        import sys
+
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        name = "vllm_torchtpu.layers.adapter.moe_tp_decode"
+
+        def form(value):
+            return patch.dict(sys.modules, {name: SimpleNamespace(stacked_form=lambda: value)})
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            saved = sys.modules.pop(name, None)
+            try:
+                absent = compute_tpu_compilation_hash(self._config())
+                with form(None):
+                    unstacked = compute_tpu_compilation_hash(self._config())
+                with form("7:[7, 256, 6144, 256]"):
+                    stacked = compute_tpu_compilation_hash(self._config())
+                with form("75:[75, 256, 6144, 256]"):
+                    stacked75 = compute_tpu_compilation_hash(self._config())
+            finally:
+                if saved is not None:
+                    sys.modules[name] = saved
+
+        assert absent == unstacked
+        assert len({unstacked, stacked, stacked75}) == 3
+
     def test_tpu_hash_ignores_the_phased_profiler_switch(self):
         """Selecting a profiler must not bust the compile cache: otherwise a
         profiled run recompiles everything, and so does the next plain one."""

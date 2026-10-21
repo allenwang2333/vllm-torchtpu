@@ -13,6 +13,7 @@ import glob
 import hashlib
 import importlib.util
 import json
+import sys
 import os
 import pickle
 import re
@@ -381,6 +382,17 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
     return factors
 
 
+def _stacked_operand_form() -> str | None:
+    """A load-time operand form that changes the compiled graphs' inputs without any
+    env saying so: the GLM-5.2 decode megakernel's stacked routed experts
+    (moe_tp_decode.stack_experts, decided after the env is read). An entry compiled
+    for the per-layer form has another arity and fails at run time ("execution
+    supplied N arguments", j-eacbb2da). Read from sys.modules: if the module was
+    never imported, nothing was stacked."""
+    mod = sys.modules.get("vllm_torchtpu.layers.adapter.moe_tp_decode")
+    return None if mod is None else mod.stacked_form()
+
+
 def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
     """Hash TPU-specific factors used by both AOT and piecewise caches."""
     cache_config = vllm_config.cache_config
@@ -424,6 +436,10 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+
+    stacked = _stacked_operand_form()
+    if stacked is not None:  # only when stacked: other configs keep their keys
+        factors["stacked_operands"] = stacked
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(

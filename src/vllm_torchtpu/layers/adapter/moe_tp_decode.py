@@ -70,6 +70,9 @@ _STACK_BUFFERS = (
     "_moe_tp_decode_es2",
 )
 _ROW_BUFFER = "_moe_tp_decode_row"
+# Set by stack_experts: the compile-cache key folds it in (tpu_compiler), since the
+# stacked form changes the stock graphs' inputs and no env records the choice.
+_STACKED_FORM: str | None = None
 # Non-persistent buffers of an armed layer: the shared expert's tensors (the
 # parameters themselves, not views: a view handed to the op is re-materialized
 # on every call), the f32 correction bias and this rank's mesh index.
@@ -697,6 +700,11 @@ def moe_tp_decode_forward(
     )
 
 
+def stacked_form() -> str | None:
+    """The stacked-expert form of this process (layers and stack shapes), or None."""
+    return _STACKED_FORM
+
+
 def expert_stacks(layer: Any) -> tuple[tuple[torch.Tensor, ...], int] | None:
     """(w13, w2, s13, s2 stacks, this layer's row) of a stacked layer, else None."""
     if getattr(layer, _ROW_BUFFER, None) is None:
@@ -805,6 +813,8 @@ def stack_experts(layers: list) -> dict:
             )
             layer._moe_tp_row = row
             setattr(layer.quant_method, _OP_ATTR, stacked_op)
+    global _STACKED_FORM
+    _STACKED_FORM = f"{len(layers)}:" + ";".join(str(list(t.shape)) for t in stacks)
     report["per_layer_bytes"] = per_layer_bytes
     report["stacked_bytes"] = sum(s.numel() * s.element_size() for s in stacks)
     report["hbm_after"] = _hbm_stats()

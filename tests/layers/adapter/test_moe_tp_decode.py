@@ -247,6 +247,7 @@ def harness(monkeypatch):
     monkeypatch.setattr(moe_tp_decode, "_selftest", selftest)
     monkeypatch.setattr(moe_tp_decode, "_RANK_BUFFER", None)
     monkeypatch.setattr(moe_tp_decode, "_SELFTEST_DONE", False)
+    monkeypatch.setattr(moe_tp_decode, "_STACKED_FORM", None)
     monkeypatch.setattr(moe_tp_decode, "logger", _Log(h.logs))
     return h
 
@@ -474,6 +475,8 @@ def test_stack_experts_moves_routed_tensors_into_one_stack_per_kind(harness):
     assert rep["stacked_bytes"] == rep["per_layer_bytes"] == sum(
         b.numel() * b.element_size() for d in before for b in d.values())
     assert "stacked the routed experts of 3 layers" in harness.logs[-1]
+    assert moe_tp_decode.stacked_form() == (
+        f"3:[3, {E}, {H}, {2 * INTER}];[3, {E}, {INTER}, {H}];[3, {E}, 1, 1, {2 * INTER}];[3, {E}, 1, 1, {H}]")
 
 
 def test_stacked_layer_hands_the_op_the_stacks_and_its_row(harness):
@@ -546,6 +549,7 @@ def test_failed_stacking_restores_the_per_layer_form(harness, monkeypatch):
     with pytest.raises(ValueError, match="per-layer form kept"):
         moe_tp_decode.stack_experts(layers)
     monkeypatch.setattr(torch, "stack", real)
+    assert moe_tp_decode.stacked_form() is None
     for r, b in zip(runners, before):
         layer = r.routed_experts
         assert moe_tp_decode.expert_stacks(layer) is None
