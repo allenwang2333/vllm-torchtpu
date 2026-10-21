@@ -881,7 +881,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             hash_block_size,
             metrics_collector=None,
             num_prefill_lookahead=0,
-            allow_partial_hash_hits: bool = True,
             **kwargs,
         ):
             groups = kv_cache_config.kv_cache_groups
@@ -954,7 +953,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 hash_block_size,
                 metrics_collector,
                 num_prefill_lookahead=num_prefill_lookahead,
-                allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,
             )
 

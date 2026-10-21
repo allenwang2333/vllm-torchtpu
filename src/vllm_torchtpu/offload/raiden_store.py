@@ -392,6 +392,7 @@ class RaidenOffloadingManager(OffloadingManager):
         # re-resolves the hash, and a slice that has gone stale simply fails
         # its read and recomputes.
         self._pending_remote_slices: dict[bytes, object] = {}
+        self._dead_remote_sub_hashes: set[bytes] = set()
 
         self._admissions: dict[int, Admission] = {}
         self._hash_to_admission: dict[bytes, Admission] = {}
@@ -493,7 +494,9 @@ class RaidenOffloadingManager(OffloadingManager):
             if status in (
                 self._block_status.HOST,
                 self._block_status.HOST_AND_HBM,
-                self._block_status.REMOTE,
+            ) or (
+                status == self._block_status.REMOTE
+                and sub_hash not in self._dead_remote_sub_hashes
             ):
                 continue
             if (
@@ -562,7 +565,9 @@ class RaidenOffloadingManager(OffloadingManager):
             # HBM. The storage tier answers whether or not the global registry
             # is enabled, so only a peer hit is gated on it.
             if (
-                status == self._block_status.REMOTE and allow_remote
+                status == self._block_status.REMOTE
+                and allow_remote
+                and sub_hash not in self._dead_remote_sub_hashes
             ) or status == self._block_status.SHARED_STORAGE:
                 if sub_hash in self._hash_to_admission:
                     # A read_remote for this sub-hash is already in flight;
@@ -705,7 +710,12 @@ class RaidenOffloadingManager(OffloadingManager):
             sub_hashes = self._sub_hashes(key)
             matches = self._probe(sub_hashes)
             if len(matches) == len(sub_hashes) and all(
-                block.status in resident_statuses for _, block in matches
+                block.status in resident_statuses
+                and not (
+                    block.status == self._block_status.REMOTE
+                    and sub_hash in self._dead_remote_sub_hashes
+                )
+                for sub_hash, block in matches
             ):
                 continue
             keys_to_store.append(key)
@@ -796,6 +806,7 @@ class RaidenOffloadingManager(OffloadingManager):
         self._inflight_store_keys.clear()
         self._remote_slices.clear()
         self._pending_remote_slices.clear()
+        self._dead_remote_sub_hashes.clear()
         self._finished.clear()
         logger.info("TPURaidenOffloadingConnector: rotated Raiden key_namespace=%s on reset_cache", self._key_namespace.hex())
 
@@ -830,6 +841,7 @@ class RaidenOffloadingManager(OffloadingManager):
             for key in keys:
                 self._evicted_sub_hashes.pop(key, None)
         sub_hashes = self._expand_keys(keys)
+        self._dead_remote_sub_hashes.difference_update(sub_hashes)
         device_ids = self._expand_device_blocks(device_block_ids)
         slices = [
             self._block_id_cls(
@@ -1053,6 +1065,8 @@ class RaidenOffloadingManager(OffloadingManager):
                 )
             )
         else:
+            if not success and admission.remote_sub_hashes:
+                self._dead_remote_sub_hashes.update(admission.remote_sub_hashes)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
