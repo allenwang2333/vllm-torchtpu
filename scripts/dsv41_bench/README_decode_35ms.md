@@ -365,6 +365,26 @@ four streams, width 5120, BF16 norm weights and HBM gate inputs.
 Other shapes retain the previous output placement. Serving validation is
 pending; these isolated timings do not establish a whole-model improvement.
 
+Source `7bf96de9` was rechecked in `exp-qfs10zulj7` with seeds 1045 and 1046;
+the integrated candidate and baseline remained bit-exact across all eight
+checked outputs. A 128-token fallback case at seed 1047 was also bit-exact.
+For 288 tokens, compiled code decreased from 1264128 to 1251328 bytes;
+arguments (29219840 bytes), outputs (15814688 bytes) and temporary storage
+(zero) were unchanged. The fallback's compiled memory sizes were unchanged.
+These pre-serving checks did not explicitly pin a DVFS state, so their timings
+are not compared with the earlier fixed-state measurements. The formal serving
+launcher retains its fixed P-state 7 configuration.
+
+Pre-commit passed. After installing the missing `uv` tool in the evaluation
+container, full-environment pyrefly reported the same 57 errors as a source copy
+with the baseline mHC files restored: zero added or removed diagnostics.
+The numerical/HLO/device-event archive is `results/mhc-vmem-tuned/micro-evidence.tgz`
+in that experiment (SHA-256
+`a59f7e3de9b4686927e58407cae04f34bdab913c030f9fae057c099024d0c78b`).
+Its saved typecheck log is the initial missing-tool failure; the subsequent
+paired check is stored separately as `typecheck-base.json` and
+`typecheck-candidate.json` in the same result directory.
+
 ```bash
 git show a04817ac:src/vllm_torchtpu/kernels/deepseek_v41/mhc/shifted_post_pre_rms.py \
   > /tmp/mhc-output-reference.py
