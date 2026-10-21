@@ -66,8 +66,36 @@ def _configure_tpu_process_env(
         os.environ.pop("WORLD_SIZE", None)
 
 
-def _release_free_host_heap() -> None:
+_TCMALLOC_PROPERTIES = (
+    "generic.current_allocated_bytes",
+    "generic.heap_size",
+    "tcmalloc.pageheap_free_bytes",
+    "tcmalloc.pageheap_unmapped_bytes",
+)
+
+
+def _host_memory() -> str:
+    """This process's resident memory and tcmalloc's heap accounting, in GiB."""
+    fields = {}
+    with open("/proc/self/status") as status:
+        for line in status:
+            key, _, value = line.partition(":")
+            if key in ("RssAnon", "RssFile", "RssShmem"):
+                fields[key] = int(value.split()[0]) / 2**20
+    get = getattr(ctypes.CDLL(None), "MallocExtension_GetNumericProperty", None)
+    if get is not None:
+        get.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_size_t)]
+        get.restype = ctypes.c_int
+        for name in _TCMALLOC_PROPERTIES:
+            value = ctypes.c_size_t()
+            if get(name.encode(), ctypes.byref(value)):
+                fields[name] = value.value / 2**30
+    return ", ".join(f"{key}={value:.2f}" for key, value in fields.items())
+
+
+def _release_free_host_heap(stage: str = "") -> None:
     """Return free allocator pages from model loading and compilation to the OS."""
+    logger.info("[host-mem] %s before release: %s", stage, _host_memory())
     process = ctypes.CDLL(None)
     if hasattr(process, "MallocExtension_ReleaseFreeMemory"):
         process.MallocExtension_ReleaseFreeMemory()
@@ -75,6 +103,7 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+    logger.info("[host-mem] %s after release: %s", stage, _host_memory())
 
 
 class TPUWorker(WorkerBase):
@@ -710,7 +739,7 @@ class TPUWorker(WorkerBase):
         # The host buffers the weights were staged in are freed, but the
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
-        _release_free_host_heap()
+        _release_free_host_heap("load")
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
@@ -721,7 +750,7 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
-        _release_free_host_heap()
+        _release_free_host_heap("warmup")
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
@@ -770,6 +799,7 @@ class TPUWorker(WorkerBase):
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        logger.info("[host-mem] after initialize_from_config: %s", _host_memory())
 
     def get_node_kv_ip_port(self) -> tuple[int, str, int]:
         node_id = dist_utils.get_node_id()
