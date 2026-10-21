@@ -57,7 +57,10 @@ EP = 4
 TP_IN_EP = N // EP
 NB = I_FULL // BLK
 F8 = jnp.float8_e4m3fn
-DECODE = [(4, 4), (8, 7), (16, 13), (32, 27), (64, 57)]
+DECODE = [(4, 4), (8, 7), (16, 13), (32, 27), (64, 57), (128, 117)]
+# Row counts at which each arm's kernel is also checked against the psum path
+# it replaced (_tp_chain + lax.psum, the same op body's fallback).
+VS_CHAIN = (64, 128)
 PREFILL = [(4096, 4000)]
 REF_ROWS = 256
 TOL = {"rel_l2": 0.06, "worst_row": 0.08, "tp_vs_ep": 0.06}
@@ -271,6 +274,23 @@ def _run_all():
             )
         )
 
+    def chain_program(statics):
+        # The op body's fallback at any token count: this rank's partial from
+        # the usual path, psummed (what an unadmitted bucket runs).
+        def body(x, scores, b, pad_mask, *rest):
+            *w, _rank, e0 = rest
+            is_pad = pad_mask[: x.shape[0]]
+            partial = adapter._tp_chain(
+                x, scores, b, is_pad, *w, statics, e0.reshape(())
+            )
+            return lax.psum(partial, "d")
+
+        return jax.jit(
+            jax.shard_map(
+                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )
+
     def operands(rows, n_valid, w):
         stacked, rank, e0 = w
         x, scores = layer.inputs(rows)
@@ -305,6 +325,7 @@ def _run_all():
     w_tp, w_ep, w_bad = weights("tp"), weights("ep"), weights("tp_bad_slice")
     res = {"tol": TOL, "cases": {}, "controls": {}}
     prog_tp, prog_ep, prog_bs = program(st_tp), program(st_ep), program(st_tp_bad_scale)
+    chain_tp, chain_ep = chain_program(st_tp), chain_program(st_ep)
     for rows, n_valid in DECODE + PREFILL:
         ops_tp, x, scores = operands(rows, n_valid, w_tp)
         ops_ep, _, _ = operands(rows, n_valid, w_ep)
@@ -342,6 +363,25 @@ def _run_all():
             "kernels_ep": kernels_in(prog_ep, ops_ep),
             "seconds": round(time.monotonic() - t0, 1),
         }
+        if rows in VS_CHAIN:
+            # Fused kernel vs the unfused path on the same rows (valid rows;
+            # the psum path runs the shared expert on padded rows).
+            for arm, prog, ops, out in (
+                ("tp", chain_tp, ops_tp, out_tp),
+                ("ep", chain_ep, ops_ep, out_ep),
+            ):
+                ref, same = run(prog, ops, rows)
+                got = out[0, :n_valid]
+                want_c = ref[0, :n_valid]
+                case[f"{arm}_kernel_vs_chain"] = dict(
+                    _metrics(got.astype(np.float64), want_c.astype(np.float64)),
+                    bitwise=bool(
+                        np.array_equal(got.view(np.uint32), want_c.view(np.uint32))
+                    ),
+                    chain_ranks_identical=same,
+                    chain_vs_ref=_metrics(ref[0, idx].astype(np.float64), want),
+                    chain_kernels=kernels_in(prog, ops),
+                )
         res["cases"][str(rows)] = case
         print("CASE", rows, json.dumps(case), flush=True)
         if rows in (16, 4096):
@@ -383,6 +423,25 @@ def test_the_tp_arm_runs_its_kernels(result, rows):
         assert k["fused_moe_prefill"] > 0 and k["moe_tp_decode"] == 0, k
     else:
         assert k["moe_tp_decode"] > 0 and k["fused_moe_prefill"] == 0, k
+
+
+@pytest.mark.parametrize("rows", [r for r, _ in DECODE])
+def test_the_ep_arm_runs_its_kernel_at_decode_buckets(result, rows):
+    # Every decode bucket up to the kernel's MAX_ROWS (128) runs the
+    # expert-range kernel, none falls back to the psum path.
+    k = result["cases"][str(rows)]["kernels_ep"]
+    assert k["moe_tp_decode"] > 0, k
+
+
+@pytest.mark.parametrize("rows", VS_CHAIN)
+def test_kernel_matches_the_psum_path_it_replaces(result, rows):
+    c = result["cases"][str(rows)]
+    for arm in ("tp", "ep"):
+        v = c[f"{arm}_kernel_vs_chain"]
+        assert v["chain_kernels"]["moe_tp_decode"] == 0, v
+        assert v["chain_ranks_identical"], v
+        assert _passes(v["chain_vs_ref"]), v
+        assert v["rel_l2"] <= TOL["tp_vs_ep"], v
 
 
 def test_fault_controls_fail_the_gate(result):
