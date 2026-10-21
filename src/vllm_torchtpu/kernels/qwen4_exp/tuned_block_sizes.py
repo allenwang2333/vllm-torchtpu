@@ -23,9 +23,13 @@ from jax.typing import DTypeLike
 
 from vllm_torchtpu.kernels.qwen4_exp.cache_regions import region_rows
 
-# Eight outstanding transfers were measured on TPU7x. This bounds unrolling
-# and explicit DMA semaphores; it is not a hardware semaphore-capacity claim.
-_DMA_BATCHES = (8, 4, 2, 1)
+# Matched1/2/4/8/16 tests on TPU7x: state wall latency plateaus at8,
+# while irregular main-row writes still benefit at16. These bound measured
+# concurrency/code expansion, not hardware semaphores or universal optima.
+# Unmeasured chips stay serial; resource admission is independently mandatory.
+_RING_TAG_DMA_BATCHES = (8, 4, 2, 1)
+_MAIN_KV_DMA_BATCHES = (16, 8, 4, 2, 1)
+_COMPILER_SMEM_RESERVE = 32 * 1024
 _MAIN_TILE = 128
 _DmaArray = jax.Array | jax.ShapeDtypeStruct
 
@@ -34,6 +38,7 @@ _DmaArray = jax.Array | jax.ShapeDtypeStruct
 class DmaHardware:
     """Immutable per-TensorCore capacity and pinned compiler tile facts."""
 
+    chip_version: pltpu.ChipVersion | None
     vmem_bytes: int
     smem_bytes: int
     lanes: int
@@ -44,6 +49,9 @@ class DmaHardware:
     @classmethod
     def from_tpu_info(cls, info: pltpu.TpuInfo) -> "DmaHardware":
         return cls(
+            info.chip_version
+            if isinstance(info.chip_version, pltpu.ChipVersion)
+            else None,
             info.vmem_capacity_bytes,
             info.smem_capacity_bytes,
             info.num_lanes,
@@ -91,7 +99,15 @@ def _vmem(shape: tuple[int, ...], dtype: DTypeLike, hw: DmaHardware) -> int:
 def _carrier(pool: _DmaArray, hw: DmaHardware | None) -> bool:
     return (
         hw is not None
-        and min(dataclasses.astuple(hw)) > 0
+        and min(
+            hw.vmem_bytes,
+            hw.smem_bytes,
+            hw.lanes,
+            hw.bf16_rows,
+            hw.fp8_rows,
+            hw.int32_rows,
+        )
+        > 0
         and len(pool.shape) == 5
         and all(0 < d < 2**31 for d in pool.shape)
         and jnp.dtype(pool.dtype)
@@ -137,7 +153,7 @@ def ring_tag_dma_memory(
         2 * typed,
         staged,
         typed + staged + vector,
-        (requests + batch + 8 + hw.lanes) * 4,
+        (requests + batch) * 4 + _COMPILER_SMEM_RESERVE,
     )
 
 
@@ -147,14 +163,12 @@ def main_kv_dma_memory(
     source = _vmem((_MAIN_TILE, *rows.shape[1:]), rows.dtype, hw)
     vector = hw.int32_rows * hw.lanes * 4
     # The destination is aliased HBM, not a full-page VMEM allocation.
+    # Count explicit prefetched words/flags and DMA counters. As in the shared
+    # metadata generator, reserve32KiB for scalar pipeline/compiler bookkeeping;
+    # this is headroom, not a hardware allocation-granularity requirement.
     scalar = (
-        3 * len(rows)
-        + len(rows) // _MAIN_TILE
-        + len(rows) // batch
-        + batch
-        + 8
-        + hw.lanes
-    ) * 4
+        3 * len(rows) + len(rows) // _MAIN_TILE + len(rows) // batch + batch
+    ) * 4 + _COMPILER_SMEM_RESERVE
     return DmaMemory(2 * source, 0, source + vector, scalar)
 
 
@@ -179,7 +193,12 @@ def ring_tag_dma_batch(
     tt, _ = region_rows(pool, tag_elements, jnp.int32)
     if rt + tt > pool.shape[1]:
         return 1
-    for batch in _DMA_BATCHES:
+    batches = (
+        _RING_TAG_DMA_BATCHES
+        if hardware.chip_version == pltpu.ChipVersion.TPU_7X
+        else (1,)
+    )
+    for batch in batches:
         if requests % batch:
             continue
         memory = ring_tag_dma_memory(
@@ -207,7 +226,12 @@ def main_kv_dma_batch(
     ):
         return 1
     assert hardware is not None
-    for batch in _DMA_BATCHES:
+    batches = (
+        _MAIN_KV_DMA_BATCHES
+        if hardware.chip_version == pltpu.ChipVersion.TPU_7X
+        else (1,)
+    )
+    for batch in batches:
         memory = main_kv_dma_memory(pool, rows, batch, hardware)
         if (
             memory.vmem_bytes <= hardware.vmem_bytes

@@ -48,7 +48,7 @@ def test_same_payload_uses_batch_independently_of_page_stride(dtype, page, monke
     assert (
         policy.get_ring_tag_dma_batch(pool, 8, ring_elements=1024, tag_elements=16) == 8
     )
-    assert policy.get_main_kv_dma_batch(pool, rows) == 8
+    assert policy.get_main_kv_dma_batch(pool, rows) == 16
 
 
 @pytest.mark.parametrize(
@@ -174,4 +174,35 @@ def test_pure_planning_never_queries_backend(monkeypatch):
             == 8
         )
         rows = jax.ShapeDtypeStruct((128, *pool.shape[2:]), pool.dtype)
-        assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 8
+        assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 16
+
+
+def test_unmeasured_chip_keeps_serial_policy_with_known_resource_facts():
+    hw = policy.DmaHardware.from_tpu_info(
+        pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+    )
+    pool = carrier()
+    rows = jax.ShapeDtypeStruct((128, *pool.shape[2:]), pool.dtype)
+    assert (
+        policy.ring_tag_dma_batch(
+            pool, 16, ring_elements=1024, tag_elements=16, hardware=hw
+        )
+        == 1
+    )
+    assert policy.main_kv_dma_batch(pool, rows, hardware=hw) == 1
+
+
+def test_registered_unknown_chip_variant_does_not_acquire_measured_policy():
+    from jax._src.tpu_info import ChipVersionBase
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    facts = policy.DmaHardware.from_tpu_info(
+        dataclasses.replace(info, chip_version=ChipVersionBase())
+    )
+    assert facts.chip_version is None
+    assert (
+        policy.ring_tag_dma_batch(
+            carrier(), 16, ring_elements=1024, tag_elements=16, hardware=facts
+        )
+        == 1
+    )
