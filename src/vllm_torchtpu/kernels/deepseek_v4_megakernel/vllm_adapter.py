@@ -54,6 +54,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import kernel_interface as KI
 from vllm_torchtpu.kernels.deepseek_v4_megakernel import weight_map as WM
+from vllm_torchtpu.kernels.deepseek_v4_megakernel.diag import vllm_adapter as SD
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -280,6 +281,7 @@ class StepDecision:
     key: str  # step-mix key: mk_*, ab_stock_* or a stock_* reason
     bucket: KI.Bucket | None = None
     idle: bool = False
+    parity: bool = False  # run the stock forward too, then compare (run only)
 
 
 def classify_local_step(
@@ -704,6 +706,25 @@ def torch_tpu_run_jax(name: str, fn: Callable, *tensors: torch.Tensor) -> torch.
 
 
 # ---------------------------------------------------------- runner access
+
+
+def _parity_config(model: Any) -> SD.ParityConfig | None:
+    """`VLLM_TPU_DSV4_MK_PARITY*`, with this rank's lm_head vocabulary shard."""
+    if not (envs.VLLM_TPU_DSV4_MK_PARITY or envs.VLLM_TPU_DSV4_MK_PARITY_WARMUP):
+        return None
+    head = model.lm_head
+    shard = head.shard_indices
+    return SD.ParityConfig(
+        head=SD.LocalHead(
+            weight=head.weight,
+            vocab_start=int(shard.org_vocab_start_index),
+            num_tokens=int(shard.num_org_elements),
+        ),
+        served_budget=envs.VLLM_TPU_DSV4_MK_PARITY,
+        every=envs.VLLM_TPU_DSV4_MK_PARITY_EVERY,
+        warmup_budget=envs.VLLM_TPU_DSV4_MK_PARITY_WARMUP,
+        tol=envs.VLLM_TPU_DSV4_MK_PARITY_TOL,
+    )
 
 
 def _find_backbone(model: Any) -> Any:
@@ -1241,6 +1262,8 @@ class DSv4Megakernel:
             ab_enabled=envs.VLLM_TPU_DSV4_MK_AB,
             stats_period_s=envs.VLLM_TPU_DSV4_MK_STATS_PERIOD_S,
             trace_steps=envs.VLLM_TPU_DSV4_MK_TRACE_STEPS,
+            nonfinite_stats=envs.VLLM_TPU_DSV4_MK_NONFINITE_STATS,
+            parity=_parity_config(runner.model),
         )
         from vllm_torchtpu.kernels.deepseek_v4_megakernel.draft.vllm_adapter import (
             DraftMegakernel,
@@ -1267,6 +1290,8 @@ class DSv4Megakernel:
         trace_steps: int = 0,
         compile_fn: Callable[[Callable], Callable] | None = None,
         op_namespace: str = "dsv4_megakernel",
+        nonfinite_stats: bool = False,
+        parity: SD.ParityConfig | None = None,
     ) -> None:
         self.spec = spec
         self.buckets = tuple(buckets)
@@ -1307,6 +1332,19 @@ class DSv4Megakernel:
         self.trace = RunTrace(
             rank, envs.VLLM_TPU_DSV4_MK_TRACE_RUNS, envs.VLLM_TPU_DSV4_MK_TRACE_SYNC
         )
+        # False until the runner's warm-up is over (`mark_serving`)
+        self.serving = False
+        self._local_real_rows = 0  # this rank's scheduled rows (classify)
+        self._nonfinite = (
+            SD.NonfiniteStats(rank, spec.q, self.device, stats_period_s, self._compile)
+            if nonfinite_stats
+            else None
+        )
+        self._parity = None
+        if parity is not None:
+            _need(not ab_enabled, "parity probe with VLLM_TPU_DSV4_MK_AB")
+            _need(not self.logits, "parity probe in logits mode")
+            self._parity = SD.ParityProbe(rank, parity, self._compile)
         logger.info(
             "DeepSeek-V4 megakernel: mode=%s attn_tp=%d q=%d buckets=%s "
             "aux_layers=%s %d weight operands, mesh index %d of %d, ab=%s",
@@ -1342,6 +1380,8 @@ class DSv4Megakernel:
         self.bind(caches, widths, swa_page=pages.pop())
         if self.draft is not None:
             self.draft.bind_caches(runner, self.buckets)
+        if self._nonfinite is not None:
+            self._nonfinite.self_check()
 
     def bind(
         self, caches: BoundCaches, group_widths: Sequence[int], swa_page: int = 128
@@ -1572,6 +1612,7 @@ class DSv4Megakernel:
         scheduled = len(scheduler_output.num_scheduled_tokens)
         local = self._classify(runner, scheduler_output, num_reqs, num_decode,
                                num_windowed, num_chunks, scheduled)  # fmt: skip
+        self._local_real_rows = scheduler_output.total_num_scheduled_tokens
         if self._trace_left > 0:
             self._trace_local = (
                 f"batch_reqs={num_reqs} scheduled_reqs={scheduled} "
@@ -1622,8 +1663,9 @@ class DSv4Megakernel:
             key, bucket = decide_step(local, reduced, self.buckets)
         run, mix_key = self.ab.choose(key, bucket is not None)
         self.last_run = None
+        parity = run and self._parity is not None and self._parity.select(self.phase)
         self._decision = StepDecision(
-            run=run, key=mix_key, bucket=bucket, idle=local.kind == IDLE
+            run=run, key=mix_key, bucket=bucket, idle=local.kind == IDLE, parity=parity
         )
         self._note_step(mix_key)
         self.trace.step += 1
@@ -1677,7 +1719,8 @@ class DSv4Megakernel:
     def owns_step(self) -> bool:
         """Whether the next forward is the megakernel's (the runner then skips
         stock-only per-step setup such as the MoE padding mask)."""
-        return self._decision is not None and self._decision.run
+        d = self._decision
+        return d is not None and d.run and not d.parity
 
     def forward(
         self,
@@ -1696,6 +1739,15 @@ class DSv4Megakernel:
             return stock_forward(
                 input_ids, positions, inputs_embeds, intermediate_tensors
             )
+        if decision.parity:
+            return self._forward_parity(
+                decision,
+                stock_forward,
+                input_ids,
+                positions,
+                inputs_embeds,
+                intermediate_tensors,
+            )
         if self.ab.enabled:
             _sync(None)
             t0 = time.perf_counter()
@@ -1712,6 +1764,29 @@ class DSv4Megakernel:
             self._record_ab((time.perf_counter() - t0) * 1e3)
         return out
 
+    def _forward_parity(
+        self,
+        decision: StepDecision,
+        stock_forward: Callable,
+        *inputs: Any,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Stock forward, then the megakernel step, on the same inputs; the
+        megakernel's output is served. Both write the step's own cache slots
+        (KV, compressor states, indexer records); the megakernel writes last,
+        so the served caches are as after the megakernel alone."""
+        out_stock = stock_forward(*inputs)
+        _sync(None)  # the stock writes land before the kernel reads the caches
+        out = self._run(decision, *inputs)
+        if not decision.idle:
+            self._parity.compare(
+                self.phase,
+                f"step {self.trace.step} {decision.bucket.key}",
+                out_stock,
+                out,
+                self._local_real_rows,
+            )
+        return out
+
     def _run(
         self,
         decision: StepDecision,
@@ -1724,6 +1799,7 @@ class DSv4Megakernel:
             raise AssertionError("megakernel step with embeddings or PP tensors")
         bucket = decision.bucket
         assert bucket is not None and self.caches is not None
+        first = None
         if decision.idle:
             ops = self._idle_operands[bucket]
         else:
@@ -1752,6 +1828,13 @@ class DSv4Megakernel:
                 self.weights,
                 self.caches.arrays,
             )
+        if self._nonfinite is not None:
+            if first is None:
+                self._nonfinite.count_idle(self.phase)
+            else:
+                self._nonfinite.count(self.phase, hidden, aux,
+                                      first.request_distribution,
+                                      self._local_real_rows)  # fmt: skip
         return self._fit(bucket, int(input_ids.shape[0]))(hidden, aux)
 
     # ----------------------------------------------------------- warmup
@@ -1792,6 +1875,7 @@ class DSv4Megakernel:
                     _sync([hidden, *aux])
                 for p in outs:
                     _sync([self._fit(b, p)(hidden, aux)[0]])
+                self._warm_diagnostics(b, outs, hidden, aux, md_like[1])
             logger.info(
                 "DeepSeek-V4 megakernel: warmed bucket %s (runner rows %s)", b.key, outs
             )
@@ -1799,7 +1883,32 @@ class DSv4Megakernel:
             self.draft.warmup(getattr(runner, "drafter", None))
         self.reset_stats()
 
+    def _warm_diagnostics(self, b, outs, hidden, aux, request_distribution) -> None:
+        """Compile the diagnostics' graphs now: compiling one at serving time
+        stalls the busy ranks while their peers wait in a collective."""
+        if self._nonfinite is not None:
+            self._nonfinite.warm(hidden, aux, request_distribution)
+            _sync(None)
+        if self._parity is not None:
+            for p in outs:
+                fit_h, fit_aux = self._fit(b, p)(hidden, aux)
+                self._parity.warm(fit_h, fit_aux or [])
+            _sync(None)
+
     # ------------------------------------------------------------- stats
+
+    @property
+    def phase(self) -> int:
+        """Index into `diag.vllm_adapter.PHASES`."""
+        return int(self.serving)
+
+    def mark_serving(self) -> None:
+        """The runner's warm-up is over: later steps are served traffic."""
+        if self._nonfinite is not None:
+            self._nonfinite.log(self.phase)
+        if self._parity is not None:
+            self._emit(self._parity.summary(self.phase))
+        self.serving = True
 
     def reset_stats(self) -> None:
         self._step_mix.clear()
@@ -1807,6 +1916,8 @@ class DSv4Megakernel:
         self.ab.reset()
 
     def _note_step(self, key: str) -> None:
+        if self._nonfinite is not None:
+            self._nonfinite.maybe_log(self.phase)
         self._step_mix[key] = self._step_mix.get(key, 0) + 1
         now = time.monotonic()
         if now - self._step_mix_t0 < self._stats_period_s:

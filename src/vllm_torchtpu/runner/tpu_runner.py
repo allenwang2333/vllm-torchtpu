@@ -6544,6 +6544,12 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        self._capture_model()
+        if self._dsv4_mk is not None:
+            # every warm-up step (the synthetic spec-decode requests too) is done
+            self._dsv4_mk.mark_serving()
+
+    def _capture_model(self) -> None:
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)

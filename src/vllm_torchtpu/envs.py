@@ -160,6 +160,11 @@ if TYPE_CHECKING:
     VLLM_TPU_DSV4_MK_TRACE_SYNC: bool = False
     VLLM_TPU_DSV4_MK_DRAFT: bool = False
     VLLM_TPU_DSV4_MK_LOGITS: bool = False
+    VLLM_TPU_DSV4_MK_NONFINITE_STATS: bool = False
+    VLLM_TPU_DSV4_MK_PARITY: int = 0
+    VLLM_TPU_DSV4_MK_PARITY_EVERY: int = 1
+    VLLM_TPU_DSV4_MK_PARITY_WARMUP: int = 0
+    VLLM_TPU_DSV4_MK_PARITY_TOL: float = 0.1
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
@@ -1096,6 +1101,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # return the logits (target: in place of compute_logits; draft: in place of
     # compute_draft_logits). Sampling stays stock.
     "VLLM_TPU_DSV4_MK_LOGITS": env_bool("VLLM_TPU_DSV4_MK_LOGITS"),
+    # Megakernel diagnostics, off by default (deepseek_v4_megakernel/diag/).
+    # Count the non-finite and dtype-max entries of every megakernel step's
+    # hidden rows (real vs padding, warm-up vs served), logged per rank each
+    # stats period.
+    "VLLM_TPU_DSV4_MK_NONFINITE_STATS": env_bool("VLLM_TPU_DSV4_MK_NONFINITE_STATS"),
+    # On up to N served megakernel steps (every _EVERY-th eligible one) and
+    # _WARMUP warm-up steps, also run the stock forward on the same inputs and
+    # log the per-row difference of the outputs; rows above _TOL relative L2
+    # are counted as over_tol. Syncs the device on those steps.
+    "VLLM_TPU_DSV4_MK_PARITY": env_int("VLLM_TPU_DSV4_MK_PARITY", 0),
+    "VLLM_TPU_DSV4_MK_PARITY_EVERY": env_int("VLLM_TPU_DSV4_MK_PARITY_EVERY", 1),
+    "VLLM_TPU_DSV4_MK_PARITY_WARMUP": env_int("VLLM_TPU_DSV4_MK_PARITY_WARMUP", 0),
+    "VLLM_TPU_DSV4_MK_PARITY_TOL": env_float("VLLM_TPU_DSV4_MK_PARITY_TOL", 0.1),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
     ),
