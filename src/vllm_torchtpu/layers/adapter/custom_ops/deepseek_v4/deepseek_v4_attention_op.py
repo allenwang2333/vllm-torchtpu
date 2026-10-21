@@ -304,6 +304,8 @@ def _attention_csa(
         logical_page_size=logical_page_size,
         swa_only=False,
         non_causal_block=non_causal_block,
+        # The sparse kernel reads l/m at 128 lanes; skip the slice-then-pad.
+        lane_padded_lm=True,
         **({"decode_by_caller": True} if swa_in_sparse else {}),
     )
     swa_output, updated_sw_cache, swa_l, swa_m = swa_results[:4]
