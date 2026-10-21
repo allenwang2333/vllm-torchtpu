@@ -134,9 +134,9 @@ def rope_cases():
 def rope_bits(row, *, target):
     a, b, c, s = row
     first = fma_bits(a, c, product_bits(b, s) ^ 0x8000)
-    if target == "sm80":
+    if target == "inner_b_cos":
         second = fma_bits(a, s, product_bits(b, c))
-    elif target in ("sm90", "sm100"):
+    elif target == "inner_a_sin":
         second = fma_bits(b, c, product_bits(a, s))
     else:
         raise ValueError(target)

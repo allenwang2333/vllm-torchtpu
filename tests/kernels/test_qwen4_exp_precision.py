@@ -70,7 +70,7 @@ def test_tpu_jit_index_fma_matches_exact_normal_bf16_arithmetic():
     _check()
 
 
-def test_index_rope_matches_pinned_sm80_and_exposes_other_target_difference():
+def test_index_rope_matches_explicit_contract_and_detects_reassociation():
     from qwen4_exp_exact_bf16 import rope_bits, rope_cases
 
     from vllm_torchtpu.kernels.qwen4_exp.qsa import index_rope
@@ -81,8 +81,8 @@ def test_index_rope_matches_pinned_sm80_and_exposes_other_target_difference():
     trig = jax.lax.bitcast_convert_type(jnp.asarray(bits[:, 2:]), jnp.bfloat16)
     trig = jnp.pad(trig, ((0, 0), (0, 126)))
     got = jax.jit(lambda x, t: index_rope(x, jnp.arange(len(x)), t, 2))(x, trig)
-    expected = np.asarray([rope_bits(r, target="sm80") for r in rows], np.uint16)
-    other = np.asarray([rope_bits(r, target="sm90") for r in rows], np.uint16)
+    expected = np.asarray([rope_bits(r, target="inner_b_cos") for r in rows], np.uint16)
+    other = np.asarray([rope_bits(r, target="inner_a_sin") for r in rows], np.uint16)
     np.testing.assert_array_equal(np.asarray(got).view(np.uint16), expected)
     assert np.any(expected != other), (
         "Target-specific fusion is not universally identical"

@@ -82,8 +82,9 @@ def index_rope(x, positions, cache, rotary_dim):
     """Indexer contract: B(a*c-B(b*s)), B(a*s+B(b*c)).
 
     These observable BF16 inner products differ from promoted main RoPE.
-    Triton fusion order is target-dependent; this matches the pinned sm80
-    indexer lowering, not every GPU target's reassociation of the same source.
+    Reassociation changes the intermediate rounding. The explicit formula
+    above specifies this implementation; do not infer a universal GPU fusion
+    order from the unfused source expression.
     """
     a, b, c, s = _rope_parts(x, positions, cache, rotary_dim)
     return jnp.concatenate(
