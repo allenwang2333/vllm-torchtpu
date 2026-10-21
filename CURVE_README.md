@@ -6,7 +6,12 @@ This branch is upstream `infx-qwen35-agentx-disagg-hillclimbing` at `e1c7027a7` 
 
 - **This merged tree has not been curve-measured.** Each curve point in the table below was measured on its own source tree, which the table names. Two of those source trees (bands D to H) sit on a different base than upstream. Treat this branch as "the same code changes, applied to upstream", not as "the tree the numbers came from".
 - **Unit tests:** 242 passed, 3 failed, in the server image on CPU. The 3 failures are pre-existing: they fail identically on upstream. See "Unit tests" at the end of this file.
-- **GSM8K gate:** pending; the result will be added here. Gate job: `j-e0de41ff-119a-4e47-ae4b`, 1P1D EVAL_ONLY on the **standard** `agentx-397b-pd-baseline` recipe (cloud-devkit-recipes master `22ec9222`), with `--map-dir` = this tree at `78a677720` and the env of the o6q gate `j-bff2f5c9` (97.57%).
+- **GSM8K gate: PASS, 97.57% ± 0.42%** (strict-match; flexible-extract also 97.57%; 1,319 questions; bar 97.0%). Job `j-e0de41ff-119a-4e47-ae4b`, completed 19:10Z 2026-10-21.
+  - **How it ran:** 1P1D EVAL_ONLY on the **standard** `agentx-397b-pd-baseline` recipe (cloud-devkit-recipes master `22ec9222`), submitted with plain `cdk job create`. `--map-dir` = this tree at `78a677720`, which the job's provenance record confirms. The env is the o6q gate `j-bff2f5c9`'s, with only `BENCH_NAME` and `COMPILE_CACHE_TAG` changed.
+  - **Comparison:** `j-bff2f5c9` scored 97.57% on o6q, so the result is identical.
+  - **KV handoff:** 2,640 requests and 21,120 Stage-3 receiver completions (8 ranks × 2,640). The proxy returned 2,640 × `200 OK` and no other status. No Traceback appears in any pod log.
+  - **Paths exercised:** the proxy log shows the llm-d proxy dispatch (`routing=llmd, running the llm-d proxy`, `quad_attn_coeff=1.23e-05`). The decode log shows R5 (`Runner stage timing: off (TPU_RUNNER_STAGE_TIMING_MODE=auto)`).
+  - **What it does not show:** this is one 1P1D accuracy gate, not a throughput measurement. Master dropped `PREFILL_TPU_RPA_PREFILL_BLOCKS`, `PREFILL_VLLM_TPU_LIGHTWEIGHT_STEP_STATS` and `LIBTPU_EXTRA_PREFILL` here, so those paths were not exercised.
 
 ## What is in the branch
 
@@ -640,4 +645,4 @@ All tests ran on CPU (`JAX_PLATFORMS=cpu`) inside the curve's server image (`vll
   - One sizing variable un-wired: 1 failed.
   - llm-d quad path off: 2 failed.
   - Fix v3 trim condition off: 2 failed.
-- No TPU kernel or serving test ran here; the GSM8K gate covers the serving path.
+- No TPU kernel or serving test ran in these unit tests. The serving path is covered by the GSM8K gate above (PASS, 97.57%).
