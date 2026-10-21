@@ -322,7 +322,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     RW = int(tiles.a2a_rw)
     if RW >= TMAX:                                   # one chunk = the unchunked exchange
         RW = 0
-    assert RW == 0 or (LSE_TILE and RW % 8 == 0 and TMAX % RW == 0), ("a2a_rw needs a2a_lse='tile', 8 | rw | TMAX",
+    assert RW == 0 or (LSE_TILE and RW % 4 == 0 and TMAX % RW == 0), ("a2a_rw needs a2a_lse='tile', 4 | rw | TMAX",
                                                                       RW, TMAX)
     NCH = TMAX // RW if RW else 1
     HPAD = max(8, -(-HR // 8) * 8)                   # lse tile rows per owner (heads padded to the f32 sublane tile)
