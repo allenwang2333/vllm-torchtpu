@@ -1427,6 +1427,7 @@ def make(E):
             return c
         lax.fori_loop(jnp.minimum(lo, U), jnp.minimum(hi, U), body, 0)
 
+    AE = getattr(E, "alias_early", None)                 # F-ALIAS-EARLY hook (kernel fault builds only)
     GREC_IN = getattr(E, "grec_in", None)
     GREC_OUT = getattr(E, "grec_out", None)
     GRECN = int(getattr(tiles, "grec", 0))
@@ -1748,6 +1749,8 @@ def make(E):
                             gwait(r)
                         else:
                             wait_full(r)
+                        if last and AE is not None:      # F-ALIAS-EARLY (fault builds only): expert DMAs land
+                            AE(r, U)                     # between the layer's last granule wait and its read
                         if GREC_OUT is not None:
                             record_rows(l, r)
                         if compute:

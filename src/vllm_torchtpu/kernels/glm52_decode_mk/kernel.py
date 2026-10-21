@@ -77,7 +77,15 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "f_alias_poison_nan_noguard",   # ... and the DSA's tail-row zeroing off: must go RED
                        "f_a2a_early",         # L4 C2: an A2A chunk is sent one request before its rows are emitted
                        "f_qag_pair_drop",     # stage-B L2-Q: qag="pair" forwards one same-parity block too few
-                       "f_leaf_shift")        # L3: the expert-operand leaf / index is one MoE layer off -> RED
+                       "f_leaf_shift",        # L3: the expert-operand leaf / index is one MoE layer off -> RED
+                       # F-ALIAS-EARLY (WHITEBOARD.v1 §11.2 / v2 §9 A2 item 9; alias admissibility rule 2: every
+                       # alias-window DMA is waited before the first expert DMA of the layer is issued). At the
+                       # layer's LAST gather granule, between its gather wait and its read (MoE layers, alias
+                       # layout only), expert units are DMA'd (start + wait) into ring slots:
+                       "f_alias_early",       # slot 0 only (the v1 / v2 text)
+                       "f_alias_early_ring",  # slots 0 .. NBE-1 (the layer's prime hoisted above the last read)
+                       "f_alias_early_g")     # only the slots whose rows overlap g_nope / g_rope and no other
+                                              # DSA view (the gather rows alone)
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -1011,6 +1019,41 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             stage[...] = val
             dput(dst, stage)
 
+        # ---------------- F-ALIAS-EARLY hook (fault builds only; trace-time gated) ----------------
+        cur_moe = [None]
+        alias_early = None
+        if fault.startswith("f_alias_early") and not typed:
+            if fault == "f_alias_early":
+                AE_SLOTS = [0]
+            elif fault == "f_alias_early_ring":
+                AE_SLOTS = list(range(NBE))
+            else:
+                def _rng(nm):
+                    r0_, shp_, dt_ = EPOOL["views"][nm]
+                    return r0_, r0_ + math.prod(shp_) * jnp.dtype(dt_).itemsize // 128
+                g_rows = [_rng("g_nope"), _rng("g_rope")]
+                # views live at the last granule's read besides the gather rows (b_keys / b_memb / b_pre / b_xacc /
+                # b_xcc serve the scan, threshold and unions of fresh layers and are dead by then)
+                other = [_rng(nm) for nm in ("kvb", "qb", "qrb", "b_sbuf", "att_acc") if nm in EPOOL["views"]]
+                ov = lambda a, b: a[0] < b[1] and b[0] < a[1]   # noqa: E731
+                AE_SLOTS = []
+                for s_ in range(NBE):
+                    sl_ = [_rng(f"w13_{s_}"), _rng(f"w2_{s_}")]
+                    if any(ov(x, g) for x in sl_ for g in g_rows) and not any(ov(x, o) for x in sl_ for o in other):
+                        AE_SLOTS.append(s_)
+            assert AE_SLOTS, ("f_alias_early_g: no expert slot overlaps only the gather rows", fault)
+
+            def alias_early(r, U):
+                is_moe_, mpos_ = cur_moe[0]
+
+                @pl.when(jnp.logical_and(is_moe_, r == U - 1))
+                def _():
+                    for s_ in AE_SLOTS:                 # expert s_ of this MoE layer into ring slot s_ (any
+                        scr["active"][s_] = jnp.int32(s_)   # expert: its bytes overwrite what the slot aliases)
+                        estart(jnp.int32(s_), mpos_)
+                    for s_ in AE_SLOTS:
+                        ewait(jnp.int32(s_))
+
         # ---------------- the batched DSA core ----------------
         core = {}
         cur_slot = [None]
@@ -1026,7 +1069,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             grec_out=(RO["gnrec_o"], RO["grrec_o"]) if tiles.record else None,
             rec_sem=scr["rec_sem"] if (REC_IN or REC_OUT) else None,
             dbg_uv=scr["dbg_uv"] if debug else None,
-            delay=delay_count, Lf=Lf, xin=x_in, xout=x_out if xout_names else None)
+            delay=delay_count, Lf=Lf, xin=x_in, xout=x_out if xout_names else None, alias_early=alias_early)
         core.update(DSA.make(Ens))
 
         def save_table():
@@ -1073,6 +1116,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             fresh = ltab[l, 1] > 0
             is_moe = ltab[l, 2] > 0
             mpos = ltab[l, 3]
+            cur_moe[0] = (is_moe, mpos)
             slot = l % 2
             cur_slot[0] = slot
             cur_layer[0] = l
