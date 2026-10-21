@@ -170,6 +170,36 @@ This mode compares 32, 96, 144 and 288 rows with automatic table dispatch,
 retaining compiled HLO and checking complete EP8 outputs against the 32-row
 reference. Height tuning remains automatic throughout the router sweep.
 
+## WO_A row chunks awaiting serving validation
+
+The TPU7x decode shape `[288,64,512]` with FP8 weight `[4096,8192]`,
+FP32 scales, tile T=288/R=1024, quantized activations and no fused RoPE now
+uses one 288-row contraction instead of three 96-row contractions. The
+lookup includes device, shapes, dtypes and tile settings; other workloads
+keep the previous divisor rule, and explicit `sub_t` values take precedence.
+
+| Seed / experiment | 96-row reference (us) | 288-row candidate (us) |
+| --- | ---: | ---: |
+| 1023 / `exp-qg29pd6unq` | 25.439 | 23.842 |
+| 1033 / `exp-1yxqyt6ap6` | 25.452 | 23.857 |
+| 1035 / `exp-1yxqyt6ap6`, automatic dispatch | 25.458 | 23.813 |
+
+These are device-module medians excluding entry barriers. Seeds 1033 and
+1035 passed comparisons of all output bit patterns, including signed zero.
+Seed 1023 used array equality. In the automatic-dispatch run, the explicit
+288-row variant measured 23.825 us. Compiled generated code shrank from
+307200 to 255488 bytes, with unchanged reported argument/output storage and
+zero temporary HBM. The roughly 1.6 us gain per layer projects to only
+0.064 ms over 40 layers and is not an end-to-end result. The serving table
+above predates this change.
+
+Reproduce on the pinned TPU runtime from the repository root:
+
+```bash
+python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1033 --seed 1033 --profile
+python scripts/dsv41_bench/bench_wo_a_tiles.py --out /tmp/woa-1035 --seed 1035 --profile
+```
+
 ## Experiments not adopted
 
 The following prototypes remain outside the production path. Unless labeled
