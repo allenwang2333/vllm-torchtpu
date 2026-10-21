@@ -259,12 +259,13 @@ def main():
 
         gather_pack()
         candidate = Upload(words, device)
-        ordinary = Upload(words, device)
         baseline = packed.to(device)
         case.update(
             logical_bytes=packed.nbytes,
             physical_bytes=candidate.transfer.physical_size_bytes,
             layout=candidate.layout,
+            host_buffer_pjrt_backed=candidate.host_buffer.is_pjrt_backed,
+            host_tensor_reports_pinned=candidate.host_bytes.is_pinned(),
         )
 
         # Test the pointer lifetime claim on the exact installed runtime.
@@ -312,12 +313,14 @@ def main():
         case["repeated_compiled_consumer_equal"] = checks
 
         candidate.host_words.copy_(packed)
-        ordinary.host_words.copy_(packed)
         methods = {
             "copy_": lambda: baseline.copy_(packed),
             "raw_api": lambda: raw_transfer.transfer_h2d(
-                ordinary.host_bytes, ordinary.device
+                candidate.host_bytes, candidate.device
             ),
+            "reprepare_api": lambda: raw_transfer.PreparedTorchRawTransfer(
+                candidate.device, candidate.host_buffer, unsafe_skip_buffer_lock=False
+            ).h2d(),
             "prepared_api": candidate.transfer.h2d,
             "prepared_upload_with_copy_and_fence": lambda: candidate.copy_from(packed),
             "host_gather_pack": gather_pack,
