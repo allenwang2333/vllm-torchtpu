@@ -79,10 +79,28 @@ def test_fixed_expert_slots_and_tail_rounding():
     owners = placement(np.array([9, 8, 2, 1]), 2)
     assert np.bincount(owners).tolist() == [2, 2]
     assert np.bincount(owners, weights=[9, 8, 2, 1]).tolist() == [10, 10]
-    result = load_summary(np.array([0, 1, 64, 129]), np.array([0, 0, 1, 1]), 2)
+    result = load_summary(
+        np.array([0, 1, 64, 129]),
+        np.array([0, 2, 64, 130]),
+        np.array([0, 0, 1, 1]),
+        2,
+    )
     assert result["tiles_128"]["per_shard"] == [1, 3]
     assert result["computed_rows_64"]["per_shard"] == [64, 256]
     assert result["active_experts"]["per_shard"] == [1, 2]
+
+
+def test_source_runs_are_aligned_before_expert_counts_are_summed():
+    rows = records()[:2]
+    rows[0]["counts"] = np.array([33, 1, 0, 0])
+    rows[1]["counts"] = np.array([31, 1, 0, 0])
+    step = aggregate(rows)[0]
+    np.testing.assert_array_equal(step["counts"], [64, 2, 0, 0])
+    np.testing.assert_array_equal(step["aligned_counts"], [66, 4, 0, 0])
+    loads = load_summary(
+        step["counts"], step["aligned_counts"], np.array([0, 0, 1, 1]), 2
+    )
+    assert loads["computed_rows_64"]["per_shard"] == [192, 0]
 
 
 def test_same_forward_is_required_even_if_sample_numbers_match():
@@ -120,5 +138,5 @@ def test_holdout_does_not_refit_placement():
     )
     owners = np.asarray(layer["placements"]["routed_rows"])
     assert holdout["fixed_training_placements"]["routed_rows"] == load_summary(
-        np.array([2, 256, 256, 2]), owners, 2
+        np.array([2, 256, 256, 2]), np.array([4, 256, 256, 4]), owners, 2
     )

@@ -429,10 +429,15 @@ python scripts/dsv41_bench/analyze_moe_routes.py /path/to/replayed \
 The analyzer rejects incomplete or duplicate same-forward EP groups and
 inconsistent biases or ownership. It retains 48 expert slots per rank, fits
 greedy placements only on forward 40, and evaluates forward 48 without refitting.
-On forward 48, the sum of per-layer maximum 64-row-rounded work decreased from
-182656 to 155200 rows; maximum 128-row tile counts summed to 2214 versus 1993.
-These are work counts, not a latency model. Round-robin placement yielded
-183296 rounded rows and did not improve this aggregate. The complete KV
+The native plan rounds each source-rank/expert run to `ROWBLK=2` **before**
+summing an expert's rows. The initial offline fit omitted that padding; its
+archived row/tile estimates are raw-count proxies, not native work counts.
+The analyzer now includes source padding (`--source-row-alignment`, default 2).
+For the same initial placements tested below, corrected sums of per-layer
+maximum 64-row-rounded work are 184960 versus 156480 rows. Refitting with
+source padding yields 156288 rows, still only a work estimate pending timing.
+This correction does not change the recorded microbenchmark timings or outputs.
+The complete KV
 capture also confirmed a median six-query union of 1376 rows and an ideal
 selected-row traffic reduction of 54.50% across 6144 request/indexer samples.
 
