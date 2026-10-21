@@ -136,6 +136,26 @@ python -m pytest --confcutdir=tests/scripts \
   tests/scripts/test_dsv41_decode_accounting.py -q
 ```
 
+## Frozen GSM8K quality comparison
+
+Against an already running server, evaluate the same frozen JSONL dataset and
+sample seed in both configurations:
+
+```bash
+python scripts/dsv41_bench/server_steps/eval_gsm8k.py \
+  --dataset /tmp/gsm8k-test.jsonl --out /tmp/quality-baseline \
+  --samples 256 --concurrency 32 --repeats 2 --seed 0 --max-tokens 2048
+```
+
+This protocol uses zero-shot chat, temperature zero and disabled thinking; it
+is not the few-shot leaderboard protocol. Each run records the dataset hash,
+selected original indices, request hash and every raw response. A strict final
+`####` numeric answer is compared after decimal normalization. Format failures,
+truncated generations and HTTP failures are reported explicitly. Failed requests
+remain in the sample denominator and cause a nonzero exit status. Use a fresh
+output directory and inspect per-question differences and repeated-run stability
+before drawing a quality conclusion. This command does not measure throughput.
+
 ## Timing and audit contract
 
 - `startup.json` measures launch through HTTP health readiness. This includes
