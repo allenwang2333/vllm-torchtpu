@@ -194,6 +194,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_MIXED_KV_PAGES: int | None = 4
     TPU_STREAMIDX_DECODE_PACK: bool = True
     TPU_STREAMIDX_SHARED_META: bool = True
+    TPU_STREAMIDX_MIXED_DECODE_SPLIT: bool = True
     TPU_SC_TOPK_ROW_CAP: bool = False
     TPU_SC_TOPK_VALID_READS: bool = True
     TPU_SC_TOPK_DCP_MERGE_FLAT: bool = True
@@ -1661,6 +1662,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # depth, 1 decoder: 21 layers x (3 schedule conds + 1 operand fusion)
     # = 190 us per step. Same operands, same result.
     "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META", default=True),
+    # Buckets above TPU_STREAMIDX_SMALL_BUCKET_TOKENS (with
+    # TPU_STREAMIDX_SMALL_BUCKET_BQ set): split the StreamIndex top-k MIXED
+    # pass so its leading q_len <= bq sequences -- the MTP decode requests of a
+    # mixed decode + prefill step -- run in their own pass with the small-bucket
+    # block sizes (bq 4, packed under TPU_STREAMIDX_DECODE_PACK) instead of one
+    # 128-row query block each (124 rows padding); the rest keep the 128-row
+    # pass, both into one aliased scores buffer. Chunked calls run the short
+    # pass only in chunks below max_num_seqs * bq tokens. GLM-5.2 DCP8
+    # 4096-token mixed step, 20-34 decodes: chunk 0 414-435 us vs 26-47 us for
+    # the others (modelled -7.3 ms per mixed step). Not bit-identical: bq 4
+    # reduces heads in f32, bq 128 over bf16-rounded relu(q.k), so top-k can
+    # differ on near ties (same caveat as TPU_STREAMIDX_SMALL_BUCKET_TOKENS
+    # > 16). 0 restores the single MIXED pass.
+    "TPU_STREAMIDX_MIXED_DECODE_SPLIT": env_bool(
+        "TPU_STREAMIDX_MIXED_DECODE_SPLIT", default=True
+    ),
     # KV pages per block of the StreamIndex top-k MIXED (multi-token) pass for
     # every bucket that does not take the small-bucket sizes (with
     # TPU_STREAMIDX_SMALL_BUCKET_BQ set, buckets above
