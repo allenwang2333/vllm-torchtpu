@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL_V2: bool = True
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = True
+    TPU_MOE_TP_DECODE_GMM_QUANT: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = True
     TPU_MOE_TP_DECODE_SPLIT_META: bool = True
     TPU_MOE_TP_DECODE_SHARED_META: bool = True
@@ -1236,6 +1237,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each layer was refused). Remove once the path is the default for these layers or
     # is replaced by another fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL", True),
+    # With USE_MOE_TP_DECODE_KERNEL: run upstream #1763's kernel as merged
+    # (kernels/experimental/moe_tp_decode/kernel_1763.py, vendored from the
+    # GLM-5.2 c48 reference image, glm-agentx b64302de0) instead of t7's
+    # kernel.py. The routed experts then quantize x per 512 columns with bf16
+    # scales and sum per-block partial products in bf16, as gmm_v2 does on the
+    # unarmed path (t7's kernel: one per-row scale, one f32 matmul), so the
+    # armed buckets match the reference and the psum path bit for bit.
+    # TPU_MOE_TP_DECODE_FAST / _HBM_OPERANDS do not apply to it.
+    "TPU_MOE_TP_DECODE_GMM_QUANT": env_bool(
+        "TPU_MOE_TP_DECODE_GMM_QUANT", default=False
+    ),
     # With USE_MOE_TP_DECODE_KERNEL: the kernel's fast schedule (same arithmetic,
     # bit-identical output): top-k without the per-pick index reduction (exact
     # fallback on ties), the expert compaction on the vector units, ring primes

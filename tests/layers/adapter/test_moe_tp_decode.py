@@ -496,3 +496,61 @@ def test_arms_an_expert_range_on_ep_by_tp_weights(harness, ep_size, tp_size, ep_
     assert scores.shape == (16, E * ep_size) and bias.shape == (E * ep_size,)
     assert w13 is layer.w13_weight and w13.shape[0] == E
     assert e0.tolist() == [[ep_rank * E]]
+
+
+@pytest.mark.parametrize("gmm_quant", [False, True])
+def test_op_body_picks_the_upstream_kernel_under_gmm_quant(gmm_quant, monkeypatch):
+    """TPU_MOE_TP_DECODE_GMM_QUANT: the armed buckets run kernel_1763
+    (upstream #1763 as merged, the reference c48 image's kernel) without the
+    t7-only fast / hbm_operands arguments; off, t7's kernel.py with them."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.experimental import moe_tp_decode as t7_kernel
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel_1763
+
+    calls = []
+
+    def fake(name):
+        def run(x, scores, bias, n_valid, rank, *weights, **kw):
+            calls.append((name, x.shape[0], sorted(kw)))
+            return jnp.zeros_like(x)
+
+        return run
+
+    for mod, name in ((t7_kernel, "t7"), (kernel_1763, "1763")):
+        monkeypatch.setattr(mod, "can_use_moe_tp_decode", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "moe_tp_decode", fake(name))
+    statics = moe_tp_decode._OpStatics(
+        topk=8,
+        routed_scale=2.5,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        fast=True,
+        hbm_operands=False,
+        gmm_quant=gmm_quant,
+    )
+    body = moe_tp_decode._op_body(statics, 16, "d")
+    for n in (8, 16):  # the n < 16 pad path, then a kernel bucket
+        x = jnp.ones((n, 128), jnp.bfloat16)
+        out = body(
+            x,
+            jnp.ones((n, 32), jnp.float32),
+            jnp.zeros((32,), jnp.float32),
+            jnp.zeros((16,), jnp.bool_),
+            *([None] * 8),
+            jnp.zeros((1,), jnp.int32),
+            jnp.zeros((1, 1), jnp.int32),
+        )
+        assert out.shape == x.shape
+    want = "1763" if gmm_quant else "t7"
+    kw = [] if gmm_quant else ["fast", "hbm_operands"]
+    assert calls == [
+        (want, 16, sorted(["n_ranks", "routed_scale", "topk", *kw])),
+        (want, 16, sorted(["n_ranks", "routed_scale", "topk", *kw])),
+    ]
+
+
+def test_gmm_quant_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("TPU_MOE_TP_DECODE_GMM_QUANT", raising=False)
+    assert envs.environment_variables["TPU_MOE_TP_DECODE_GMM_QUANT"]() is False
