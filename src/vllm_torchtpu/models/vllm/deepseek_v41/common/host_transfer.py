@@ -58,12 +58,15 @@ class PreparedEngramUpload:
         if self.needs_consumer:
             raise RuntimeError("Record the Engram consumer before reusing its buffer")
         self.wait()
+        self.release_consumers()
+        return self.host_words
+
+    def release_consumers(self) -> None:
         if self.consumers:
             from torch_tpu._internal import sync
 
             sync.synchronize(tensors=self.consumers, wait=True)
             self.consumers = []
-        return self.host_words
 
     def start(self) -> None:
         self.pending = self.transfer.h2d_async()

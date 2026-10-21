@@ -181,6 +181,16 @@ def test_prefetch_uses_other_slot_and_preserves_current_values(staging):
     assert sum(isinstance(event, tuple) for event in events) == 4
 
 
+def test_bucket_switch_releases_dormant_activation_outputs(staging):
+    layer, _, _, _, _ = staging
+    layer.prepare_embeddings(torch.ones((3, 2), dtype=torch.int64))
+    old = layer._active_upload
+    layer.record_upload_consumers([layer._ready_rows(3)])
+    assert old.consumers
+    layer.start_prepare_embeddings(torch.ones((4, 2), dtype=torch.int64))
+    assert not old.consumers
+
+
 @pytest.fixture
 def prompt_inputs():
     module = load_nodes(

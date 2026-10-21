@@ -684,6 +684,12 @@ class Engram(upstream.Engram):
 
         assert self._prepared_uploads is not None
         assert self._staged_raw is not None
+        # Warmup visits many shapes. Keep their DMA allocations, but do not
+        # retain a full activation graph for every dormant token bucket.
+        for tokens, slots in self._prepared_uploads.items():
+            if tokens != num_tokens:
+                for slot in slots:
+                    slot.release_consumers()
         uploads = self._prepared_uploads.get(num_tokens)
         if uploads is None:
             cols = self.embed_tokens.part_n_hash_cols
