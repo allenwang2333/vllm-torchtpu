@@ -317,9 +317,17 @@ class _FakeGitHub:
         self.labels = list(labels)
         self.comment = (7, state) if state is not None else (None, {})
         self.loads = {}
+        self.pinned = set()  # logins GitHub refuses to withdraw
         self.requested = []
         self.pruned = []
         self.written = []
+
+        def remove(logins, pr, repo, style):
+            kept = [login for login in logins if login in self.pinned]
+            withdrawn = [login for login in logins if login not in self.pinned]
+            self.pruned.extend(withdrawn)
+            return withdrawn, kept
+
         m = monkeypatch
         m.setattr(
             find_owners,
@@ -333,11 +341,7 @@ class _FakeGitHub:
             "request_reviewers",
             lambda handles, pr, repo, style: self.requested.extend(handles),
         )
-        m.setattr(
-            find_owners,
-            "remove_reviewers",
-            lambda logins, pr, repo, style: self.pruned.extend(logins),
-        )
+        m.setattr(find_owners, "remove_reviewers", remove)
         m.setattr(
             find_owners,
             "write_marker",
@@ -455,3 +459,16 @@ def test_dry_balance_reports_without_acting(monkeypatch):
     assert result["picks"] == ["@k", "@r"]
     assert result["pruned"] == []
     assert gh.requested == gh.pruned == gh.written == []
+
+
+def test_pinned_requests_are_reported_not_claimed(monkeypatch):
+    # The ruleset still requires code-owner review, so GitHub keeps q and s.
+    gh = _FakeGitHub(monkeypatch, pending=["p", "q", "r", "s", "k"])
+    gh.loads = {"p": 5, "q": 9, "r": 1, "s": 5, "k": 3}
+    gh.pinned = {"q", "s"}
+    result = _balance(gh)
+    assert result["pruned"] == ["p"]
+    assert result["pinned"] == ["q", "s"]
+    ((_, body),) = gh.written
+    assert "Withdrew the other code-owner requests: `p`." in body
+    assert "GitHub kept the requests of `q`, `s`" in body

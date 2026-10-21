@@ -19,8 +19,14 @@ name: Reviewer Balancer
 # one owner per area: the owner with the fewest open review requests in the
 # repo, as `scripts/find_owners.py --balance` picks them. The other pending
 # code-owner requests of those areas are withdrawn. CODEOWNERS stays the
-# record of who may approve; the ruleset still needs one owner's approval
-# per area, and any owner may give it.
+# record of who may approve; one owner's approval per area is still required,
+# and any owner may give it.
+#
+# Withdrawing only works while no ruleset requires review from code owners:
+# GitHub pins automatically requested owners under that rule and answers the
+# withdrawal with 200 without acting. The script reads the request list back
+# and reports such owners as kept, on the PR as well, rather than claiming
+# to have withdrawn them.
 #
 # What it never does: ask or drop anyone on a draft; touch a reviewer who has
 # already reviewed, or one who owns none of the areas balanced in this run

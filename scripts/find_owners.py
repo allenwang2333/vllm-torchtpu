@@ -41,12 +41,14 @@ Typical use, from anywhere inside the repo:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+from contextlib import nullcontext
 from typing import NoReturn
 
 CODEOWNERS_CANDIDATES = (
@@ -224,13 +226,25 @@ def changed_files(root: str, base: str) -> tuple[list[str], str]:
 
 
 def pr_files(pr: str, repo: str | None) -> tuple[list[str], str]:
-    cmd = ["gh", "pr", "diff", str(pr), "--name-only"]
-    if repo:
-        cmd += ["--repo", repo]
-    out = run(cmd)
-    if out is None:
-        die(f"could not read PR #{pr}; is `gh` installed and authenticated?")
-    return sorted(set(out.splitlines())), f"PR #{pr}"
+    """The files a PR changes, by their path in the PR.
+
+    The files endpoint pages up to 3000 files. `gh pr diff --name-only`
+    fetches the diff media type instead, which GitHub refuses above 300
+    files, so a large sweep or rename would never get an answer.
+    """
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{resolve_repo(repo)}/pulls/{pr}/files",
+            "--paginate",
+            "--jq",
+            ".[].filename",
+        ]
+    )
+    if not ok:
+        die(f"could not read the files of PR #{pr}: {out}")
+    return sorted({line for line in out.splitlines() if line}), f"PR #{pr}"
 
 
 def expand_paths(root: str, paths: list[str]) -> list[str]:
@@ -546,7 +560,10 @@ def parse_marker(body: str) -> dict | None:
 
 
 def balancer_comment(
-    picks: dict[str, tuple[str, int]], pruned: list[str], state: dict
+    picks: dict[str, tuple[str, int]],
+    pruned: list[str],
+    state: dict,
+    kept: list[str] | None = None,
 ) -> str:
     """The PR comment explaining a run; handles are not @-mentioned, because
     the review request already notified the picks."""
@@ -564,6 +581,14 @@ def balancer_comment(
     if pruned:
         quoted = ", ".join(f"`{p}`" for p in pruned)
         lines += ["", f"Withdrew the other code-owner requests: {quoted}."]
+    if kept:
+        quoted = ", ".join(f"`{p}`" for p in kept)
+        pinned_note = (
+            f"GitHub kept the requests of {quoted}: the ruleset still requires "
+            "review from code owners, which pins automatically requested "
+            "owners. No action is needed from them."
+        )
+        lines += ["", pinned_note]
     lines += ["", outro, "", format_marker(state)]
     return "\n".join(lines)
 
@@ -638,9 +663,18 @@ def write_marker(pr: str, repo: str, comment_id: int | None, body: str) -> None:
         die(f"could not write the balancer comment on PR #{pr}: {out}")
 
 
-def remove_reviewers(logins: list[str], pr: str, repo: str, style: Style) -> None:
+def remove_reviewers(
+    logins: list[str], pr: str, repo: str, style: Style
+) -> tuple[list[str], list[str]]:
+    """Withdraw pending requests; returns (withdrawn, kept).
+
+    GitHub answers 200 either way. While a ruleset requires review from code
+    owners it keeps automatically requested owners whose files are still in
+    the diff, so the request list is read back and anyone still on it is
+    reported as kept rather than claimed as withdrawn.
+    """
     if not logins:
-        return
+        return [], []
     ok, out = run_checked(
         [
             "gh",
@@ -655,8 +689,24 @@ def remove_reviewers(logins: list[str], pr: str, repo: str, style: Style) -> Non
     )
     if not ok:
         die(f"could not withdraw review requests on PR #{pr}: {out}")
-    joined = ", ".join(f"@{login}" for login in logins)
-    print(f"Withdrew review requests on PR #{pr} from {style.yellow(joined)}")
+    try:
+        still = {u["login"].lower() for u in json.loads(out)["requested_reviewers"]}
+    except (ValueError, KeyError, TypeError):
+        still = {login.lower() for login in pr_review_state(pr, repo)[0]}
+    withdrawn = [login for login in logins if login.lower() not in still]
+    kept = [login for login in logins if login.lower() in still]
+    if withdrawn:
+        joined = ", ".join(f"@{login}" for login in withdrawn)
+        print(f"Withdrew review requests on PR #{pr} from {style.yellow(joined)}")
+    if kept:
+        joined = ", ".join(f"@{login}" for login in kept)
+        print(
+            style.yellow(
+                f"GitHub kept the requests of {joined}: a ruleset that requires "
+                "review from code owners pins automatically requested owners."
+            )
+        )
+    return withdrawn, kept
 
 
 def balance_pr(
@@ -687,6 +737,7 @@ def balance_pr(
         "loads": {},
         "requested": [],
         "pruned": [],
+        "pinned": [],
         "skipped": None,
     }
     if OPT_OUT_LABEL in labels:
@@ -731,15 +782,19 @@ def balance_pr(
 
     if request and to_request:
         request_reviewers(to_request, pr, repo, style)
-    if prune:
-        remove_reviewers(to_prune, pr, repo, style)
+    withdrawn, kept = remove_reviewers(to_prune, pr, repo, style) if prune else ([], [])
+    result["pruned"] = withdrawn
+    result["pinned"] = kept
     if comment:
         new_state = {
             "areas": sorted(set(state.get("areas", [])) | set(areas)),
             "picks": sorted({handle_key(p) for p in prev_picks + picks}),
         }
         write_marker(
-            pr, repo, comment_id, balancer_comment(picked_by_area, to_prune, new_state)
+            pr,
+            repo,
+            comment_id,
+            balancer_comment(picked_by_area, withdrawn, new_state, kept),
         )
     return result
 
@@ -917,6 +972,12 @@ def main() -> None:
     if (args.prune or args.comment) and not (args.pr and args.balance):
         parser.error("--prune and --comment need --pr and --balance")
 
+    color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
+    style = Style(color)
+
+    # With --json the human report goes to stderr, so stdout stays parseable.
+    report_to = contextlib.redirect_stdout(sys.stderr) if args.json else nullcontext()
+
     root = repo_root()
     rules, codeowners_path = load_rules(root, args.codeowners)
 
@@ -931,21 +992,19 @@ def main() -> None:
     groups, unowned = group_by_rule(files, rules)
     author = resolve_author(args.pr, args.repo)
 
-    color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
-    style = Style(color)
-
     if args.balance and args.pr and (args.request or args.prune or args.comment):
         # The workflow path: act on the PR and report what was done.
-        result = balance_pr(
-            groups,
-            author,
-            str(args.pr),
-            resolve_repo(args.repo),
-            style,
-            request=args.request,
-            prune=args.prune,
-            comment=args.comment,
-        )
+        with report_to:
+            result = balance_pr(
+                groups,
+                author,
+                str(args.pr),
+                resolve_repo(args.repo),
+                style,
+                request=args.request,
+                prune=args.prune,
+                comment=args.comment,
+            )
         if args.json:
             print(json.dumps(result, indent=2))
         return
