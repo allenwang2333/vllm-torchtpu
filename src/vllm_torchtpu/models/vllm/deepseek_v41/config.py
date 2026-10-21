@@ -114,7 +114,6 @@ def _automatic_expert_permutations(config: "VllmConfig") -> ExpertPermutations:
             parallel.prefill_context_parallel_size,
             parallel.pipeline_parallel_size,
         ),
-        hash_layers=hf.num_hash_layers,
     )
 
 

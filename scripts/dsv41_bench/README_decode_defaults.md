@@ -26,7 +26,7 @@ conditions hold:
 
 - TPU v7, TP1, DP8, PCP1 and PP1, with expert parallelism enabled.
 - 40 layers, 384 routed experts, hidden size 5120, MoE intermediate size 2304,
-  and top-k six. No remapped layer may use hash routing.
+  and top-k six. DSV4.1 uses learned routing in all MoE layers.
 - Linear expert placement, EPLB disabled, `runai_streamer` loading and
   `--enable-ep-weight-filter` enabled.
 
@@ -59,6 +59,11 @@ only the expert IDs sent to dispatch. Draft layers retain their native placement
 The built-in table preserves every value of the earlier calibrated JSON
 (SHA-256 `8cf1d65275f04e2a142edf6f00b295604c6da5c9522a4f4a8f4f13ddfb7bcb7b`).
 
+The placement resolver does not read `num_hash_layers`: that field belongs to
+DSV4, while upstream DSV4.1 explicitly constructs its MoE with zero hash layers.
+The serving-policy tests use the upstream HF config class with nested
+`text_config` and `quantization_config` to cover the actual checkpoint schema.
+
 ## Validation and limits
 
 The extracted branch was checked in Falcon `exp-kcu0tqsle9` /
@@ -70,6 +75,13 @@ disablement, incompatible layouts, worker serialization, all 11520 calibrated
 destinations and the replicated map operand. Full-environment pyrefly reports
 57 existing errors on the base and 54 on this branch, with no new errors.
 Changed-file pre-commit checks pass.
+
+Falcon `exp-wkw0p48cx4` additionally reproduced the missing-`num_hash_layers`
+startup error before the correction. With the correction, all 315 tests pass
+using the upstream HF config class, and `EngineArgs.create_engine_config()`
+succeeds with the real checkpoint config and enables all 30 placement layers.
+Full-environment pyrefly reports the same 54 existing errors and no new errors.
+This checks configuration startup without loading model weights.
 
 Fresh TPU checks also pass: FP4 automatic dispatch matches the four-height
 reference at seed 1140, and all eight mHC consumer-chain outputs match at seed

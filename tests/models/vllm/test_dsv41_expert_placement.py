@@ -70,7 +70,7 @@ def test_default_table_retains_every_calibrated_checkpoint_destination():
     )
 
     key = ExpertPlacementKey("TPU v7", 40, 384, 5120, 2304, 6, 1, 8, 1, 1)
-    mapping = default_expert_permutations(key, hash_layers=2)
+    mapping = default_expert_permutations(key)
     serialized = json.dumps(mapping, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
         "3a2b821714a4b26187c4d14f033b65aef9ea86cb4402d08fc2844f537370f937"
@@ -85,10 +85,10 @@ def test_default_table_retains_every_calibrated_checkpoint_destination():
                 == f"model.layers.{layer}.ffn.experts.{physical}.w1.weight"
             )
     mapping.clear()
-    assert len(default_expert_permutations(key, hash_layers=2)) == 30
+    assert len(default_expert_permutations(key)) == 30
 
 
-def test_default_table_refuses_other_topologies_and_hash_layer_overlap():
+def test_default_table_refuses_other_topologies():
     from vllm_torchtpu.models.vllm.deepseek_v41.tuned_expert_placement import (
         ExpertPlacementKey,
         default_expert_permutations,
@@ -107,5 +107,4 @@ def test_default_table_refuses_other_topologies_and_hash_layer_overlap():
         key._replace(pcp=2),
         key._replace(pp=2),
     ):
-        assert default_expert_permutations(changed, hash_layers=2) == {}
-    assert default_expert_permutations(key, hash_layers=3) == {}
+        assert default_expert_permutations(changed) == {}

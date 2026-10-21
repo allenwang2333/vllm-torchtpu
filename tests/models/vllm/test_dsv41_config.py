@@ -7,6 +7,9 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from vllm.transformers_utils.configs.deepseek_v41 import (
+    DeepseekV41Config as HFDeepseekV41Config,
+)
 
 from vllm_torchtpu.models.vllm.deepseek_v41.config import (
     DeepseekV41Config,
@@ -45,14 +48,15 @@ def config(**policy):
         load_config=SimpleNamespace(load_format="runai_streamer"),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(
-                expert_dtype="fp4",
-                num_hidden_layers=40,
-                n_routed_experts=4,
-                hidden_size=5120,
-                moe_intermediate_size=2304,
-                num_experts_per_tok=6,
-                num_hash_layers=2,
+            hf_config=HFDeepseekV41Config(
+                text_config={
+                    "num_hidden_layers": 40,
+                    "n_routed_experts": 4,
+                    "hidden_size": 5120,
+                    "moe_intermediate_size": 2304,
+                    "num_experts_per_tok": 6,
+                },
+                quantization_config={"expert_dtype": "fp4"},
             )
         ),
         cache_config=SimpleNamespace(
@@ -98,6 +102,7 @@ def test_defaults_are_explicit_and_do_not_enable_approximation():
 def test_calibrated_placement_is_default_and_frozen_for_worker_copies():
     cfg = config(moe="fused_ep_w4a8")
     cfg.model_config.hf_config.n_routed_experts = 384
+    assert "num_hash_layers" not in cfg.model_config.hf_config.to_dict()
     verify_and_update_config(cfg)
     resolved = cfg.additional_config["deepseek_v41"]["expert_permutations"]
     assert len(resolved) == 30

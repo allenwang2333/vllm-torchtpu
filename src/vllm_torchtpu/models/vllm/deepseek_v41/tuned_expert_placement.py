@@ -831,16 +831,18 @@ _EXPERT_PLACEMENTS = {
 
 
 def default_expert_permutations(
-    key: ExpertPlacementKey, *, hash_layers: int
+    key: ExpertPlacementKey,
 ) -> dict[str, tuple[int, ...]]:
-    """Return an independent map only for the calibrated non-hash topology."""
+    """Return an independent map for the calibrated DSV4.1 topology.
+
+    Upstream DSV4.1 always uses learned routing, with no hash MoE layers.
+    """
     preset = _EXPERT_PLACEMENTS.get(key)
-    if preset is None or any(int(layer) < hash_layers for layer in preset):
+    if preset is None:
         logger.warning_once(
-            "[DSV41] No calibrated expert placement for %s, hash_layers=%s; "
+            "[DSV41] No calibrated expert placement for %s; "
             "retaining native expert order",
             key,
-            hash_layers,
         )
         return {}
     return dict(preset)
