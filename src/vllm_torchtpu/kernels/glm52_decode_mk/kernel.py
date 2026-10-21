@@ -74,7 +74,8 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "f_alias_poison_red", "f_stale_is_alias",   # own_uv placed in the alias (+ poison)
                        "f_ar_earlyread",      # AR#1 sums its slots before waiting them (delay-exposed race)
                        "f_alias_poison_nan",  # F-ALIAS-POISON with 0xFF bytes (e4m3fn NaN): must stay identical
-                       "f_alias_poison_nan_noguard")   # ... and the DSA's tail-row zeroing off: must go RED
+                       "f_alias_poison_nan_noguard",   # ... and the DSA's tail-row zeroing off: must go RED
+                       "f_leaf_shift")        # L3: the expert-operand leaf / index is one MoE layer off -> RED
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -108,6 +109,18 @@ class Tiles:
     scan_unroll: int = 4         # DSA scan inner unroll (was the MKD_SCAN_UNROLL env var: outside every cache key)
     interp_alias: bool = True    # interpret mode: run the Mosaic alias layout (dpool / epool views) through
                                  # interp_alias.install() instead of separate typed buffers (alias=False: typed)
+    # stage-B lane L3 (served operand form; WHITEBOARD.v3 §6.3). Defaults = stage A, program unchanged.
+    ecas: str = "when2"          # expert-operand cascade over the Lm per-layer operands (stack_e=False, or edummy):
+                                 # "when2" (stage A: two pl.when per level) | "cond" (L3-a: one lax.cond if/else
+                                 # per level, half the compares)
+    ebatch: int = 1              # L3-b: expert-ring refill batch k. 1 = stage A (one issue, one cascade evaluation
+                                 # per unit). k > 1: the ring primes in one evaluation and refills once >= k slots
+                                 # are free (or the layer's last units are issuable): ~U / k evaluations per layer
+    edummy: bool = False         # L3 mechanism arm (stack_e=True only): route every issue through the served
+                                 # form's Lm-leaf cascade, leaf i reading the stacked operands at the static `.at[i]`
+    esingle: bool = False        # L3-s: ONE issue site per MoE layer (bundles): the expert loop runs from step -1,
+                                 # whose iteration primes the ring through the same refill site and then runs the
+                                 # shared expert; uses the L3-b refill rule with k = ebatch (k = 1 included)
 
 
 def bf(x):
@@ -199,6 +212,38 @@ def bswitch(idx, fns):
         def _():
             rec(ks[mid:])
     rec(keys)
+
+
+def bswitch_cond(idx, fns):
+    """bswitch with one lax.cond (scf.if with an else region) per level: one compare per level instead of two
+    [source: jax/_src/pallas/mosaic/lowering.py:4719-4752@7f6fe90 (cond -> scf.IfOp has_else=True); pl.when =
+    cond(c, f, noop), jax/_src/pallas/helpers.py:68-87@7f6fe90]."""
+    keys = sorted(fns)
+
+    def rec(ks):
+        if len(ks) == 1:
+            fns[ks[0]]()
+            return
+        mid = len(ks) // 2
+        lax.cond(idx < ks[mid], lambda: rec(ks[:mid]), lambda: rec(ks[mid:]))
+    rec(keys)
+
+
+def ring_issue_evals(count, nbe, k):
+    """Host mirror of the expert ring's issue schedule (M6 driver): cascade evaluations for one MoE layer with
+    `count` units, ring depth nbe, refill batch k (k = 1: stage A, one per unit)."""
+    if count <= 0:
+        return 0
+    if k == 1:
+        return count
+    ev, iss = 1, min(count, nbe)
+    for s_ in range(count):
+        avail = min(s_ + nbe, count - 1) + 1
+        pend = avail - iss
+        if pend >= k or (avail == count and pend > 0):
+            ev, iss = ev + 1, avail
+    assert iss == count, (count, nbe, k, iss)
+    return ev
 
 
 class Phases:
@@ -310,6 +355,11 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     NBLK = H // QB
     QB8 = 8
     NBD, NBE = tiles.nbd, tiles.nbe
+    KB = int(tiles.ebatch)
+    ES = bool(tiles.esingle)
+    assert tiles.ecas in ("when2", "cond"), tiles.ecas
+    assert 1 <= KB and NBE - KB >= 3, ("refill batch keeps >= 3 slots (>= 6 MiB) in flight", NBE, KB)
+    assert not (tiles.edummy and not stack_e), "edummy is the stacked-form mechanism arm"
     # typed: separate typed buffers per dense kind / expert slot / DSA buffer. The Mosaic path (and, through
     # interp_alias, the interpret path) instead runs the shared-storage layout: dense banks shared across kinds in
     # `dpool`, expert slots and the aliased DSA set as views of `epool`.
@@ -610,12 +660,21 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             delay_here(cur_layer[0], extra=jnp.logical_and(gi == 0, r == 1))
 
         # ---------------- expert ring (csq / moe_tp_decode) ----------------
+        lshift = 1 if fault == "f_leaf_shift" else 0     # FAULT: the operand leaf / index is one MoE layer off
+
         def esel(mpos, fn):
-            if stack_e:
-                fn(E_REFS["ew13"].at[mpos], E_REFS["ew2"].at[mpos], E_REFS["es13"].at[mpos], E_REFS["es2"].at[mpos])
+            if stack_e and not tiles.edummy:
+                mp = lax.rem(mpos + lshift, Lm) if lshift else mpos
+                fn(E_REFS["ew13"].at[mp], E_REFS["ew2"].at[mp], E_REFS["es13"].at[mp], E_REFS["es2"].at[mp])
             else:
-                bswitch(mpos, {i: (lambda i=i: fn(E_REFS["ew13"][i], E_REFS["ew2"][i], E_REFS["es13"][i],
-                                                  E_REFS["es2"][i])) for i in range(Lm)})
+                def leaf(i):
+                    j = (i + lshift) % Lm
+                    if stack_e:     # edummy: the served cascade, static leaves over the stacked operands
+                        fn(E_REFS["ew13"].at[j], E_REFS["ew2"].at[j], E_REFS["es13"].at[j], E_REFS["es2"].at[j])
+                    else:
+                        fn(E_REFS["ew13"][j], E_REFS["ew2"][j], E_REFS["es13"][j], E_REFS["es2"][j])
+                sw = bswitch if tiles.ecas == "when2" else bswitch_cond
+                sw(mpos, {i: (lambda i=i: leaf(i)) for i in range(Lm)})
 
         def ecopies(w13r, w2r, s13r, s2r, w, slot):
             d13, d2 = (scr["er13"].at[slot], scr["er2"].at[slot]) if typed else (er13v(slot), er2v(slot))
@@ -633,6 +692,19 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             def arm(w13r, w2r, s13r, s2r):
                 for cp in ecopies(w13r, w2r, s13r, s2r, w, slot):
                     cp.start()
+            esel(mpos, arm)
+
+        def estart_range(lo, hi, mpos):
+            """L3-b: issue units [lo, hi) of the current MoE layer under ONE operand selection (cascade)."""
+            def arm(w13r, w2r, s13r, s2r):
+                def one(u, c):
+                    w = scr["active"][u]
+                    if fault == "f_ichunk":                 # FAULT: the unit loads another expert's slice
+                        w = lax.rem(w + 1, E)
+                    for cp in ecopies(w13r, w2r, s13r, s2r, w, lax.rem(u, NBE)):
+                        cp.start()
+                    return c
+                lax.fori_loop(lo, hi, one, 0)
             esel(mpos, arm)
 
         def ewait(step):
@@ -1042,30 +1114,41 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 if "experts" in skip:
                     count = jnp.int32(0)
 
-                def prime(st0, c):
-                    estart(st0, mpos)
-                    return c
-                lax.fori_loop(0, jnp.minimum(count, NBE), prime, 0)
-            with sc("M_shared"):
-                w13s = dtake("sh13", g_ffn + plan["gate"][2])
-                w2s = dtake("sh2", g_ffn + plan["gate"][2] + plan["sh13"][2])
-                if fault != "stale_accumulator":
-                    scr["owner"][...] = jnp.zeros((M, H), F32)
-                else:                                       # FAULT: the routed accumulator is never cleared
-                    @pl.when(mpos == 0)
+                if ES:
+                    pass                                    # L3-s: primed by the loop's step -1 (one site)
+                elif KB == 1:
+                    def prime(st0, c):
+                        estart(st0, mpos)
+                        return c
+                    lax.fori_loop(0, jnp.minimum(count, NBE), prime, 0)
+                else:                                       # L3-b: the whole prime under one selection
+                    @pl.when(count > 0)
                     def _():
+                        estart_range(jnp.int32(0), jnp.minimum(count, NBE), mpos)
+            def shared_part():
+                with sc("M_shared"):
+                    w13s = dtake("sh13", g_ffn + plan["gate"][2])
+                    w2s = dtake("sh2", g_ffn + plan["gate"][2] + plan["sh13"][2])
+                    if fault != "stale_accumulator":
                         scr["owner"][...] = jnp.zeros((M, H), F32)
-                xb2f = xb2.astype(F32)
-                sxq, sxs = quantize_block(xb2f, axis=1, target_dtype=FP8)
-                gu = dot8(sxq, w13s[...])
-                gu = (gu * sxs * sm(slot, "sw13_s")).astype(BF16).astype(F32)
-                act = jax.nn.silu(gu[:, :ISR]).astype(BF16).astype(F32) * gu[:, ISR:]
-                aq, asc = quantize_block(act.astype(BF16), axis=1, target_dtype=FP8)
-                for n0 in range(0, H, 512):
-                    n1 = min(H, n0 + 512)
-                    yv = dot8(aq, w2s[:, n0:n1])
-                    scr["shared"][:, n0:n1] = yv * asc * sm(slot, "sw2_s")[:, n0:n1]
-                mtk._quantize_blocks(xb2, scr["xqb"], scr["xsb"])
+                    else:                                       # FAULT: the routed accumulator is never cleared
+                        @pl.when(mpos == 0)
+                        def _():
+                            scr["owner"][...] = jnp.zeros((M, H), F32)
+                    xb2f = xb2.astype(F32)
+                    sxq, sxs = quantize_block(xb2f, axis=1, target_dtype=FP8)
+                    gu = dot8(sxq, w13s[...])
+                    gu = (gu * sxs * sm(slot, "sw13_s")).astype(BF16).astype(F32)
+                    act = jax.nn.silu(gu[:, :ISR]).astype(BF16).astype(F32) * gu[:, ISR:]
+                    aq, asc = quantize_block(act.astype(BF16), axis=1, target_dtype=FP8)
+                    for n0 in range(0, H, 512):
+                        n1 = min(H, n0 + 512)
+                        yv = dot8(aq, w2s[:, n0:n1])
+                        scr["shared"][:, n0:n1] = yv * asc * sm(slot, "sw2_s")[:, n0:n1]
+                    mtk._quantize_blocks(xb2, scr["xqb"], scr["xsb"])
+
+            if not ES:
+                shared_part()
 
             lane_e = lax.broadcasted_iota(I32, (M, EPAD), 1)
             with sc("M_exp"):
@@ -1091,7 +1174,23 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                         a2 = dot8(mq, w2_of(eslot, n0, n1))
                         scr["owner"][:, n0:n1] += a2 * scr["es2"][pl.ds(eslot, 1), n0:n1] * ms
 
-                @pl.when(count > 0)
+                def refill(step, iss):
+                    """L3-b: units < avail may be issued (their slots' previous units have finished); issue
+                    them once >= KB are pending, or when the layer's last unit is issuable (flush). With
+                    NBE - KB >= 3 every unit is issued >= NBE - KB steps before its wait."""
+                    avail = jnp.minimum(step + NBE, count - 1) + 1
+                    pend = avail - iss
+                    go = jnp.logical_or(pend >= KB, jnp.logical_and(avail == count, pend > 0))
+
+                    @pl.when(go)
+                    def _():
+                        estart_range(iss, avail, mpos)
+                    return jnp.where(go, avail, iss)
+
+                def when_stage_a(c):                        # L3-s replaces the whole block below
+                    return (lambda f: None) if ES else pl.when(c)
+
+                @when_stage_a(count > 0)
                 def _():
                     ewait(jnp.int32(0))
 
@@ -1115,7 +1214,60 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                             def _():
                                 estart(step + NBE, mpos)
                         return a1n
-                    lax.fori_loop(0, count, body, gate_up(0))
+
+                    def body_b(step, carry):
+                        a1, iss = carry
+                        nxt = step + 1
+
+                        @pl.when(nxt < count)
+                        def _():
+                            ewait(nxt)
+                        a1n = lax.cond(nxt < count, lambda: gate_up(lax.rem(nxt, NBE)),
+                                       lambda: jnp.zeros((M, 2 * IR), BF16))
+                        if fault == "f_slotreuse":          # FAULT: refill before this unit's down-proj read
+                            iss = refill(step, iss)
+                        finish(step, lax.rem(step, NBE), a1)
+                        if fault != "f_slotreuse":
+                            iss = refill(step, iss)
+                        return a1n, iss
+                    if KB == 1:
+                        lax.fori_loop(0, count, body, gate_up(0))
+                    else:
+                        lax.fori_loop(0, count, body_b, (gate_up(0), jnp.minimum(count, NBE)))
+
+                if ES:
+                    z1 = jnp.zeros((M, 2 * IR), BF16)
+
+                    def body_s(step, carry):
+                        """L3-s: step -1 = prime (through the one refill site) + shared expert + unit 0's wait /
+                        gate_up; steps >= 0 = the stage-A unit body with the refill at the same site."""
+                        a1, iss = carry
+
+                        def unit():
+                            nxt = step + 1
+
+                            @pl.when(nxt < count)
+                            def _():
+                                ewait(nxt)
+                            a1n = lax.cond(nxt < count, lambda: gate_up(lax.rem(nxt, NBE)), lambda: z1)
+                            finish(step, lax.rem(step, NBE), a1)
+                            return a1n
+
+                        def first():
+                            ewait(jnp.int32(0))
+                            return gate_up(0)
+
+                        def pro():
+                            shared_part()
+                            return lax.cond(count > 0, first, lambda: z1)
+                        if fault == "f_slotreuse":          # FAULT: refill before this unit's down-proj read
+                            iss = refill(step, iss)
+                        a1x = lax.cond(step >= 0, unit, lambda: a1)
+                        if fault != "f_slotreuse":
+                            iss = refill(step, iss)
+                        a1y = lax.cond(step < 0, pro, lambda: a1x)
+                        return a1y, iss
+                    lax.fori_loop(-1, count, body_s, (z1, jnp.int32(0)))
                 # lazy flush: the router / shared tiles refill only now (Qwen flush_rel)
                 dgive(g_ffn)
                 dgive(g_ffn + plan["gate"][2])
