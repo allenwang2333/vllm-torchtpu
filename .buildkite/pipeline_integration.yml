@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # The integration suite on the Kueue fleet.
 #
 # qwen35-pcp8-dp8-disagg-correctness and qwen35-gpc-correctness run a second
@@ -117,6 +131,21 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
+
+      # Nightly only: pipeline parallelism behind a P/D boot that dominates
+      # the step.
+      - label: "Integration: Nightly qwen35-pp4-disagg-offload"
+        key: "integration_nightly_qwen35_pp4_disagg_offload"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pp4_disagg_offload_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh
 
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
