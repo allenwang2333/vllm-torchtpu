@@ -20,7 +20,8 @@ layer over the requests of test_strict_causal.SEQ and
 test_store_granules.CASES in one call, once per TPU_STREAMIDX_STRICT_CAUSAL
 value: caches bit-exact vs the references, every top-k row equal to stock
 rope_quant + streamindex_topk (SparseCore top-k) with the same flag,
-attention within the phase tolerance. Controls: stock top-k with the other
+attention within the phase tolerance; references computed on the CPU
+backend (`cpu_reference`). Controls: stock top-k with the other
 flag must differ on some row; attn_phase.STORE_FAULT = "two_runs" is run and
 its corrupted requests printed (on a device the race's winner is timing).
 Prints RESULT lines; exits 1 if a check fails. `--interpret`: a CPU dry run
@@ -28,6 +29,7 @@ of the same script (word arrays, no stock SparseCore comparison).
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -64,6 +66,18 @@ def run(ls, kind, layer, inp, strict):
     return caches, np.asarray(res[n_c], np.float32), tk
 
 
+def cpu_reference(ls, kind, layer, inp, **kw):
+    """H.reference on the CPU backend: run as TPU XLA ops, its f32 compressor
+    pooling rounds 1 bf16 ulp away from the CPU (and the kernel) on some HCA
+    records."""
+    cpu = jax.devices("cpu")[0]
+    put = lambda x: jax.device_put(x, cpu)  # noqa: E731
+    with jax.default_device(cpu):
+        ls_c = dataclasses.replace(ls, arrays=[put(a) for a in ls.arrays],
+                                   weights={k: put(v) for k, v in ls.weights.items()})
+        return H.reference(ls_c, kind, layer, {k: put(v) for k, v in inp.items()}, **kw)
+
+
 def att_err(o, e):
     R = e.shape[0]
     o = o[:R, :Q * 128].reshape(R, Q, 128, 512)
@@ -82,7 +96,7 @@ def main():
     inp = {k: H.make_inputs(rng, ls, k) for k in ("hca", "csa")}
     for strict in (False, True):
         caches, out, _ = run(ls, "hca", 0, inp["hca"], strict)
-        exp_c, exp_o, _ = H.reference(ls, "hca", 0, inp["hca"])
+        exp_c, exp_o, _ = cpu_reference(ls, "hca", 0, inp["hca"])
         bad = [i for i, (c, x) in enumerate(zip(caches, exp_c)) if not np.array_equal(c, x)]
         e = att_err(out, exp_o)
         good = not bad and e[0] <= 1e-2 and e[1] <= 1e-3
@@ -91,7 +105,7 @@ def main():
                                           att_maxrel_meanabs=e, ok=good)), flush=True)
 
         caches, out, tk = run(ls, "csa", 1, inp["csa"], strict)
-        exp_c, exp_o, _ = H.reference(ls, "csa", 1, inp["csa"], strict_causal=strict)
+        exp_c, exp_o, _ = cpu_reference(ls, "csa", 1, inp["csa"], strict_causal=strict)
         bad = [i for i, (c, x) in enumerate(zip(caches, exp_c)) if not np.array_equal(c, x)]
         e = att_err(out, exp_o)
         if INTERPRET:  # no SparseCore: the reference's lists stand in for stock's
@@ -115,7 +129,7 @@ def main():
     AP.STORE_FAULT = "two_runs"
     caches, _, _ = run(ls, "csa", 1, inp["csa"], False)
     AP.STORE_FAULT = ""
-    exp_c, _, _ = H.reference(ls, "csa", 1, inp["csa"])
+    exp_c, _, _ = cpu_reference(ls, "csa", 1, inp["csa"])
     corrupted = {role: sorted(TSG._diff_requests(ls, 1, role, caches, exp_c))
                  for role in ("kv", "kv_rope", "indexer_k")}
     print("RESULT " + json.dumps(dict(control="store_fault_two_runs",
