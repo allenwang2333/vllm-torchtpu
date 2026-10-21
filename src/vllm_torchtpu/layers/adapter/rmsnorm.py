@@ -209,6 +209,89 @@ def arm_prequant(model: torch.nn.Module) -> int:
     return n
 
 
+_quant_moe_ops: dict[float, object] = {}
+
+
+def _get_quant_moe_op(eps: float):
+    """The add + RMSNorm op that also emits the stage-A MoE prefill kernel's
+    fp8 rows and scales (TPU_FUSED_ADD_RMSNORM_QUANT_MOE; built at arming)."""
+    key = float(eps)
+    op = _quant_moe_ops.get(key)
+    if op is not None:
+        return op
+    with _ops_lock:
+        op = _quant_moe_ops.get(key)
+        if op is not None:
+            return op
+        tag = f"{float(eps):.3e}".replace(".", "p").replace("-", "m").replace("+", "")
+
+        def fn(
+            x: jax.Array, residual: jax.Array, weight: jax.Array
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return kernel.fused_add_rms_norm_quant_moe(
+                x, residual, weight, eps=float(eps)
+            )
+
+        def fake(x, residual, weight):
+            rows, hidden = x.shape
+            return (
+                torch.empty_like(x),
+                torch.empty(
+                    (rows, hidden // 128, 128),
+                    dtype=torch.float8_e4m3fn,
+                    device=x.device,
+                ),
+                torch.empty((rows,), dtype=torch.float32, device=x.device),
+                torch.empty_like(residual),
+            )
+
+        op = pallas.jax_op(f"pallas::fused_add_rmsnorm_quant_moe_{tag}", fn)
+        op.register_fake(fake)
+        _quant_moe_ops[key] = op
+        return op
+
+
+def arm_prequant_moe(model: torch.nn.Module) -> int:
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: pair each MoE layer's
+    post_attention_layernorm with its moe_tp_decode-armed experts, so on the
+    norm's Pallas (prefill-sized) branch the norm emits the stage-A prefill
+    kernel's own fp8 rows and scales and the op skips its quantization. The
+    bf16 y is still returned (the router reads it). Returns the pair count.
+
+    Call after moe_tp_decode.arm, on the target model only (the drafter's
+    norms stay upstream). Pairs only where every bucket the norm's Pallas
+    branch takes (`rows > bucket_gate_edge(_min_rows)`) is above the op's
+    prefill cut-over, so a filled slot always meets the prefill kernel."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+        PREQUANT_MOE_ATTR,
+        arm_prequant_op,
+    )
+
+    n = 0
+    for layer in model.modules():
+        ln_post = getattr(layer, "post_attention_layernorm", None)
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(ln_post, TpuRMSNorm) or not ln_post._pallas_ok or mlp is None:
+            continue
+        if ln_post._prequant_slot is not None:
+            continue  # already paired with a dense linear (TPU_FUSED_ADD_RMSNORM_QUANT)
+        runners = [m for m in mlp.modules() if isinstance(m, MoERunner)]
+        if len(runners) != 1:
+            continue
+        experts = runners[0].routed_experts
+        cut_over = arm_prequant_op(experts)
+        if cut_over is None or envs.bucket_gate_edge(ln_post._min_rows) < cut_over:
+            continue
+        ln_post._op_quant_moe = _get_quant_moe_op(ln_post.variance_epsilon)
+        slot = PrequantSlot()
+        ln_post._prequant_moe_slot = slot
+        setattr(experts, PREQUANT_MOE_ATTR, slot)
+        n += 1
+    return n
+
+
 _barrier_op = None
 
 
@@ -266,6 +349,9 @@ class TpuRMSNorm(RMSNorm):
         # TPU_FUSED_ADD_RMSNORM_QUANT: set by arm_prequant.
         self._prequant_slot = None
         self._op_quant = None
+        # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: set by arm_prequant_moe.
+        self._prequant_moe_slot = None
+        self._op_quant_moe = None
         if self._pallas_ok:
             self._op_res = _get_op(self.variance_epsilon, True)
             self._op_nores = _get_op(self.variance_epsilon, False)
@@ -329,6 +415,17 @@ class TpuRMSNorm(RMSNorm):
             assert self._op_quant is not None
             y, y_q, scale, new_res = self._op_quant(x, residual, self.weight.data)
             self._prequant_slot.value = (y_q, scale)
+            return y, new_res
+        if (
+            self._prequant_moe_slot is not None
+            and residual is not None
+            and x.dim() == 2
+        ):
+            # Same rows predicate again. The paired MoE op takes (x_q, x_scale)
+            # on its stage-A prefill kernel; y still feeds the router.
+            assert self._op_quant_moe is not None
+            y, x_q, x_scale, new_res = self._op_quant_moe(x, residual, self.weight.data)
+            self._prequant_moe_slot.value = (x_q, x_scale)
             return y, new_res
         if x.dim() == 2:
             # No view ops on the 2-D residual stream: a view the backend

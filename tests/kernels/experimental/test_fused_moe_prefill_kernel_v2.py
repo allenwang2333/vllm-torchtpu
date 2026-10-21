@@ -116,6 +116,58 @@ def test_v2_matches_its_default_build_bit_for_bit(setup, m, hot):
     assert rel < 3e-2, rel
 
 
+@pytest.mark.parametrize("m", [512, 4096])
+def test_norm_quant_moe_feeds_stage_a_bit_for_bit(setup, m):
+    """TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the norm's (x_q, x_scale) are the
+    stage-A build's own `_quantize_rows` of the norm output, and the stage-A
+    build fed them returns exactly what it returns quantizing y itself."""
+    from vllm_torchtpu.kernels import fused_add_rmsnorm as fnorm
+
+    weights, mesh = setup
+    x0 = jax.random.normal(jax.random.key(1), (m, H)).astype(jnp.bfloat16)
+    r0 = (jax.random.normal(jax.random.key(2), (m, H)) * 0.5).astype(jnp.bfloat16)
+    nw = (1.0 + 0.05 * jax.random.normal(jax.random.key(3), (H,))).astype(jnp.bfloat16)
+    y_ref, res_ref = fnorm.fused_add_rms_norm(x0, r0, nw, eps=1e-5)
+    y, x_q, x_scale, res = fnorm.fused_add_rms_norm_quant_moe(x0, r0, nw, eps=1e-5)
+    q_ref, s_ref = jax.jit(lambda y: v2._quantize_rows(y, F8))(y_ref)
+    np.testing.assert_array_equal(np.asarray(y), np.asarray(y_ref))
+    np.testing.assert_array_equal(np.asarray(res), np.asarray(res_ref))
+    np.testing.assert_array_equal(
+        np.asarray(x_q).view(np.uint8), np.asarray(q_ref).view(np.uint8)
+    )
+    np.testing.assert_array_equal(np.asarray(x_scale), np.asarray(s_ref))
+
+    tw, ti = _routing(m, 9, True)
+
+    def stage_a(y, tw, ti, *w, **kw):
+        w1, w2, w1s, w2s, sw1, sw1s, sw2, sw2s = w
+        return v2.fused_moe_prefill_stage_a(
+            y,
+            w1,
+            w2,
+            w1s,
+            w2s,
+            sw1,
+            sw1s,
+            sw2,
+            sw2s,
+            None,
+            tw,
+            ti,
+            axis_name="d",
+            routed_scale=ROUTED_SCALE,
+            **kw,
+        )
+
+    def fed(y, x_q, x_scale, tw, ti, *w):
+        return stage_a(y, tw, ti, *w, x_q=x_q, x_scale=x_scale)
+
+    np.testing.assert_array_equal(
+        np.asarray(_run(mesh, fed, y, x_q, x_scale, tw, ti, *weights)),
+        np.asarray(_run(mesh, stage_a, y_ref, tw, ti, *weights)),
+    )
+
+
 @pytest.fixture(scope="module")
 def setup_tp8():
     """The 2x2x1 twin's TP8 slice: per-rank intermediate 256 (gate|up 512 columns),

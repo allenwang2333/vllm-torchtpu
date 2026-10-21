@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_MIN_TOKENS: int = 512
     TPU_FUSED_ADD_RMSNORM_MIN_HIDDEN: int = 4096
     TPU_FUSED_ADD_RMSNORM_QUANT: bool = True
+    TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
@@ -2097,6 +2098,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the bf16 output. Bit-identical. Only where the Pallas norm already runs
     # (the same rows predicate); decode buckets are untouched.
     "TPU_FUSED_ADD_RMSNORM_QUANT": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT", True),
+    # With TPU_FUSED_ADD_RMSNORM, USE_MOE_TP_DECODE_KERNEL, FUSED_MOE_PREFILL_KERNEL
+    # and FUSED_MOE_PREFILL_KERNEL_V2: a MoE layer's post-attention norm also
+    # emits the stage-A prefill kernel's per-row fp8 activation rows and scales
+    # from its Pallas pass, and the kernel skips its own amax / relayout /
+    # convert passes (#1935 trial 4). Bit-identical to the kernel's own
+    # quantization. Only where the Pallas norm already runs and its rows
+    # threshold is at or above the layer's prefill cut-over; buckets where the
+    # stage-A build does not serve (blocked mode) quantize as before.
+    "TPU_FUSED_ADD_RMSNORM_QUANT_MOE": env_bool("TPU_FUSED_ADD_RMSNORM_QUANT_MOE"),
     # Comma-separated layer-prefix suffixes that take that path, matched on a "."
     # boundary. The defaults are the sites XLA does not prefetch on GLM-5.2-FP8
     # decode; a VMEM-prefetched weight (indexer wq_b, shared experts, dense
