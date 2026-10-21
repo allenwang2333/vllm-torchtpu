@@ -473,6 +473,79 @@ Source, HLO, numerical checks and device events are preserved under
 | `results/combine-resident-coef-evidence.tgz` | `1d52001cad5fedd1800afd61ae95fcb97f1c956e820374e83602c598d8ea422f` |
 | `results/combine-resident-groups-evidence.tgz` | `3f3e3a827e769287ef3a1159d23303403481f0fdb97285436cd50c83ec20963e` |
 
+Capacity-256 experiments in `exp-ruclqwp7hs` used source `275a56c1`,
+the pinned runtime, EP8 with 288 local rows, P-state 7, 31 rotating host
+repetitions and five ordered device repetitions. Increasing capacity reduces
+the number of expert tiles for skewed routing, but also widens activation
+staging and scale mirrors. The initial two-dimensional scale mirror failed
+compilation because a dynamic row slice was not aligned to its eight-row tile.
+Representing it as `[rows, 1, 256]` made the row dimension untiled and allowed
+compilation; this layout change is included in all timings below.
+
+| Routing / seed | Capacity 128, heights 64/128 (ms) | Capacity 256, one weight buffer (ms) | Capacity 256, two buffers, heights 64/128/256 (ms) | Capacity 256, two buffers, heights 64/128/192/256 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Biased / 1060 | 0.502908 | 0.600451 | 0.512601 | 1.477304 |
+| Uniform / 1061 | 0.460531 | 0.613309 | 0.478496 | 1.601546 |
+
+Every complete EP8 output bit matched. Times are whole-device-module medians
+excluding entry barriers. Two weight buffers required a prototype VMEM
+estimate of 65363968 bytes against a 65766686-byte budget, accounting for
+the actual 256-column widened weight blocks. At seed 1060, expert tile count
+fell from 344 to 304, but expert kernel time increased from 335.154 to
+342.307 us with three heights, and the post-expert tail rose from 26.733 to
+28.894 us. At seed 1061 the tile count stayed at 384, and those times rose
+from 292.655/26.331 to 309.102/28.612 us. The four-height regression has no
+established compiler or hardware diagnosis.
+
+A follow-up removed the intermediate 128-row height and added stronger skew:
+
+| Routing / seed | Capacity 128 reference (ms) | Capacity 256, heights 64/256 (ms) | Capacity 256, heights 64/128/256 (ms) | Expert tiles, 128 → 256 |
+| --- | ---: | ---: | ---: | ---: |
+| Biased / 1062 | 0.562718 | 0.570758 | 0.562921 | 328 → 288 |
+| Strongly biased / 1063 | 0.534970 | 0.536370 | 0.541608 | 227 → 179 |
+| Uniform / 1064 | 0.459860 | 0.474558 | 0.479208 | 384 → 384 |
+
+All outputs again matched bit-for-bit. Biased cases used `sqrtsoftplus`,
+correction bias and routed scale 1.5, with gate bias 0.9 or 1.5 for the
+strongly biased case; uniform cases used softmax. Even when the stronger skew
+reduced expert tile count by 21%, whole-module time did not improve. The
+64/256 expert kernel at seed 1063 was essentially unchanged at
+366.291 → 366.011 us, while its tail increased from 27.125 to 28.790 us.
+Capacity 128 and heights 64/128 remain the production dispatch.
+
+Compiled argument/output storage remained 970702848/2949120 bytes. At seed
+1060, the three-height/two-buffer candidate increased generated code from
+4645888 to 6233600 bytes and temporary storage from 99334336 to 100959424
+bytes. These are executable storage measurements, not serving HBM peaks.
+
+The same job tested a separate load-time FP4 K permutation to avoid the
+interleaving operation in a manual packed-word FP4-to-FP8 expansion. This was
+a small dot probe with 16 independent RHS blocks per executable, FP8 LHS,
+FP32 output and seed 1065; it was not a complete EP8 or serving benchmark.
+All nine dot-output bit checks passed. Weight preparation was outside timing.
+
+| M / K / N | Native conversion (us) | Manual interleaved (us) | Manual prepermuted (us) |
+| --- | ---: | ---: | ---: |
+| 64 / 512 / 256 | 9.845 | 11.190 | 10.407 |
+| 128 / 512 / 256 | 10.179 | 11.484 | 10.889 |
+| 64 / 256 / 256 | 9.602 | 10.019 | 9.789 |
+
+These are medians for the entire 16-block device module excluding entry
+barriers. Prepermutation improved the manual implementation but remained
+slower than native conversion in every shape. No weight-format change is
+adopted. A future implementation would also need to permute the active
+256-row down-projection tail separately from the padded 512-row block.
+
+The job succeeded. Source, HLO, checks and device events are preserved under
+`exp-ruclqwp7hs` / `art-8vp4y0bles`:
+
+| Artifact path | Verified SHA-256 |
+| --- | --- |
+| `results/capacity256-evidence.tgz` | `6a1b4baa0d6246c58455a488e489ac22c33b670a2cae92f7aa6c0f0fde63db20` |
+| `results/capacity256-3d-evidence.tgz` | `f65e281f644074bd2bf876754dc8f1714d7e94e47c73c4a3eb52cb34c510c9be` |
+| `results/capacity256-two-heights-evidence.tgz` | `06ceecfe8f147143f32051aacb2661d44651f7a87b89808eec309c4c5915676a` |
+| `results/fp4-prepermuted-evidence.tgz` | `e531c88aed535da2f60d3583b5d5cd14beab651b70c6b66f1c1a1d0ba8af132c` |
+
 A separate small MXU operand probe in `exp-c5bdngz3ad` tested FP8 LHS with a native
 FP4 RHS at M64/K256/N256 and M128/K512/N256. The pinned compiler rejected
 both with `Unsupported element type for matmul push rhs: 'f4E2M1FN'`.
