@@ -34,7 +34,7 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
 from vllm_torchtpu.megakernel import profile as profile_mod
-from vllm_torchtpu.megakernel.cache import _should_use_pool_gather
+from vllm_torchtpu.megakernel.cache import should_use_pool_gather
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 
@@ -465,7 +465,7 @@ def test_gpr_matches_split_bitwise_t4(prof: mk.Profile, B: int):
     """
     g, ex = _flip_exec(prof, T=4, B=B)
     spec = qwen35.qwen35_spec(g)
-    assert _should_use_pool_gather(spec, spec.cache_backend, ex, use_fused=False)
+    assert should_use_pool_gather(spec, spec.cache_backend, ex, use_fused=False)
     _assert_same(
         _pooled_outputs(prof, T=4, B=B), _pooled_outputs(_QWEN35_DEFAULT, T=4, B=B)
     )
@@ -483,12 +483,12 @@ def test_profile_pool_gather_true_means_where_eligible():
     assert (
         mk.cache_exec(ex1).pool_gather == "eligible" and mk.cache_exec(ex1).GPR is False
     )
-    assert _should_use_pool_gather(spec, pb, ex1, use_fused=False) is False  # no raise
+    assert should_use_pool_gather(spec, pb, ex1, use_fused=False) is False  # no raise
     ex4 = prof.exec_for(base, B=24, T=4, g=g)
-    assert _should_use_pool_gather(spec, pb, ex4, use_fused=False) is True
+    assert should_use_pool_gather(spec, pb, ex4, use_fused=False) is True
     # An explicit (strict) request on an ineligible bucket is a config error.
     with pytest.raises(mk.MegakernelConfigError, match="pool_gather=True"):
-        _should_use_pool_gather(
+        should_use_pool_gather(
             spec, pb, mk.with_cache(ex1, pool_gather=True), use_fused=False
         )
     with pytest.raises(ValueError, match="pool_gather"):
@@ -547,8 +547,8 @@ def test_builtin_profiles_resolve_in_a_fresh_interpreter():
     code = (
         "from vllm_torchtpu import megakernel as mk; "
         "print(mk.get_profile('qwen35-candidate30-fused').name); "
-        "from vllm_torchtpu.megakernel import profiles; "
-        "print(profiles.qwen35_candidate30.PROFILE.name)"
+        "from vllm_torchtpu.megakernel import models; "
+        "print(models.qwen35_candidate30.PROFILE.name)"
     )
     env = dict(os.environ, JAX_PLATFORMS="cpu")
     out = subprocess.run(
@@ -576,14 +576,14 @@ def test_exec_spec_pool_gather_values_and_explicit_split():
         R=2, ctx=256, interpret=True, cache=mk.CacheExec(paged_kv=True, num_pages=2048)
     )
     ex_auto = gpr.exec_for(base, B=24, T=4, g=g)
-    assert _should_use_pool_gather(spec, spec.cache_backend, ex_auto, use_fused=False)
+    assert should_use_pool_gather(spec, spec.cache_backend, ex_auto, use_fused=False)
     # An explicit "split" wins over a GPR profile; the default False does not.
     ex_split = gpr.exec_for(mk.with_cache(base, pool_gather="split"), B=24, T=4, g=g)
     assert (
         mk.cache_exec(ex_split).pool_gather == "split"
         and mk.cache_exec(ex_split).GPR is False
     )
-    assert not _should_use_pool_gather(
+    assert not should_use_pool_gather(
         spec, spec.cache_backend, ex_split, use_fused=False
     )
 

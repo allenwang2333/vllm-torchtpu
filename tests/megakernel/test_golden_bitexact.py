@@ -76,7 +76,7 @@ def _cpu_model_name() -> str:
     return platform.processor() or "unknown"
 
 
-def _host_fingerprint() -> dict[str, str]:
+def _host_fingerprint() -> dict[str, Any]:
     return {
         "cpu": f"{_cpu_model_name()} ({platform.machine()})",
         "jax": jax.__version__,
@@ -84,6 +84,12 @@ def _host_fingerprint() -> dict[str, str]:
         "numpy": np.__version__,
         "python": platform.python_version(),
     }
+
+
+def _fingerprint_matches(meta: Any, cur: dict[str, Any]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    return {k: v for k, v in meta.items() if k != "gpr_resolved"} == cur
 
 
 def _format_fingerprint(fp: dict[str, Any] | None) -> str:
@@ -111,7 +117,7 @@ def _write_golden_case(
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         gold = json.loads(golden_path.read_text()) if golden_path.exists() else {}
-        gold[_META_KEY] = _host_fingerprint()
+        gold[_META_KEY] = {**_host_fingerprint(), "gpr_resolved": True}
         gold[name] = got
         golden_path.write_text(json.dumps(gold, indent=1, sort_keys=True) + "\n")
 
@@ -239,14 +245,14 @@ def run_case(
         jax.device_put(np.asarray(r).copy(), tp)
         for r in mk.states_to_pool(g, ex, st_l, pt, ckpt[..., :T], jnp.maximum(roff, 0))
     )
-    step, _ = mk.PallasWriter(fused_pool_io=fused).make_step(
+    step, info = mk.PallasWriter(fused_pool_io=fused).make_step(
         mesh, spec, ex, donate=fused
     )
     out, raw = step(pos, hid_mk, w_mk, pools, pt, ckpt, roff)
     return {
         "hid": _h(out),
         "pools": [_h(r) for r in raw],
-        "gpr": bool(mk.cache_exec(ex).GPR),
+        "gpr": bool(info["use_gpr"]),
     }
 
 
@@ -263,7 +269,7 @@ def test_golden_bitexact(name: str):
     if not is_custom_golden:
         meta = all_gold.get(_META_KEY)
         cur = _host_fingerprint()
-        if meta != cur:
+        if not _fingerprint_matches(meta, cur):
             pytest.skip(
                 f"golden recorded on {_format_fingerprint(meta)}, "
                 f"this host is {_format_fingerprint(cur)}; "
@@ -276,7 +282,8 @@ def test_golden_bitexact(name: str):
     gold = all_gold[name]
     assert got["hid"] == gold["hid"], (name, "hidden", got["hid"], gold["hid"])
     assert got["pools"] == gold["pools"], (name, "pools", got["pools"], gold["pools"])
-    assert got["gpr"] == gold["gpr"], (name, "gpr", got["gpr"], gold["gpr"])
+    if all_gold.get(_META_KEY, {}).get("gpr_resolved"):
+        assert got["gpr"] == gold["gpr"], (name, "gpr", got["gpr"], gold["gpr"])
 
 
 def test_golden_covers_every_case():

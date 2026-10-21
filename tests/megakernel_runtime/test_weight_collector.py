@@ -734,6 +734,42 @@ def test_reshard_layer_experts_ep_to_tp() -> None:
     assert mlp.experts.moe_config.moe_parallel_config.ep_size == 1
 
 
+def test_pack_weights_does_not_touch_jax_devices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pack_weights` with `tiles=None` never calls `jax.devices()`."""
+    g = qwen35.Qwen35Geometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=2,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=False,
+        e_slots=68,
+    )
+    ex = ExecSpec(R=2, B=4, T=1, ctx=2048, stack_e=False, tiles=None)
+    backbone = make_synthetic_qwen35_backbone(g, ex)
+    monkeypatch.setattr(
+        jax,
+        "devices",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("jax.devices() must not be called during pack_weights")
+        ),
+    )
+    packed = pack_weights(backbone, g, ex, tp_rank=1)
+    assert set(packed["plan"].w_names) <= set(packed)
+
+
 def test_bridge_and_weight_collector_have_no_vllm_imports() -> None:
     """Verify `exported_bridge` and `weight_collector` are framework-portable.
 

@@ -22,11 +22,11 @@ from jax.sharding import PartitionSpec as P
 
 from . import kernel
 from .cache_common import (
-    _require_fused_donation,
-    _require_pool_backend,
-    _resolve_model_spec,
-    _should_use_pool_gather,
-    _validate_page_table_shape,
+    require_fused_donation,
+    require_pool_backend,
+    resolve_model_spec,
+    should_use_pool_gather,
+    validate_page_table_shape,
 )
 from .cache_experimental import should_fuse_pool_io
 from .exec_spec import ExecSpec
@@ -56,8 +56,8 @@ def make_flat_pooled_step(
     Flat output signature:
       `(out_hidden, *raw_pools_out)`
     """
-    ms = _resolve_model_spec(model_spec)
-    pb = _require_pool_backend(ms)
+    ms = resolve_model_spec(model_spec)
+    pb = require_pool_backend(ms)
     pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(
         ms,
@@ -66,8 +66,8 @@ def make_flat_pooled_step(
         max_b_low=max_b_low,
         min_b_hi=min_b_hi,
     )
-    use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
-    _require_fused_donation(ms, use_fused, donate_pools)
+    use_gpr = should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    require_fused_donation(ms, use_fused, donate_pools)
     ex_paged = with_cache(
         ex,
         paged_kv=True,
@@ -158,7 +158,7 @@ def make_flat_pooled_step(
                 )
             w_idx += t_len
 
-        _validate_page_table_shape(page_table, ex_paged)
+        validate_page_table_shape(page_table, ex_paged)
         if page_table.ndim == 3:
             page_table = page_table.squeeze(0)
         if page_table.shape[-1] > max_pt:

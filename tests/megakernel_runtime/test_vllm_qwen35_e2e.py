@@ -940,9 +940,11 @@ def test_driver_validates_profile_before_packing_and_uses_profile_buckets(
 
 def test_maybe_create_disables_on_unsupported_tpu_chip(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """`maybe_create` catches `MegakernelConfigError` on unsupported TPU chips."""
-    import vllm.distributed as vllm_dist
+    import logging
+    import sys
 
     g = _tiny_geom(L=4, att_every=4)
     ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
@@ -974,11 +976,111 @@ def test_maybe_create_disables_on_unsupported_tpu_chip(
         _dp_lockstep_enabled=lambda: False,
         vllm_config=SimpleNamespace(additional_config={"megakernel": True}),
     )
+    fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
     monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
-    monkeypatch.setattr(vllm_dist, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
     monkeypatch.setattr(
         driver_mod, "_build_tp_rank_mesh", lambda _r, fallback_mesh=None: fallback_mesh
     )
+    try:
+        driver_mod.logger._resolve()
+    except ModuleNotFoundError:
+        monkeypatch.setattr(
+            driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
+        )
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    with caplog.at_level(logging.WARNING):
+        assert MegakernelDriver.maybe_create(runner) is None
+    assert "Megakernel disabled: Unsupported TPU" in caplog.text
+
+
+def test_maybe_create_uses_model_default_profile_and_disables_empty_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`maybe_create` resolves the model default profile's `buckets` and
+    `pool_gather`, and disables gracefully when effective bucket lists are empty."""
+    import logging
+    import sys
+
+    from vllm_torchtpu.megakernel import Profile, register_profile
+    from vllm_torchtpu.megakernel import profile as profile_mod
+
+    g = _tiny_geom(L=4, att_every=4)
+    ex_base = _tiny_exec(R=8, B=4, T=1, ctx=256, num_pages=96)
+    backbone = make_synthetic_qwen35_backbone(g, ex_base)
+    model = SimpleNamespace(model=backbone)
+    mesh8 = _cpu_mesh(8)
+    fake_vllm_dist = SimpleNamespace(get_tensor_model_parallel_rank=lambda: 0)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", fake_vllm_dist)
+    try:
+        driver_mod.logger._resolve()
+    except ModuleNotFoundError:
+        monkeypatch.setattr(
+            driver_mod.logger, "_logger", logging.getLogger(driver_mod.logger._name)
+        )
+    monkeypatch.setattr(MegakernelDriver, "_expected_num_layers", g.L)
+    monkeypatch.setattr(driver_mod, "_resolve_tp_size", lambda _r: 8)
+    monkeypatch.setattr(driver_mod, "_build_tp_rank_mesh", lambda *_a, **_k: mesh8)
+    monkeypatch.setattr(
+        MegakernelDriver,
+        "_prepare_and_pack_weights",
+        lambda *_a, **_k: {"w_flat": []},
+    )
+    monkeypatch.setattr(profile_mod, "_REGISTRY", dict(profile_mod._REGISTRY))
+    monkeypatch.setattr(
+        profile_mod, "_MODEL_DEFAULTS", dict(profile_mod._MODEL_DEFAULTS)
+    )
+
+    # 1. Model default profile setting `buckets=(4, 16)` and `pool_gather=None`:
+    #    `maybe_create` inherits both without user overrides.
+    custom_default = Profile(
+        name="qwen35-test-default",
+        model="qwen3_5",
+        buckets=(4, 16),
+        verify_buckets=(8,),
+        pool_gather=None,
+        model_default=True,
+    )
+    register_profile(custom_default, replace=True)
+    runner = SimpleNamespace(
+        model=model,
+        mesh=mesh8,
+        _unified_kv_layout=True,
+        speculative_config=None,
+        vllm_config=SimpleNamespace(
+            additional_config={"megakernel": {"enabled": True}}
+        ),
+    )
+    drv = MegakernelDriver.maybe_create(runner)
+    assert drv is not None
+    assert drv.profile.name == "qwen35-test-default"
+    assert drv.profile.pool_gather is None
+    assert drv.buckets == (4, 16)
+    assert drv.verify_buckets == ()
+
+    # 2. Explicit `buckets=0` on a non-speculative runner disables gracefully.
+    runner_off = SimpleNamespace(
+        model=model,
+        mesh=mesh8,
+        _unified_kv_layout=True,
+        speculative_config=None,
+        vllm_config=SimpleNamespace(
+            additional_config={"megakernel": {"enabled": True, "buckets": []}}
+        ),
+    )
+    assert MegakernelDriver.maybe_create(runner_off) is None
+
+    # 3. Model default profile with `buckets=()` on a non-speculative runner
+    #    disables gracefully before packing weights.
+    empty_default = Profile(
+        name="qwen35-test-empty",
+        model="qwen3_5",
+        buckets=(),
+        verify_buckets=(8,),
+        model_default=True,
+    )
+    register_profile(empty_default, replace=True)
     assert MegakernelDriver.maybe_create(runner) is None
 
 

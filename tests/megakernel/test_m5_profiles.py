@@ -27,10 +27,10 @@ from jax.sharding import Mesh
 import vllm_torchtpu.megakernel as mk
 from tests.megakernel.frozen_utils import load_frozen_qwen35
 from vllm_torchtpu.megakernel.models import qwen35
-from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
-from vllm_torchtpu.megakernel.profiles.qwen35_candidate30 import (
+from vllm_torchtpu.megakernel.models.qwen35_candidate30 import (
     candidate30_tiles,
 )
+from vllm_torchtpu.megakernel.models.qwen35_profile import TINY_TILES, baseline_tiles
 
 
 def _tile_value(t: mk.Tiles, name: str) -> object:

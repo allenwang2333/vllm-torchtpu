@@ -54,8 +54,8 @@ import vllm_torchtpu.envs as envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel.blocks.gqa import GQABlock, GQATunables
 from vllm_torchtpu.megakernel.cache import (
-    _should_use_pool_gather,
     should_fuse_pool_io,
+    should_use_pool_gather,
 )
 from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
@@ -475,6 +475,29 @@ def resolve_driver_profile(
     # Real changes re-label the profile (`<name>+overrides`) and derive its
     # numerics class, so an override never silently keeps `exact`.
     return prof.with_overrides(**overrides)
+
+
+def _resolve_driver_buckets(
+    profile: Profile,
+    buckets: Sequence[int] | None,
+    verify_buckets: Sequence[int] | None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Resolve `(buckets, verify_buckets)` from explicit args, `profile` or defaults."""
+    eff_buckets = (
+        buckets
+        if buckets is not None
+        else (profile.buckets if profile.buckets is not None else _DEFAULT_BUCKETS)
+    )
+    eff_verify = (
+        verify_buckets
+        if verify_buckets is not None
+        else (
+            profile.verify_buckets
+            if profile.verify_buckets is not None
+            else _DEFAULT_VERIFY_BUCKETS
+        )
+    )
+    return tuple(sorted(eff_buckets)), tuple(sorted(eff_verify))
 
 
 def check_compile_hlo_mesh(mesh: Any, compile_hlo_check: bool) -> None:
@@ -914,6 +937,7 @@ class MegakernelDriver:
     `_prepare_and_pack_weights` (or by passing `spec` / `weights` directly).
     """
 
+    _model_name: str = qwen35.QWEN35_MODEL_NAME
     _expected_num_layers: int = 60
     _total_routed_experts: int = 512
 
@@ -979,21 +1003,10 @@ class MegakernelDriver:
         self.pool_gather: bool | None = self.profile.pool_gather
 
         # Bucket lists: explicit arguments, else the profile's, else defaults.
-        if buckets is None:
-            buckets = (
-                self.profile.buckets
-                if self.profile.buckets is not None
-                else _DEFAULT_BUCKETS
-            )
-        if verify_buckets is None:
-            verify_buckets = (
-                self.profile.verify_buckets
-                if self.profile.verify_buckets is not None
-                else _DEFAULT_VERIFY_BUCKETS
-            )
-        self.buckets = tuple(sorted(buckets))
+        self.buckets, self.verify_buckets = _resolve_driver_buckets(
+            self.profile, buckets, verify_buckets
+        )
         self.max_bucket = max(self.buckets) if self.buckets else 0
-        self.verify_buckets = tuple(sorted(verify_buckets))
         self.max_verify_bucket = max(self.verify_buckets) if self.verify_buckets else 0
         _need(
             bool(self.buckets or self.verify_buckets),
@@ -1209,20 +1222,19 @@ class MegakernelDriver:
                 r_cnt,
             )
             return None
-        dev_kind = getattr(mesh.devices.flat[0], "device_kind", None)
+        dev_kind = getattr(mesh.devices.flat[0], "device_kind", "") or ""
         try:
-            chip_budget(
-                dev_kind
-                if isinstance(dev_kind, str) and dev_kind.startswith("TPU")
-                else None
-            )
+            chip_budget(str(dev_kind))
         except MegakernelConfigError as exc:
             logger.warning("Megakernel disabled: %s; skipping.", exc)
             return None
         # Profile-owned settings the user didn't set stay None, so the driver
         # takes them from the effective profile.
         owned = explicit_profile_settings(cfg)
-        buckets, verify_buckets = owned["buckets"], owned["verify_buckets"]
+        prof = resolve_driver_profile(cfg["profile"], model_name=cls._model_name)
+        buckets, verify_buckets = _resolve_driver_buckets(
+            prof, owned["buckets"], owned["verify_buckets"]
+        )
         if hasattr(runner, "speculative_config"):
             spec_cfg = getattr(runner, "speculative_config", None)
             num_spec = int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
@@ -1239,7 +1251,7 @@ class MegakernelDriver:
                 "verify_buckets_explicit", False
             ):
                 verify_buckets = ()
-        if buckets == () and verify_buckets == ():
+        if not buckets and not verify_buckets:
             logger.info("Megakernel disabled (both bucket lists empty).")
             return None
 
@@ -1429,7 +1441,7 @@ class MegakernelDriver:
         use_gpr = (
             False
             if (use_fused or pb is None)
-            else _should_use_pool_gather(
+            else should_use_pool_gather(
                 self.spec,
                 pb,
                 ex_cand2,

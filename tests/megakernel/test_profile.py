@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import exec_spec, profile, profiles
+from vllm_torchtpu.megakernel import block_options, profile, profiles
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.pool.config import CacheExec, cache_exec, with_cache
 from vllm_torchtpu.megakernel.profile import (
@@ -54,7 +54,7 @@ _TEST_BLOCK = "test_profile_block"
 @pytest.fixture(autouse=True)
 def _isolated_profile_state(monkeypatch: pytest.MonkeyPatch):
     """Register `_TestTunables` and isolate profile registry state per test."""
-    monkeypatch.setitem(exec_spec._TUNABLES, _TEST_BLOCK, _TestTunables)
+    monkeypatch.setitem(block_options._TUNABLES, _TEST_BLOCK, _TestTunables)
     monkeypatch.setattr(profile, "_REGISTRY", {"default": DEFAULT_PROFILE})
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", {})
     monkeypatch.setattr(profile, "_BUILTINS_LOADED", True)

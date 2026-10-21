@@ -209,13 +209,39 @@ def _guarded_files() -> list[Path]:
     files += sorted((_MK_ROOT / "blocks").rglob("*.py"))
     files += sorted((_MK_ROOT / "experimental").glob("*.py"))
     files += sorted((_MK_ROOT / "models").glob("*.py"))
-    assert len(files) >= 6, files
+    files += sorted((_MK_ROOT / "pool").glob("*.py"))
+    rel_paths = {p.relative_to(_MK_ROOT).as_posix() for p in files}
+    expected_files = {
+        "kernel.py",
+        "cache.py",
+        "cache_common.py",
+        "cache_pooled.py",
+        "cache_pooled_local.py",
+        "cache_flat.py",
+        "cache_experimental.py",
+        "blocks/gqa/block.py",
+        "blocks/gqa/kv.py",
+        "blocks/gdn/block.py",
+        "blocks/gdn/states.py",
+        "blocks/moe/block.py",
+        "experimental/fused_pool_io.py",
+        "models/qwen35.py",
+        "models/qwen35_pool.py",
+        "pool/gather.py",
+        "pool/scatter.py",
+        "pool/scatter_ckpt.py",
+        "pool/scatter_kv.py",
+    }
+    assert expected_files <= rel_paths, expected_files - rel_paths
     return files
 
 
 def test_no_raw_pool_state_literal_in_core():
     """`"raw"` is defined once (`POOL_STATE_NAME`), never repeated elsewhere."""
+    assert mk.POOL_STATE_NAME == "raw"
     for path in _guarded_files():
+        if path.relative_to(_MK_ROOT).as_posix() == "pool/config.py":
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and node.value == "raw":

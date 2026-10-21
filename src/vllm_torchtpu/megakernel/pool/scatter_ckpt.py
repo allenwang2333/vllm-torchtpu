@@ -107,7 +107,6 @@ def prepare_ckpt(
         conv_buf_dt = BF16
         ckpt_is_3d = False
         ckpt_t_off = 0
-
         taps = 0
     geom = dict(
         vh=vh,
@@ -190,19 +189,24 @@ def start_scatter_seq(
         conv_bf16: Any = conv_buf[slot, 0].astype(BF16) if conv_tail_row else None
         for t in range(T):
             s_km = rec_buf[slot, pl.ds(t * vh, vh)]
-            u32_val = pltpu.bitcast(s_km.reshape(vh * KD, VD), U32)
             if bool(interpret):
-                u32_pad = (
-                    jnp.pad(u32_val, ((0, rec_u32_cap - ssm_u32_rows), (0, 0)))
+                bf16_pairs = s_km.reshape(ssm_u32_rows, 2, VD).swapaxes(1, 2)
+                bf16_pad = (
+                    jnp.pad(
+                        bf16_pairs,
+                        ((0, rec_u32_cap - ssm_u32_rows), (0, 0), (0, 0)),
+                    )
                     if ssm_u32_rows < rec_u32_cap
-                    else u32_val
+                    else bf16_pairs
                 )
                 page_buf[slot, pl.ds(t * pps, rec_pages)] = (
-                    lax.bitcast_convert_type(u32_pad, FP8)
+                    lax.bitcast_convert_type(bf16_pad, FP8)
+                    .reshape(rec_u32_cap, VD, 4)
                     .swapaxes(1, 2)
                     .reshape(rec_pages, *page_shape)
                 )
             else:
+                u32_val = pltpu.bitcast(s_km.reshape(vh * KD, VD), U32)
                 page_buf.at[slot, pl.ds(t * pps, rec_pages)].bitcast(U32).reshape(
                     rec_u32_cap, LANES
                 )[:ssm_u32_rows, :] = u32_val

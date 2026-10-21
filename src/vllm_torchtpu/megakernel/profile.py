@@ -315,7 +315,7 @@ def _load_builtins() -> None:
     if not _BUILTINS_LOADED:
         from . import profiles
 
-        profiles.load_builtin_profiles()  # registers checked-in profiles
+        profiles.load_builtin_profiles()  # loads model-agnostic profile hook
         _BUILTINS_LOADED = True  # only after a successful import
 
 

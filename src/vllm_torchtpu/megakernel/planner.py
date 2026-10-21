@@ -170,17 +170,33 @@ def _discover_schedule(
     )
 
 
-def plan(model_spec: ModelSpec, ex: ExecSpec) -> Plan:
+def plan(
+    model_spec: ModelSpec,
+    ex: ExecSpec,
+    *,
+    fit_vmem: bool = True,
+) -> Plan:
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
 
-    `ex.tiles=None` plans the default tiles fitted to the model's VMEM budget,
-    as `kernel.build` does (`vmem.fit_default_tiles`).
+    When `fit_vmem=True` (default), `ex.tiles=None` plans the default tiles
+    fitted to the model's VMEM budget, as `kernel.build` does
+    (`vmem.fit_default_tiles`). Callers that only need weight tile shapes and
+    smalls layout (e.g. `pack_weights`) pass `fit_vmem=False` to avoid querying
+    device budgets when no JAX backend is initialized.
     """
-    if ex.tiles is None:
+    if fit_vmem and ex.tiles is None:
         # Local import: `vmem` builds on this module.
         from .vmem import fit_default_tiles
 
         ex = fit_default_tiles(model_spec, ex)
+    active_blocks = model_spec.all_blocks()
+    active_names = {b.name for b in active_blocks}
+    unknown_debug = sorted(set(ex.debug.blocks) - active_names)
+    if unknown_debug:
+        raise MegakernelConfigError(
+            f"DebugOptions.blocks has unknown or inactive block(s) {unknown_debug}; "
+            f"active blocks: {sorted(active_names)}"
+        )
     g = model_spec.config
     tiles = ex.resolve_tiles(g)
     (
@@ -375,7 +391,7 @@ def weight_shapes(
 ) -> dict[str, Any]:
     """Per-rank HBM weight operand shapes derived from `Block.weights`."""
     if p is None:
-        p = plan(model_spec, ex)
+        p = plan(model_spec, ex, fit_vmem=False)
     g = model_spec.config
     out: dict[str, Any] = {}
     for name, w in p.weight_decls.items():

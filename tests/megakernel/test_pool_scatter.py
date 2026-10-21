@@ -209,14 +209,15 @@ def test_scatter_direct_conv_window_when_the_caller_conv_is_short():
     _check_scatter(lay, _exec(R=1, B=10, T=5), 3, seed=96)
 
 
-@pytest.mark.parametrize("T", [2, 5])
+@pytest.mark.parametrize("T", [2, 4, 5])
 def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
     """24 lane-rows per rank has no exact `taps + 1` row window of its 80
     padded conv rows, so the direct path reads `taps` rows. Traced for TPU
-    (`interpret=False`)."""
+    (`interpret=False`) and verified against reference (`interpret=True`)."""
     lay = replace(_layout(1, num_pools=1), kh=8, vh=8)
     qkv = lay.qkv_per_rank(1)
     assert qkv // 128 == 24
+    _check_scatter(lay, _exec(R=1, B=2 * T, T=T), 3, seed=101 + T)
     ex = replace(_exec(R=1, B=2 * T, T=T), interpret=False)
     pt, ckpt, _ = _tables(lay, ex, 3)
     vh, NS = lay.vh_per_rank(1), ex.NS
@@ -233,6 +234,43 @@ def test_scatter_direct_conv_window_traces_for_24_lane_rows(T: int):
         lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
     )(*args)
     assert "qwen3_5_scatter_pool_states" in str(jaxpr)
+
+
+@pytest.mark.parametrize("R,kh,vh", [(1, 8, 8), (4, 32, 32)])
+@pytest.mark.parametrize("T", [2, 4, 5])
+def test_scatter_direct_conv_window_lowers_for_24_lane_rows_on_tpu(
+    R: int, kh: int, vh: int, T: int
+):
+    """On TPU, lower and run the `qkv_128=24` direct conv scatter path
+    (`conv_tail_row=False`, padded from 72 to 80 lane-rows)."""
+    try:
+        tpu_devs = jax.devices("tpu")
+    except RuntimeError:
+        tpu_devs = []
+    if not tpu_devs:
+        pytest.skip("Requires TPU device for Mosaic lowering")
+    lay = replace(_layout(1, num_pools=1), kh=kh, vh=vh)
+    qkv = lay.qkv_per_rank(R)
+    assert qkv // 128 == 24
+    ex = replace(_exec(R=R, B=2 * T, T=T), interpret=False)
+    with jax.default_device(tpu_devs[0]):
+        pt, ckpt, _ = _tables(lay, ex, 3)
+        vh_r, NS = lay.vh_per_rank(R), ex.NS
+        args = (
+            (jnp.zeros((NUM_PAGES, *lay.kv_page_shape), FP8),),
+            jnp.arange(ex.B, dtype=jnp.int32),
+            pt,
+            jnp.zeros((1, ex.MR, lay.hd), FP8),
+            jnp.zeros((1, ex.MR, lay.hd), FP8),
+            jnp.ones((1, NS, 8 * ((3 + T + 7) // 8), qkv), jnp.float32),
+            jnp.ones((1, ex.B * vh_r, lay.KD, lay.VD), jnp.bfloat16),
+        )
+        fn = jax.jit(
+            lambda *a: pool.scatter_pool_states(lay, ex, *a, ckpt_indices=ckpt)
+        )
+        out = fn(*args)
+        jax.block_until_ready(out)
+        assert out[0].shape == (NUM_PAGES, *lay.kv_page_shape)
 
 
 @pytest.mark.parametrize("T", [1, 2])

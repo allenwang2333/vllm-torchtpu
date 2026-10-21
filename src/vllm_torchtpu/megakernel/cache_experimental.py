@@ -52,31 +52,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from .cache_common import require_pool_backend, resolve_model_spec
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .fused_io_hook import fused_io_available
 from .pool import POOL_KERNEL_NAMES
-from .pool.config import PoolBackend, cache_exec
-from .spec import ModelSpec
-
-
-def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
-    if isinstance(g_or_spec, ModelSpec):
-        return g_or_spec
-    if hasattr(g_or_spec, "to_model_spec"):
-        return g_or_spec.to_model_spec()
-    raise TypeError(
-        "Expected a ModelSpec or a geometry config implementing .to_model_spec(), "
-        f"got {type(g_or_spec).__name__}"
-    )
-
-
-def _require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
-    if model_spec.cache_backend is None:
-        raise ValueError(
-            f"ModelSpec {model_spec.name!r} does not configure a cache_backend"
-        )
-    return model_spec.cache_backend
+from .pool.config import cache_exec
 
 
 def should_fuse_pool_io(
@@ -106,8 +87,8 @@ def should_fuse_pool_io(
     the pool backend doesn't support fused I/O, `"auto"` resolves to split pool
     I/O and an explicit `True` raises `MegakernelConfigError`.
     """
-    ms = _resolve_model_spec(model_spec)
-    pb = _require_pool_backend(ms)
+    ms = resolve_model_spec(model_spec)
+    pb = require_pool_backend(ms)
     if fused_pool_io is None:
         want_fused = bool(cache_exec(ex).fused_pool_io)
         explicit_true = want_fused

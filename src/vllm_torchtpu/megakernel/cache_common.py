@@ -29,7 +29,7 @@ from .spec import ModelSpec
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(frozen=True)
-class _ModeTag:
+class ModeTag:
     """Zero-leaf pytree wrapper for string modes like `'from_ckpt'` in `jax.jit`."""
 
     mode: str
@@ -38,29 +38,29 @@ class _ModeTag:
         return (), self.mode
 
     @classmethod
-    def tree_unflatten(cls, aux_data: str, children: tuple[()]) -> _ModeTag:
+    def tree_unflatten(cls, aux_data: str, children: tuple[()]) -> ModeTag:
         del children
         return cls(aux_data)
 
 
-def _wrap_active_seqs(active_seqs: Any) -> Any:
+def wrap_active_seqs(active_seqs: Any) -> Any:
     if isinstance(active_seqs, str):
         if active_seqs not in ("from_ckpt", "all"):
             raise ValueError(
                 f"Unsupported active_seqs mode {active_seqs!r}; "
                 "expected 'from_ckpt', 'all', None, or an int32/bool mask array"
             )
-        return _ModeTag(active_seqs)
+        return ModeTag(active_seqs)
     return active_seqs
 
 
-def _unwrap_active_seqs(active_seqs: Any) -> Any:
-    if isinstance(active_seqs, _ModeTag):
+def unwrap_active_seqs(active_seqs: Any) -> Any:
+    if isinstance(active_seqs, ModeTag):
         return active_seqs.mode
     return active_seqs
 
 
-def _resolve_active_seqs_mode(
+def resolve_active_seqs_mode(
     active_seqs: Any,
     *,
     default_mode: str = "from_ckpt",
@@ -77,7 +77,7 @@ def _resolve_active_seqs_mode(
     return "ref", jnp.asarray(active_seqs, dtype=jnp.int32)
 
 
-def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
+def resolve_model_spec(g_or_spec: Any) -> ModelSpec:
     if isinstance(g_or_spec, ModelSpec):
         return g_or_spec
     if hasattr(g_or_spec, "to_model_spec"):
@@ -88,7 +88,7 @@ def _resolve_model_spec(g_or_spec: Any) -> ModelSpec:
     )
 
 
-def _require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
+def require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
     if model_spec.cache_backend is None:
         raise ValueError(
             f"ModelSpec {model_spec.name!r} does not configure a cache_backend"
@@ -96,7 +96,7 @@ def _require_pool_backend(model_spec: ModelSpec) -> PoolBackend:
     return model_spec.cache_backend
 
 
-def _validate_page_table_shape(page_table: Any, ex: ExecSpec) -> None:
+def validate_page_table_shape(page_table: Any, ex: ExecSpec) -> None:
     ns, r = ex.NS, ex.R
     if page_table.ndim == 2:
         if page_table.shape[0] not in (ns, r * ns) or page_table.shape[1] < 1:
@@ -113,7 +113,7 @@ def _validate_page_table_shape(page_table: Any, ex: ExecSpec) -> None:
         raise ValueError(f"page_table must be 2D or 3D, got shape {page_table.shape}")
 
 
-class _PooledStepFn:
+class PooledStepFn:
     """Callable step function that unpacks as `(step_fn, info)` and has `.lower()`."""
 
     def __init__(self, call_fn: Any, lower_fn: Any, info: dict[str, Any]):
@@ -132,7 +132,7 @@ class _PooledStepFn:
         yield self.info
 
 
-def _should_use_pool_gather(
+def should_use_pool_gather(
     ms: ModelSpec,
     pb: PoolBackend,
     ex: ExecSpec,
@@ -159,7 +159,7 @@ def _should_use_pool_gather(
     return bool(cache_exec(ex).pool_gather)
 
 
-def _require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) -> None:
+def require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) -> None:
     """Fail closed: fused pool I/O is only correct with outer pool donation.
 
     On TPU the fused megakernel writes the pools through unaliased HBM DMAs and
@@ -171,3 +171,17 @@ def _require_fused_donation(ms: ModelSpec, use_fused: bool, donate_pools: bool) 
             f"fused_pool_io for ModelSpec {ms.name!r} requires donate_pools=True "
             "(the fused kernel relies on outer buffer donation for its pool writes)"
         )
+
+
+__all__ = [
+    "ModeTag",
+    "PooledStepFn",
+    "require_fused_donation",
+    "require_pool_backend",
+    "resolve_active_seqs_mode",
+    "resolve_model_spec",
+    "should_use_pool_gather",
+    "unwrap_active_seqs",
+    "validate_page_table_shape",
+    "wrap_active_seqs",
+]

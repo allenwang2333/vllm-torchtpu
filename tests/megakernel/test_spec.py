@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import exec_spec
+from vllm_torchtpu.megakernel import block_options, exec_spec
 from vllm_torchtpu.megakernel import spec as spec_mod
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
@@ -85,7 +85,10 @@ def test_spec_declaration_dataclasses_and_defaults():
 
 
 def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
-    monkeypatch.setattr(exec_spec, "_TUNABLES", dict(exec_spec._TUNABLES))
+    tunables_copy = dict(block_options._TUNABLES)
+    debug_copy = dict(block_options._DEBUG)
+    monkeypatch.setattr(block_options, "_TUNABLES", tunables_copy)
+    monkeypatch.setattr(block_options, "_DEBUG", debug_copy)
 
     @dataclasses.dataclass(frozen=True)
     class _CustomTunables:

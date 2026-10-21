@@ -24,10 +24,10 @@ from jax.sharding import PartitionSpec as P
 
 from . import kernel
 from .cache_common import (
-    _ModeTag,
-    _resolve_active_seqs_mode,
-    _unwrap_active_seqs,
-    _validate_page_table_shape,
+    ModeTag,
+    resolve_active_seqs_mode,
+    unwrap_active_seqs,
+    validate_page_table_shape,
 )
 from .pool import check_ckpt_bounds
 from .pool.config import cache_exec
@@ -53,7 +53,7 @@ def run_local(
     call, p, w_names, s_names, o_names = b.call, b.p, b.w_names, b.s_names, b.o_names
     wsh, has_rec, pool_key, pt_key = b.wsh, b.has_rec, b.pool_key, b.pt_key
     max_pt, _get_compiled = b.max_pt, b.get_compiled
-    active_seqs = _unwrap_active_seqs(active_seqs)
+    active_seqs = unwrap_active_seqs(active_seqs)
     raw_6d = raw_pools[0].ndim == 6
     raw_in = tuple(r.squeeze(0) for r in raw_pools) if raw_6d else tuple(raw_pools)
     if page_table.ndim == 3:
@@ -92,7 +92,7 @@ def run_local(
     ]
 
     if use_fused or use_gpr:
-        act_mode_l, active_mask_l = _resolve_active_seqs_mode(
+        act_mode_l, active_mask_l = resolve_active_seqs_mode(
             active_seqs, default_mode="from_ckpt" if has_rec else "all"
         )
         if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
@@ -182,7 +182,7 @@ def run_local(
 
 def _meta_spec(b: PooledBuild, arr: Any, ns_dim: int, max_unsharded_ndim: int = 2) -> P:
     ex_paged = b.ex_paged
-    if isinstance(arr, _ModeTag) or arr is None or ex_paged.R <= 1:
+    if isinstance(arr, ModeTag) or arr is None or ex_paged.R <= 1:
         return P()
     if arr.ndim > max_unsharded_ndim:
         return P("tp") if arr.shape[0] == ex_paged.R else P()
@@ -204,7 +204,7 @@ def raw_step(
     """Shard the pooled step's arguments and run `run_local` per rank."""
     mesh, ex_paged, extras, has_rec = b.mesh, b.ex_paged, b.extras, b.has_rec
     rec_slots, pt_key = b.rec_slots, b.pt_key
-    _validate_page_table_shape(page_table, ex_paged)
+    validate_page_table_shape(page_table, ex_paged)
     ws = {
         k: tuple(P("tp") for _ in weights[k])
         if isinstance(weights[k], tuple)

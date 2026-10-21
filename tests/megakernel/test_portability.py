@@ -108,16 +108,9 @@ def test_megakernel_portability_ast_guard():
 
             # `__init__.py` is the public package facade and may re-export
             # model helpers; all other core modules outside `models/` must not.
-            # A profile targeting a model takes the model's name from the
-            # model's profile module.
             facade_allowlist = {"__init__.py"}
-            model_name_imports = {
-                "profiles/qwen35_candidate30.py": {"models.qwen35_profile"}
-            }
             if rel not in facade_allowlist and not rel.startswith("models/"):
                 for mod in modules:
-                    if mod in model_name_imports.get(rel, ()):
-                        continue
                     assert mod != "models" and not mod.startswith("models."), (
                         f"{rel}:{node.lineno} imports '{mod}'; core megakernel "
                         "modules must be model-agnostic and never import models/."
@@ -154,7 +147,21 @@ def test_blocks_do_not_import_experimental_code():
     at any level, so GQA / GDN can land without the experimental code.
     """
     blocks_root = Path(megakernel.__file__).resolve().parent / "blocks"
-    for path in sorted(blocks_root.rglob("*.py")):
+    py_files = sorted(blocks_root.rglob("*.py"))
+    rel_paths = {p.relative_to(blocks_root).as_posix() for p in py_files}
+    expected_block_files = {
+        "__init__.py",
+        "gqa/__init__.py",
+        "gqa/block.py",
+        "gqa/kv.py",
+        "gdn/__init__.py",
+        "gdn/block.py",
+        "gdn/states.py",
+        "moe/__init__.py",
+        "moe/block.py",
+    }
+    assert expected_block_files <= rel_paths, expected_block_files - rel_paths
+    for path in py_files:
         rel = path.relative_to(blocks_root).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

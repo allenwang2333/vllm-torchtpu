@@ -1,6 +1,7 @@
 {
  "_meta": {
   "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (x86_64)",
+  "gpr_resolved": true,
   "jax": "0.11.2",
   "jaxlib": "0.11.2",
   "numpy": "2.5.4",
@@ -63,21 +64,21 @@
   ]
  },
  "c30_t4_b24": {
-  "gpr": false,
+  "gpr": true,
   "hid": "dfdd515665e120501032d1f6",
   "pools": [
    "f7a9c99dc99ca16c9f0d1eef"
   ]
  },
  "c30_t4_b40": {
-  "gpr": false,
+  "gpr": true,
   "hid": "893056e9824c4d70ecb84a87",
   "pools": [
    "3bac669f1769f838316f7592"
   ]
  },
  "c30_t4_b48": {
-  "gpr": false,
+  "gpr": true,
   "hid": "0d2eace2aa47ac39559d624e",
   "pools": [
    "334312405ea4b3e95b53585c"

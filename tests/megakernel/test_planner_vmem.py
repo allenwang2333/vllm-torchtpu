@@ -28,7 +28,7 @@ from conftest import (
 )
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.megakernel import planner, vmem
+from vllm_torchtpu.megakernel import block_options, planner, vmem
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.ops import F32, FP8
@@ -211,3 +211,41 @@ def test_unsupported_stream_ring_is_config_error(
     monkeypatch.setattr(FakeMixerBlock, "weights", _weights)
     with pytest.raises(MegakernelConfigError, match="Unsupported stream_ring"):
         planner.plan(make_fake_model_spec(), fake_ex)
+
+
+def test_plan_fit_vmem_false_and_inactive_debug_block(
+    fake_ex: ExecSpec, monkeypatch: pytest.MonkeyPatch
+):
+    """`plan(..., fit_vmem=False)` and `weight_shapes` skip VMEM fitting;
+    `plan` rejects `DebugOptions.blocks` targeting a block not in `model_spec`."""
+    import jax
+
+    from vllm_torchtpu.megakernel import exec_spec
+
+    ms = make_fake_model_spec(L=4, att_every=1, H=256)
+    ex_unset = dataclasses.replace(fake_ex, tiles=None)
+    monkeypatch.setattr(
+        jax,
+        "devices",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("jax.devices() must not be called when fit_vmem=False")
+        ),
+    )
+    p = planner.plan(ms, ex_unset, fit_vmem=False)
+    assert p.ex.tiles is None
+    wsh = planner.weight_shapes(ms, ex_unset)
+    assert set(wsh) == set(p.w_names)
+
+    @dataclasses.dataclass(frozen=True)
+    class _InactiveDebug:
+        flag: bool = False
+
+    monkeypatch.setitem(block_options._DEBUG, "fake_gdn", _InactiveDebug)
+    ex_bad_dbg = dataclasses.replace(
+        fake_ex,
+        debug=exec_spec.DebugOptions(blocks={"fake_gdn": _InactiveDebug(flag=True)}),
+    )
+    with pytest.raises(
+        MegakernelConfigError, match="unknown or inactive block.*fake_gdn"
+    ):
+        planner.plan(ms, ex_bad_dbg)

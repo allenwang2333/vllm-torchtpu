@@ -52,8 +52,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import kernel
-from .cache_common import _resolve_model_spec
-from .cache_common import _should_use_pool_gather as _should_use_pool_gather
+from .cache_common import resolve_model_spec, should_use_pool_gather
 from .cache_experimental import should_fuse_pool_io
 from .cache_flat import make_flat_pooled_step
 from .cache_hlo import check_pooled_step_hlo
@@ -82,7 +81,7 @@ class CachePipe(abc.ABC):
 
 @dataclass(frozen=True)
 class DirectHBM(CachePipe):
-    """M1/M2 direct-HBM state cache pipe (`kc`/`vc`, `conv`/`rec` in HBM buffers)."""
+    """Direct-HBM state cache pipe (`kc`/`vc`, `conv`/`rec` in HBM buffers)."""
 
     def make_step(
         self,
@@ -94,14 +93,14 @@ class DirectHBM(CachePipe):
         donate_states: bool | None = None,
     ) -> Any:
         use_donate = donate if donate_states is None else bool(donate_states)
-        ms = _resolve_model_spec(g_or_spec)
+        ms = resolve_model_spec(g_or_spec)
         ex_direct = with_cache(ex, paged_kv=False, fused_pool_io=False)
         return kernel.make_step(mesh, ms, ex_direct, donate_states=use_donate)
 
 
 @dataclass(frozen=True)
 class PallasWriter(CachePipe):
-    """M3 pooled cache pipe (default split 3-stage; opt-in GPR or `fused_pool_io`)."""
+    """Pooled cache pipe (default split 3-stage; opt-in GPR or `fused_pool_io`)."""
 
     fused_pool_io: bool | str | None = None
     max_b_low: int = 24
@@ -119,7 +118,7 @@ class PallasWriter(CachePipe):
     ) -> Any:
         use_donate = donate if donate_pools is None else bool(donate_pools)
         f_mode = self.fused_pool_io if fused_pool_io is None else fused_pool_io
-        ms = _resolve_model_spec(g_or_spec)
+        ms = resolve_model_spec(g_or_spec)
         return make_pooled_step(
             mesh,
             ms,
@@ -139,4 +138,5 @@ __all__ = [
     "make_flat_pooled_step",
     "make_pooled_step",
     "should_fuse_pool_io",
+    "should_use_pool_gather",
 ]

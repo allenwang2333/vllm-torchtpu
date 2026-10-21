@@ -22,14 +22,14 @@ import jax
 
 from . import kernel
 from .cache_common import (
-    _PooledStepFn,
-    _require_fused_donation,
-    _require_pool_backend,
-    _resolve_active_seqs_mode,
-    _resolve_model_spec,
-    _should_use_pool_gather,
-    _unwrap_active_seqs,
-    _wrap_active_seqs,
+    PooledStepFn,
+    require_fused_donation,
+    require_pool_backend,
+    resolve_active_seqs_mode,
+    resolve_model_spec,
+    should_use_pool_gather,
+    unwrap_active_seqs,
+    wrap_active_seqs,
 )
 from .cache_experimental import should_fuse_pool_io
 from .cache_pooled_local import raw_step
@@ -98,8 +98,8 @@ def make_pooled_step(
          `hid, raw_pools = step(pos, hidden, weights, raw_pools, page_table,
                                 [*extra_inputs], [active_seqs])`
     """
-    ms = _resolve_model_spec(model_spec)
-    pb = _require_pool_backend(ms)
+    ms = resolve_model_spec(model_spec)
+    pb = require_pool_backend(ms)
     pb.layout.validate(ex)
     use_fused = should_fuse_pool_io(
         ms,
@@ -108,8 +108,8 @@ def make_pooled_step(
         max_b_low=max_b_low,
         min_b_hi=min_b_hi,
     )
-    use_gpr = _should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
-    _require_fused_donation(ms, use_fused, donate_pools)
+    use_gpr = should_use_pool_gather(ms, pb, ex, use_fused=use_fused)
+    require_fused_donation(ms, use_fused, donate_pools)
     ex_paged = with_cache(
         ex,
         paged_kv=True,
@@ -140,7 +140,8 @@ def make_pooled_step(
     cx = cache_exec(ex_paged)
     default_ckpt_k = cx.ckpt_k if cx.ckpt_k > 0 else ex_paged.T
     call, info = _get_compiled(cx.act_mode, cx.ckpt_2d, default_ckpt_k, cx.roff_1d)
-    p = info["plan"]
+    info: dict[str, Any] = {**info, "use_fused": use_fused, "use_gpr": use_gpr}
+    p: Any = info["plan"]
     w_names = p.w_names
     s_names = p.s_names
     o_names = p.o_names
@@ -216,8 +217,8 @@ def make_pooled_step(
             extra_tuple,
         ) = parse_call_args(b, states_or_raw, rest)
         if has_rec and cache_exec(ex_paged).check_ckpt_bounds:
-            act_m, act_arr = _resolve_active_seqs_mode(
-                _unwrap_active_seqs(active_seqs),
+            act_m, act_arr = resolve_active_seqs_mode(
+                unwrap_active_seqs(active_seqs),
                 default_mode="from_ckpt",
             )
             check_ckpt_bounds(
@@ -268,7 +269,7 @@ def make_pooled_step(
             *extra_tuple,
         )
 
-    return _PooledStepFn(_call, _lower, info)
+    return PooledStepFn(_call, _lower, info)
 
 
 def parse_call_args(
@@ -291,7 +292,7 @@ def parse_call_args(
         page_table = states[pt_key]
         ckpt_indices = states.get("ckpt_indices")
         read_offsets = states.get("read_offsets")
-        active_seqs = _wrap_active_seqs(states.get("active_seqs"))
+        active_seqs = wrap_active_seqs(states.get("active_seqs"))
         extra_tuple = tuple(rest[:n_extra])
         return (
             True,
@@ -316,7 +317,7 @@ def parse_call_args(
         tail = rest[1:]
 
     extra_tuple = tuple(tail[:n_extra])
-    active_seqs = _wrap_active_seqs(tail[n_extra] if len(tail) > n_extra else None)
+    active_seqs = wrap_active_seqs(tail[n_extra] if len(tail) > n_extra else None)
 
     return (
         False,

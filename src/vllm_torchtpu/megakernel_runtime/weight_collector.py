@@ -763,15 +763,16 @@ def pack_weights(
 ) -> dict[str, Any]:
     """Pack all `g.L` layers of `backbone` into the megakernel's weight dictionary.
 
-    Driven by `planner.plan(qwen35.qwen35_spec(g), ex)`:
+    Driven by `planner.plan(qwen35.qwen35_spec(g), ex, fit_vmem=False)`:
     - Returns all keys in `plan.w_names` (`lin_in`, `lin_out`, `att_in`, `att_out`,
       `router`, `sh13`, `sh2`, `e13`, `e2`, `es`, `smalls`, `final_norm`).
     - Returns `"w_flat"`: flat list of `torch.Tensor` leaves in `plan.w_names` order
       (expanding `tuple`s for unstacked dynamic kinds `plan.dynamic_kinds`).
-    - Returns `"plan"`: the resolved `Plan`.
+    - Returns `"plan"`: the unfitted `Plan` (`fit_vmem=False`, so packing never
+      initializes a JAX backend).
     """
     spec = qwen35.qwen35_spec(g)
-    p = planner.plan(spec, ex)
+    p = planner.plan(spec, ex, fit_vmem=False)
     tk = p.tk
     in_s_width = p.smalls_layout["in_s"][1]
 

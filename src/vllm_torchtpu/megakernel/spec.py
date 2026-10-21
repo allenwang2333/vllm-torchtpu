@@ -129,6 +129,12 @@ class Block:
             from .exec_spec import register_tunables
 
             register_tunables(cls.name, cls.Tunables)
+        if cls.Debug is not None and (
+            "Debug" in cls.__dict__ or "name" in cls.__dict__
+        ):
+            from .exec_spec import register_debug
+
+            register_debug(cls.name, cls.Debug)
 
     def tunables(self, ex: ExecSpec) -> Any:
         """This block's `Tunables` in `ex`'s tiles (class defaults when unset)."""
