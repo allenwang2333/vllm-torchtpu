@@ -33,6 +33,7 @@ from vllm_torchtpu.logger import init_logger
 
 from . import kernel as K
 from . import layout as LY
+from . import presets as PR
 from .config import FULL, rup
 
 logger = init_logger(__name__)
@@ -293,13 +294,16 @@ class Glm52DecodeMK:
             self.dense, self.experts = self._collect_weights()
             self.smalls = self._build_smalls().detach()
         self.tiles = K.Tiles(trace=os.environ.get("GLM52_DECODE_MK_TRACE", "0") == "1")
+        # stage-B levers (presets.py): GLM52_DECODE_MK_LEVERS = "" / "A" (stage A) | "B" (all) | "L4,L1,..."
+        self.levers = PR.parse(os.environ.get("GLM52_DECODE_MK_LEVERS", ""))
+        self.tiles_by_rows = {t: dataclasses.replace(self.tiles, **PR.tiles_kwargs(t, self.levers)) for t in self.rows}
         self.caches = None
         self._steps = {}
         self.mla_layer_name = _attn_module(bb.layers[0].self_attn).layer_name
         logger.info("GLM-5.2 decode megakernel: built for rows %s, L %d (fresh indexer layers %s, freq %d skip %d), "
-                    "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s", self.rows, cfg.L,
+                    "rope cache rows %d (max_model_len %d), k_scales %s, trace %s, enabled %s, levers %s", self.rows, cfg.L,
                     LY.layers_of(cfg, "iwq"), freq, skip, int(self.cos_sin.shape[0]), mml, sorted(set(self.k_scales)),
-                    self.tiles.trace, self.enabled)
+                    self.tiles.trace, self.enabled, ",".join(self.levers) or "stage A")
 
     # ---------------------------------------------------------------- weights
 
@@ -484,7 +488,8 @@ class Glm52DecodeMK:
 
         n_d, n_e, n_c = len(self.dense), len(self.experts), len(self.caches)
         smap, in_specs, out_specs, info = build_spmd(cfg, self.mesh, max_pages=self.max_pages, nb=self.nb,
-                                                     nbi=self.nbi, tiles=self.tiles, groups=self.groups)
+                                                     nbi=self.nbi, tiles=self.tiles_by_rows[cfg.TMAX],
+                                                     groups=self.groups)
         assert list(info["dkinds"]) == list(self._dense_kind), (info["dkinds"], list(self._dense_kind))
         assert len(info["e_names"]) == n_e, (len(info["e_names"]), n_e)
         assert len(info["c_names"]) == n_c
@@ -615,7 +620,8 @@ class Glm52DecodeMK:
                 "L": self.cfg.L, "fresh_layers": LY.layers_of(self.cfg, "iwq"),
                 "idx_freq_skip": [self.cfg.idx_freq, self.cfg.idx_skip], "n_dense": len(self.dense),
                 "n_experts": len(self.experts), "n_caches": len(self.caches or []), "nb": getattr(self, "nb", None),
-                "max_pages": self.max_pages, "trace": self.tiles.trace, "calls": self.calls,
+                "max_pages": self.max_pages, "trace": self.tiles.trace,
+                "levers": list(self.levers), "calls": self.calls,
                 "cache_views": getattr(self, "cache_views", None), "k_scales": sorted(set(self.k_scales)),
                 "counts": dict(self.counts)}
 
