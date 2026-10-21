@@ -75,7 +75,8 @@ FAULTS = DSA.FAULTS + ("stale_accumulator", "dropped_tail_row", "missing_rank_pa
                        "f_ar_earlyread",      # AR#1 sums its slots before waiting them (delay-exposed race)
                        "f_alias_poison_nan",  # F-ALIAS-POISON with 0xFF bytes (e4m3fn NaN): must stay identical
                        "f_alias_poison_nan_noguard",   # ... and the DSA's tail-row zeroing off: must go RED
-                       "f_a2a_early")         # L4 C2: an A2A chunk is sent one request before its rows are emitted
+                       "f_a2a_early",         # L4 C2: an A2A chunk is sent one request before its rows are emitted
+                       "f_qag_pair_drop")     # stage-B L2-Q: qag="pair" forwards one same-parity block too few
                                               # WHITEBOARD.v1's F-ALIAS-EARLY is not built (needs a hook between a
                                               # granule's gather wait and its read)
 ABLATIONS = ("weights", "experts", "coll", "index", "gather", "attn")
@@ -128,6 +129,25 @@ class Tiles:
     rec_thr: bool = False        # timing harness only: export b_row[2:5] / own_uv / b_req / b_greq per fresh layer
     thr_given: bool = False      # timing-only backing arm: load the recorded T / P / allowance, skip threshold()
     union_given: bool = False    # timing-only backing arm: load the recorded union table, skip threshold() + unions
+    # ---- stage B, lane L2 (WHITEBOARD.v3 §6.2); every default reproduces stage A (e852e35b7) ----
+    gearly: tuple = ()           # (g1, g2): the next IndexShare layer's OLD gather entries of granules [0, g1) are
+                                 # issued inside this MoE layer's AR#2 reduce-scatter wait and [g1, g2) inside its
+                                 # all-gather wait (the TC is idle there; the alias window is free once the expert
+                                 # loop has drained); () = stage A
+    qag: str = "mk"              # q head all-gather transport: "mk" = stage A's one-round all-peer `exchange`;
+                                 # "pair" = chip-sibling dedupe (P-TX j-ae1c975b: 22.7 vs 35.4 us at T = 32): own
+                                 # block -> the R/2 - 1 same-parity ranks + the sibling me^1 (same chip); at q_wait
+                                 # the same-parity blocks are forwarded to the sibling over the on-chip path
+    qmid: int = 0                # qag="pair": forward the same-parity blocks to the sibling right after the
+                                 # attention pre-issue has issued `qmid` granules (0 = at q_wait, after the whole
+                                 # pre-issue), so the on-chip forward overlaps the remaining issue
+    # timing-only backing arms (WHITEBOARD.v3 §5.3 record / replay; compose: L2 `replay` renamed `l2replay`; outputs must stay bit-identical):
+    record: bool = False         # extra HBM outputs: qall per layer [L, R, TMAX, QH] and the first `grec` gather
+                                 # granules' rows per layer [L, grec * 128, 128] (nope, rope) as gathered
+    l2replay: str = ""           # "q": qall per layer DMA'd from a recorded HBM input instead of the q AG; "g": the
+                                 # first `grec` granules' rows DMA'd from recorded inputs instead of the row gather
+                                 # (n rows per granule, the waits unchanged); "qg": both
+    grec: int = 40
 
 
 def bf(x):
@@ -316,6 +336,13 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     caches: per kind (nope, rope, idx) `groups[kind]` stacked operands [n_layers / groups, ...]."""
     cfg.check()
     assert tiles.fault in FAULTS, tiles.fault
+    GEARLY = bool(tiles.gearly)
+    assert set(tiles.l2replay) <= {"q", "g"}, tiles.l2replay
+    REC_IN = (["qrec"] if "q" in tiles.l2replay else []) + (["gnrec", "grrec"] if "g" in tiles.l2replay else [])
+    REC_OUT = ["qrec_o", "gnrec_o", "grrec_o"] if tiles.record else []
+    assert tiles.qag in ("mk", "pair"), tiles.qag
+    assert tiles.qag == "mk" or cfg.R == 1 or (cfg.R % 2 == 0 and (cfg.R & (cfg.R - 1)) == 0), (tiles.qag, cfg.R)
+    POISON_FAULTS = ("f_alias_poison", "f_alias_poison_red", "f_alias_poison_nan", "f_alias_poison_nan_noguard")
     assert set(skip) <= set(ABLATIONS), skip
     fault = tiles.fault
     R, L, H, M, TMAX, BMAX = cfg.R, cfg.L, cfg.H, cfg.M, cfg.TMAX, cfg.BMAX
@@ -416,6 +443,11 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         "spin": pltpu.VMEM((8, 128), F32),
         "arbuf": pltpu.VMEM((M, H), BF16),
     }
+    if REC_IN or REC_OUT:
+        scratch["rec_sem"] = pltpu.SemaphoreType.DMA((2,))
+    if tiles.qag == "pair":
+        scratch["q_send2"] = pltpu.SemaphoreType.DMA(())
+        scratch["q_recv2"] = pltpu.SemaphoreType.DMA(())
     for i, sp in enumerate(CO.ar_scratch(R, M, H) if R > 1 else []):
         scratch[f"ar1_{CO.AR_NAMES[i]}"] = sp
     if LSE_TILE:                                 # rows d * HPAD + hh (owner d, head hh), lanes = rows t
@@ -486,13 +518,17 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
         (scal, rmeta, qmeta, bt, bti, ltab, dtab, rvec, h0, rope_tab, smalls) = refs[:n_fixed]
         Wd = dict(zip(dkinds, refs[n_fixed:n_fixed + n_d]))
         e_in = refs[n_fixed + n_d:n_fixed + n_d + n_e]
-        c_in = refs[n_fixed + n_d + n_e:n_fixed + n_d + n_e + n_c]
+        r0_ = n_fixed + n_d + n_e
+        RI = dict(zip(REC_IN, refs[r0_:r0_ + len(REC_IN)]))          # L2 records: before the caches
+        c_in = refs[r0_ + len(REC_IN):r0_ + len(REC_IN) + n_c]
         # extra HBM inputs after the caches: L4 replay records (n_r), then L1 backing-arm records (n_x)
-        recs = refs[n_fixed + n_d + n_e + n_c:n_fixed + n_d + n_e + n_c + n_r]
-        x_in = dict(zip(xin_names, refs[n_fixed + n_d + n_e + n_c + n_r:n_fixed + n_d + n_e + n_c + n_r + n_x]))
-        o0 = n_fixed + n_d + n_e + n_c + n_r + n_x
+        x0_ = r0_ + len(REC_IN) + n_c
+        recs = refs[x0_:x0_ + n_r]
+        x_in = dict(zip(xin_names, refs[x0_ + n_r:x0_ + n_r + n_x]))
+        o0 = x0_ + n_r + n_x
         out_ref, nrow_out, rrow_out, irec_out = refs[o0:o0 + 4]
-        rest = refs[o0 + 4:]
+        RO = dict(zip(REC_OUT, refs[o0 + 4:o0 + 4 + len(REC_OUT)]))
+        rest = refs[o0 + 4 + len(REC_OUT):]
         if debug:
             (d_state, d_attn, d_xin, d_xffn, d_qc, d_kvcn, d_qall, d_oloc, d_wtab, d_uv, d_ureq) = rest[:11]
             rest = rest[11:]
@@ -638,7 +674,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             pre = "ar1_" if (which == 1 or fault == "f_xrace") else "ar2_"
             return {n: scr[pre + n] for n in CO.AR_NAMES} if R > 1 else {}
 
-        def all_reduce(partial_f32, which, drop_last=False, early_read=False):
+        def all_reduce(partial_f32, which, drop_last=False, early_read=False, mids=()):
             """bf16 partial [M, H] (rows >= T zeroed, moe_tp_decode all_reduce._masked) -> rank-order f32 sum ->
             bf16 values as f32."""
             if tiles.replay == "ar":                 # TIMING-ONLY: the recorded all-reduce output of this layer
@@ -650,7 +686,11 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             buf[...] = jnp.where(row_m < T_eff, bf(partial_f32), 0.0).astype(BF16)
             if "coll" not in skip:
                 with sc(f"X_ar{which}"):
-                    CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last, early_read=early_read)
+                    if mids:
+                        CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last, early_read=early_read,
+                                      mids=mids)
+                    else:
+                        CO.all_reduce(R, me, buf, M, H, ar_set(which), drop_last=drop_last, early_read=early_read)
             return buf[...].astype(F32)
 
         def exchange(src_fn, dst_fn, ss, rs, wait=True):
@@ -664,6 +704,55 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             r0_ = c_ * RW
             CO.start_all(R, me, lambda d: scr["osend"].at[d, pl.ds(r0_, RW)],
                          lambda i: scr["orecv"].at[i, pl.ds(r0_, RW)], scr["a_send"], scr["a_recv"])
+
+        def qag_pair_start():
+            """q AG, transport "pair" (stage-B L2-Q): start the R/2 sends (sibling + same-parity ranks); returns
+            finish(): wait the same-parity blocks, forward them to the sibling, wait the sibling's own block and
+            its forwards, then every send. Exact (copies); correctness does not depend on the chip mapping."""
+            if "coll" in skip or R == 1:
+                return lambda: None
+            sib = me ^ 1
+            par = me & 1
+            peers = [((me >> 1) ^ k) * 2 + par for k in range(1, R // 2)]
+
+            def rc(src, dst, ss, rs, d):
+                pltpu.make_async_remote_copy(src_ref=src, dst_ref=dst, send_sem=ss, recv_sem=rs, device_id=(d,),
+                                             device_id_type=CO.MESH).start()
+            rc(scr["qsend"], scr["qall"].at[me], scr["q_send"], scr["q_recv"], sib)
+            for p_ in peers:
+                rc(scr["qsend"], scr["qall"].at[me], scr["q_send2"], scr["q_recv2"], p_)
+
+            def desc(ss, rs):
+                return pltpu.make_async_remote_copy(src_ref=scr["qsend"], dst_ref=scr["qall"].at[0], send_sem=ss,
+                                                    recv_sem=rs, device_id=(me,), device_id_type=CO.MESH)
+
+            nf = len(peers) - (1 if fault == "f_qag_pair_drop" else 0)
+
+            def forward():
+                d2 = desc(scr["q_send2"], scr["q_recv2"])
+                with sc("X_qpar"):
+                    for _ in peers:
+                        d2.wait_recv()
+                for i, p_ in enumerate(peers):
+                    if fault == "f_qag_pair_drop" and i == 0:     # FAULT: one forward omitted (sibling waits one less)
+                        continue
+                    rc(scr["qall"].at[p_], scr["qall"].at[p_], scr["q_send"], scr["q_recv"], sib)
+
+            def finish():
+                d2 = desc(scr["q_send2"], scr["q_recv2"])
+                if not tiles.qmid:
+                    forward()
+                d1 = desc(scr["q_send"], scr["q_recv"])
+                with sc("X_qsib"):
+                    for _ in range(1 + nf):
+                        d1.wait_recv()
+                for _ in range(1 + nf):
+                    d1.wait_send()
+                for _ in peers:
+                    d2.wait_send()
+            if tiles.qmid:
+                finish.mid = forward                    # called by the DSA pre-issue loop (exactly once)
+            return finish
 
         cur_layer = [None]
 
@@ -861,6 +950,9 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
             mxu=mxu, fp8_decode_hw=fp8_decode_hw, mono_key=mono_key, pack2=pack2, unpack_lo=unpack_lo,
             unpack_hi=unpack_hi, bf=bf, misc_sem=scr["misc_sem"], wrow=scr["wrow"], rwrow=scr["rwrow"], M=M,
             debug=False, nb=nb, ks=lambda: sm(cur_slot[0], "k_scale")[:, 0:1],
+            grec_in=(RI["gnrec"], RI["grrec"]) if "g" in tiles.l2replay else None,
+            grec_out=(RO["gnrec_o"], RO["grrec_o"]) if tiles.record else None,
+            rec_sem=scr["rec_sem"] if (REC_IN or REC_OUT) else None,
             dbg_uv=scr["dbg_uv"] if debug else None,
             delay=delay_count, Lf=Lf, xin=x_in, xout=x_out if xout_names else None)
         core.update(DSA.make(Ens))
@@ -975,8 +1067,15 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 qrow = jnp.concatenate(parts, axis=1)
                 scr["qsend"][...] = pack2(qrow[:, :QH], qrow[:, QH:])
                 scr["qall"][me] = scr["qsend"][...]
-                q_wait = exchange(lambda d: scr["qsend"], lambda i: scr["qall"].at[i], "q_send", "q_recv",
-                                  wait=False)
+                if "q" in tiles.l2replay:                       # backing arm q_replay: qall from the record (bit-equal)
+                    qcp = pltpu.make_async_copy(RI["qrec"].at[l], scr["qall"], scr["rec_sem"].at[0])
+                    qcp.start()
+                    q_wait = qcp.wait
+                elif tiles.qag == "pair":
+                    q_wait = qag_pair_start()
+                else:
+                    q_wait = exchange(lambda d: scr["qsend"], lambda i: scr["qall"].at[i], "q_send", "q_recv",
+                                      wait=False)
 
             # ===== this layer's new KV rows -> staging (the q AG flies meanwhile) =====
             with sc("L_kvw"):
@@ -1018,13 +1117,22 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                             a2a_chunk(c_)
                             scr["a2a_n"][0] = jnp.int32(c_ + 1)
             with sc("L_attn"):
-                core["attention"](l, fresh, q_wait, after_req=after_req)
+                if GEARLY:
+                    prev_moe = jnp.logical_and(l >= 1, ltab[jnp.maximum(l - 1, 0), 2] > 0)
+                    core["attention"](l, fresh, q_wait, after_req=after_req,
+                                      early=jnp.logical_and(prev_moe, jnp.logical_not(fresh)))
+                else:
+                    core["attention"](l, fresh, q_wait, after_req=after_req)
             if fault == "stale_indexshare":
                 @pl.when(jnp.logical_and(fresh, l > full_l[0]))
                 def _():
                     restore_table()
             if debug:
                 dput(d_qall.at[l], scr["qall"])
+            if tiles.record:
+                rcp = pltpu.make_async_copy(scr["qall"], RO["qrec_o"].at[l], scr["rec_sem"].at[0])
+                rcp.start()
+                rcp.wait()
 
             # ===== A2A partials + lse to head owners, LSE merge =====
             with sc("L_merge"):
@@ -1118,8 +1226,13 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 def _moe():
                     moe(l, slot, g_ffn, mpos)
             stage_wait(l)
-            if fault in ("f_alias_poison", "f_alias_poison_red", "f_alias_poison_nan", "f_alias_poison_nan_noguard"):
-                poison_alias()
+            if fault in POISON_FAULTS:
+                if GEARLY:                                   # MoE layers poisoned before their AR#2 (moe())
+                    @pl.when(jnp.logical_not(is_moe))
+                    def _():
+                        poison_alias()
+                else:
+                    poison_alias()
             return carry
 
         def poison_alias():
@@ -1240,9 +1353,23 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 dgive(g_ffn)
                 dgive(g_ffn + plan["gate"][2])
                 dgive(g_ffn + plan["gate"][2] + plan["sh13"][2])
+            if GEARLY and fault in POISON_FAULTS:          # the alias window is idle from here: poison it BEFORE the
+                poison_alias()                              # early gathers land in it (not at the end of the layer)
             with sc("M_combine"):
                 comb = mtk._combine(scr["owner"][...], scr["shared"][...], cfg.routed_scale)
-            scr["hcur"][...] = all_reduce(comb.astype(F32), 2)
+            if GEARLY:
+                nxt_is = jnp.logical_and(l + 1 < L, ltab[jnp.minimum(l + 1, L - 1), 1] == 0)
+
+                def early(which):
+                    def f():
+                        @pl.when(nxt_is)
+                        def _():
+                            with sc("G_early"):
+                                core["early_issue"](l + 1, which)
+                    return f
+                scr["hcur"][...] = all_reduce(comb.astype(F32), 2, mids=(early(0), early(1)))
+            else:
+                scr["hcur"][...] = all_reduce(comb.astype(F32), 2)
 
         def route(scores, bias, n_valid):
             """moe_tp_decode._route (kernel.py:171-193 @ 9ffdb1eb4); FAULT router_tiebreak picks the highest
@@ -1301,10 +1428,15 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + n_c + n_r + n_x)
+    in_specs = [smem] * 7 + [vmem] * 3 + [hbm] + [hbm] * (n_d + n_e + len(REC_IN) + n_c + n_r + n_x)
+    rec_shapes = {"qrec": ((L, R, TMAX, QH), U32), "gnrec": ((L, tiles.grec * 128, 128), U32),
+                  "grrec": ((L, tiles.grec * 128, 128), U32)}
     out_shape = [jax.ShapeDtypeStruct((M, H), BF16), jax.ShapeDtypeStruct((L, TMAX, 128), U32),
                  jax.ShapeDtypeStruct((L, TMAX, 128), U32), jax.ShapeDtypeStruct((L, TMAX, 256), I32)]
     out_specs = [vmem, hbm, hbm, hbm]
+    for nm in REC_OUT:
+        out_shape.append(jax.ShapeDtypeStruct(*rec_shapes[nm[:-2]]))
+        out_specs.append(hbm)
     if debug:
         dshapes = [((L + 1, 2, M, H), F32), ((L, M, H), F32), ((L, M, H), F32), ((L, M, H), F32),
                    ((L, M, QL), F32), ((L, M, KL), F32), ((L, R, TMAX, QH), U32), ((L, HR, M, KL), F32),
@@ -1337,5 +1469,7 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                          starts_per_peer=NCH + (1 if LSE_TILE else 0), shadow=bool(tiles.shadow_a2a)),
                 n_rec=n_r, rec_shapes=({"a2a": [((L, HR, M, KL), "float32")],
                                         "ar": [((L, M, H), "float32"), ((L, M, H), "float32")]}.get(tiles.replay, [])),
-                xin=[(k,) + rec_specs[k] for k in xin_names], xout=[(k,) + rec_specs[k] for k in xout_names])
+                xin=[(k,) + rec_specs[k] for k in xin_names], xout=[(k,) + rec_specs[k] for k in xout_names],
+                rec_in=[(nm,) + rec_shapes[nm] for nm in REC_IN],
+                rec_out=[(nm,) + rec_shapes[nm[:-2]] for nm in REC_OUT])
     return call, info
