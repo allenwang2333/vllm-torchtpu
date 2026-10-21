@@ -25,6 +25,7 @@ from vllm_torchtpu.model_loader_patches import register_row_slice
 
 from ..config import engram_cpu_offload
 from .host_exchange import PendingRowExchange, start_exchange_rows
+from .host_pages import alloc_packed_staging
 
 
 @dataclass
@@ -628,8 +629,9 @@ class Engram(upstream.Engram):
             raw_words_per_tok = (cols * head_dim) // 4
             scale_words_per_tok = -(-(cols * blocks) // 4)
             words_per_tok = raw_words_per_tok + scale_words_per_tok
-            self._host_packed_buf = torch.zeros(
-                max_tokens * words_per_tok * 4, dtype=torch.uint8, device="cpu"
+            self._host_packed_buf = alloc_packed_staging(
+                max_tokens * words_per_tok * 4,
+                huge=envs.TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING,
             )
             self._host_raw = self._host_packed_buf[
                 : max_tokens * raw_words_per_tok * 4

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -367,6 +368,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # Debug escape hatch for comparing the default THP-backed H2D source with
+    # the ordinary CPU allocator. Does not change device layout or arithmetic.
+    "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

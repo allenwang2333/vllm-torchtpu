@@ -51,6 +51,8 @@ steps:
         bash .buildkite/scripts/run_in_docker.sh
         python -m pytest
         tests/models/vllm/test_dsv41_config.py
+        tests/models/vllm/test_dsv41_engram_host_pages.py
+        tests/models/vllm/test_dsv41_common_v1_v2_engram.py::test_packed_staging_preserves_bytes_across_bucket_changes
         tests/models/vllm/test_dsv41_v2_model_full.py
         tests/models/vllm/test_dsv41_v2_model_sp.py
         tests/models/vllm/test_dsv41_v2_local_q.py

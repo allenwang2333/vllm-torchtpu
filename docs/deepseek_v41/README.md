@@ -68,6 +68,19 @@ host table or hold/exchange head shards. Shared tables require a shared IPC
 namespace and approximately 190 GiB of `/dev/shm` for Flash, plus runtime space.
 The host-placement choice does not change the checkpoint's numeric format.
 
+Packed Engram upload buffers use aligned, prefaulted transparent huge pages
+when the host supports them (normally 2 MiB on x86). This reduces page-mapping
+overhead for H2D copies without changing packed bytes, device buffers or copy
+ordering. Allocation occurs at model initialization. If advice fails or full
+huge-page backing cannot be verified, a warning is emitted and the ordinary
+`torch.zeros` allocation is used. This needs no reserved hugetlb pool or `mlock`.
+For a diagnostic A/B against the previous allocator, set
+`TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING=0` before starting the server.
+The default is enabled. Each buffer rounds up to the host PMD page size and
+reserves one additional page of virtual address space for alignment.
+Performance on the current serving runtime requires a same-host cold-start A/B;
+historical results from the source branch are not an incremental speedup claim.
+
 ## Benchmarks and CI
 
 - `scripts/dsv41_bench/serve_cached_prefill.sh`: TP1/DP8, CED, CPU Engram,

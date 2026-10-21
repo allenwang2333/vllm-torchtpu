@@ -21,6 +21,31 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v1 import engram as v1_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 
 
+@pytest.mark.parametrize("huge", [False, True])
+def test_packed_staging_preserves_bytes_across_bucket_changes(monkeypatch, huge):
+    """Exercise the actual packing/upload path with CPU destination buffers."""
+    monkeypatch.setattr(
+        common_engram.envs, "TPU_DEEPSEEK_V41_ENGRAM_HUGEPAGE_STAGING", huge
+    )
+    engram = object.__new__(common_engram.Engram)
+    nn.Module.__init__(engram)
+    engram.embed_tokens = SimpleNamespace(
+        host_offload=True, part_n_hash_cols=3, dp_size=1, block_size=16
+    )
+    engram._init_staging(max_tokens=10, head_dim=16)
+    for tokens in (10, 3, 7, 3):
+        raw = (torch.arange(tokens * 3 * 16) % 251).to(torch.uint8)
+        scales = torch.full((tokens * 3,), 127 + tokens, dtype=torch.uint8)
+        engram._host_raw[:tokens].copy_(raw.view(tokens, 3, 16))
+        engram._host_scale[:tokens].copy_(scales.view(tokens, 3, 1))
+        engram.finish_prepare_embeddings(common_engram.HostEngramStaging(tokens))
+        uploaded = engram._staged_tensors(tokens).view(torch.uint8)
+        assert torch.equal(uploaded[: raw.numel()], raw)
+        assert torch.equal(uploaded[raw.numel() : raw.numel() + scales.numel()], scales)
+        assert torch.all(uploaded[raw.numel() + scales.numel() :] == 255)
+        assert engram._active_raw.data_ptr() == uploaded.data_ptr()
+
+
 @pytest.fixture(autouse=True)
 def setup_torch_accelerator(monkeypatch: pytest.MonkeyPatch):
     """Enable CPU execution for upstream Engram constructor checks."""
