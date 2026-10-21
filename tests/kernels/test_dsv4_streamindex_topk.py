@@ -1467,6 +1467,98 @@ class TestChunkedPipelining:
             " fallback that the cases above rely on has changed")
 
 
+def _shared_meta_kwargs(T_list, S_list, cp_size=1, cp_rank=0, chunk=None):
+    page_size, H_I, D = 256, 32, 128
+    inputs = _chunk_inputs(
+        T_list, _fragmented_pages(len(T_list), 40), page_size, H_I, D
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, 2048, 1, 4, 16, _SAL, chunk, return_scores=True
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    return kwargs
+
+
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list,S_list,cp_size,cp_rank,chunk",
+    [
+        # MTP verify rows only: every row lands in the MIXED pass.
+        pytest.param((4, 4, 4), (9001, 8 * 2047 + 1, 260), 1, 0, None, id="mtp_rows"),
+        # q_len-1 rows: the batched and remainder decode passes run too.
+        pytest.param((1, 1, 4, 4), (5000, 777, 9001, 260), 1, 0, None,
+                     id="decode_rows"),
+        pytest.param((1, 1, 1, 1, 1, 4, 21),
+                     (5000, 777, 3000, 9, 8 * 4000, 9001, 3021),
+                     8, 5, None, id="decode_batched_dcp8_rank5"),
+        pytest.param((1, 1, 4, 250), (5000, 777, 9001, 3021), 1, 0, 64, id="chunked"),
+    ],
+)
+# fmt: on
+def test_shared_meta_is_bitwise(T_list, S_list, cp_size, cp_rank, chunk):
+    """TPU_STREAMIDX_SHARED_META builds the same kernel operands, so the same result.
+
+    Indices and scores bitwise against the same call with the flag off. The
+    positive control is structural: the flag must remove exactly one empty-pass
+    cond per pass schedule from the lowered program, or nothing changed.
+    """
+    kwargs = _shared_meta_kwargs(T_list, S_list, cp_size, cp_rank, chunk)
+    # A batched decode pass exists once the batch can hold a full decode tile.
+    num_passes = 2 + (len(S_list) >= 4)
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, shared_meta=True).as_text()
+    n_off, n_on = off_hlo.count("stablehlo.case"), on_hlo.count("stablehlo.case")
+    assert n_off - n_on == num_passes, f"conds {n_off} -> {n_on}, {num_passes} passes"
+
+    off_idx, off_scores = streamindex_topk(**kwargs)
+    on_idx, on_scores = streamindex_topk(**kwargs, shared_meta=True)
+    assert (np.array(off_idx)[: sum(T_list)] >= 0).any(), "vacuous: no index selected"
+    np.testing.assert_array_equal(
+        np.array(on_idx), np.array(off_idx), err_msg="shared_meta changed indices"
+    )
+    np.testing.assert_array_equal(
+        np.array(on_scores).view(np.int32),
+        np.array(off_scores).view(np.int32),
+        err_msg="shared_meta changed scores",
+    )
+
+
+def test_shared_meta_shares_the_schedule_across_layers():
+    """Two indexer layers on the same step metadata build their schedules once.
+
+    The second call of a two-layer program must cost fewer compiled
+    instructions with the flag on than off: only shared schedule ops make it
+    cheaper, since everything else (scores, top-k) runs per layer either way.
+    """
+    kwargs = _shared_meta_kwargs((1, 1, 4, 4), (5000, 777, 9001, 260))
+    arrays = {
+        n: kwargs.pop(n)
+        for n in ("q", "indexer_weights", "cache_kv", "seq_lens", "page_indices",
+                  "cu_q_lens", "distribution")
+    }
+    cache_b = arrays["cache_kv"][::-1]
+
+    def layers(n, shared_meta, arrays, cache_b):
+        outs = [streamindex_topk(**arrays, **kwargs, shared_meta=shared_meta)]
+        if n == 2:
+            outs.append(streamindex_topk(
+                **{**arrays, "cache_kv": cache_b}, **kwargs, shared_meta=shared_meta
+            ))
+        return outs
+
+    def n_instructions(n, shared_meta):
+        txt = jax.jit(layers, static_argnums=(0, 1)).lower(
+            n, shared_meta, arrays, cache_b).compile().as_text()
+        return sum(1 for line in txt.splitlines() if " = " in line)
+
+    second_off = n_instructions(2, False) - n_instructions(1, False)
+    second_on = n_instructions(2, True) - n_instructions(1, True)
+    assert second_on < second_off, f"second layer {second_off} -> {second_on} instrs"
+
+
 def main(argv):
     del argv
 

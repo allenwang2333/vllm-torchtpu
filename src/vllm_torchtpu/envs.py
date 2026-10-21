@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_STREAMIDX_SHARED_META: bool = False
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -819,6 +820,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Build each StreamIndex pass schedule without its empty-pass lax.cond, so
+    # the indexer layers of a step share one copy instead of building one each.
+    "TPU_STREAMIDX_SHARED_META": env_bool("TPU_STREAMIDX_SHARED_META"),
     # Score full speculative verify windows (1 + K tokens) in the attention
     # kernels' static query-length pass instead of the mixed pass. Only takes
     # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps

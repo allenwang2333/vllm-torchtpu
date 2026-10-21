@@ -444,6 +444,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        shared_meta = envs.TPU_STREAMIDX_SHARED_META
         small_bucket = (
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
@@ -526,6 +527,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                shared_meta=shared_meta,
             )
             return cache_kv, topk_indices
 
@@ -560,6 +562,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        shared_meta = envs.TPU_STREAMIDX_SHARED_META
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         small_bucket = (
@@ -626,6 +629,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                shared_meta=shared_meta,
             )
             return cache_kv, local_topk
 

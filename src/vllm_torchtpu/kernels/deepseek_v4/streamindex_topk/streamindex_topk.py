@@ -1085,6 +1085,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "uniform_q_len",
+        "shared_meta",
     ),
 )
 def streamindex_topk(
@@ -1114,6 +1115,7 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     uniform_q_len: int | None = None,
+    shared_meta: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1175,6 +1177,10 @@ def streamindex_topk(
         a static q length and the (decode, prefill, mixed) block sizes' prefill
         entry, instead of the decode passes, which assume one query token. None
         keeps the segment on the decode passes.
+      shared_meta: build each pass schedule without its empty-pass `lax.cond`
+        (`compute_metadata(branchless=True)`). Same operands bit for bit, but
+        the indexer layers of a step, which all build them from the same step
+        metadata, then share one copy instead of building one each.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1502,6 +1508,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            branchless=shared_meta,
         )
 
     def _scores_for_chunk(
@@ -1699,6 +1706,7 @@ def streamindex_topk(
         "chunk_tokens",
         "dcp_axis_name",
         "a2a_merge",
+        "shared_meta",
     ),
 )
 def streamindex_topk_dcp(
@@ -1724,6 +1732,7 @@ def streamindex_topk_dcp(
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
+    shared_meta: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1792,6 +1801,7 @@ def streamindex_topk_dcp(
       dcp_axis_name: name of the DCP mesh axis.
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
+      shared_meta: see `streamindex_topk`.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1855,6 +1865,7 @@ def streamindex_topk_dcp(
             cp_rank=dcp_rank,
             interleave_size=interleave_size,
             return_scores=True,
+            shared_meta=shared_meta,
         )
 
         if a2a_merge:
