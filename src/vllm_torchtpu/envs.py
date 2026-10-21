@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_VSPACE_FUSED: bool = False
+    TPU_FUSED_MOE_PREFILL_V2_PSUM: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -783,6 +785,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", 0
     ),
+    # EXPERIMENTAL. With TPU_DCP_MLA_UV_BEFORE_MERGE: on the buckets that take
+    # the chunked reduce-scatter merge, build its operand in V space in one
+    # computation (#1935 trial 6's TPU_DCP_MERGE_VSPACE: head-batched W_UV
+    # matmul, weight, mask, one rounding; layers/adapter/dcp_vspace.py)
+    # instead of a pre-merge projection followed by the latent merge path.
+    "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
+    # EXPERIMENTAL. FUSED_MOE_PREFILL_KERNEL_V2's combine reduces each chunk
+    # with one all-reduce (lax.psum, as before #2196) instead of
+    # reduce-scatter + all-gather.
+    "TPU_FUSED_MOE_PREFILL_V2_PSUM": env_bool("TPU_FUSED_MOE_PREFILL_V2_PSUM"),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the

@@ -46,6 +46,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kernel import (  # noqa: E501
     _GATHER_UNROLL,
     _LANES,
@@ -156,6 +157,8 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
 
 
 _COMBINE_CHUNK_TOKENS = 2048
+# Fixed at import (experimental): the combine all-reduces each chunk.
+_V2_PSUM = envs.TPU_FUSED_MOE_PREFILL_V2_PSUM
 # What FUSED_MOE_PREFILL_KERNEL_V2 serves (t4-moe-prefill probes 03-04, v7x, GLM-5.2
 # TP16 per-rank shapes; device time per call of the whole op against the default build).
 # 4096 tokens: -134 us uniform routing, -85 Zipf s 0.3, -78 s 0.6, -72 s 1.0, -65
@@ -998,8 +1001,9 @@ def combine(slab, slab_row, coeff, axis_name, flat=False):
             y = jnp.sum(gathered * coeff[rows][..., None], axis=1).astype(jnp.bfloat16)
         if outs:
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        # Reduce-scatter + all-gather, not one all-reduce of the chunk (#2196).
-        outs.append(_psum_rows(y, axis_name))
+        # Reduce-scatter + all-gather, not one all-reduce of the chunk (#2196);
+        # TPU_FUSED_MOE_PREFILL_V2_PSUM (experimental): the all-reduce.
+        outs.append(lax.psum(y, axis_name) if _V2_PSUM else _psum_rows(y, axis_name))
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
