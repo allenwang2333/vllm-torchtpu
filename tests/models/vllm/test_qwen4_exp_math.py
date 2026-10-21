@@ -31,7 +31,11 @@ TPU = pytest.mark.tpu_test
 def cpu_default(request):
     # Repository device fixture defaults to TPU; CPU cases intentionally never
     # request it. Explicit factories also protect against a caller default.
-    if "tpu" in request.node.name:
+    if request.node.get_closest_marker("tpu_test"):
+        # Independent module cases must not exhaust shared wrapper variants.
+        torch.compiler.reset()
+        # Worker initialization precedes HC construction in native execution.
+        torch.ones(1, device="tpu").cpu()
         yield
     else:
         with torch.device("cpu"):
@@ -293,14 +297,26 @@ def test_hc_rejects_invalid_full_tile(tile):
     "tokens,hidden,dtype,full_tile,expected",
     [
         (256, 128, torch.bfloat16, 128, True),
-        (128, 128, torch.bfloat16, 128, False),
+        (128, 128, torch.bfloat16, 128, True),
+        (384, 128, torch.bfloat16, 128, True),
         (257, 128, torch.bfloat16, 128, False),
         (256, 129, torch.bfloat16, 128, False),
         (256, 128, torch.float32, 128, False),
         (256, 128, torch.bfloat16, 0, False),
     ],
 )
-def test_hc_full_dispatch_and_fallback(tokens, hidden, dtype, full_tile, expected):
+def test_hc_full_dispatch_and_fallback(
+    tokens, hidden, dtype, full_tile, expected, monkeypatch
+):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+    from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
+
+    # Static mocked layout: this test checks dispatch, not TPU arithmetic.
+    monkeypatch.setattr(
+        vllm_adapter,
+        "current_hc_hardware",
+        lambda: HcHardware("mock-layout", 64 << 20, 128, 16, 8, 256),
+    )
     module, x, block = hc_fixture(
         True, tokens=tokens, hidden=hidden, full_tile=full_tile
     )
@@ -327,11 +343,118 @@ def test_hc_full_dispatch_and_fallback(tokens, hidden, dtype, full_tile, expecte
     assert mixed.dtype == result.dtype == dtype
 
 
+def hc_rank_fixture(monkeypatch):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+    from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
+
+    def forbidden(*args):
+        pytest.fail("rank-ineligible input reached a fused HC callable")
+
+    # Exercise real admission/caller code with CPU-only boundary sentinels.
+    monkeypatch.setattr(
+        vllm_adapter,
+        "current_hc_hardware",
+        lambda: HcHardware("mock-layout", 64 << 20, 128, 16, 8, 256),
+    )
+    monkeypatch.setattr(vllm_adapter, "build_full_mix_op", lambda *args: forbidden)
+    monkeypatch.setattr(
+        vllm_adapter, "build_gated_residual_op", lambda *args: forbidden
+    )
+    module, _, _ = hc_fixture(True, hidden=128, full_tile=128)
+    assert module._prefill_full_op is module._prefill_combine_op is forbidden
+    return module
+
+
+@pytest.mark.parametrize("batch_shape", [(), (128, 2), (128, 1, 2)])
+def test_hc_mix_rank_fallback_matches_reference(batch_shape, monkeypatch):
+    module = hc_rank_fixture(monkeypatch)
+    branches, hidden = module.hc_count, module.hidden_size
+    x = torch.randn(*batch_shape, branches * hidden).bfloat16()
+    streams = x.float().unflatten(-1, (branches, hidden))
+    weight = module.hc_norm.weight.float().reshape(branches, hidden)
+    norm = (
+        (
+            streams
+            * torch.rsqrt(streams.square().mean(-1, keepdim=True) + 1e-6)
+            * (1 + weight)
+        )
+        .bfloat16()
+        .flatten(-2)
+    )
+    down = F.linear(norm, module.input_mix_weight_down.weight)
+    gate = F.linear(
+        F.silu(down.float() / branches).bfloat16(),
+        module.input_mix_weight_up.weight,
+    )
+    expected = (
+        (
+            torch.sigmoid(gate.float()).unflatten(-1, (branches, hidden))
+            * norm.float().unflatten(-1, (branches, hidden))
+        )
+        .mean(-2)
+        .bfloat16()
+    )
+
+    actual, (residual, actual_norm) = module.mix(x)
+    assert residual is x
+    assert torch.isfinite(actual).all() and torch.isfinite(actual_norm).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_norm, norm, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "residual_batch,block_batch,norm_batch",
+    [
+        ((128, 2), (128, 2), (128, 2)),
+        ((128, 1, 2), (128, 1, 2), (128, 1, 2)),
+        ((128, 2), (2,), (2,)),
+        ((128,), (128, 1), (128,)),
+        ((128,), (128,), (128, 1)),
+        ((), (128,), (128,)),
+        ((128,), (), (128,)),
+        ((128,), (128,), ()),
+    ],
+    ids=[
+        "all-rank3",
+        "all-rank4",
+        "residual-rank3",
+        "block-rank3",
+        "norm-rank3",
+        "residual-rank1",
+        "block-rank1",
+        "norm-rank1",
+    ],
+)
+def test_hc_combine_rank_fallback_matches_reference(
+    residual_batch, block_batch, norm_batch, monkeypatch
+):
+    module = hc_rank_fixture(monkeypatch)
+    branches, hidden = module.hc_count, module.hidden_size
+    residual = torch.randn(*residual_batch, branches * hidden).bfloat16()
+    block = torch.randn(*block_batch, hidden).bfloat16()
+    norm = torch.randn(*norm_batch, branches * hidden).bfloat16()
+    injection = F.linear(norm, module.block_inject_weight.weight)
+    gates = 2 * torch.sigmoid(injection.float() / branches)
+    expected = (
+        (
+            residual.float().unflatten(-1, (branches, hidden))
+            + block.float().unsqueeze(-2) * gates.unsqueeze(-1)
+        )
+        .bfloat16()
+        .flatten(-2)
+    )
+
+    actual = module.combine(block, (residual, norm))
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @TPU
 @pytest.mark.parametrize("compiled", [False, True])
-def test_hc_tpu_full_mix_and_combine(compiled):
+@pytest.mark.parametrize("tokens", [128, 256, 384])
+def test_hc_tpu_full_mix_and_combine(compiled, tokens):
     with torch.device("cpu"):
-        module, x, block = hc_fixture(True, tokens=256, full_tile=128)
+        module, x, block = hc_fixture(True, tokens=tokens, full_tile=128)
         expected = hc_cuda_source_reference(module, x, block)
     assert module._prefill_full_op is not None
     assert module._prefill_combine_op is not None
@@ -340,6 +463,96 @@ def test_hc_tpu_full_mix_and_combine(compiled):
     def chain(hyper_input, block_output):
         mixed, residuals = module.mix(hyper_input)
         return mixed, module.combine(block_output, residuals)
+
+    run = (
+        torch.compile(chain, backend="tpu", fullgraph=True, dynamic=False)
+        if compiled
+        else chain
+    )
+    with torch.inference_mode():
+        actual = run(x.to("tpu"), block.to("tpu"))
+        repeated = run(x.to("tpu"), block.to("tpu"))
+    for first, second in zip(actual, repeated, strict=True):
+        torch.testing.assert_close(first.cpu(), second.cpu(), rtol=0, atol=0)
+    for a, e in zip(actual, expected, strict=True):
+        assert np.isfinite(_np(a.cpu())).all()
+        assert_metrics(_np(a.cpu()), _np(e))
+
+
+@pytest.mark.parametrize(
+    "capacity,full_tile,combine_tile", [(16, 128, 16), (64, 512, 32)]
+)
+def test_hc_resource_fallback_keeps_independent_combine(
+    capacity, full_tile, combine_tile, monkeypatch
+):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+    from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
+
+    monkeypatch.setattr(
+        vllm_adapter,
+        "current_hc_hardware",
+        lambda: HcHardware("mock-layout", capacity << 20, 128, 16, 8, 256),
+    )
+    config = HyperConnectionConfig(
+        hidden_size=2560, hc_count=4, hc_lowrank=320, hc_per_branch_norm=True
+    )
+    module = GatedResidual(
+        config, prefill_full_tile=full_tile, prefill_combine_tile=combine_tile
+    )
+    assert module._prefill_full_op is None
+    assert module._prefill_combine_op is not None
+    x = torch.ones(combine_tile, 10240, dtype=torch.bfloat16)
+    block = torch.ones(combine_tile, 2560, dtype=torch.bfloat16)
+    calls = []
+
+    def merge(residual, block, gates):
+        calls.append(gates.dtype)
+        return residual
+
+    module._prefill_combine_op = merge
+    mixed, residual = module.mix(x)
+    assert torch.isfinite(mixed).all()
+    assert module.combine(block, residual) is x
+    assert calls == [torch.float32]
+
+
+def test_hc_unknown_hardware_and_default_optout_do_not_claim_device(monkeypatch):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter
+
+    def forbidden():
+        raise AssertionError("default optout must not inspect hardware")
+
+    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", forbidden)
+    module, _, _ = hc_fixture(True)
+    assert module._prefill_full_op is module._prefill_combine_op is None
+    monkeypatch.setattr(vllm_adapter, "current_hc_hardware", lambda: None)
+    module, x, block = hc_fixture(True, tokens=128, full_tile=128)
+    assert module._prefill_full_op is module._prefill_combine_op is None
+    expected = hc_cuda_source_reference(module, x, block)
+    mixed, residual = module.mix(x)
+    torch.testing.assert_close(mixed, expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.combine(block, residual), expected[1], rtol=0, atol=0
+    )
+
+
+@TPU
+@pytest.mark.parametrize("compiled", [False, True])
+def test_hc_tpu_residual_only_small_tile(compiled):
+    with torch.device("cpu"):
+        config = HyperConnectionConfig(
+            hidden_size=2560, hc_count=3, hc_lowrank=320, hc_per_branch_norm=True
+        )
+        module = GatedResidual(config, prefill_combine_tile=32)
+        x = torch.ones(96, 7680, dtype=torch.bfloat16)
+        block = torch.full((96, 2560), 0.25, dtype=torch.bfloat16)
+        expected = hc_cuda_source_reference(module, x, block)
+    assert module._prefill_full_op is None and module._prefill_combine_op is not None
+    module = module.to("tpu")
+
+    def chain(x, block):
+        mixed, residual = module.mix(x)
+        return mixed, module.combine(block, residual)
 
     run = (
         torch.compile(chain, backend="tpu", fullgraph=True, dynamic=False)
