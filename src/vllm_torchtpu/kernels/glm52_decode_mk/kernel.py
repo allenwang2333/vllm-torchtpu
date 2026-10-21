@@ -118,6 +118,9 @@ class Tiles:
                                  # "pair" = chip-sibling dedupe (P-TX j-ae1c975b: 22.7 vs 35.4 us at T = 32): own
                                  # block -> the R/2 - 1 same-parity ranks + the sibling me^1 (same chip); at q_wait
                                  # the same-parity blocks are forwarded to the sibling over the on-chip path
+    qmid: int = 0                # qag="pair": forward the same-parity blocks to the sibling right after the
+                                 # attention pre-issue has issued `qmid` granules (0 = at q_wait, after the whole
+                                 # pre-issue), so the on-chip forward overlaps the remaining issue
     # timing-only backing arms (WHITEBOARD.v3 §5.3 record / replay; outputs must stay bit-identical):
     record: bool = False         # extra HBM outputs: qall per layer [L, R, TMAX, QH] and the first `grec` gather
                                  # granules' rows per layer [L, grec * 128, 128] (nope, rope) as gathered
@@ -651,17 +654,22 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                 return pltpu.make_async_remote_copy(src_ref=scr["qsend"], dst_ref=scr["qall"].at[0], send_sem=ss,
                                                     recv_sem=rs, device_id=(me,), device_id_type=CO.MESH)
 
-            def finish():
+            nf = len(peers) - (1 if fault == "f_qag_pair_drop" else 0)
+
+            def forward():
                 d2 = desc(scr["q_send2"], scr["q_recv2"])
                 with sc("X_qpar"):
                     for _ in peers:
                         d2.wait_recv()
-                nf = 0
                 for i, p_ in enumerate(peers):
                     if fault == "f_qag_pair_drop" and i == 0:     # FAULT: one forward omitted (sibling waits one less)
                         continue
                     rc(scr["qall"].at[p_], scr["qall"].at[p_], scr["q_send"], scr["q_recv"], sib)
-                    nf += 1
+
+            def finish():
+                d2 = desc(scr["q_send2"], scr["q_recv2"])
+                if not tiles.qmid:
+                    forward()
                 d1 = desc(scr["q_send"], scr["q_recv"])
                 with sc("X_qsib"):
                     for _ in range(1 + nf):
@@ -670,6 +678,8 @@ def build(cfg, *, max_pages, nb, nbi, tiles=DEFAULT_TILES, interpret=False, debu
                     d1.wait_send()
                 for _ in peers:
                     d2.wait_send()
+            if tiles.qmid:
+                finish.mid = forward                    # called by the DSA pre-issue loop (exactly once)
             return finish
 
         cur_layer = [None]

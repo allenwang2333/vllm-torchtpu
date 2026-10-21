@@ -1335,7 +1335,15 @@ def make(E):
             def pre(r, c):
                 issue(l, r)
                 return c
-        lax.fori_loop(0, jnp.minimum(U, GR), pre, 0)
+        QM = int(getattr(tiles, "qmid", 0) or 0)
+        qmid_fn = getattr(q_wait, "mid", None) if QM else None
+        if qmid_fn is not None:                          # pair q AG: forward to the sibling after QM granules
+            n_pre = jnp.minimum(U, GR)
+            lax.fori_loop(0, jnp.minimum(n_pre, QM), pre, 0)
+            qmid_fn()
+            lax.fori_loop(jnp.minimum(n_pre, QM), n_pre, pre, 0)
+        else:
+            lax.fori_loop(0, jnp.minimum(U, GR), pre, 0)
         pa.mark("A_qwait")
         q_wait()
         pa.mark("A_comp")
