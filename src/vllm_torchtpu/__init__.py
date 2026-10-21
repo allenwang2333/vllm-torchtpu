@@ -130,6 +130,73 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     Scheduler._update_requests_with_invalid_blocks = (
         _hybrid_update_requests_with_invalid_blocks
     )
+    original_handle_invalid = getattr(Scheduler, "_handle_invalid_blocks", None)
+    if original_handle_invalid is not None:
+
+        @wraps(original_handle_invalid)
+        def _hybrid_handle_invalid_blocks(
+            self,
+            invalid_block_ids: set[int],
+            num_scheduled_tokens: dict[str, int],
+        ) -> set[str]:
+            if len(self.kv_cache_config.kv_cache_groups) <= 1:
+                return original_handle_invalid(
+                    self, invalid_block_ids, num_scheduled_tokens
+                )
+            from vllm.v1.request import RequestStatus
+
+            should_fail = not self.recompute_kv_load_failures
+            async_load_reqs = (
+                req
+                for req in getattr(self, "kv_holding_waiting", self.waiting)
+                if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            )
+            async_failed_req_ids, num_failed_tokens, _ = (
+                self._update_requests_with_invalid_blocks(
+                    async_load_reqs,
+                    invalid_block_ids,
+                    num_scheduled_tokens,
+                    evict_blocks=False,
+                )
+            )
+            total_failed_requests = len(async_failed_req_ids)
+            total_failed_tokens = num_failed_tokens
+
+            sync_failed_req_ids, num_failed_tokens, sync_blocks_to_evict = (
+                self._update_requests_with_invalid_blocks(
+                    self.running,
+                    invalid_block_ids,
+                    num_scheduled_tokens,
+                    evict_blocks=True,
+                )
+            )
+            total_failed_requests += len(sync_failed_req_ids)
+            total_failed_tokens += num_failed_tokens
+            if not total_failed_requests:
+                return set()
+            if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+                self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
+            if should_fail:
+                all_failed_req_ids = async_failed_req_ids | sync_failed_req_ids
+                logger.error(
+                    "Failing %d request(s) due to KV load failure "
+                    "(failure_policy=fail, %d tokens affected). Request IDs: %s",
+                    total_failed_requests,
+                    total_failed_tokens,
+                    all_failed_req_ids,
+                )
+                return all_failed_req_ids
+            logger.warning(
+                "Recovered from KV load failure: "
+                "%d request(s) rescheduled (%d tokens affected).",
+                total_failed_requests,
+                total_failed_tokens,
+            )
+            self.failed_recving_kv_req_ids |= async_failed_req_ids
+            return sync_failed_req_ids
+
+        Scheduler._handle_invalid_blocks = _hybrid_handle_invalid_blocks
+
     Scheduler._tpu_hybrid_kv_load_failure_patch = True
     logger.info(
         "Applied TPU patch: hybrid KV cache load failure recovery (vLLM #50388)."
@@ -992,7 +1059,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             hash_block_size,
             metrics_collector=None,
             num_prefill_lookahead=0,
-            allow_partial_hash_hits: bool = True,
             **kwargs,
         ):
             groups = kv_cache_config.kv_cache_groups
@@ -1065,7 +1131,6 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 hash_block_size,
                 metrics_collector,
                 num_prefill_lookahead=num_prefill_lookahead,
-                allow_partial_hash_hits=allow_partial_hash_hits,
                 **kwargs,
             )
 

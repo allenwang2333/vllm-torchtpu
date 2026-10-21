@@ -6880,9 +6880,6 @@ class TPURaidenConnectorWorker:
             )
             manager_kwargs.update(
                 listener_port=0,
-                parallelism=(
-                    self._raiden_transfer_parallelism() if self.is_producer else 1
-                ),
                 parallelism=max(default_parallelism, socket_parallelism_env),
             )
             if _reshard_store_mode():
