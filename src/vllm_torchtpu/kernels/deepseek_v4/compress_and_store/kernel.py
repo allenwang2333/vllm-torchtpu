@@ -83,7 +83,10 @@ def inner_kernel(
         field_rows=cfgs.field_rows,
         state_rows_per_token=cfgs.state_rows_per_token,
         overlap=cfgs.dims.overlap,
-        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER,
+        # A 128-lane indexer state row holds one field half, laid out like
+        # CSA's; only the 256-lane rows need the indexer's own gather.
+        is_indexer=cfgs.dims.mode == config.Mode.CSA_INDEXER
+        and cfgs.last_dim_size == 2 * config.LANE,
     )
 
     kv_val = window_vmem.at[0][...]  # (tile_n, window, head_tiles, 128)
@@ -287,7 +290,7 @@ def kernel_fn(
     if cfgs.dims.seq_along_lane:
         _, run_src_ref, run_dst_ref, rmw_ref, sems = sal_scratch
         ops = kv_cache_append._SalTiles(
-            records_t_ref, _out_cache_ref, rmw_ref, config.SAL_PAGE_SIZE
+            records_t_ref, _out_cache_ref, rmw_ref, cfgs.kv_block_size
         )
         # Only the grid's tokens were staged; kv slot -1 marks the rest.
         num_tokens = jnp.minimum(grid_size * cfgs.tile_sizes.tile_n, cfgs.dims.size_n)
@@ -296,7 +299,7 @@ def kernel_fn(
             kv_slot_mapping_ref,
             run_src_ref,
             run_dst_ref,
-            num_rows=_out_cache_ref.shape[0] * config.SAL_PAGE_SIZE,
+            num_rows=_out_cache_ref.shape[0] * cfgs.kv_block_size,
             num_tokens=num_tokens,
         )
         kv_cache_append._write_runs(
@@ -395,11 +398,11 @@ def compress_norm_rope_store(
     """Compresses, normalizes, applies RoPE and stores to cache.
 
     With `seq_along_lane` (CSA indexer only), `cache` is the SEQ_ALONG_LANE
-    `[num_pages, SAL_SUBLANE_GROUPS, SLOT_PACK, SAL_PAGE_SIZE]` =
-    `[num_pages, 33, 4, 256]` array (32 fp8 sublane groups + 1 scale group,
-    4 bytes per group, 256 compressed tokens per page). Its f32 state is read
-    through the same `(rows, 4, 256)` view as always; the records are staged in
-    VMEM as cache lanes and stored after the pipeline (see `kernel_fn`).
+    `[num_pages, SAL_SUBLANE_GROUPS, SLOT_PACK, T]` = `[num_pages, 33, 4, T]`
+    array (32 fp8 sublane groups + 1 scale group, 4 bytes per group, T
+    compressed tokens per page, T in `SAL_PAGE_SIZES`). Its f32 state is read
+    through the same `(rows, 4, T)` view; the records are staged in VMEM as
+    cache lanes and stored after the pipeline (see `kernel_fn`).
     """
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
@@ -424,12 +427,8 @@ def compress_norm_rope_store(
         compress_ratio=compress_ratio,
         quant_block=quant_block,
         seq_along_lane=seq_along_lane,
+        sal_page_size=cache.shape[-1] if seq_along_lane else None,
     )
-    if seq_along_lane and cache.shape[-1] != config.SAL_PAGE_SIZE:
-        raise ValueError(
-            f"SEQ_ALONG_LANE indexer cache {cache.shape} must have "
-            f"{config.SAL_PAGE_SIZE} token lanes per page."
-        )
 
     if cfgs.dims.mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
         assert cfgs.tile_sizes.tile_n % 4 == 0, (

@@ -364,6 +364,22 @@ class TestTpuPlatform:
         # test_tpu_block_size_utils.py).
         mock_update.assert_called_once_with(vllm_config, mock_pallas)
 
+    @pytest.mark.parametrize("user_block_size, expected", [(None, 512), (1024, 1024)])
+    def test_dsv4_block_size_default(self, vllm_config, user_block_size, expected):
+        """DSv4 takes its own default, and a user-set block size wins."""
+        vllm_config.model_config.hf_config = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"]
+        )
+        if user_block_size is not None:
+            vllm_config.cache_config.block_size = user_block_size
+            vllm_config.cache_config.user_specified_block_size = True
+
+        vllm_config, mock_backend = set_mock_attn_to_vllm_config(vllm_config, 999, 1)
+        TpuPlatform.update_block_size_for_backend(vllm_config)
+
+        assert vllm_config.cache_config.block_size == expected
+        mock_backend.get_page_size.assert_not_called()
+
     def test_unified_kv_layout_enablement_contract(self, vllm_config, monkeypatch):
         from vllm_torchtpu.platforms.tpu_block_size_utils import (
             unified_kv_layout_enabled,

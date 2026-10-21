@@ -288,9 +288,10 @@ class VllmCompressorStateCache(CompressorStateCache):
         page that sets the count, not this mode's own.
 
         Not a closed form: HCA writes two rows per record, the indexer array
-        is 256 lanes wide, HCA's state is hosted on a *CSA* page, and CSA and
-        the indexer are floored to a shared value so vLLM groups them
-        together. Ask the kernel's own layout model instead of guessing.
+        is as many lanes wide as its page holds tokens, HCA's state is hosted
+        on a *CSA* page, and CSA and the indexer are floored to a shared value
+        so vLLM groups them together. Ask the kernel's own layout model instead
+        of guessing.
         """
         try:
             if kv_cache_block_size // self.compress_ratio <= 0:

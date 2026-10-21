@@ -71,6 +71,10 @@ else:
 
 logger = init_logger(__name__)
 
+# DeepSeek-V4's KV block size in tokens unless the user sets one: 128 CSA and
+# indexer rows, 4 HCA rows and a 64-token SWA page per block. 1024 also works.
+_DSV4_DEFAULT_BLOCK_SIZE = 512
+
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
 # list against. How that key relates to the topology string differs by
@@ -1110,13 +1114,9 @@ class TpuPlatform(Platform):
             if is_ds_v4 and not cache_config.user_specified_block_size:
                 # DSv4 pages hold compressed rows. Its backend's
                 # get_preferred_block_size is a hardcoded 256, which does not fit
-                # the packed latent record, so take the MLA page size directly.
-                from vllm_torchtpu.layers.adapter.attention import (
-                    PallasMLAttentionBackend,
-                )
-
+                # the packed latent record, so it has its own default.
                 cache_config.block_size = (  # type: ignore[assignment]
-                    PallasMLAttentionBackend.get_page_size(vllm_config)
+                    _DSV4_DEFAULT_BLOCK_SIZE
                 )
             else:
                 is_hybrid = vllm_config.model_config.is_hybrid

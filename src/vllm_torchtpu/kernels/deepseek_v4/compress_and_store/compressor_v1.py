@@ -77,7 +77,7 @@ def derive_metadata(
       slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
       kv_slot_mapping: [num_tokens]. Sub-slot index in the compressed KV cache
         (``// tokens_in_second_minor`` gives the physical row; under
-        SEQ_ALONG_LANE it is ``page * SAL_PAGE_SIZE + lane``).
+        SEQ_ALONG_LANE it is ``page * cache.shape[-1] + lane``).
     """
     num_tokens = positions.shape[0]
     rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
@@ -93,6 +93,7 @@ def derive_metadata(
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
         seq_along_lane=seq_along_lane,
+        sal_page_size=cache.shape[-1] if seq_along_lane else None,
     )
     # Rows per page, rows per token's state, and the KV sub-slot packing.
     page_size = cfgs.state_physical_page_size

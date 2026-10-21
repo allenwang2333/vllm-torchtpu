@@ -247,13 +247,16 @@ def _dsv4_group(layer_names, spec):
     )
 
 
-def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
+def dsv4_materialization(*, num_blocks=16, tokens_per_page=256, indexer_lanes=256):
     """A DSv4 materialization with the runner's overlay plan applied.
 
     Two CSA layers, two indexer layers, one HCA layer, two SWA layers and the
     four compressor state caches. Every SWA and state cache aliases an
     already-allocated array, so the returned caches exercise the
     block-ID-disjoint aliasing DSv4 admission has to describe.
+
+    `indexer_lanes` is the SEQ_ALONG_LANE indexer page width: one lane per
+    compressed token, 128 or 256 of them.
 
     Returns `(named_kv_caches, kv_cache_groups)`.
     """
@@ -269,7 +272,7 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     # allocates them; everything overlaid on NoPE inherits that.
     csa_nope = [words(tokens) for _ in range(2)]
     csa_rope = [words(tokens // 4) for _ in range(2)]
-    indexer = [cache(33, 256) for _ in range(2)]
+    indexer = [cache(33, indexer_lanes) for _ in range(2)]
     hca = cache(tokens * 2, 128)
 
     csa_names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]

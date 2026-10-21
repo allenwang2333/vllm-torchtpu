@@ -144,9 +144,10 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = self.cache_config.block_size
+        # The per-token record does not depend on which page size is used.
         _, sublane_groups, packing, _ = get_kv_cache_shape(
             1,
-            compressor_config.SAL_PAGE_SIZE,
+            compressor_config.SAL_PAGE_SIZES[0],
             128,
             KVLayout.SEQ_ALONG_LANE,
         )

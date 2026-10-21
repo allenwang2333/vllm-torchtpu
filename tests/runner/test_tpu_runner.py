@@ -2354,19 +2354,18 @@ def test_block_size_resolution_needs_no_ambient_config(monkeypatch):
 
 @pytest.mark.tpu_test
 def test_tpu_platform_block_size_override_is_dsv4_only(vllm_config_context):
-    """Only DSv4 takes the MLA page size; other MLA models keep vLLM's path.
+    """Only DSv4 takes its own default; other MLA models keep vLLM's path.
 
-    DSv4's own backend does not define get_page_size, so its size comes from
-    PallasMLAttentionBackend. Applying that to every `use_mla` model would
-    silently re-size DeepSeek-V2/V3 caches too.
+    Applying the DSv4 default to every `use_mla` model would silently re-size
+    DeepSeek-V2/V3 caches too.
     """
-    assert _block_size_for("DeepseekV4ForCausalLM") == 1024
+    assert _block_size_for("DeepseekV4ForCausalLM") == 512
     assert _block_size_for("DeepseekV2ForCausalLM") == 256
     assert _block_size_for("DeepseekV32ForCausalLM") == 256
 
     # DSv4's own backend hardcodes get_preferred_block_size to 256, which does
     # not fit the packed latent record; DSv4 must not be clamped by it.
-    assert _block_size_for("DeepseekV4ForCausalLM", preferred=256) == 1024
+    assert _block_size_for("DeepseekV4ForCausalLM", preferred=256) == 512
 
 
 def test_spec_token_room_guard_caps_writes_at_context_limit():

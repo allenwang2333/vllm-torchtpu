@@ -53,10 +53,13 @@ def _state_cache(compress_ratio: int, head_dim: int = 512):
         # compression ratio alone would suggest.
         (128, 512, 1024, 32),
         (128, 512, 512, 16),
+        (4, 512, 512, 8),
         # The lightning indexer: 33 SEQ_ALONG_LANE rows of 1024 bytes hold 16
         # token states (2 rows each), matching CSA's 16 so the two share a
-        # `(block_size, sliding_window)` cache group.
+        # `(block_size, sliding_window)` cache group. At a 512-token block the
+        # rows are 512 bytes, so 4 rows each and 8 states, again CSA's count.
         (4, 128, 1024, 16),
+        (4, 128, 512, 8),
     ],
 )
 def test_state_block_size_follows_the_host_page(
@@ -65,8 +68,9 @@ def test_state_block_size_follows_the_host_page(
     """Block size must come from the kernel's own layout model.
 
     It is not a closed form -- HCA writes two rows per record, the indexer
-    array is 256 lanes wide, HCA's state is hosted on a CSA page, and CSA and
-    the indexer are floored to a shared value -- so this pins the values
+    array is as many lanes wide as its page holds tokens, HCA's state is
+    hosted on a CSA page, and CSA and the indexer are floored to a shared
+    value -- so this pins the values
     `compress_and_store.config` actually produces, which is what the
     compressor kernel indexes the block table with.
     """
@@ -83,18 +87,20 @@ def test_state_block_size_refuses_a_page_holding_no_row():
 
 @pytest.mark.parametrize("compress_ratio, head_dim", [(4, 512), (4, 128)])
 def test_state_block_size_with_seq_along_lane_indexer(compress_ratio, head_dim):
-    """The SEQ_ALONG_LANE indexer requires a 1024-token block (256 compressed tokens).
+    """The SEQ_ALONG_LANE indexer needs a 512- or 1024-token block.
 
-    The SEQ_ALONG_LANE indexer page holds 16 compressor states, the same as a
-    CSA page, so CSA and the indexer can stay in the same KV cache group. The
-    layout only works with 256 compressed tokens per page (a 1024-token
-    block). Any other block size raises an error when the block size is
-    computed, instead of failing later inside the kernel.
+    The SEQ_ALONG_LANE indexer page holds as many compressor states as a CSA
+    page, so CSA and the indexer can stay in the same KV cache group. The
+    layout only works with 128 or 256 compressed tokens per page (a 512- or
+    1024-token block). Any other block size raises an error when the block
+    size is computed, instead of failing later inside the kernel.
     """
     cache = _state_cache(compress_ratio, head_dim)
     assert cache._derive_block_size(1024) == 16
-    with pytest.raises(ValueError, match="cannot be paged"):
-        cache._derive_block_size(512)
+    assert cache._derive_block_size(512) == 8
+    for block_size in (256, 2048):
+        with pytest.raises(ValueError, match="cannot be paged"):
+            cache._derive_block_size(block_size)
 
 
 def test_state_cache_spec_is_raw_uint8_at_the_host_page_size():

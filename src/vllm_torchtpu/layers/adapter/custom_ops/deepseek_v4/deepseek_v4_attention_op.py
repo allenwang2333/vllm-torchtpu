@@ -41,6 +41,12 @@ logger = init_logger(__name__)
 
 BATCH_AXIS = None
 
+# Tokens per SWA KV block, tuned on microbenchmarks as two 128-token pages. The
+# page count follows the SWA page size (64 tokens at the default 512-token KV
+# block): a fixed count doubles the block at 128-token pages, which overflows
+# VMEM.
+_SWA_KV_BLOCK_TOKENS = 256
+
 
 def _run_swa(
     q: jax.Array,
@@ -72,6 +78,7 @@ def _run_swa(
             jnp.zeros((q.shape[0], q.shape[1]), dtype=jnp.float32),
             jnp.full((q.shape[0], q.shape[1]), -1e9, dtype=jnp.float32),
         )
+    kv_pages_per_block = max(1, _SWA_KV_BLOCK_TOKENS // logical_page_size)
     return mla_sliding_window_ragged_paged_attention(
         q=q,
         new_kv=new_kv,
@@ -85,7 +92,7 @@ def _run_swa(
         sliding_window=sliding_window,
         logical_page_size=logical_page_size,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(2, 2, 2),
+        num_kv_pages_per_block=(kv_pages_per_block,) * 3,
         num_queries_per_block=(1, 32, 32),
         q_compute_block_size=4,
         unnormalized_output=not swa_only,

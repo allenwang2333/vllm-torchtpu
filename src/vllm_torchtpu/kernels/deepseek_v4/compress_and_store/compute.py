@@ -455,7 +455,7 @@ def gather_from_page_buffer(
                     score_window_u8[n, w, 0, :, :] = val_score
 
     else:
-        # Standard HCA/CSA (last dim 128)
+        # HCA/CSA, and the 128-lane SEQ_ALONG_LANE indexer (last dim 128)
         slots_per_part_head = kv_window_u8.shape[2]
 
         for n in range(tile_n):

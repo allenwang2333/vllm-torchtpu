@@ -205,8 +205,8 @@ class DsV4KVCacheAllocator:
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
                 # SEQ_ALONG_LANE: token t is lane t of 32 fp8 groups + 1
                 # e8m0 scale group (132B/token of key traffic); the
-                # compressor state still addresses the page as
-                # (33, 4, 256) rows, hence exactly 256 tokens per page.
+                # compressor state addresses the page as (33, 4, T) rows,
+                # hence T is 128 or 256 tokens per page.
                 compressor_config.check_seq_along_lane_page_size(page_size)
                 shape = (
                     num_blocks,

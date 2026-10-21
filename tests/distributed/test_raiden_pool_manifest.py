@@ -1220,6 +1220,30 @@ def test_dsv4_aliased_pools_share_their_host_storage_and_geometry():
         assert alias.num_blocks == host.num_blocks
 
 
+@pytest.mark.parametrize("tokens_per_page", [128, 256])
+def test_dsv4_manifest_describes_both_indexer_page_widths(tokens_per_page):
+    """512- and 1024-token blocks page 128 or 256 compressed tokens, so the
+    SEQ_ALONG_LANE indexer array, and the state on it, is that many lanes wide."""
+    named, groups = dsv4_materialization(
+        tokens_per_page=tokens_per_page, indexer_lanes=tokens_per_page
+    )
+
+    manifest = rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=()
+    )
+    idx_pools = [
+        pool
+        for pool in manifest.pools
+        if pool.tag.startswith(("dsv4.idx.", "dsv4.state.idx."))
+    ]
+    assert len(idx_pools) == 4
+    for pool in idx_pools:
+        (region,) = pool.regions
+        assert region.num_units == 33
+        assert region.unit_bytes == 4 * tokens_per_page
+        assert pool.block_stride_bytes == 33 * 4 * tokens_per_page
+
+
 def test_dsv4_csa_state_pool_covers_nope_only():
     """The compressor runs CSA in overlap mode: no separate state view, and
     the state rows go through NoPE, so RoPE holds no state to transfer."""

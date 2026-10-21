@@ -101,9 +101,9 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
-    TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (128, 64, 64)
+    TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (256, 128, 128)
     TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
-    TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (32, 64, 32)
+    TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK: tuple[int, int, int] = (64, 128, 64)
     TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK: tuple[int, int, int] = (1, 32, 32)
     TPU_DSV4_CSA_GATHER_AND_ATTENTION_CHUNK_SIZE: int = 64
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -824,17 +824,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
     "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # DSv4 kernel block sizes, each "decode,prefill,mixed". Defaults are the
-    # microbenchmark-tuned values. HCA: compressed-KV pass
+    # microbenchmark-tuned values, tuned at a 1024-token KV block; the KV page
+    # counts are doubled for the default 512-token block so a kernel block
+    # spans as many tokens. With --block-size 1024, halve them (128,64,64 and
+    # 32,64,32) to get the tuned blocks back. HCA: compressed-KV pass
     # (mla_ragged_paged_attention).
     "TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK": env_positive_int_triple(
-        "TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK", (128, 64, 64)
+        "TPU_DSV4_HCA_NUM_KV_PAGES_PER_BLOCK", (256, 128, 128)
     ),
     "TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
         "TPU_DSV4_HCA_NUM_QUERIES_PER_BLOCK", (1, 32, 32)
     ),
     # Indexer: StreamIndex top-k scoring (streamindex_topk).
     "TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK": env_positive_int_triple(
-        "TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK", (32, 64, 32)
+        "TPU_DSV4_INDEXER_NUM_KV_PAGES_PER_BLOCK", (64, 128, 64)
     ),
     "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK": env_positive_int_triple(
         "TPU_DSV4_INDEXER_NUM_QUERIES_PER_BLOCK", (1, 32, 32)

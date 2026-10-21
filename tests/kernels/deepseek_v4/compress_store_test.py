@@ -25,6 +25,7 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout, streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compress_store_ref,
+    compressor_v1,
     config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
@@ -658,9 +659,9 @@ class CompressStoreTest(jtu.JaxTestCase):
             {7: 0},
         )
 
-    def test_seq_along_lane_state_block_size(self):
-        # DSv4's 1024-token KV block: 256 compressed indexer tokens per page.
-        kv_block = 1024
+    @parameterized.parameters((512, 8), (1024, 16))
+    def test_seq_along_lane_state_block_size(self, kv_block, expected_state_block):
+        # 128 / 256 compressed indexer tokens per page.
         self.assertEqual(
             config.physical_page_size(
                 config.Mode.CSA_INDEXER, kv_block, 4, seq_along_lane=True
@@ -674,9 +675,33 @@ class CompressStoreTest(jtu.JaxTestCase):
                 config.state_block_size(mode, kv_block, indexer_seq_along_lane=True),
                 config.state_block_size(mode, kv_block),
             )
-        with self.assertRaisesRegex(ValueError, "256 compressed tokens"):
+            self.assertEqual(
+                config.state_block_size(mode, kv_block, indexer_seq_along_lane=True),
+                expected_state_block,
+            )
+
+    def test_seq_along_lane_page_size_errors(self):
+        with self.assertRaisesRegex(ValueError, "128 or 256 compressed tokens"):
             config.physical_page_size(
-                config.Mode.CSA_INDEXER, 512, 4, seq_along_lane=True
+                config.Mode.CSA_INDEXER, 2048, 4, seq_along_lane=True
+            )
+        with self.assertRaisesRegex(ValueError, "128 or 256 compressed tokens"):
+            config.Configs.make(
+                config.Mode.CSA_INDEXER,
+                size_n=4,
+                physical_page_size=config.SAL_SUBLANE_GROUPS,
+                state_block_size=16,
+                head_dim=128,
+                seq_along_lane=True,
+                sal_page_size=512,
+            )
+        with self.assertRaisesRegex(ValueError, "requires seq_along_lane"):
+            config.Configs.make(
+                config.Mode.CSA_INDEXER,
+                size_n=4,
+                physical_page_size=32,
+                state_block_size=16,
+                sal_page_size=128,
             )
         with self.assertRaisesRegex(ValueError, "only supported for the CSA indexer"):
             config.Configs.make(
@@ -697,6 +722,7 @@ class CompressStoreTest(jtu.JaxTestCase):
         # Only seeds the compressor state through the reference projection;
         # both layouts get the same state, so its width is not under test.
         hidden_size=512,
+        page_tokens=256,
     ):
         """SAL output == the HAS kernel's records, transposed into a SAL cache.
 
@@ -708,7 +734,6 @@ class CompressStoreTest(jtu.JaxTestCase):
         """
         head_dim, rope_head_dim, compress_ratio, quant_block = 128, 64, 4, 128
         mode = config.Mode.CSA_INDEXER
-        page_tokens = config.SAL_PAGE_SIZE
         has_rows = page_tokens // config.SLOT_PACK
         sal_rows = config.SAL_SUBLANE_GROUPS
         state_block_size = config.state_block_size(
@@ -726,6 +751,7 @@ class CompressStoreTest(jtu.JaxTestCase):
                 compress_ratio=compress_ratio,
                 quant_block=quant_block,
                 seq_along_lane=seq_along_lane,
+                sal_page_size=page_tokens if seq_along_lane else None,
             )
 
         has_cfgs = make_cfgs(has_rows, False)
@@ -815,7 +841,7 @@ class CompressStoreTest(jtu.JaxTestCase):
         sal_out = run(sal_cache, True)
         self.assertEqual(sal_out.shape, sal_cache.shape)
 
-        # HAS rows are row-major in `page * 256 + slot`.
+        # HAS rows are row-major in `page * page_tokens + slot`.
         has_records = has_out.reshape(num_pages * page_tokens, -1)[
             jnp.maximum(kv_slots, 0)
         ]
@@ -837,31 +863,144 @@ class CompressStoreTest(jtu.JaxTestCase):
         )
 
     @parameterized.named_parameters(
-        # 384 boundary rows: three full 128-lane tiles, filling page 0 and
-        # continuing into page 1.
-        ("prefill_two_pages", dict(num_tokens=1536)),
-        # Boundary and non-boundary decode tokens interleaved over prefilled
-        # state; the non-boundary ones leave -1 (padding) slots.
-        (
-            "decode_mixed",
-            dict(
-                num_tokens=6,
-                positions=np.array([3, 2, 7, 6, 11, 10], dtype=np.int32),
-                prefill_len=32,
-            ),
-        ),
-        # 32 boundary rows from 4 requests: one partial tile, multi-row table.
-        (
-            "multi_request_table",
-            dict(
-                num_tokens=128,
-                token_to_req_indices=np.arange(128, dtype=np.int32) % 4,
-                block_table_rows=4,
-            ),
-        ),
+        *[
+            (f"{name}_page{page_tokens}", dict(cfg, page_tokens=page_tokens))
+            for name, cfg in (
+                # 384 boundary rows: three full 128-lane tiles, spanning two
+                # 256-token pages or three 128-token ones.
+                ("prefill_multi_page", dict(num_tokens=1536)),
+                # Boundary and non-boundary decode tokens interleaved over
+                # prefilled state; the non-boundary ones leave -1 (padding)
+                # slots.
+                (
+                    "decode_mixed",
+                    dict(
+                        num_tokens=6,
+                        positions=np.array([3, 2, 7, 6, 11, 10], dtype=np.int32),
+                        prefill_len=32,
+                    ),
+                ),
+                # 32 boundary rows from 4 requests: one partial tile,
+                # multi-row table.
+                (
+                    "multi_request_table",
+                    dict(
+                        num_tokens=128,
+                        token_to_req_indices=np.arange(128, dtype=np.int32) % 4,
+                        block_table_rows=4,
+                    ),
+                ),
+            )
+            for page_tokens in config.SAL_PAGE_SIZES
+        ]
     )
     def test_compress_store_seq_along_lane(self, cfg):
         self.run_seq_along_lane_matches_head_along_sublane(**cfg)
+
+    def run_indexer_compressor_forward(
+        self, page_tokens, prefill_lens, decode_steps, hidden_size=512
+    ):
+        """Runs the indexer compressor over a prefill then `decode_steps` decodes.
+
+        Returns every request's records in compressed-position order, as
+        `(num_records, SAL_SUBLANE_GROUPS, SLOT_PACK)` uint8. Inputs do not
+        depend on `page_tokens`; the state and compressed-KV pages of each
+        request are disjoint pages of the one shared array, as the allocator
+        lays them out.
+        """
+        head_dim, rope_head_dim, compress_ratio, quant_block = 128, 64, 4, 128
+        num_reqs = len(prefill_lens)
+        state_block_size = config.state_block_size(
+            config.Mode.CSA_INDEXER,
+            page_tokens * compress_ratio,
+            indexer_seq_along_lane=True,
+        )
+        final_lens = [n + decode_steps for n in prefill_lens]
+        max_len = max(final_lens)
+        state_cols = math.ceil(max_len / state_block_size)
+        kv_cols = math.ceil(max_len // compress_ratio / page_tokens)
+        num_pages = num_reqs * (state_cols + kv_cols)
+        pages = np.random.default_rng(0).permutation(num_pages).astype(np.int32)
+        block_table = jnp.array(pages[: num_reqs * state_cols])
+        kv_block_table = pages[num_reqs * state_cols :]
+        cache = jnp.zeros(
+            (num_pages, config.SAL_SUBLANE_GROUPS, config.SLOT_PACK, page_tokens),
+            dtype=jnp.uint8,
+        )
+
+        keys = jax.random.split(jax.random.key(0), 4 + num_reqs)
+        state_width = 2 * head_dim
+        wkv_wgate = jax.random.normal(keys[0], (hidden_size, 2 * state_width))
+        ape = jax.random.normal(keys[1], (compress_ratio, state_width))
+        norm_weight = jax.random.normal(keys[2], (head_dim,))
+        cos_sin_cache = jax.random.normal(keys[3], (max_len, rope_head_dim))
+        hidden = [
+            jax.random.normal(keys[4 + r], (n, hidden_size))
+            for r, n in enumerate(final_lens)
+        ]
+
+        def step(cache, starts, lens, distribution):
+            positions = np.concatenate(
+                [np.arange(s, s + n) for s, n in zip(starts, lens)]
+            ).astype(np.int32)
+            out, _, _ = compressor_v1.compressor_forward(
+                hidden_states=jnp.concatenate(
+                    [h[s : s + n] for h, s, n in zip(hidden, starts, lens)]
+                ),
+                wkv_wgate=wkv_wgate,
+                ape=ape,
+                norm_weight=norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                positions=jnp.array(positions),
+                block_table=block_table,
+                query_start_loc=jnp.array(np.cumsum([0, *lens]), dtype=jnp.int32),
+                kv_block_table=jnp.array(kv_block_table),
+                cache=cache,
+                rope_cache=None,
+                distribution=jnp.array(distribution, dtype=jnp.int32),
+                state_block_size=state_block_size,
+                head_dim=head_dim,
+                compress_ratio=compress_ratio,
+                overlap=True,
+                rms_eps=1e-6,
+                quant_block=quant_block,
+                seq_along_lane=True,
+            )
+            return out
+
+        cache = step(cache, [0] * num_reqs, prefill_lens, [0, 0, num_reqs])
+        for d in range(decode_steps):
+            starts = [n + d for n in prefill_lens]
+            cache = step(cache, starts, [1] * num_reqs, [num_reqs] * 3)
+
+        cache_np = np.asarray(cache)
+        records = []
+        for r, n in enumerate(final_lens):
+            c = np.arange(n // compress_ratio)
+            page = kv_block_table[r * kv_cols + c // page_tokens]
+            records.append(cache_np[page, :, :, c % page_tokens])
+        return np.concatenate(records)
+
+    @parameterized.named_parameters(
+        ("prefill", dict(prefill_lens=(1100, 700), decode_steps=0)),
+        # Decode boundaries land both mid-page and on fresh state pages.
+        ("prefill_then_decode", dict(prefill_lens=(1100, 701), decode_steps=9)),
+    )
+    def test_compressor_forward_seq_along_lane_page_sizes(self, cfg):
+        """A 128-token SAL page holds the same records as a 256-token one.
+
+        Runs the whole indexer compressor (state projection, then compression)
+        at both page sizes, with the 256-token page, the layout DSv4 served
+        with before, as the reference. The 128-token page addresses each
+        token's state as 4 rows instead of 2, so this covers that path through
+        both kernels.
+        """
+        small, large = (
+            self.run_indexer_compressor_forward(page_tokens=page_tokens, **cfg)
+            for page_tokens in config.SAL_PAGE_SIZES
+        )
+        self.assertGreater(int(np.count_nonzero(large)), 0)
+        self.assertArraysEqual(small, large)
 
 
 if __name__ == "__main__":
