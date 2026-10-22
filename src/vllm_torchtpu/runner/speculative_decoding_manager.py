@@ -287,10 +287,16 @@ class SpeculativeDecodingManager:
           A SpecDecodeMetadata object containing the necessary indices for
           speculative decoding.
         """
+        dp_target_bucket = (
+            self.runner._dp_target_bucket
+            if self.runner._dp_lockstep_enabled()
+            else None
+        )
         cache_key = (
             num_draft_tokens.tobytes(),
             cu_num_scheduled_tokens.tobytes(),
             padded_num_reqs,
+            dp_target_bucket,
         )
         if cache_key == self._meta_cache_key:
             assert self._meta_cache is not None
@@ -371,8 +377,21 @@ class SpeculativeDecodingManager:
         # Padding
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
+        logits_len = logits_indices.shape[0]
+        if (
+            self.runner._dp_lockstep_enabled()
+            and self.runner._dp_target_bucket is not None
+        ):
+            assert self.runner.speculative_config is not None
+            max_spec_logits = self.runner.max_num_reqs * (
+                self.runner.speculative_config.num_speculative_tokens + 1
+            )
+            logits_len = max(
+                logits_len,
+                min(self.runner._dp_target_bucket, max_spec_logits),
+            )
         padded_logits_length = _get_padded_token_len(
-            self.runner.num_tokens_paddings, logits_indices.shape[0]
+            self.runner.num_tokens_paddings, logits_len
         )
 
         padded_logits_indices = np.zeros(padded_logits_length, dtype=np.int32)

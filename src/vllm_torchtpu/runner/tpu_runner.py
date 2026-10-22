@@ -3066,8 +3066,11 @@ class TPUModelRunner(GPUModelRunner):
         else:
             assert self.num_reqs_most_model_len is not None
             target_num_reqs = self.num_reqs_most_model_len
+        effective_num_reqs = num_reqs
+        if self._dp_lockstep_enabled():
+            effective_num_reqs = max(effective_num_reqs, self._dp_step_max_reqs)
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
-            num_reqs, self.max_num_reqs
+            effective_num_reqs, self.max_num_reqs
         )
 
         layout_plan = sequence_layout_planner.prepare_real(
@@ -5064,6 +5067,11 @@ class TPUModelRunner(GPUModelRunner):
                         next_tokens_tpu = torch.nn.functional.pad(
                             next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
                         )
+                    if spec_num_rejected.shape[0] < self.max_num_reqs:
+                        spec_num_rejected = torch.nn.functional.pad(
+                            spec_num_rejected,
+                            (0, self.max_num_reqs - spec_num_rejected.shape[0]),
+                        )
                 self._pre_async_results = AsyncPreResults(
                     req_ids=req_ids,
                     next_tokens_tpu=next_tokens_tpu,
@@ -7033,7 +7041,10 @@ class TPUModelRunner(GPUModelRunner):
                 self.max_num_tokens,
             )
             return
-        P = max(1, min(P, self.max_num_tokens // max(1, R)))
+        r_tok_bucket = _get_padded_token_len(
+            self.num_tokens_paddings, min(R * (1 + K), int(self.max_num_tokens))
+        )
+        P = max(1, min(P, r_tok_bucket // max(1, R)))
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
@@ -7055,6 +7066,35 @@ class TPUModelRunner(GPUModelRunner):
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
+            for b in self.num_tokens_paddings:
+                b_int = int(b)
+                if b_int < R or b_int >= r_tok_bucket:
+                    continue
+                p_b = max(1, b_int // R)
+                b_reqs = [
+                    NewRequestData(
+                        req_id=rid,
+                        prompt_token_ids=[0] * p_b,
+                        mm_features=[],
+                        sampling_params=sp,
+                        pooling_params=None,
+                        block_ids=tuple(
+                            list(range(1 + j * nblk, 1 + j * nblk + g_nblk))
+                            for g_nblk in group_nblks
+                        ),
+                        num_computed_tokens=0,
+                        lora_request=None,
+                    )
+                    for j, rid in enumerate(rids)
+                ]
+                so = SchedulerOutput.make_empty()
+                so.scheduled_new_reqs = b_reqs
+                so.num_scheduled_tokens = {r.req_id: p_b for r in b_reqs}
+                so.total_num_scheduled_tokens = R * p_b
+                assert self.execute_model(so) is None
+                self.sample_tokens(None)
+                self.take_draft_token_ids()
+                self._warmup_spec_decode_cleanup(rids)
             # Match the low-block working set used by the LIFO BlockPool
             # workaround. High physical block ids can trigger the v7x SC2
             # indexed-KV halt even though they are inside the allocated pool.
@@ -7116,15 +7156,16 @@ class TPUModelRunner(GPUModelRunner):
             if (
                 mixed
                 and self.max_num_reqs >= R + 1
-                and int(self.max_num_tokens) - R * (1 + K) >= P
+                and int(self.max_num_tokens) - R * (1 + K) >= 1
             ):
-                # Mixed verify+prefill steps at the full step budget: R verify
-                # windows plus one prefill chunk filling the budget, then two
+                # Mixed verify+prefill steps at both the R+1 mixed bucket (from
+                # _spec_warmup_bucket_grid) and the full step budget: R verify
+                # windows plus one prefill chunk filling the bucket, then two
                 # prefill requests sharing the step while the first finishes.
                 # Saturated serving runs both shapes; the decode-only steps
                 # above never compile them.
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
-                P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
+                P_mix = max(1, min(P_mix, self.max_model_len - (1 + K) - 1))
                 mix_nblks = [
                     min(
                         cdiv(P_mix + 1 + K, int(g.kv_cache_spec.block_size)),
@@ -7133,13 +7174,24 @@ class TPUModelRunner(GPUModelRunner):
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)
-                variants = [[P_mix]]
-                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
-                    variants.append([P_mix // 2, P_mix - P_mix // 2])
+                variants: list[list[int]] = []
+                mix_tok_bucket = _get_padded_token_len(
+                    self.num_tokens_paddings,
+                    min(R * (1 + K) + 1, int(self.max_num_tokens)),
+                )
+                for target_budget in (mix_tok_bucket, int(self.max_num_tokens)):
+                    p_budget = target_budget - R * (1 + K)
+                    p_budget = max(1, min(p_budget, self.max_model_len - (1 + K) - 1))
+                    if [p_budget] not in variants:
+                        variants.append([p_budget])
+                    if self.max_num_reqs >= R + 2 and p_budget >= 2:
+                        pair = [p_budget // 2, p_budget - p_budget // 2]
+                        if pair not in variants:
+                            variants.append(pair)
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
                 for vi, plist in enumerate(variants):
-                    if top <= base_lo + (vi + 1) * len(plist) * mix_nblk + 1:
+                    if top <= base_lo + (vi * 2 + len(plist)) * mix_nblk + 1:
                         break
                     extras = []
                     for k_, Pk in enumerate(plist):

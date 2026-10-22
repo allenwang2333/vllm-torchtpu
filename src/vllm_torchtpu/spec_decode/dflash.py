@@ -433,7 +433,7 @@ class DFlashProposer:
             # request anchors on the prompt-chunk path.
             draft_lengths = chunk.draft_lengths
             if draft_lengths is None:
-                draft_lengths = self._zero_draft_lengths(num_reqs)
+                draft_lengths = self._zero_draft_lengths(next_tokens_device.shape[0])
             input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_next_tokens(
                 next_tokens_device,
                 query_start_loc_device,
