@@ -366,7 +366,11 @@ page-DMA writer baseline at commit `c590a5009`. They retain the same 288 queries
 `filter_clustered` uses one contiguous 16K candidate range per request;
 `filter_scattered` independently distributes each query's 16K candidates over
 the 96K context. These are synthetic coverage cases, not measured model
-candidate distributions. Both have a 16K-column compact score output.
+candidate distributions. Both have a 16K-column compact score output. These
+labels describe logical token positions: both fixtures randomize physical page
+placement. Scattered candidates can touch almost every 128-token page despite
+selecting only 16K tokens; page reads and compact score width are different
+quantities.
 
 | Variant | Clustered (microseconds) | Scattered (microseconds) |
 | --- | ---: | ---: |

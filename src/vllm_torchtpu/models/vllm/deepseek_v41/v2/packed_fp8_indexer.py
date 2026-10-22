@@ -213,12 +213,10 @@ def _score_and_select(
     inputs = tuple(
         jnp.pad(x, ((0, padded - tokens),) + ((0, 0),) * (x.ndim - 1)) for x in inputs
     )
-    order = jnp.argsort(inputs[-1], stable=True)
-    inputs = tuple(x[order] for x in inputs)
     counts = jnp.bincount(inputs[-1], length=records.shape[0])
     query_offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
 
-    def block(start, rows, sparse_mode):
+    def block(start, rows, sparse_mode, inputs):
         queries, row_weights, row_lengths, row_candidates, owners = tuple(
             jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs
         )
@@ -304,45 +302,56 @@ def _score_and_select(
         return sparse() if sparse_mode else dense()
 
     def run(sparse_mode):
+        order = jnp.argsort(inputs[-1], stable=True)
+        sorted_inputs = tuple(x[order] for x in inputs)
         output = jnp.full((padded, min(topk, width)), -1, jnp.int32)
         published = jnp.full((padded, candidates.shape[1]), -1, jnp.int32)
 
         def body(index, outputs):
-            result = block(index * rows, rows, sparse_mode)
+            result = block(index * rows, rows, sparse_mode, sorted_inputs)
             return tuple(
                 jax.lax.dynamic_update_slice_in_dim(dst, src, index * rows, axis=0)
                 for dst, src in zip(outputs, result)
             )
 
-        return jax.lax.fori_loop(0, padded // rows, body, (output, published))
-
-    def sparse():
-        chunk_rows = PACKED_FP8_INDEXER_QUERY_ROWS.get(
-            (tokens, width, candidates.shape[1], topk, block_size, len(banks))
+        output, published = jax.lax.fori_loop(
+            0, padded // rows, body, (output, published)
         )
-        if chunk_rows is None or chunk_rows > rows or padded != tokens or not unordered:
-            return run(True)
-        starts = range(0, padded, chunk_rows)
+        inverse = jnp.argsort(order)
+        return output[inverse][:tokens], published[inverse][:tokens]
 
-        def independent_chunks():
-            parts = [block(i, chunk_rows, True) for i in starts]
-            return tuple(jnp.concatenate(values, axis=0) for values in zip(*parts))
+    filtering = candidate_filter and candidates.shape[1] * block_size < width
+    short = jnp.minimum(batch_max.max(), width) <= topk
 
-        # Moving a query between the four-row and two-row head reductions can
-        # change BF16 rounding. Split only complete six-query request groups.
-        return jax.lax.cond(
-            jnp.all(counts % query_tile == 0), independent_chunks, lambda: run(True)
-        )
-
-    if candidate_filter and candidates.shape[1] * block_size < width:
+    def unsplit():
         # Keep the original whole-batch short-context bypass outside the chunks.
-        output, published = jax.lax.cond(
-            jnp.minimum(batch_max.max(), width) <= topk, lambda: run(False), sparse
-        )
-    else:
-        output, published = run(False)
-    inverse = jnp.argsort(order)
-    return output[inverse][:tokens], published[inverse][:tokens]
+        if filtering:
+            return jax.lax.cond(short, lambda: run(False), lambda: run(True))
+        return run(False)
+
+    chunk_rows = PACKED_FP8_INDEXER_QUERY_ROWS.get(
+        (tokens, width, candidates.shape[1], topk, block_size, len(banks))
+    )
+    if (
+        not filtering
+        or not unordered
+        or chunk_rows is None
+        or chunk_rows > rows
+        or padded != tokens
+    ):
+        return unsplit()
+    starts = range(0, padded, chunk_rows)
+
+    def independent_chunks():
+        parts = [block(i, chunk_rows, True, inputs) for i in starts]
+        return tuple(jnp.concatenate(values, axis=0) for values in zip(*parts))
+
+    # Already grouped requests need neither sorting nor output reordering.
+    # Preserve complete six-query groups: moving between the four-row and
+    # two-row head reductions can change BF16 rounding.
+    grouped = jnp.all(inputs[-1][1:] >= inputs[-1][:-1])
+    complete = jnp.all(counts % query_tile == 0)
+    return jax.lax.cond(grouped & complete & ~short, independent_chunks, unsplit)
 
 
 def _select(

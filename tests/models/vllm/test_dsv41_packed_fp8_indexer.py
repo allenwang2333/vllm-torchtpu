@@ -14,9 +14,12 @@ import torch
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("request_sizes,expected_rows", [([6, 6], 6), ([5, 7], 12)])
+@pytest.mark.parametrize(
+    "request_sizes,interleaved,expected_rows",
+    [([6, 6], False, 6), ([5, 7], False, 12), ([6, 6], True, 12)],
+)
 def test_query_chunks_preserve_six_query_head_groups(
-    monkeypatch, request_sizes, expected_rows
+    monkeypatch, request_sizes, interleaved, expected_rows
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
         PackedFP8Layout,
@@ -41,6 +44,8 @@ def test_query_chunks_preserve_six_query_head_groups(
         lambda q, *args, **kw: jnp.zeros((q.shape[0], 256), jnp.float32),
     )
     requests = jnp.repeat(jnp.arange(2), jnp.asarray(request_sizes))
+    if interleaved:
+        requests = requests.reshape(2, 6).T.reshape(-1)
     candidates = jnp.tile(jnp.arange(8), (12, 1))
     selected, published = model._score_and_select(
         jnp.zeros((12, 32, 128), jnp.bfloat16),
