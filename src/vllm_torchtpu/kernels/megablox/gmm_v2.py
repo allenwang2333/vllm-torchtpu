@@ -901,6 +901,12 @@ DECODE_COL_SPLIT_UNFUSED = 2
 #: every row. Applies without zero initialization only.
 DECODE_OWNED_SLABS = True
 
+#: Rows (a multiple of the lhs sublane) of the decode path's small-row bucket:
+#: when the owned rows end within it, only these lhs rows are fetched,
+#: quantized and multiplied. 0 runs every call over all rows. Needs
+#: DECODE_OWNED_SLABS, since rows past the bucket are never written.
+DECODE_SMALL_ROWS = 16
+
 
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
@@ -917,7 +923,7 @@ class DecodeRefs:
     lhs_scale: Any  # [size_k // lhs quant block, size_m, 1]
     weight: Any  # [decode_slots, size_k, size_n]
     scale: Any  # [decode_slots, 1, 1, size_n]
-    lhs_sem: Any  # DMA[1]
+    lhs_sem: Any  # DMA[2]: lhs rows before and past the small-row bucket
     weight_sems: Any  # DMA[decode_slots, panels]: one per weight column panel
     scale_sems: Any  # DMA[decode_slots]
     out: Any  # [size_m, aligned out_size_n]
@@ -954,6 +960,14 @@ def decode_out_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
 def decode_out_slabs(out_rows: int, sublane: int) -> int:
     """Sublane row slabs the decode path may write back of `out_rows` rows."""
     return pl.cdiv(out_rows, sublane)
+
+
+def decode_small_rows(cfgs: GmmConfigs, lhs_rows: int) -> int | None:
+    """Rows of the decode path's small-row bucket, or None without one."""
+    if 0 < DECODE_SMALL_ROWS < lhs_rows:
+        assert DECODE_SMALL_ROWS % cfgs.dims.size_lhs_sublane == 0
+        return DECODE_SMALL_ROWS
+    return None
 
 
 def decode_weight_copies(
@@ -1070,7 +1084,6 @@ def decode_kernel(
     """
     dims = cfgs.dims
     sublane = dims.size_lhs_sublane
-    rows = dims.size_m
     slots = decode_slots(cfgs)
     lookahead = slots - 1
 
@@ -1101,15 +1114,32 @@ def decode_kernel(
                 if p == 0:
                     scale.start()
 
-    lhs_copy = pltpu.make_async_copy(
-        lhs_hbm_ref, dec.lhs.at[pl.ds(0, lhs_hbm_ref.shape[0])], dec.lhs_sem.at[0]
-    )
-    lhs_copy.start()
-
     out_rows = out_hbm_ref.shape[0]
     out_slabs = decode_out_slabs(out_rows, sublane)
     out_panels = decode_out_panels(cfgs)
     owned_only = DECODE_OWNED_SLABS and not cfgs.zero_init
+
+    # lhs rows [0, small_rows) arrive first; the rest only for calls whose
+    # owned rows end past them.
+    lhs_rows = lhs_hbm_ref.shape[0]
+    small_rows = decode_small_rows(cfgs, lhs_rows) if owned_only else None
+
+    def lhs_copy(part):
+        split = small_rows or lhs_rows
+        start, size = (0, split) if part == 0 else (split, lhs_rows - split)
+        return pltpu.make_async_copy(
+            lhs_hbm_ref.at[pl.ds(start, size)],
+            dec.lhs.at[pl.ds(start, size)],
+            dec.lhs_sem.at[part],
+        )
+
+    lhs_copy(0).start()
+    m_hi = metadata_ref.gm_id_to_m_offset[num_gm]
+    if small_rows is not None:
+
+        @pl.when(m_hi > small_rows)
+        def _():
+            lhs_copy(1).start()
 
     def out_copy(o, slab):
         (col, width), row = out_panels[o], slab * sublane
@@ -1123,7 +1153,6 @@ def decode_kernel(
         if not owned_only:
             return True
         m_lo = metadata_ref.gm_id_to_m_offset[0]
-        m_hi = metadata_ref.gm_id_to_m_offset[num_gm]
         return (slab * sublane < m_hi) & ((slab + 1) * sublane > m_lo)
 
     def write_back(o):
@@ -1169,94 +1198,105 @@ def decode_kernel(
         preferred_element_type = jnp.int32
     acc_dtype = cfgs.acc_dtype
 
-    dec.out[...] = jnp.zeros_like(dec.out)
+    def compute(rows):
+        """Quantizes lhs rows [0, rows) and runs every tile over them."""
 
-    lhs_copy.wait()
-    for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
-        block_lhs = dec.lhs[:, pl.ds(start_k, q_block_size)]
-        block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-        block_scale = block_abs_max / dtype_max
-        block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-        dec.lhs_q[:, pl.ds(start_k, q_block_size)] = (
-            block_lhs * block_scale_inv
-        ).astype(lhs_q_dtype)
-        dec.lhs_scale[b_id] = block_scale
+        dec.out[:rows] = jnp.zeros((rows, dec.out.shape[1]), dec.out.dtype)
 
-    def matmul_panel(slot, panel):
-        """acc_dtype[rows, width] of `panels[panel]`'s weight columns."""
-        col, panel_n = panels[panel]
-        cols = pl.ds(col, panel_n)
-        rhs_ref = WeightsRef(
-            weight=dec.weight.at[slot, :, cols],
-            scale=dec.scale.at[slot, :, :, cols],
-            bias=None,
-        )
-        rhs = rhs_ref.get_weight()
-        rhs_scale_replicated = rhs_ref.get_scale(replicate_size=rows)
+        lhs_copy(0).wait()
+        if small_rows is not None and rows > small_rows:
+            lhs_copy(1).wait()
+        for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
+            block_lhs = dec.lhs[:rows, pl.ds(start_k, q_block_size)]
+            block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+            block_scale = block_abs_max / dtype_max
+            block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+            dec.lhs_q[:rows, pl.ds(start_k, q_block_size)] = (
+                block_lhs * block_scale_inv
+            ).astype(lhs_q_dtype)
+            dec.lhs_scale[b_id, :rows] = block_scale
 
-        acc_list = []
-        for start_n in range(0, panel_n, mxu_size):
-            end_n = min(panel_n, start_n + mxu_size)
-            acc_n = jnp.zeros((rows, end_n - start_n), dtype=acc_dtype)
-            for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
-                block_rhs = rhs[start_k : start_k + q_block_size, start_n:end_n]
-                if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
-                    block_rhs = block_rhs.astype(lhs_q_dtype)
-                block_acc = jnp.matmul(
-                    dec.lhs_q[:, pl.ds(start_k, q_block_size)],
-                    block_rhs,
-                    preferred_element_type=preferred_element_type,
-                ).astype(acc_dtype)
-                block_acc *= dec.lhs_scale[b_id].astype(acc_dtype)
-                block_acc *= rhs_scale_replicated[0, :, start_n:end_n].astype(
-                    acc_dtype
-                )
-                acc_n += block_acc
-            acc_list.append(acc_n)
-        return jnp.concatenate(acc_list, axis=1)
+        def matmul_panel(slot, panel):
+            """acc_dtype[rows, width] of `panels[panel]`'s weight columns."""
+            col, panel_n = panels[panel]
+            cols = pl.ds(col, panel_n)
+            rhs_ref = WeightsRef(
+                weight=dec.weight.at[slot, :, cols],
+                scale=dec.scale.at[slot, :, :, cols],
+                bias=None,
+            )
+            rhs = rhs_ref.get_weight()
+            rhs_scale_replicated = rhs_ref.get_scale(replicate_size=rows)
 
-    def store_out(gm, o, acc):
-        """Keeps tile gm's rows of output panel o's acc in the VMEM output."""
-        col, width = out_panels[o]
-        out_ref = dec.out.at[:, pl.ds(col, width)]
-        acc = acc.astype(out_ref.dtype)
-        m_start = metadata_ref.gm_id_to_m_offset[gm]
-        m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
-        first_row = m_start - m_start % sublane
-        iota = lax.broadcasted_iota(jnp.int32, out_ref.shape, 0)
-        out = jnp.where((m_start <= iota) & (iota < m_end), acc, out_ref[...])
-        # `inner_kernel` adds its previous partial rows (or zeros) into the first
-        # sublane row of every tile, which turns -0.0 into +0.0 there.
-        is_first_row = (first_row <= iota) & (iota < first_row + sublane)
-        out_ref[...] = jnp.where(is_first_row, out + jnp.zeros_like(out), out)
+            acc_list = []
+            for start_n in range(0, panel_n, mxu_size):
+                end_n = min(panel_n, start_n + mxu_size)
+                acc_n = jnp.zeros((rows, end_n - start_n), dtype=acc_dtype)
+                for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
+                    block_rhs = rhs[start_k : start_k + q_block_size, start_n:end_n]
+                    if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
+                        block_rhs = block_rhs.astype(lhs_q_dtype)
+                    block_acc = jnp.matmul(
+                        dec.lhs_q[:rows, pl.ds(start_k, q_block_size)],
+                        block_rhs,
+                        preferred_element_type=preferred_element_type,
+                    ).astype(acc_dtype)
+                    block_acc *= dec.lhs_scale[b_id, :rows].astype(acc_dtype)
+                    block_acc *= rhs_scale_replicated[0, :, start_n:end_n].astype(
+                        acc_dtype
+                    )
+                    acc_n += block_acc
+                acc_list.append(acc_n)
+            return jnp.concatenate(acc_list, axis=1)
 
-        @pl.when(gm == num_gm - 1)
-        def _():
-            write_back(o)
+        def store_out(gm, o, acc):
+            """Keeps tile gm's rows of output panel o's acc in the VMEM output."""
+            col, width = out_panels[o]
+            out_ref = dec.out.at[:rows, pl.ds(col, width)]
+            acc = acc.astype(out_ref.dtype)
+            m_start = metadata_ref.gm_id_to_m_offset[gm]
+            m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
+            first_row = m_start - m_start % sublane
+            iota = lax.broadcasted_iota(jnp.int32, out_ref.shape, 0)
+            out = jnp.where((m_start <= iota) & (iota < m_end), acc, out_ref[...])
+            # `inner_kernel` adds its previous partial rows (or zeros) into the first
+            # sublane row of every tile, which turns -0.0 into +0.0 there.
+            is_first_row = (first_row <= iota) & (iota < first_row + sublane)
+            out_ref[...] = jnp.where(is_first_row, out + jnp.zeros_like(out), out)
 
-    def gm_body(gm, carry):
-        slot = gm % slots
-        weights, scale = copies(gm)
-        # Fused gate and up are multiplied as separate contiguous column panels
-        # and paired per output panel; each column sees the same ops as
-        # interleaved. A panel of the tile `lookahead` ahead is started as the
-        # same panel here begins, so its DMAs are queued in panel order.
-        gate = None
-        for p in range(num_panels):
-            start_fetch(gm + lookahead, panels=(p,))
-            weights[p].wait()
-            if p == 0:
-                scale.wait()
-            acc_p = matmul_panel(slot, p)
-            if cfgs.fuse_act is None:
-                store_out(gm, p, acc_p)
-            elif p % 2 == 0:
-                gate = acc_p
-            else:
-                store_out(gm, p // 2, apply_gated_act(gate, acc_p, cfgs.fuse_act))
-        return carry
+            @pl.when(gm == num_gm - 1)
+            def _():
+                write_back(o)
 
-    lax.fori_loop(0, num_gm, gm_body, 0)
+        def gm_body(gm, carry):
+            slot = gm % slots
+            weights, scale = copies(gm)
+            # Fused gate and up are multiplied as separate contiguous column panels
+            # and paired per output panel; each column sees the same ops as
+            # interleaved. A panel of the tile `lookahead` ahead is started as the
+            # same panel here begins, so its DMAs are queued in panel order.
+            gate = None
+            for p in range(num_panels):
+                start_fetch(gm + lookahead, panels=(p,))
+                weights[p].wait()
+                if p == 0:
+                    scale.wait()
+                acc_p = matmul_panel(slot, p)
+                if cfgs.fuse_act is None:
+                    store_out(gm, p, acc_p)
+                elif p % 2 == 0:
+                    gate = acc_p
+                else:
+                    store_out(gm, p // 2, apply_gated_act(gate, acc_p, cfgs.fuse_act))
+            return carry
+
+        lax.fori_loop(0, num_gm, gm_body, 0)
+
+    if small_rows is None:
+        compute(dims.size_m)
+    else:
+        pl.when(m_hi <= small_rows)(lambda: compute(small_rows))
+        pl.when(m_hi > small_rows)(lambda: compute(dims.size_m))
 
     # Without tiles the output is still written where zero initialization
     # requires it; otherwise the last tile wrote back every panel.
@@ -1899,7 +1939,7 @@ def gmm_v2(
                 ),
                 weight=pltpu.VMEM((slots, dims.size_k, dims.size_n), rhs.dtype),
                 scale=pltpu.VMEM((slots, 1, 1, dims.size_n), jnp.float32),
-                lhs_sem=pltpu.SemaphoreType.DMA((1,)),
+                lhs_sem=pltpu.SemaphoreType.DMA((2,)),
                 weight_sems=pltpu.SemaphoreType.DMA(
                     (slots, len(decode_panels(cfgs)))
                 ),
