@@ -97,6 +97,9 @@ MK_SPLIT_BASE = 80
 # A2: one wide call over the same rows (MKConfig.mb_rows microbatches inside the kernel, the
 # MoE phase once over all rows); the w<n> case pairs with the r<n> split case on the same rows
 WIDE_MB = int(os.environ.get("P3_MK_WIDE_MB", "64"))
+# decode context parallelism inside the kernel (MKConfig.dcp), as in test_p3_mk_step_bench.py:
+# the bench's page tables are rank-local either way
+DCP = int(os.environ.get("MK_BENCH_DCP", "1"))
 # w16: one microbatch (n_mb 1); w8 (32 rows) pairs with the regular 32-row call for a
 # two-microbatch step with P3_MK_WIDE_MB=16 (same rows, same routing union)
 A2_CASES = {"w8": 32, "w16": 64, "w24": 96, "w32": 128, "w48": 192, "w64": 256, "w128": 512}
@@ -305,6 +308,7 @@ def _cfg(b: int, e_slots: int = E_SLOTS, wide: bool | None = None) -> C.MKConfig
         max_pages_per_seq=MAXP,
         gdn_stride_pages=GDN_STRIDE,
         ctx=MAXP * 128,
+        dcp=DCP,
     )
 
 
