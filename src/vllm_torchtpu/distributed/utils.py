@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
+
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
@@ -29,18 +31,32 @@ def set_node_kv_ip_port(ip_port: tuple[int, str, int]):
 
 
 def get_kv_ips() -> str | list[str]:
-    if envs.TPU_MULTIHOST_BACKEND == "ray":
+    if envs.TPU_MULTIHOST_BACKEND == "ray" and _NODES_KV_IP_PORT:
         # Node-sorted: the consumer indexes the advertised lists by node id.
         return [ip for _, (ip, _) in sorted(_NODES_KV_IP_PORT.items())]
-    else:
-        return get_host_ip()
+    kv_host_ips = os.getenv("TPU_KV_HOST_IPS", "")
+    if kv_host_ips:
+        ips = [ip.strip() for ip in kv_host_ips.split(",") if ip.strip()]
+        if len(ips) > 1:
+            return ips
+        elif len(ips) == 1:
+            return ips[0]
+    return get_host_ip()
 
 
-def get_kv_ports() -> str | list[int]:
-    if envs.TPU_MULTIHOST_BACKEND == "ray":
+def get_kv_ports(tp_size: int = 8) -> str | list[int]:
+    if envs.TPU_MULTIHOST_BACKEND == "ray" and _NODES_KV_IP_PORT:
         return [port for _, (_, port) in sorted(_NODES_KV_IP_PORT.items())]
-    else:
-        return get_kv_transfer_port()
+    kv_host_ips = os.getenv("TPU_KV_HOST_IPS", "")
+    if kv_host_ips:
+        ips = [ip.strip() for ip in kv_host_ips.split(",") if ip.strip()]
+        if len(ips) > 1:
+            n_cfg = get_transfer_channel_number()
+            n_channels = tp_size if n_cfg <= 0 else min(n_cfg, tp_size)
+            n_channels = max(1, n_channels)
+            base_port = int(get_kv_transfer_port())
+            return [base_port + i * n_channels for i in range(len(ips))]
+    return get_kv_transfer_port()
 
 
 def get_host_ip() -> str:
@@ -58,6 +74,8 @@ def get_side_channel_port() -> str:
 
 def get_node_id() -> int:
     # TODO(xiang): Is it possible to get this from a pre-defiend env?
+    if "TPU_NODE_ID" not in os.environ and "NODE_RANK" in os.environ:
+        return int(os.environ["NODE_RANK"])
     return envs.TPU_NODE_ID
 
 

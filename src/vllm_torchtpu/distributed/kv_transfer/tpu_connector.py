@@ -800,6 +800,29 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 "vLLM produced a MambaSpec with a negative speculative "
                 f"depth: value={stage3_mamba_num_speculative_blocks}"
             )
+        elif kv_cache_config is not None and getattr(
+            kv_cache_config, "kv_cache_groups", None
+        ):
+            fa_indices = [
+                index
+                for index, group in enumerate(kv_cache_config.kv_cache_groups)
+                if not isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+            mamba_indices = [
+                index
+                for index, group in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            ]
+            if fa_indices and mamba_indices:
+                self._stage3_fa_group_index = fa_indices[0]
+                self._stage3_mamba_group_indices = mamba_indices
+                speculative_depths = {
+                    kv_cache_config.kv_cache_groups[
+                        i
+                    ].kv_cache_spec.num_speculative_blocks
+                    for i in mamba_indices
+                }
+                stage3_mamba_num_speculative_blocks = next(iter(speculative_depths), 0)
         if use_raiden:
             scheduler_cls = TPURaidenConnectorScheduler
             worker_cls = TPURaidenConnectorWorker
@@ -812,13 +835,16 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = scheduler_cls(vllm_config)
-            if use_raiden and _use_raiden_stage3_transport():
+            if (
+                use_raiden and _use_raiden_stage3_transport()
+            ) or self._stage3_mamba_group_indices:
                 self.connector_scheduler._stage3_fa_group_index = (
                     self._stage3_fa_group_index
                 )
-                self.connector_scheduler._stage3_transfer_groups = (
-                    self._stage3_transfer_groups
-                )
+                if hasattr(self.connector_scheduler, "_stage3_transfer_groups"):
+                    self.connector_scheduler._stage3_transfer_groups = (
+                        self._stage3_transfer_groups
+                    )
                 self.connector_scheduler._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices
                 )
@@ -919,6 +945,16 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
                 block_ids[self._stage3_fa_group_index],
                 mamba_block_ids=mamba_block_ids,  # type: ignore
                 group_block_ids=group_block_ids,
+            )
+        if self._stage3_mamba_group_indices:
+            mamba_block_ids = [
+                list(block_ids[mamba_gid])
+                for mamba_gid in self._stage3_mamba_group_indices
+            ]
+            return self.connector_scheduler.request_finished(
+                request,
+                block_ids[self._stage3_fa_group_index],
+                mamba_block_ids=mamba_block_ids,
             )
         assert len(block_ids) == 1, (
             "Non-HMA TPUConnector expects a single kv-cache group; got "
@@ -1045,6 +1081,9 @@ class TPUConnectorScheduler:
         self.is_producer = self.config.is_kv_producer
 
         self.block_size = vllm_config.cache_config.block_size
+        self._stage3_fa_group_index = 0
+        self._stage3_mamba_group_indices: list[int] = []
+        self._stage3_mamba_num_speculative_blocks: int = 0
 
         # Populated by request_finished() on P.
         self.reqs_to_send: dict[ReqId, SendMeta] = {}
@@ -1063,7 +1102,7 @@ class TPUConnectorScheduler:
             if vllm_config.parallel_config
             else 1
         )
-        port_base = dist_utils.get_kv_ports()
+        port_base = dist_utils.get_kv_ports(tp_size)
         if isinstance(port_base, list):
             self.kv_port = [int(p) + dp_rank * tp_size for p in port_base]
         else:
@@ -1075,6 +1114,27 @@ class TPUConnectorScheduler:
             self.kv_port,
             self.side_channel_port,
         )
+
+    def _refresh_kv_endpoints_if_needed(self) -> None:
+        if isinstance(self.kv_ip, list) and not self.kv_ip:
+            ips = dist_utils.get_kv_ips()
+            if ips:
+                self.kv_ip = ips
+                dp_rank = (
+                    self.vllm_config.parallel_config.data_parallel_rank
+                    if self.vllm_config.parallel_config
+                    else 0
+                )
+                tp_size = (
+                    self.vllm_config.parallel_config.tensor_parallel_size
+                    if self.vllm_config.parallel_config
+                    else 1
+                )
+                port_base = dist_utils.get_kv_ports(tp_size)
+                if isinstance(port_base, list):
+                    self.kv_port = [int(p) + dp_rank * tp_size for p in port_base]
+                else:
+                    self.kv_port = int(port_base) + dp_rank * tp_size
 
     def _maybe_truncate_prompt_for_handoff(self, request: "Request") -> None:
         """P-side: drop the last prompt token so P stops where the handoff does.
@@ -1110,8 +1170,10 @@ class TPUConnectorScheduler:
         )
 
     def on_new_request(self, request: "Request") -> None:
-        """Validates decoder kv_transfer_params once at admission. The Raiden
-        stage-3 subclass also truncates producer Mamba prompts here."""
+        """Validates decoder kv_transfer_params once at admission. Also
+        truncates producer Mamba prompts so P stops at N-1 tokens."""
+        if self.is_producer and self._stage3_mamba_group_indices:
+            self._maybe_truncate_prompt_for_handoff(request)
         self._admit_kv_transfer_params(request)
 
     def _admit_kv_transfer_params(self, request: "Request") -> bool:
@@ -1176,6 +1238,11 @@ class TPUConnectorScheduler:
             if side_channel_port is None:
                 return "remote_side_channel_port must be an integer"
             params["remote_side_channel_port"] = side_channel_port
+        if params.get("num_tokens") is not None:
+            num_tokens = _as_int(params["num_tokens"])
+            if num_tokens is None or num_tokens <= 0:
+                return "num_tokens must be a positive integer"
+            params["num_tokens"] = num_tokens
         params["uuid"] = uuid
         params["remote_block_ids"] = remote_block_ids
         params["remote_host"] = remote_host
@@ -1223,6 +1290,13 @@ class TPUConnectorScheduler:
         ) or request.kv_transfer_params.get("_remote_kv_processed"):
             return 0, False
 
+        params = request.kv_transfer_params
+        if self._stage3_mamba_group_indices and params.get("num_tokens") is not None:
+            count = max(int(params["num_tokens"]) - num_computed_tokens, 0)
+            if count > 0:
+                return count, True
+            return 0, False
+
         assert num_computed_tokens % self.block_size == 0
         # Rounding must match request_finished()'s remote_block_ids computation.
         rounded_num_prompt_tokens = round_down(
@@ -1243,7 +1317,19 @@ class TPUConnectorScheduler:
 
         params = request.kv_transfer_params
         if num_external_tokens > 0:
-            local_block_ids = blocks.get_block_ids()[0]
+            grouped_block_ids = blocks.get_block_ids()
+            if self._stage3_mamba_group_indices:
+                fa_block_ids = list(grouped_block_ids[self._stage3_fa_group_index])
+                mamba_block_ids = [
+                    list(grouped_block_ids[mamba_gid])
+                    for mamba_gid in self._stage3_mamba_group_indices
+                ]
+                committed_mamba_blocks = _select_committed_mamba_blocks(
+                    mamba_block_ids, self._stage3_mamba_num_speculative_blocks
+                )
+                local_block_ids = fa_block_ids + committed_mamba_blocks
+            else:
+                local_block_ids = grouped_block_ids[0]
             # D must pull the whole prefill blocks regardless of partial
             # prefix-cache hits, because the transport has no RDMA-style
             # partial-pull and P publishes the full payload under a uuid.
@@ -1287,12 +1373,21 @@ class TPUConnectorScheduler:
         return meta
 
     def get_finished_count(self) -> int:
-        return len(self.kv_ip) if isinstance(self.kv_ip, list) else 1
+        self._refresh_kv_endpoints_if_needed()
+        nnodes = (
+            self.vllm_config.parallel_config.nnodes
+            if self.vllm_config.parallel_config
+            else 1
+        )
+        return max(
+            1, len(self.kv_ip) if isinstance(self.kv_ip, list) else 1, nnodes
+        )
 
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
+        mamba_block_ids: list[list[int]] | None = None,
     ) -> tuple[bool, dict[str, Any] | None]:
         if not self.is_producer:
             return False, None
@@ -1302,10 +1397,23 @@ class TPUConnectorScheduler:
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             return False, None
 
-        # Only transfer full blocks; let D re-prefill the trailing partial
-        # block locally.
-        all_full = request.num_computed_tokens % self.block_size == 0
-        computed_block_ids = block_ids if all_full else block_ids[:-1]
+        self._refresh_kv_endpoints_if_needed()
+        num_tokens: int | None = None
+        if self._stage3_mamba_group_indices and mamba_block_ids:
+            num_tokens = int(request.num_computed_tokens)
+            expected_fa_blocks = (
+                num_tokens + self.block_size - 1
+            ) // self.block_size
+            fa_block_ids = list(block_ids)[:expected_fa_blocks]
+            committed_mamba_blocks = _select_committed_mamba_blocks(
+                mamba_block_ids, self._stage3_mamba_num_speculative_blocks
+            )
+            computed_block_ids = fa_block_ids + committed_mamba_blocks
+        else:
+            # Only transfer full blocks; let D re-prefill the trailing partial
+            # block locally.
+            all_full = request.num_computed_tokens % self.block_size == 0
+            computed_block_ids = block_ids if all_full else block_ids[:-1]
 
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
@@ -1315,14 +1423,17 @@ class TPUConnectorScheduler:
                 uuid=uuid,
                 local_block_ids=computed_block_ids,
                 expiration_time=expiration_time,
+                num_tokens=num_tokens,
             )
-            kv_transfer_params = dict(
+            kv_transfer_params: dict[str, Any] = dict(
                 uuid=uuid,
                 remote_block_ids=computed_block_ids,
                 remote_host=self.kv_ip,
                 remote_port=self.kv_port,
                 remote_side_channel_port=self.side_channel_port,
             )
+            if num_tokens is not None:
+                kv_transfer_params["num_tokens"] = num_tokens
             logger.info(
                 "TPUConnectorScheduler --> reqs_to_send=%s | kv_transfer_params=%s",
                 self.reqs_to_send,
@@ -1350,7 +1461,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         self, slot_idx: int, num_blocks: int, block_ids: list[int]
     ) -> tuple[list, list, int]:
         indices = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
-        kv_caches = self.runner.kv_caches
+        kv_caches = self._get_kv_caches()
         tpu_tensors: list = []
         cpu_tensors: list = []
         d2h_total_bytes = 0
@@ -1512,7 +1623,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if vllm_config.parallel_config
             else 1
         )
-        port_base = dist_utils.get_kv_ports()
+        port_base = dist_utils.get_kv_ports(tp_size)
         if isinstance(port_base, list):
             self.kv_port = [int(p) + 2 * dp_rank * tp_size for p in port_base]
         else:

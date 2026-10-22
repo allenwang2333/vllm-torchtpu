@@ -464,11 +464,52 @@ class ZmqShmKvConnectorBase:
             self.zmq_cxt.destroy(linger=0)
 
     # ---- Bring-up -------------------------------------------------------
+    def _get_kv_caches(self) -> list[torch.Tensor]:
+        """Return the unique underlying KV cache storage tensors on the runner.
+
+        Under the unified hybrid pool (FA + Mamba/GDN sharing raw buffers),
+        ``runner.kv_cache_raw_tensors`` holds the deduplicated pool tensors,
+        while ``runner.kv_caches`` contains duplicate references across the
+        shared FA and Mamba layers. Using the deduplicated list avoids
+        transferring shared blocks twice and prevents aliased buffer donation
+        in ``kv_scatter.multi_layer_scatter_into``.
+        """
+        assert self.runner is not None
+        raw_tensors = getattr(self.runner, "kv_cache_raw_tensors", None)
+        if isinstance(raw_tensors, list) and len(raw_tensors) > 0:
+            all_uniform = all(
+                isinstance(t, torch.Tensor)
+                and t.shape == raw_tensors[0].shape
+                and t.dtype == raw_tensors[0].dtype
+                for t in raw_tensors
+            )
+            if all_uniform:
+                return raw_tensors
+        return self.runner.kv_caches
+
+    def _max_transfer_blocks(self) -> int:
+        block_size = self.vllm_config.cache_config.block_size
+        max_model_len = self.vllm_config.model_config.max_model_len
+        max_blocks = (max_model_len + block_size - 1) // block_size
+        raw_tensors = getattr(self.runner, "kv_cache_raw_tensors", None)
+        runner_kv_caches = getattr(self.runner, "kv_caches", None)
+        if (
+            isinstance(raw_tensors, list)
+            and isinstance(runner_kv_caches, list)
+            and 0 < len(raw_tensors) < len(runner_kv_caches)
+        ):
+            mamba_plan = getattr(self.runner, "_mamba_copy_plan", None)
+            extra_mamba_blocks = (
+                len(mamba_plan) if isinstance(mamba_plan, list) and mamba_plan else 1
+            )
+            max_blocks += extra_mamba_blocks
+        return max_blocks
+
     def register_runner(self, runner: Any):
         self.runner = runner
         self.device = runner.device
 
-        kv_caches = runner.kv_caches
+        kv_caches = self._get_kv_caches()
         assert len(kv_caches) > 0, (
             "register_runner called before kv_caches were allocated"
         )
@@ -503,7 +544,7 @@ class ZmqShmKvConnectorBase:
         """Default (uniform) layout: every kv cache layer has the same shape
         and dtype."""
         assert self.runner is not None
-        kv_caches = self.runner.kv_caches
+        kv_caches = self._get_kv_caches()
         kv_layer = kv_caches[0]
         self.num_layers = len(kv_caches)
         self.shape = list(kv_layer.shape)
@@ -530,26 +571,47 @@ class ZmqShmKvConnectorBase:
         runner.kv_caches leaves Attention.forward() reading a stale tensor.
         """
         assert self.runner is not None
-        kv_caches = self.runner.kv_caches
+        kv_caches = self._get_kv_caches()
         old_cache = kv_caches[layer_idx]
         for idx, cache in enumerate(kv_caches):
             if cache is old_cache:
                 kv_caches[idx] = new_cache
+        runner_kv_caches = getattr(self.runner, "kv_caches", None)
+        if isinstance(runner_kv_caches, list) and runner_kv_caches is not kv_caches:
+            for idx, cache in enumerate(runner_kv_caches):
+                if cache is old_cache:
+                    runner_kv_caches[idx] = new_cache
+
+        mamba_copy_plan = getattr(self.runner, "_mamba_copy_plan", None)
+        if isinstance(mamba_copy_plan, list):
+            for idx, entry in enumerate(mamba_copy_plan):
+                if (
+                    isinstance(entry, tuple)
+                    and len(entry) == 2
+                    and isinstance(entry[1], list)
+                ):
+                    group_idx, state_group = entry
+                    for t_idx, tensor in enumerate(state_group):
+                        if tensor is old_cache:
+                            state_group[t_idx] = new_cache
+                    mamba_copy_plan[idx] = (group_idx, state_group)
 
         compilation_config = self.vllm_config.compilation_config
         static_forward_context = compilation_config.static_forward_context
         if not isinstance(static_forward_context, dict):
             return
         for layer in static_forward_context.values():
-            if getattr(layer, "kv_cache", None) is old_cache:
+            layer_kv = getattr(layer, "kv_cache", None)
+            if layer_kv is old_cache:
                 layer.kv_cache = new_cache
+            elif isinstance(layer_kv, list):
+                for idx, item in enumerate(layer_kv):
+                    if item is old_cache:
+                        layer_kv[idx] = new_cache
 
     def _warmup_block_sizes(self) -> list[int]:
         """Block count to pre-compile: the worst-case max_blocks only."""
-        block_size = self.vllm_config.cache_config.block_size
-        max_model_len = self.vllm_config.model_config.max_model_len
-        max_blocks = (max_model_len + block_size - 1) // block_size
-        return [max_blocks]
+        return [self._max_transfer_blocks()]
 
     def _warmup_kv_ops(self) -> None:
         """Pre-compile the XLA executables for the KV gather/scatter hot
@@ -598,7 +660,7 @@ class ZmqShmKvConnectorBase:
         rather than calling the hot path so warmup samples don't leak into
         the latency tracker or emit a stray scatter log line."""
         assert self.runner is not None
-        kv_caches = self.runner.kv_caches
+        kv_caches = self._get_kv_caches()
         indices = torch.arange(num_blocks, dtype=torch.int64, device=self.device)
         slot_idx = 0
         if self.is_producer:
@@ -638,20 +700,38 @@ class ZmqShmKvConnectorBase:
 
     def _resolve_remote_host_port(
         self, req_meta: LoadMeta
-    ) -> tuple[str, int, int | None]:
-        if isinstance(req_meta.remote_host, list):
-            assert isinstance(req_meta.remote_port, list)
-            assert len(req_meta.remote_host) == len(req_meta.remote_port)
-            host = req_meta.remote_host[self.node_id]
-            port = req_meta.remote_port[self.node_id]
-        else:
-            host = req_meta.remote_host
-            assert not isinstance(req_meta.remote_port, list)
-            port = req_meta.remote_port
+    ) -> tuple[str | list[str], int | list[int], int | None]:
         side_channel_port = None
         if req_meta.remote_side_channel_port:
             side_channel_port = int(req_meta.remote_side_channel_port)
-        return host, int(port), side_channel_port
+        if isinstance(req_meta.remote_host, list):
+            assert isinstance(req_meta.remote_port, list)
+            assert len(req_meta.remote_host) == len(req_meta.remote_port)
+            num_consumer_hosts = int(os.getenv("TPU_NUM_HOSTS", "1"))
+            if len(req_meta.remote_host) == 1:
+                return (
+                    req_meta.remote_host[0],
+                    int(req_meta.remote_port[0]),
+                    side_channel_port,
+                )
+            if num_consumer_hosts == len(req_meta.remote_host) and self.node_id < len(
+                req_meta.remote_host
+            ):
+                host = req_meta.remote_host[self.node_id]
+                port = int(req_meta.remote_port[self.node_id])
+                if side_channel_port is not None:
+                    side_channel_port += self.node_id
+                return host, port, side_channel_port
+            return (
+                list(req_meta.remote_host),
+                [int(p) for p in req_meta.remote_port],
+                side_channel_port,
+            )
+        else:
+            host = req_meta.remote_host
+            assert not isinstance(req_meta.remote_port, list)
+            port = int(req_meta.remote_port)
+            return host, port, side_channel_port
 
     # ---- Polled by the runner each step --------------------------------
     def get_finished(
@@ -673,10 +753,8 @@ class ZmqShmKvConnectorBase:
         """Build the per-host shm pool spec. Subclasses
         override this and return their own spec."""
         assert self.runner is not None
-        kv_layer = self.runner.kv_caches[0]
-        block_size = self.vllm_config.cache_config.block_size
-        max_model_len = self.vllm_config.model_config.max_model_len
-        max_blocks = (max_model_len + block_size - 1) // block_size
+        kv_layer = self._get_kv_caches()[0]
+        max_blocks = self._max_transfer_blocks()
 
         # Shard shape is what one rank holds for one layer at max block count.
         # kv_layer is already this rank's shard, so kv_layer.shape[0] is
@@ -1170,7 +1248,7 @@ class ZmqShmKvConnectorBase:
             uuid,
             slot_idx,
             num_blocks,
-            len(self.runner.kv_caches),
+            len(self._get_kv_caches()),
         )
         enqueue_t0 = time.perf_counter()
         future, src_refs, dst_refs, d2h_total_bytes = self._stage_d2h(
@@ -1681,10 +1759,15 @@ class ZmqShmKvConnectorBase:
                 sock.close(linger=0)
 
         t_total0 = time.perf_counter()
+        consumer_num_hosts = int(os.getenv("TPU_NUM_HOSTS", "1"))
+        if num_hosts == consumer_num_hosts and 0 <= self.node_id < num_hosts:
+            host_indices = [self.node_id]
+        else:
+            host_indices = list(range(num_hosts))
         try:
             futures = [
                 self._coord_channel_executor.submit(_pull_channel, h, ch)
-                for h in range(num_hosts)
+                for h in host_indices
                 for ch in range(n_channels)
             ]
             # Annotation was stale: _pull_channel returns 6 values
@@ -1874,7 +1957,7 @@ class ZmqShmKvConnectorBase:
             return
         assert self.runner is not None
         assert self._coord_pool is not None
-        kv_caches = self.runner.kv_caches
+        kv_caches = self._get_kv_caches()
         use_fast_scatter = self._kv_scatter_enabled
         h2d_ms_total = 0.0
         h2d_issue_ms = 0.0
@@ -2017,7 +2100,16 @@ class ZmqShmKvConnectorBase:
                 int(dist_utils.get_side_channel_port()) + self.dp_rank
             )
 
-        for h_idx, r_host in enumerate(remote_hosts):
+        consumer_num_hosts = int(os.getenv("TPU_NUM_HOSTS", "1"))
+        if (
+            len(remote_hosts) == consumer_num_hosts
+            and 0 <= self.node_id < len(remote_hosts)
+        ):
+            notify_indices = [self.node_id]
+        else:
+            notify_indices = list(range(len(remote_hosts)))
+        for h_idx in notify_indices:
+            r_host = remote_hosts[h_idx]
             side_port = target_side_port_base + h_idx
             sock_path = make_zmq_path("tcp", r_host, side_port)
             # DEALER is not thread-safe; serialize create+send under the lock.
