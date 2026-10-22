@@ -310,6 +310,32 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _apply_gdn_recurrent_state_dtype(vllm_config: "VllmConfig") -> None:
+    """Store the Qwen GDN recurrent state in the GDN v3 kernel's HBM dtype.
+
+    Runs before anything reads `mamba_ssm_cache_dtype` (block-size fit, the
+    layers' MambaSpec, the kernel's state plan), so they all agree on it.
+    """
+    from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
+    from vllm_torchtpu.kernels.gdn.v3.config import RECURRENT_STATE_HBM_DTYPE
+
+    model_config = vllm_config.model_config
+    if (
+        RECURRENT_STATE_HBM_DTYPE is None
+        or model_config is None
+        or model_config.architecture not in QWEN_GDN_ARCHITECTURES
+    ):
+        return
+    cache_config = vllm_config.cache_config
+    if cache_config.mamba_ssm_cache_dtype != RECURRENT_STATE_HBM_DTYPE:
+        logger.info(
+            "Storing the GDN recurrent state as %s (was %s); compute stays fp32.",
+            RECURRENT_STATE_HBM_DTYPE,
+            cache_config.mamba_ssm_cache_dtype,
+        )
+        cache_config.mamba_ssm_cache_dtype = RECURRENT_STATE_HBM_DTYPE
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -605,6 +631,7 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+        _apply_gdn_recurrent_state_dtype(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

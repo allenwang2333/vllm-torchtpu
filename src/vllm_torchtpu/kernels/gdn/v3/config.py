@@ -21,6 +21,12 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+#: HBM storage dtype of the Qwen GDN recurrent state, applied to vLLM's
+#: `mamba_ssm_cache_dtype` by the TPU platform. The kernel computes in fp32
+#: either way; bf16 halves the state bytes every step streams. None keeps
+#: vLLM's choice (the checkpoint's `mamba_ssm_dtype`, fp32 for Qwen3.5).
+RECURRENT_STATE_HBM_DTYPE: str | None = "bfloat16"
+
 
 class AttentionMode(enum.StrEnum):
     # Gated Delta Net: one scalar gate per value head.
