@@ -1,0 +1,191 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "gmm-v2-397b-score"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: scorer
+      replicas: 1
+      template:
+        spec:
+          ttlSecondsAfterFinished: 3600
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: "200Gi"
+                - name: work
+                  ephemeral:
+                    volumeClaimTemplate:
+                      spec:
+                        storageClassName: "standard-rwo-hdd"
+                        accessModes: ["ReadWriteOnce"]
+                        resources:
+                          requests:
+                            storage: 256Gi
+              containers:
+                - name: scorer
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu-rdna/vllm-torchtpu-caojx_google_com@sha256:78108de22c693ad17d2547c82076f34863752feda979e670d5a2230993e24cb2"
+                  imagePullPolicy: Always
+                  env:
+                    - name: TPU_TOPOLOGY
+                      value: "2x2x1"
+                    - name: XLA_FLAGS
+                      value: ""
+                    - name: PYTHONDONTWRITEBYTECODE
+                      value: "1"
+                    - name: WORK_DIR
+                      value: "/root/perfkit-cluster"
+                    - name: TMPDIR
+                      value: "/root/perfkit-cluster/tmp"
+                    - name: BUNDLE_URI
+                      value: "gs://forge-gcs-tpu/forge/perfkit-cluster/gmm-v2-397b-score/bundle.tgz"
+                    - name: RESULTS_URI
+                      value: "gs://forge-gcs-tpu/forge/perfkit-cluster/gmm-v2-397b-score"
+                    - name: JOB_NAME
+                      value: "gmm-v2-397b-score"
+                    - name: REPS
+                      value: "1"
+                    - name: SCORER_PYTHON
+                      value: "python3"
+                    - name: EXPECT_JAX
+                      value: "0.10.2"
+                    - name: EXPECT_LIBTPU
+                      value: "0.0.47"
+                    - name: PROFILE_JAX
+                      value: ""
+                    - name: POD_NAME
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: metadata.name
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: work
+                      mountPath: /root/perfkit-cluster
+                    - name: work
+                      mountPath: /root/.cache
+                      subPath: root_cache
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      say() { printf 'perfkit-cluster: %s\n' "$*"; }
+                      WORK=${WORK_DIR:-/root/perfkit-cluster}
+                      B=$WORK/bundle
+                      DEST=$RESULTS_URI/$POD_NAME
+                      PY=$SCORER_PYTHON
+                      refuse() {
+                        local code=$1
+                        shift
+                        say "REFUSED: $*"
+                        printf '%s\n' "$*" > "$WORK/refused.txt"
+                        gsutil -q cp "$WORK/refused.txt" "$DEST/refused.txt" || say "could not upload refused.txt"
+                        exit "$code"
+                      }
+                      watchdog() {
+                        local logs=${PERFKIT_TPU_LOGS:-/tmp/tpu_logs}
+                        while sleep "${PERFKIT_STALL_POLL:-60}"; do
+                          if grep -rlsF "Stall detected" "$logs" > "$WORK/stall.txt"; then
+                            echo "PERFKIT_CLUSTER_STALL pod=$POD_NAME"
+                            gsutil -q cp "$WORK/stall.txt" "$DEST/stall.txt" || say "could not upload stall.txt"
+                            return 0
+                          fi
+                        done
+                      }
+                      mkdir -p "$B" "$WORK/out" "${TMPDIR:-/tmp}"
+                      watchdog &
+                      watchdog_pid=$!
+                      trap 'kill "$watchdog_pid" 2> /dev/null' EXIT
+                      say "job $JOB_NAME, pod $POD_NAME, $REPS rep(s), results under $DEST/"
+                      gsutil -q cp "$BUNDLE_URI" "$WORK/bundle.tgz" || refuse 2 "cannot download $BUNDLE_URI"
+                      tar -xzf "$WORK/bundle.tgz" -C "$B" --no-same-owner || refuse 2 "cannot extract $BUNDLE_URI"
+                      gsutil -q cp "$B/manifest.json" "$DEST/manifest.json" || say "could not upload manifest.json"
+                      command -v git > /dev/null || refuse 2 "the image has no git, so no arm can name its tree"
+                      versions=$("$PY" -c '
+                      import importlib.metadata as m
+                      def version(dist):
+                          try:
+                              return m.version(dist)
+                          except m.PackageNotFoundError:
+                              return "missing"
+                      print(version("jax"), version("libtpu"))
+                      ') || refuse 2 "cannot run $PY"
+                      read -r jax libtpu <<< "$versions"
+                      say "the image holds jax $jax and libtpu $libtpu; this job expects jax $EXPECT_JAX and libtpu $EXPECT_LIBTPU"
+                      if [ "$jax" != "$EXPECT_JAX" ] || [ "$libtpu" != "$EXPECT_LIBTPU" ]; then
+                        refuse 3 "the image holds jax $jax and libtpu $libtpu, not jax $EXPECT_JAX and libtpu $EXPECT_LIBTPU"
+                      fi
+                      kind=$("$PY" -c 'import jax; print(jax.devices()[0].device_kind)' 2> /dev/null | tail -n 1)
+                      say "device kind: ${kind:-unknown}"
+                      export PERFKIT_HOME=$B/forge
+                      export PYTHONPATH=$B/forge${PYTHONPATH:+:$PYTHONPATH}
+                      if [ -n "${PROFILE_JAX:-}" ]; then
+                        prof=$WORK/profenv
+                        mkdir -p "$prof"
+                        for w in "$B"/profile/wheels/*.whl; do
+                          "$PY" -m zipfile -e "$w" "$prof" || refuse 2 "cannot unpack $w"
+                        done
+                        export PYTHONPATH=$prof:$PYTHONPATH
+                        got=$("$PY" -c 'import jax, jaxlib; print(jax.__version__, jaxlib.__version__)' 2>&1 | tail -n 1)
+                        say "profile job: jax and jaxlib $got from the bundle, over the image's libtpu $libtpu; its timings are not a measurement"
+                        if [ "$got" != "$PROFILE_JAX $PROFILE_JAX" ]; then
+                          refuse 3 "the bundle's jax $PROFILE_JAX did not load over the image: $got"
+                        fi
+                      fi
+                      git config --global --add safe.directory '*'
+                      (cd "$B" && "$PY" -c 'import sys; from perfkit import cluster; sys.exit(cluster.pod_preflight("."))') \
+                        || refuse 4 "an arm does not have the tree the bundle recorded for it"
+                      mapfile -t args < "$B/scorer.args"
+                      status=0
+                      for k in $(seq 1 "$REPS"); do
+                        r=$WORK/out/rep$k
+                        mkdir -p "$r"
+                        if [ -n "${PROFILE_JAX:-}" ]; then
+                          mkdir -p "$r/profile"
+                          export PERFKIT_PROFILE_DIR=$r/profile
+                        fi
+                        say "rep $k of $REPS: start"
+                        # stdout goes to score.json; stderr goes to this log and to scorer.log.
+                        (cd "$B" && "$PY" -m perfkit scorer run "${args[@]}" --python "$PY" \
+                            --job-id "$JOB_NAME-${POD_NAME##*-}-rep$k" 2>&1 1>&3 3>&-) 3> "$r/score.json" \
+                          | tee "$r/scorer.log" >&2
+                        rc=${PIPESTATUS[0]}
+                        echo "$rc" > "$r/rc"
+                        say "rep $k of $REPS: exit $rc, $(wc -c < "$r/score.json") bytes on stdout"
+                        echo "PERFKIT_CLUSTER_SCORE_BEGIN rep=$k pod=$POD_NAME"
+                        cat "$r/score.json"
+                        echo
+                        echo "PERFKIT_CLUSTER_SCORE_END rep=$k pod=$POD_NAME"
+                        gsutil -q cp "$r/score.json" "$r/scorer.log" "$r/rc" "$DEST/rep$k/" \
+                          || say "rep $k: upload to $DEST/rep$k/ failed; its stdout is between the markers above"
+                        if [ -n "${PROFILE_JAX:-}" ]; then
+                          say "rep $k: traces $(find "$r/profile" -name '*.xplane.pb' | wc -l)"
+                          "$PY" -c 'import sys; from perfkit import cluster; cluster.write_profile_summary(sys.argv[1])' \
+                            "$r/profile" || say "rep $k: no trace summary"
+                          { tar -czf "$r/profile.tgz" -C "$r" profile && gsutil -q cp "$r/profile.tgz" "$DEST/rep$k/"; } \
+                            || say "rep $k: the profile upload to $DEST/rep$k/ failed"
+                        fi
+                        if [ "$rc" -ne 0 ] && [ "$status" -eq 0 ]; then
+                          status=$rc
+                        fi
+                      done
+                      say "finished, exit $status"
+                      exit "$status"
+                  resources:
+                    limits:
+                      cpu: "192"
+                      memory: "900Gi"
+                      google.com/tpu: 4
+                    requests:
+                      cpu: "192"
+                      memory: "900Gi"
+                      google.com/tpu: 4
