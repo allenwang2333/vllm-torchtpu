@@ -58,6 +58,14 @@ def _route_ids(layer, x, k):
     return torch.topk(biased, k, dim=-1).indices.to(torch.int32)
 
 
+def _first_rows(t):
+    """t's first MAX_ROWS rows, zero-padded, with a STATIC row count: slicing
+    a symbolic token count directly (t[:MAX_ROWS]) adds a Min() SymInt that
+    differs between shape variants (ShapeSpecializationError)."""
+    pad = t.new_zeros((MAX_ROWS,) + tuple(t.shape[1:]))
+    return torch.cat([t, pad], dim=0)[:MAX_ROWS]
+
+
 def _layer_forward(self, positions, hidden_states, residual, llama_4_scaling):
     """DeepseekV2DecoderLayer.forward (v0.29.0) that also returns the MoE input
     and the post-attention residual."""
@@ -163,28 +171,23 @@ def patched_model_forward(
         r_in = None
         if prev is not None and _is_moe(layer):
             # layer L's input residual = layer L-1's output + its residual
-            r_in = (hidden_states[:MAX_ROWS] + residual[:MAX_ROWS])
+            r_in = _first_rows(hidden_states) + _first_rows(residual)
         hidden_states, residual, mlp_in, r_mid = _layer_forward(
             layer, positions, hidden_states, residual, llama_4_scaling
         )
         if _is_moe(layer) and prev is not None:
             p_mlp_in, p_r_mid = prev
             norm = layer.post_attention_layernorm
-            act = _route_ids(layer, mlp_in[:MAX_ROWS], TOPK)
+            act = _route_ids(layer, _first_rows(mlp_in), TOPK)
             a = _route_ids(layer, p_mlp_in, K_PRED)
             a2 = _route_ids(layer, norm(p_r_mid), K_PRED)
             b = _route_ids(layer, norm(r_in), K_PRED)
             slots.append(torch.cat([act, a, a2, b], dim=-1))
-        prev = (mlp_in[:MAX_ROWS], r_mid[:MAX_ROWS])
+        prev = (_first_rows(mlp_in), _first_rows(r_mid))
 
     if slots:
-        rec = torch.stack(slots, dim=1)  # [min(T, MAX), n_slots, WIDTH]
-        pad = torch.zeros(
-            (MAX_ROWS,) + tuple(rec.shape[1:]), dtype=rec.dtype, device=rec.device
-        )
-        ids_buf.copy_(torch.cat([rec, pad], dim=0)[:MAX_ROWS])
-        pzero = torch.full((MAX_ROWS,), -1, dtype=torch.int32, device=positions.device)
-        pos_buf.copy_(torch.cat([positions[:MAX_ROWS].to(torch.int32), pzero])[:MAX_ROWS])
+        ids_buf.copy_(torch.stack(slots, dim=1))  # [MAX_ROWS, n_slots, WIDTH]
+        pos_buf.copy_(_first_rows(positions.to(torch.int32) + 1) - 1)
 
     if not get_pp_group().is_last_rank:
         return IntermediateTensors(
