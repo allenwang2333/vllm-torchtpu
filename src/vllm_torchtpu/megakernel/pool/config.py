@@ -142,9 +142,9 @@ class PoolBackend:
 
     layout: PoolLayout
     kernel_names: tuple[str, str]
-    gather_states: Any = None
-    scatter_states: Any = None
-    can_pool_gather: Any = None
+    gather_states: Any = dataclasses.field(default=None, compare=False)
+    scatter_states: Any = dataclasses.field(default=None, compare=False)
+    can_pool_gather: Any = dataclasses.field(default=None, compare=False)
     page_table_state_name: str = "page_table"
     supports_fused_io: bool = False
     supports_pool_gather: bool = False
