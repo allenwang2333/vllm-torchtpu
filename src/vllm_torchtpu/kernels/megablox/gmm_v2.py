@@ -896,6 +896,11 @@ FIRST_SCAN_CHUNK = 8
 DECODE_COL_SPLIT_FUSED = 4
 DECODE_COL_SPLIT_UNFUSED = 2
 
+#: Whether the decode path writes back only the sublane slabs of output rows
+#: some group owns, as `inner_kernel`'s bounded output blocks do, instead of
+#: every row. Applies without zero initialization only.
+DECODE_OWNED_SLABS = True
+
 
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
@@ -915,6 +920,8 @@ class DecodeRefs:
     lhs_sem: Any  # DMA[1]
     weight_sems: Any  # DMA[decode_slots, panels]: one per weight column panel
     scale_sems: Any  # DMA[decode_slots]
+    out: Any  # [size_m, aligned out_size_n]
+    out_sems: Any  # DMA[output panels, output row slabs]
 
 
 def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
@@ -934,6 +941,19 @@ def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
         for s in range(split)
         for h in range(halves)
     )
+
+
+def decode_out_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
+    """`(first output column, width)` of each decode output panel, in order."""
+    panels = decode_panels(cfgs)
+    if cfgs.fuse_act is None:
+        return panels
+    return tuple((col, width) for col, width in panels[::2])
+
+
+def decode_out_slabs(out_rows: int, sublane: int) -> int:
+    """Sublane row slabs the decode path may write back of `out_rows` rows."""
+    return pl.cdiv(out_rows, sublane)
 
 
 def decode_weight_copies(
@@ -1024,29 +1044,29 @@ def use_decode_path(cfgs: GmmConfigs) -> bool:
 
 
 def decode_kernel(
-    # Out
-    out_ref: jax.Array,  # [<= size_m, aligned out_size_n], VMEM
     # Scratch
     metadata_ref: MetadataRef,
     dec: DecodeRefs,
     *,
+    out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n]
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
     lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
     cfgs: GmmConfigs,
 ):
-    """Whole-call body of a one-step pipeline that only writes the output back.
+    """Whole-call body of a one-step pipeline with no pipelined operands.
 
-    lhs_hbm_ref and out_ref may hold fewer rows than size_m: the rows past
+    lhs_hbm_ref and out_hbm_ref may hold fewer rows than size_m: the rows past
     them are computed on stale VMEM and never stored.
 
     lhs is fetched and quantized once for every expert. Each gm tile's expert
     arrives as one contiguous weight DMA plus one scale DMA through
     `decode_slots` rotating buffers (tile 0's started before the metadata is
     filled), and is multiplied over every lhs row, of which the tile's rows
-    are kept in the VMEM-resident output. Each output element sees the same
-    ops in the same order as `inner_kernel`.
+    are kept in the VMEM-resident output. Each output panel is written back
+    from VMEM as soon as the last tile has stored it. Each output element sees
+    the same ops in the same order as `inner_kernel`.
     """
     dims = cfgs.dims
     sublane = dims.size_lhs_sublane
@@ -1086,6 +1106,33 @@ def decode_kernel(
     )
     lhs_copy.start()
 
+    out_rows = out_hbm_ref.shape[0]
+    out_slabs = decode_out_slabs(out_rows, sublane)
+    out_panels = decode_out_panels(cfgs)
+    owned_only = DECODE_OWNED_SLABS and not cfgs.zero_init
+
+    def out_copy(o, slab):
+        (col, width), row = out_panels[o], slab * sublane
+        span = (pl.ds(row, min(sublane, out_rows - row)), pl.ds(col, width))
+        return pltpu.make_async_copy(
+            dec.out.at[span], out_hbm_ref.at[span], dec.out_sems.at[o, slab]
+        )
+
+    def slab_written(slab):
+        """Whether output rows [slab * sublane, +sublane) are written back."""
+        if not owned_only:
+            return True
+        m_lo = metadata_ref.gm_id_to_m_offset[0]
+        m_hi = metadata_ref.gm_id_to_m_offset[num_gm]
+        return (slab * sublane < m_hi) & ((slab + 1) * sublane > m_lo)
+
+    def write_back(o):
+        for slab in range(out_slabs):
+
+            @pl.when(slab_written(slab))
+            def _():
+                out_copy(o, slab).start()
+
     # Tile 0's fetch is in flight unless metadata put another group there
     # (group_offset != 0); then it is drained and tile 0 fetched as usual.
     first_started = first_group < dims.size_group
@@ -1122,7 +1169,7 @@ def decode_kernel(
         preferred_element_type = jnp.int32
     acc_dtype = cfgs.acc_dtype
 
-    out_ref[...] = jnp.zeros_like(out_ref)
+    dec.out[...] = jnp.zeros_like(dec.out)
 
     lhs_copy.wait()
     for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
@@ -1168,29 +1215,11 @@ def decode_kernel(
             acc_list.append(acc_n)
         return jnp.concatenate(acc_list, axis=1)
 
-    def gm_body(gm, carry):
-        slot = gm % slots
-        weights, scale = copies(gm)
-        # Fused gate and up are multiplied as separate contiguous column panels
-        # and paired per output panel; each column sees the same ops as
-        # interleaved. A panel of the tile `lookahead` ahead is started as the
-        # same panel here begins, so its DMAs are queued in panel order.
-        outs, gate = [], None
-        for p in range(num_panels):
-            start_fetch(gm + lookahead, panels=(p,))
-            weights[p].wait()
-            if p == 0:
-                scale.wait()
-            acc_p = matmul_panel(slot, p)
-            if cfgs.fuse_act is None:
-                outs.append(acc_p)
-            elif p % 2 == 0:
-                gate = acc_p
-            else:
-                outs.append(apply_gated_act(gate, acc_p, cfgs.fuse_act))
-        acc = jnp.concatenate(outs, axis=1)
-        acc = acc[: out_ref.shape[0]].astype(out_ref.dtype)
-
+    def store_out(gm, o, acc):
+        """Keeps tile gm's rows of output panel o's acc in the VMEM output."""
+        col, width = out_panels[o]
+        out_ref = dec.out.at[:, pl.ds(col, width)]
+        acc = acc.astype(out_ref.dtype)
         m_start = metadata_ref.gm_id_to_m_offset[gm]
         m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
         first_row = m_start - m_start % sublane
@@ -1200,9 +1229,48 @@ def decode_kernel(
         # sublane row of every tile, which turns -0.0 into +0.0 there.
         is_first_row = (first_row <= iota) & (iota < first_row + sublane)
         out_ref[...] = jnp.where(is_first_row, out + jnp.zeros_like(out), out)
+
+        @pl.when(gm == num_gm - 1)
+        def _():
+            write_back(o)
+
+    def gm_body(gm, carry):
+        slot = gm % slots
+        weights, scale = copies(gm)
+        # Fused gate and up are multiplied as separate contiguous column panels
+        # and paired per output panel; each column sees the same ops as
+        # interleaved. A panel of the tile `lookahead` ahead is started as the
+        # same panel here begins, so its DMAs are queued in panel order.
+        gate = None
+        for p in range(num_panels):
+            start_fetch(gm + lookahead, panels=(p,))
+            weights[p].wait()
+            if p == 0:
+                scale.wait()
+            acc_p = matmul_panel(slot, p)
+            if cfgs.fuse_act is None:
+                store_out(gm, p, acc_p)
+            elif p % 2 == 0:
+                gate = acc_p
+            else:
+                store_out(gm, p // 2, apply_gated_act(gate, acc_p, cfgs.fuse_act))
         return carry
 
     lax.fori_loop(0, num_gm, gm_body, 0)
+
+    # Without tiles the output is still written where zero initialization
+    # requires it; otherwise the last tile wrote back every panel.
+    @pl.when(num_gm == 0)
+    def _():
+        for o in range(len(out_panels)):
+            write_back(o)
+
+    for o in range(len(out_panels)):
+        for slab in range(out_slabs):
+
+            @pl.when(slab_written(slab))
+            def _():
+                out_copy(o, slab).wait()
 
 
 def kernel_main(
@@ -1259,22 +1327,20 @@ def kernel_main(
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
     if decode_refs is not None:
-        # The output block spans every row and zeroes those no group owns, so
+        # The VMEM output spans every row and zeroes those no group owns, so
         # zero initialization needs no DMAs of its own. The body fills the
         # metadata itself, after starting its first expert's fetch.
         body = functools.partial(
             decode_kernel,
+            out_hbm_ref=out_ref,
             lhs_group_sizes_ref=lhs_group_sizes_ref,
             group_offset_ref=group_offset_ref,
             lhs_hbm_ref=lhs_ref,
             rhs_hbm_ref=rhs_ref,
             cfgs=cfgs,
         )
-        out_spec = pl.BlockSpec(out_ref.shape, lambda i: (0, 0))
-        pipeline_fn = pltpu.emit_pipeline(
-            body, grid=(1,), in_specs=(), out_specs=out_spec
-        )
-        pipeline_fn(out_ref, scratches=[metadata_ref, decode_refs])
+        pipeline_fn = pltpu.emit_pipeline(body, grid=(1,))
+        pipeline_fn(scratches=[metadata_ref, decode_refs])
         return
 
     # Fill metadata buffer and return number of group & m interations.
@@ -1838,6 +1904,16 @@ def gmm_v2(
                     (slots, len(decode_panels(cfgs)))
                 ),
                 scale_sems=pltpu.SemaphoreType.DMA((slots,)),
+                out=pltpu.VMEM(
+                    (dims.size_m, align_to(cfgs.out_size_n, num_lanes)),
+                    cfgs.out_dtype,
+                ),
+                out_sems=pltpu.SemaphoreType.DMA(
+                    (
+                        len(decode_out_panels(cfgs)),
+                        decode_out_slabs(size_m, dims.size_lhs_sublane),
+                    )
+                ),
             )
         )
     else:
