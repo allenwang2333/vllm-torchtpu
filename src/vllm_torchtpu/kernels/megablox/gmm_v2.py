@@ -907,6 +907,11 @@ DECODE_OWNED_SLABS = True
 #: DECODE_OWNED_SLABS, since rows past the bucket are never written.
 DECODE_SMALL_ROWS = 16
 
+#: Whether the decode path fetches group_sizes into SMEM itself, after
+#: starting its lhs fetch, instead of as a scalar prefetch operand that every
+#: DMA of the body waits behind.
+DECODE_ASYNC_GROUP_SIZES = True
+
 
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
@@ -928,6 +933,8 @@ class DecodeRefs:
     scale_sems: Any  # DMA[decode_slots]
     out: Any  # [size_m, aligned out_size_n]
     out_sems: Any  # DMA[output panels, output row slabs]
+    group_sizes: Any  # int32[size_lhs_group] SMEM, or None if scalar prefetched
+    group_sizes_sem: Any  # DMA[1], or None
 
 
 def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
@@ -1063,7 +1070,7 @@ def decode_kernel(
     dec: DecodeRefs,
     *,
     out_hbm_ref: jax.Array,  # [<= size_m, aligned out_size_n]
-    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group], HBM if dec has SMEM
     group_offset_ref: jax.Array,  # int32[1]
     lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
@@ -1086,6 +1093,35 @@ def decode_kernel(
     sublane = dims.size_lhs_sublane
     slots = decode_slots(cfgs)
     lookahead = slots - 1
+
+    out_rows = out_hbm_ref.shape[0]
+    out_slabs = decode_out_slabs(out_rows, sublane)
+    out_panels = decode_out_panels(cfgs)
+    owned_only = DECODE_OWNED_SLABS and not cfgs.zero_init
+
+    # lhs rows [0, small_rows) arrive first; the rest only for calls whose
+    # owned rows end past them.
+    lhs_rows = lhs_hbm_ref.shape[0]
+    small_rows = decode_small_rows(cfgs, lhs_rows) if owned_only else None
+
+    def lhs_copy(part):
+        split = small_rows or lhs_rows
+        start, size = (0, split) if part == 0 else (split, lhs_rows - split)
+        return pltpu.make_async_copy(
+            lhs_hbm_ref.at[pl.ds(start, size)],
+            dec.lhs.at[pl.ds(start, size)],
+            dec.lhs_sem.at[part],
+        )
+
+    if dec.group_sizes is not None:
+        # lhs_group_sizes_ref is in HBM; lhs needs no group size to start.
+        sizes_copy = pltpu.make_async_copy(
+            lhs_group_sizes_ref, dec.group_sizes, dec.group_sizes_sem.at[0]
+        )
+        sizes_copy.start()
+        lhs_copy(0).start()
+        sizes_copy.wait()
+        lhs_group_sizes_ref = dec.group_sizes
 
     first_group = start_first_decode_fetch(
         lhs_group_sizes_ref, rhs_hbm_ref, dec, cfgs=cfgs
@@ -1114,26 +1150,8 @@ def decode_kernel(
                 if p == 0:
                     scale.start()
 
-    out_rows = out_hbm_ref.shape[0]
-    out_slabs = decode_out_slabs(out_rows, sublane)
-    out_panels = decode_out_panels(cfgs)
-    owned_only = DECODE_OWNED_SLABS and not cfgs.zero_init
-
-    # lhs rows [0, small_rows) arrive first; the rest only for calls whose
-    # owned rows end past them.
-    lhs_rows = lhs_hbm_ref.shape[0]
-    small_rows = decode_small_rows(cfgs, lhs_rows) if owned_only else None
-
-    def lhs_copy(part):
-        split = small_rows or lhs_rows
-        start, size = (0, split) if part == 0 else (split, lhs_rows - split)
-        return pltpu.make_async_copy(
-            lhs_hbm_ref.at[pl.ds(start, size)],
-            dec.lhs.at[pl.ds(start, size)],
-            dec.lhs_sem.at[part],
-        )
-
-    lhs_copy(0).start()
+    if dec.group_sizes is None:
+        lhs_copy(0).start()
     m_hi = metadata_ref.gm_id_to_m_offset[num_gm]
     if small_rows is not None:
 
@@ -1429,6 +1447,11 @@ def kernel_main(
 
     if cfgs.zero_init:
         zero_out_end(out_ref, semaphore_ref, zero_size, dims=cfgs.dims)
+
+
+def decode_entry(group_offset_ref, lhs_group_sizes_ref, *refs, cfgs: GmmConfigs):
+    """`kernel_main` with group_sizes as an HBM operand after group_offset."""
+    kernel_main(lhs_group_sizes_ref, group_offset_ref, *refs, cfgs=cfgs)
 
 
 def calculate_tiling(
@@ -1954,6 +1977,14 @@ def gmm_v2(
                         decode_out_slabs(size_m, dims.size_lhs_sublane),
                     )
                 ),
+                group_sizes=(
+                    pltpu.SMEM((dims.size_lhs_group,), jnp.int32)
+                    if DECODE_ASYNC_GROUP_SIZES
+                    else None
+                ),
+                group_sizes_sem=(
+                    pltpu.SemaphoreType.DMA((1,)) if DECODE_ASYNC_GROUP_SIZES else None
+                ),
             )
         )
     else:
@@ -1964,20 +1995,29 @@ def gmm_v2(
     out_init = jax.ShapeDtypeStruct((out_rows, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
+    weights_spec = WeightsRef(
+        weight=pl.BlockSpec(memory_space=pltpu.HBM),
+        scale=rhs_scale_spec,
+        bias=rhs_bias_spec,
+    )
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if is_decode and DECODE_ASYNC_GROUP_SIZES:
+        # Only group_offset is scalar prefetched; the body fetches group_sizes.
+        kernel = functools.partial(decode_entry, cfgs=cfgs)
+        num_scalar_prefetch, in_specs = 1, [hbm_spec, hbm_spec, weights_spec]
+        operands = (group_offset, group_sizes, lhs, rhs_weights)
+    else:
+        kernel = functools.partial(kernel_main, cfgs=cfgs)
+        num_scalar_prefetch, in_specs = 2, [hbm_spec, weights_spec]
+        operands = (group_sizes, group_offset, lhs, rhs_weights)
+
     return pl.pallas_call(
-        functools.partial(kernel_main, cfgs=cfgs),
+        kernel,
         out_shape=out_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
-            in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
-                WeightsRef(
-                    weight=pl.BlockSpec(memory_space=pltpu.HBM),
-                    scale=rhs_scale_spec,
-                    bias=rhs_bias_spec,
-                ),
-            ],
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            num_scalar_prefetch=num_scalar_prefetch,
+            in_specs=in_specs,
+            out_specs=hbm_spec,
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
@@ -1987,4 +2027,4 @@ def gmm_v2(
         name=get_scope_name(cfgs),
         cost_estimate=get_cost_estimate(cfgs),
         metadata=get_metadata(cfgs),
-    )(group_sizes, group_offset, lhs, rhs_weights)[:size_m, : cfgs.out_size_n]
+    )(*operands)[:size_m, : cfgs.out_size_n]
