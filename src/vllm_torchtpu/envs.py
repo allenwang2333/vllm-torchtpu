@@ -2010,7 +2010,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ring, so XLA stages it with an async copy that its memory-space assignment can
     # start under the collectives / latency-bound ops before the call (steer with
     # --xla_tpu_preferred_prefetch_overrides on the f8e4m3fn[1,1024,6144] operand,
-    # operand_number 4). Bitwise the ring path.
+    # operand_number 4). Bitwise the ring path. Measured on the GLM-5.2 TP16 x DCP8
+    # mirror twin (t6-prefetch, 2026-10-22): the kernel is 0.5-1 us faster, but the extra
+    # 6 MB VMEM prefetch displaces the next layer's q_a/kv_a prefetch (b1 skip layer
+    # +7 us) and slows the MoE kernel (b4/b8): -4.9% / -1.7% / -1.0% step. Keep off.
     "TPU_FUSED_OPROJ_AR_VMEM_W": env_bool("TPU_FUSED_OPROJ_AR_VMEM_W"),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
@@ -2098,6 +2101,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # streamed on the critical path (q_b 16.8 MB at TP16 x DCP8 decode). Steer the
     # copy with --xla_tpu_preferred_prefetch_overrides (custom-call operand 3).
     # Takes precedence over TPU_FP8_SKINNY_HBM_PIN_SITES. Bit-identical outputs.
+    # Measured on the GLM-5.2 TP16 x DCP8 mirror twin (t6-prefetch, 2026-10-22): q_b's
+    # kernel drops from ~7 to 2.5 us, but XLA never starts the 16.8 MB copy before the
+    # q_a/kv_a fusion that precedes it (also with prefetch_eagerness 1.0 and with
+    # --xla_tpu_scoped_vmem_limit_kib 24576 / 16384), so ~6 us of it is exposed in a
+    # copy wait: -0.6% to -5% per step. Keep off.
     "TPU_FP8_SKINNY_VMEM_SITES": env_str("TPU_FP8_SKINNY_VMEM_SITES", ""),
     # MoE router logits (the bf16 gate GEMM, [T, hidden] x [E, hidden]^T) of a layer
     # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
