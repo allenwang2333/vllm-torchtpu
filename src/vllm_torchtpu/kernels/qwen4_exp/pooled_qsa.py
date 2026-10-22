@@ -13,6 +13,7 @@
 # limitations under the License.
 """QSA over one donated pool, with independent group-native block tables."""
 
+import functools
 import math
 
 import jax
@@ -20,9 +21,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
-from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
-from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    TopKBackend,
+)
+from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_index_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
     _token_metadata,
@@ -53,7 +55,8 @@ def _write_main_cache_universal(pool, rows, page, logical, valid):
     tile = 128
 
     if len(rows) % tile or pool.shape[1] % tile:
-        return pool.at[page, logical % pool.shape[1]].set(rows, mode="drop")
+        safe_page = jnp.where(valid, page, pool.shape[0])
+        return pool.at[safe_page, logical % pool.shape[1]].set(rows, mode="drop")
 
     offsets = logical % pool.shape[1]
     pages_by_tile = page.reshape(-1, tile)
@@ -270,6 +273,13 @@ def write_main_cache(
     )
 
 
+def _compressed_rows(ratio):
+    # Each128-original-token logical block must contain complete BF16 pairs.
+    if ratio < 1 or ratio & (ratio - 1) or 128 % ratio or (128 // ratio) % 2:
+        raise ValueError("QSA ratio must divide128 into an even number of BF16 groups")
+    return 128 // ratio
+
+
 def write_compressed(pool, keys, complete, req, logical, starts, context, table, ratio):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
@@ -277,6 +287,9 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     BF16 row needs a read/modify/write; the last completion in each pair owns
     that write and includes both new rows when both completed this step.
     """
+    _compressed_rows(ratio)
+    if len(keys) == 0:
+        return pool
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     pairs_per_page = math.prod(pool.shape[1:-1]) // packing
@@ -462,10 +475,14 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     pair = pair.astype(jnp.int32)
     write = write.astype(jnp.int32)
     mask = mask.astype(jnp.int32)
-    # The compiler prefetches the rows operand into SMEM. A 4K-token step
-    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
-    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
-    max_rows = max(1, (512 * 1024) // bytes_per_token)
+    # Scalar prefetch contains index, active and two mask words per query;
+    # values use the VMEM BlockSpec above. Match the shared metadata reserve,
+    # retaining half of SMEM for pipeline/compiler state.512 bounds scan work,
+    # not a chip capacity or the size of the BF16 values operand.
+    scalar_budget = (pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024) // 2
+    max_rows = scalar_budget // (4 * jnp.dtype(jnp.int32).itemsize)
+    if max_rows < 1:
+        raise ValueError("QSA pair metadata exceeds the scalar-prefetch budget")
     chunk_size = min(len(keys), 512, 1 << (max_rows.bit_length() - 1))
     if len(keys) <= chunk_size:
         view = update(view, pair, write, mask, values)
@@ -496,10 +513,11 @@ def select_blocks(
     *,
     ratio,
     block_topk,
+    topk_backend: TopKBackend | None = None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
     width = pool.shape[-1]
-    rows = 128 // ratio
+    rows = _compressed_rows(ratio)
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     physical_pages = (
         math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
@@ -512,79 +530,18 @@ def select_blocks(
             -1
         )
 
-    def select_chunk(q, lens, pages):
-        batch = len(q)
-        expanded = expand_pages(pages).reshape(batch, -1)
-        return streamindex_topk(
-            jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1]))),
-            jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
-            cache,
-            lens,
-            expanded.reshape(-1),
-            jnp.arange(batch + 1, dtype=jnp.int32),
-            jnp.full((3,), batch, jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=256 // rows,
-            num_queries_per_block=1,
-            decode_req_batch_size=8 if batch >= 8 else 4,
-            enable_early_exit=True,
-            components=qsa_indexing(),
-        )
-
-    if len(query) > len(context):
-        # Present prefill as its native ragged request batch. The previous path
-        # treated every query as a one-token decode sequence, so every row
-        # reloaded the same KV history and ran an M=1 score matmul. BQ128 reuses
-        # each KV tile across neighboring queries; chunking overlaps chunk g's
-        # SparseCore top-k with chunk g+1's TensorCore scoring.
-        query_lens = starts[1:] - starts[:-1]
-        num_seqs = jnp.max(
-            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
-        )
-        seq_lens = context + query_lens
-        chunk_tokens = 512 if len(query) % 512 == 0 else None
-        return streamindex_topk(
-            jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
-            jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
-            cache,
-            seq_lens,
-            expand_pages(table),
-            starts,
-            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
-            k=block_topk,
-            compression_ratio=ratio,
-            num_kv_pages_per_block=(256 // rows,) * 3,
-            num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=8,
-            enable_early_exit=True,
-            chunk_tokens=chunk_tokens,
-            components=qsa_indexing(ratio - 1),
-        )
-
-    pages_per_query = table.shape[1] * logical_pages
-    chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
-    if len(query) <= chunk_size:
-        return select_chunk(query, lengths, table[req])
-
-    padding = (-len(query)) % chunk_size
-    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
-    lens = jnp.pad(lengths, (0, padding))
-    request_ids = jnp.pad(req, (0, padding))
-    chunks = (
-        q.reshape(-1, chunk_size, *q.shape[1:]),
-        lens.reshape(-1, chunk_size),
-        request_ids.reshape(-1, chunk_size),
+    return select_index_blocks(
+        query,
+        cache,
+        lengths,
+        expand_pages(table).reshape(len(table), -1),
+        req,
+        starts=starts,
+        context=context,
+        ratio=ratio,
+        block_topk=block_topk,
+        topk_backend=topk_backend,
     )
-    _, selected = jax.lax.scan(
-        lambda carry, inputs: (
-            carry,
-            select_chunk(inputs[0], inputs[1], table[inputs[2]]),
-        ),
-        None,
-        chunks,
-    )
-    return selected.reshape(-1, block_topk)[: len(query)]
 
 
 def pooled_qsa_step(
@@ -610,6 +567,8 @@ def pooled_qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    *,
+    topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -636,7 +595,9 @@ def pooled_qsa_step(
         logical,
         valid,
     )
-    ring_rows = math.ceil(compress_ratio / 8) * 8
+    # The persistent ring/tag ABI pads request rows to eight logical lanes;
+    # VMEM padding of those typed views is independently handled by lowering.
+    ring_rows = (compress_ratio + 7) // 8 * 8
     ring_elements = ring_rows * raw.shape[-1]
     ring, tags = read_ring_and_tags(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
@@ -681,6 +642,7 @@ def pooled_qsa_step(
         context,
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        topk_backend=topk_backend,
     )
     output, pool = qsa_attention(
         q,
@@ -700,3 +662,8 @@ def pooled_qsa_step(
         output.reshape(len(q), -1),
         selected_tokens(blocks, lengths, token_topk, compress_ratio),
     )
+
+
+# Bind the protocol object outside the Torch schema: jax_op accepts only POD
+# static arguments. Factories may bind a different immutable backend with partial.
+pooled_qsa_step = functools.partial(pooled_qsa_step, topk_backend=None)

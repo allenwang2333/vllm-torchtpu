@@ -20,6 +20,10 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+)
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 
 
@@ -37,9 +41,21 @@ def decode_query_chunk_size(pages_per_query: int) -> int:
     return min(512, 1 << (queries.bit_length() - 1))
 
 
-@functools.partial(jax.jit, static_argnames=("compress_ratio", "block_topk"))
+@functools.partial(
+    jax.jit, static_argnames=("compress_ratio", "block_topk", "topk_backend")
+)
 def select_decode_blocks(
-    indexq, compressed, lengths, table, request_ids, *, compress_ratio=4, block_topk=512
+    indexq,
+    compressed,
+    lengths,
+    table,
+    request_ids,
+    *,
+    compress_ratio=4,
+    block_topk=512,
+    starts=None,
+    context=None,
+    topk_backend: TopKBackend | None = None,
 ):
     """Return int32[B, block_topk] completed-group IDs with a -1 suffix.
 
@@ -50,8 +66,13 @@ def select_decode_blocks(
     by the table capacity are the caller's contract. Only complete groups enter
     top-k; the attention caller adds the current partial group's tokens.
 
-    Winner order is unspecified. Exact boundary-score ties choose lower group
-    IDs, as in StreamIndex's forward SparseCore compaction.
+    Supplying starts/context enables ragged query-block reuse for T>R;
+    omission retains per-query scheduling. T<=R is always a valid conservative
+    per-query route, including multi-token requests with padded idle slots.
+
+    Winner order is unspecified. The default SparseCore backend chooses lower
+    group IDs at exact boundary-score ties. Alternatives follow TopKBackend's
+    tie contract.
     """
     if indexq.ndim != 3 or indexq.shape[1] < 1 or indexq.shape[2] < 1:
         raise ValueError("decode index query must have shape [B, H, D] with H,D >= 1")
@@ -88,35 +109,105 @@ def select_decode_blocks(
         raise ValueError("block_topk must be a multiple of 16 in [16, 4096]")
 
     cache = compressed.reshape(compressed.shape[0], page_size // 2, 2, -1)
+    return select_index_blocks(
+        indexq,
+        cache,
+        lengths,
+        table,
+        request_ids,
+        starts=starts,
+        context=context,
+        ratio=compress_ratio,
+        block_topk=block_topk,
+        topk_backend=topk_backend,
+    )
+
+
+def select_index_blocks(
+    query,
+    cache,
+    lengths,
+    table,
+    request_ids,
+    *,
+    starts,
+    context,
+    ratio,
+    block_topk,
+    topk_backend: TopKBackend | None = None,
+):
+    """Share ragged query-block reuse and bounded per-query scoring schedules.
+
+    ``cache`` is the reader's BF16 or byte-carrier view; ``table`` addresses
+    those physical pages. Small padded token buckets conservatively use
+    per-query causal lengths, even when a request contains multiple queries.
+    T>padded request capacity is a static scheduling heuristic, not a semantic
+    mode classifier, safety requirement or proven profitability boundary.
+    Per-request starts/context and per-query causal lengths are authoritative.
+    """
+    if topk_backend is None:
+        topk_backend = SparseCoreTopK()
+    page_size = cache.shape[1] * 2
+    query_width = query.shape[-1]
+    query = jnp.pad(query, ((0, 0), (0, 0), (0, cache.shape[-1] - query_width)))
+    scale = query_width**-0.5
+    if (starts is None) != (context is None):
+        raise ValueError("starts and context must be supplied together")
+    if starts is not None and context is not None and len(query) > len(context):
+        query_lens = starts[1:] - starts[:-1]
+        num_seqs = jnp.max(
+            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
+        )
+        return streamindex_topk(
+            query,
+            jnp.full(query.shape[:2], scale, jnp.float32),
+            cache,
+            context + query_lens,
+            table.reshape(-1),
+            starts,
+            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
+            k=block_topk,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=(max(1, 256 // page_size),) * 3,
+            num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=8,
+            enable_early_exit=True,
+            chunk_tokens=512 if len(query) % 512 == 0 else None,
+            components=qsa_indexing(ratio - 1),
+            topk_backend=topk_backend,
+        )
+
+    batch = len(query)
     chunk_size = min(batch, decode_query_chunk_size(table.shape[1]))
 
     def select_chunk(q, lens, req):
         size = len(q)
         return streamindex_topk(
             q,
-            jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
+            jnp.full(q.shape[:2], scale, jnp.float32),
             cache,
             lens,
             table[req].reshape(-1),
             jnp.arange(size + 1, dtype=jnp.int32),
             jnp.full((3,), size, jnp.int32),
             k=block_topk,
-            compression_ratio=compress_ratio,
+            compression_ratio=ratio,
             num_kv_pages_per_block=max(1, 256 // page_size),
             num_queries_per_block=1,
             decode_req_batch_size=8 if size >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            topk_backend=topk_backend,
         )
 
     if batch <= chunk_size:
-        return select_chunk(indexq, lengths, request_ids)
+        return select_chunk(query, lengths, request_ids)
     padding = (-batch) % chunk_size
-    query = jnp.pad(indexq, ((0, padding), (0, 0), (0, 0)))
+    query = jnp.pad(query, ((0, padding), (0, 0), (0, 0)))
     lens = jnp.pad(lengths, (0, padding))
     req = jnp.pad(request_ids, (0, padding))
     chunks = (
-        query.reshape(-1, chunk_size, *indexq.shape[1:]),
+        query.reshape(-1, chunk_size, *query.shape[1:]),
         lens.reshape(-1, chunk_size),
         req.reshape(-1, chunk_size),
     )

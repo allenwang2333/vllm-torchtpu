@@ -24,6 +24,9 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    TopKBackend,
+)
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _token_metadata,
@@ -150,7 +153,14 @@ def qsa_attention(
     k_scale=1.0,
     v_scale=1.0,
 ):
-    """Use block reuse for prefill and fused decode within its supported envelope."""
+    """Use query-block reuse for large buckets, per-query attention otherwise.
+
+    T<=request capacity can include multi-token prefill. Each row still uses
+    its own request table, selected groups and causal length on that route.
+    T>padded request capacity is a static scheduling heuristic, not a semantic
+    mode classifier, safety requirement or proven profitability boundary.
+    Per-request starts/context and per-query causal lengths are authoritative.
+    """
     if len(query) > len(starts) - 1:
         from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
             block_sparse_gqa_attention,
@@ -196,12 +206,10 @@ def qsa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-    from vllm_torchtpu.kernels.sparse_gqa_decode import (
-        is_supported_by_fused_decode,
-        qsa_decode_attention,
-    )
+    from vllm_torchtpu.kernels.sparse_gqa_decode import plan_decode
+    from vllm_torchtpu.kernels.sparse_gqa_decode.decode import execute_decode
 
-    if is_supported_by_fused_decode(
+    launch = plan_decode(
         query,
         gate,
         blocks,
@@ -212,16 +220,16 @@ def qsa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
-    ):
-        return qsa_decode_attention(
+    )
+    if launch is not None:
+        return execute_decode(
             query,
             gate,
             blocks,
             lengths,
             table,
             cache,
-            kv_heads=kv_heads,
-            ratio=ratio,
+            launch=launch,
             k_scale=k_scale,
             v_scale=v_scale,
         )
@@ -265,6 +273,8 @@ def qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    *,
+    topk_backend: TopKBackend | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     if len(qgate) == 0:
         return (
@@ -312,6 +322,9 @@ def qsa_step(
         req,
         compress_ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        starts=starts,
+        context=context,
+        topk_backend=topk_backend,
     )
     # Keep the persistent owner in RPA's native dtype. Full-cache uint8/FP8
     # bitcast-converts lower to HBM reads/writes even when layouts match.
@@ -346,3 +359,8 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
             jnp.arange(len(blocks)), count * compress_ratio + tail
         ].set(jnp.where(token < lengths, token, -1))
     return selected
+
+
+# Bind the protocol object outside the Torch schema: jax_op accepts only POD
+# static arguments. Factories may bind a different immutable backend with partial.
+qsa_step = functools.partial(qsa_step, topk_backend=None)
