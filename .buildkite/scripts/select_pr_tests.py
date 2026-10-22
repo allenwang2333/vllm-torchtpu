@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Diff-aware PR test selection and YAML step filter for Buildkite CI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_TEST_PATTERN = "tests/**/{test_*,*_test}.py"
+
+ALL_PR_TEST_STEPS: tuple[str, ...] = (
+    "typecheck_full",
+    "unit_tests_cpu_pr",
+    "unit_tests_general_pr",
+    "unit_tests_multichip_pr",
+    "unit_tests_spec_decode_pr",
+    "unit_tests_spec_decode_multichip_pr",
+    "unit_tests_omni_pr",
+)
+
+ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
+    "integration_qwen35_pcp4_dp4_disagg_correctness",
+    "integration_disagg_correctness",
+    "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+    "integration_dcp_correctness",
+    "presubmit_disagg_single_host",
+    "integration_qwen35_apc_correctness",
+    "integration_qwen35_gpc_global_dram_pool",
+    "integration_compilation_cache_e2e",
+    "integration_k3_pruned75_apc_offload_correctness",
+    "vllm_torchtpu_multihost_presubmit",
+    "integration_qwen35_pcp8_dp8_disagg_correctness",
+    "integration_qwen35_gpc_correctness",
+)
+
+DISAGG_KV_INTEGRATION_STEPS: frozenset[str] = frozenset(
+    {
+        "integration_qwen35_pcp4_dp4_disagg_correctness",
+        "integration_disagg_correctness",
+        "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+        "integration_dcp_correctness",
+        "presubmit_disagg_single_host",
+        "integration_qwen35_pcp8_dp8_disagg_correctness",
+        "integration_qwen35_gpc_correctness",
+        "integration_qwen35_gpc_global_dram_pool",
+    }
+)
+
+K3_OFFLOAD_INTEGRATION_STEPS: frozenset[str] = frozenset(
+    {"integration_k3_pruned75_apc_offload_correctness"}
+)
+
+INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
+    "scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh": (
+        frozenset(
+            {
+                "integration_qwen35_pcp4_dp4_disagg_correctness",
+                "integration_disagg_correctness",
+            }
+        )
+    ),
+    "scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh": (
+        frozenset(
+            {
+                "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+                "integration_dcp_correctness",
+            }
+        )
+    ),
+    "examples/disagg/run_disagg_single_host.sh": frozenset(
+        {"presubmit_disagg_single_host", "integration_disagg_correctness"}
+    ),
+    "examples/disagg/toy_proxy_server.py": frozenset(
+        {"presubmit_disagg_single_host", "integration_disagg_correctness"}
+    ),
+    "scripts/vllm/integration/run_qwen35_apc_correctness.sh": frozenset(
+        {"integration_qwen35_apc_correctness"}
+    ),
+    "scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh": frozenset(
+        {"integration_qwen35_gpc_global_dram_pool"}
+    ),
+    "scripts/vllm/integration/run_compilation_cache_e2e.sh": frozenset(
+        {"integration_compilation_cache_e2e"}
+    ),
+    "scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh": (
+        frozenset({"integration_k3_pruned75_apc_offload_correctness"})
+    ),
+    "scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh": (
+        frozenset({"integration_qwen35_pcp8_dp8_disagg_correctness"})
+    ),
+    ".buildkite/kubernetes/manifests/qwen3.5-p8d8-disagg.yaml": frozenset(
+        {"integration_qwen35_pcp8_dp8_disagg_correctness"}
+    ),
+    "scripts/vllm/integration/run_qwen35_gpc_correctness.sh": frozenset(
+        {"integration_qwen35_gpc_correctness"}
+    ),
+    ".buildkite/kubernetes/manifests/qwen3.5-gpc-two-replica.yaml": frozenset(
+        {"integration_qwen35_gpc_correctness"}
+    ),
+    "examples/offline_inference.py": frozenset({"vllm_torchtpu_multihost_presubmit"}),
+    ".buildkite/scripts/run_multihost_presubmit.sh": frozenset(
+        {"vllm_torchtpu_multihost_presubmit"}
+    ),
+    ".buildkite/kubernetes/manifests/ray-multihost.yaml": frozenset(
+        {"vllm_torchtpu_multihost_presubmit"}
+    ),
+    ".buildkite/kubernetes/run_multihost.sh": frozenset(
+        {
+            "vllm_torchtpu_multihost_presubmit",
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_gpc_correctness",
+        }
+    ),
+}
+
+CPU_TESTED_BENCHMARK_FILES: frozenset[str] = frozenset(
+    {
+        "scripts/vllm/benchmarking/run_benchmark_suite.py",
+        "scripts/vllm/benchmarking/verify_regression.py",
+    }
+)
+
+NIGHTLY_ONLY_INTEGRATION_EXACT: frozenset[str] = frozenset(
+    {
+        "scripts/vllm/integration/test_accuracy.py",
+        "scripts/vllm/integration/test_serving_performance.py",
+        "scripts/vllm/integration/pcp_disagg_test.sh",
+        "scripts/vllm/integration/run_dsv4_offload_correctness.sh",
+        "scripts/vllm/integration/run_dsv4_pd_disagg_correctness.sh",
+        "scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh",
+        "scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh",
+        ".buildkite/kubernetes/manifests/dsv4-pd-disagg.yaml",
+        ".buildkite/kubernetes/manifests/workloads/dsv4-pd-disagg.yaml",
+    }
+)
+
+NIGHTLY_ONLY_INTEGRATION_PREFIXES: tuple[str, ...] = (
+    "scripts/vllm/integration/mm/",
+    "scripts/vllm/integration/spec_decode/",
+    "scripts/vllm/integration/structured_outputs/",
+)
+
+NON_PR_BUILDKITE_PREFIXES: tuple[str, ...] = (
+    ".buildkite/features/",
+    ".buildkite/models/",
+    ".buildkite/parallelism/",
+    ".buildkite/quantization/",
+    ".buildkite/rl/",
+    ".buildkite/kernel_microbenchmarks/",
+)
+
+NON_PR_BUILDKITE_EXACT: frozenset[str] = frozenset(
+    {
+        ".buildkite/pipeline_perf.yml",
+        ".buildkite/pipeline_perf_kube.yml",
+        ".buildkite/pipeline_promote.yml",
+        ".buildkite/pipeline_nightly_image.yml",
+        ".buildkite/pipeline_dynamic.yml",
+        ".buildkite/pipeline_dev.yml",
+        ".buildkite/pipeline_k3_sweep.yml",
+        ".buildkite/scripts/bootstrap_dev.sh",
+        ".buildkite/scripts/upload_models_and_features.sh",
+        ".buildkite/scripts/run_support_matrices.sh",
+        ".buildkite/scripts/record_step_result.sh",
+        ".buildkite/scripts/generate_support_matrix.sh",
+        ".buildkite/scripts/check_results.sh",
+        ".buildkite/scripts/update_lkg_version.sh",
+        ".buildkite/scripts/publish_nightly_images.sh",
+        ".buildkite/kubernetes/manifests/kimi-k3-agentx-1p1d.yaml",
+        ".buildkite/kubernetes/manifests/workloads/kimi-k3-agentx-1p1d.yaml",
+        ".buildkite/kubernetes/k3_1p1d.sh",
+        ".buildkite/kubernetes/k3_agentx_client_pod.sh",
+        ".buildkite/scripts/k3_agentx_client_pod.sh",
+        ".buildkite/scripts/build_k3_engine_image.sh",
+    }
+)
+
+SPEC_DECODE_TEST_FILE = "tests/entrypoints/llm/test_speculative_decoding.py"
+
+
+@dataclass
+class SelectionPlan:
+    """Computed lane and step selection for a PR diff."""
+
+    skip_all_ci: bool = False
+    skip_all_reason: str = ""
+    lanes: tuple[str, ...] = ("verify", "integration", "tests")
+    omni_image_skip: str = ""
+    skip_steps: dict[str, str] = field(default_factory=dict)
+    general_test_pattern: str = DEFAULT_TEST_PATTERN
+    general_test_parallelism: int = 3
+    multichip_test_pattern: str = DEFAULT_TEST_PATTERN
+    annotation: str = ""
+
+
+def _is_doc_or_non_pr_file(path: str) -> bool:
+    if path.endswith((".md", ".ico", ".png")):
+        return True
+    if path in {
+        "README",
+        "LICENSE",
+        "mkdocs.yml",
+        ".github/CODEOWNERS",
+        ".git-blame-ignore-revs",
+        ".pyrefly-baseline.json",
+        "verified_commit_hashes.csv",
+    }:
+        return True
+    if path.startswith(("docs/", ".github/", "support_matrices/")):
+        return True
+    if path.startswith(NON_PR_BUILDKITE_PREFIXES):
+        return True
+    if path in NON_PR_BUILDKITE_EXACT:
+        return True
+    if path in NIGHTLY_ONLY_INTEGRATION_EXACT:
+        return True
+    if path.startswith(NIGHTLY_ONLY_INTEGRATION_PREFIXES):
+        return True
+    return (
+        path.startswith(("scripts/vllm/benchmarking/", "scripts/vllm/benchmarks/"))
+        and path not in CPU_TESTED_BENCHMARK_FILES
+    )
+
+
+def _is_cpu_only_file(path: str) -> bool:
+    if path in {
+        ".pyrefly-baseline-full.json",
+        ".pre-commit-config.yaml",
+    }:
+        return True
+    if path.startswith(".buildkite/scripts/") and path.endswith(".py"):
+        return True
+    if path in CPU_TESTED_BENCHMARK_FILES:
+        return True
+    return path.startswith(("tools/", "tests/scripts/", "tests/tools/"))
+
+
+def _is_omni_file(path: str) -> bool:
+    return path.startswith(
+        (
+            "src/vllm_torchtpu/omni/",
+            "src/vllm_torchtpu/kernels/diffusion_attention/",
+            "tests_omni/",
+            "tests/omni/",
+        )
+    )
+
+
+def _classify_unit_test_file(
+    rel_path: str, repo_root: Path = REPO_ROOT
+) -> tuple[bool, bool]:
+    """Returns (has_tpu_general, has_multichip) for a unit test file."""
+    full_path = repo_root / rel_path
+    if not full_path.is_file():
+        return (True, True)
+    try:
+        content = full_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return (True, True)
+    has_multichip = bool(re.search(r"\bmultichip\b", content))
+    has_tpu = bool(re.search(r"\btpu_test\b", content))
+    return (has_tpu or not has_multichip, has_multichip)
+
+
+def _is_cpu_only_unit_test(rel_path: str, repo_root: Path = REPO_ROOT) -> bool:
+    full_path = repo_root / rel_path
+    if not full_path.is_file():
+        return False
+    try:
+        content = full_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return not bool(re.search(r"\b(tpu_test|multichip)\b", content))
+
+
+def _format_brace_pattern(files: list[str]) -> str:
+    unique = sorted(set(files))
+    if not unique:
+        return DEFAULT_TEST_PATTERN
+    if len(unique) == 1:
+        return unique[0]
+    return "{" + ",".join(unique) + "}"
+
+
+def _finalize_plan(
+    run_test_steps: set[str],
+    run_integration_steps: set[str],
+    reason: str,
+    general_test_pattern: str = DEFAULT_TEST_PATTERN,
+    general_test_parallelism: int = 3,
+    multichip_test_pattern: str = DEFAULT_TEST_PATTERN,
+) -> SelectionPlan:
+    lanes = ["verify"]
+    if run_integration_steps:
+        lanes.append("integration")
+    if run_test_steps:
+        lanes.append("tests")
+
+    skip_steps: dict[str, str] = {}
+    if run_test_steps:
+        for step in ALL_PR_TEST_STEPS:
+            if step not in run_test_steps:
+                skip_steps[step] = reason[:70]
+    if run_integration_steps:
+        for step in ALL_PR_INTEGRATION_STEPS:
+            if step not in run_integration_steps:
+                skip_steps[step] = reason[:70]
+
+    omni_image_skip = ""
+    if "unit_tests_omni_pr" not in run_test_steps:
+        omni_image_skip = "No Omni changes in this PR."
+
+    skipped_count = len(skip_steps)
+    dropped_lanes = [lane for lane in ("integration", "tests") if lane not in lanes]
+    summary_parts = [f"lanes: `{' '.join(lanes)}`"]
+    if dropped_lanes:
+        summary_parts.append(f"skipped lanes: `{', '.join(dropped_lanes)}`")
+    if skipped_count:
+        summary_parts.append(f"skipped {skipped_count} step(s)")
+    if general_test_pattern != DEFAULT_TEST_PATTERN:
+        summary_parts.append(
+            f"general pattern: `{general_test_pattern}` "
+            f"(parallelism={general_test_parallelism})"
+        )
+    if multichip_test_pattern != DEFAULT_TEST_PATTERN:
+        summary_parts.append(f"multichip pattern: `{multichip_test_pattern}`")
+
+    annotation = (
+        f"Diff-aware PR test selection ({reason}): " + "; ".join(summary_parts) + "."
+    )
+    return SelectionPlan(
+        skip_all_ci=False,
+        lanes=tuple(lanes),
+        omni_image_skip=omni_image_skip,
+        skip_steps=skip_steps,
+        general_test_pattern=general_test_pattern,
+        general_test_parallelism=general_test_parallelism,
+        multichip_test_pattern=multichip_test_pattern,
+        annotation=annotation,
+    )
+
+
+def select_for_files(
+    changed_files: list[str], repo_root: Path = REPO_ROOT
+) -> SelectionPlan:
+    """Computes the PR test selection plan for a list of changed file paths."""
+    files = [f.strip() for f in changed_files if f.strip()]
+    if not files:
+        return SelectionPlan()
+
+    active_files = [f for f in files if not _is_doc_or_non_pr_file(f)]
+    if not active_files:
+        return SelectionPlan(
+            skip_all_ci=True,
+            skip_all_reason=(
+                "Only docs, benchmarks, or non-PR workflow/config files changed."
+            ),
+            lanes=(),
+        )
+
+    for f in active_files:
+        if (
+            f == "pyproject.toml"
+            or f.startswith("docker/")
+            or f
+            in {
+                ".buildkite/pipeline_build.yml",
+                ".buildkite/pipeline_verify.yml",
+                ".buildkite/pipeline_verify_kube.yml",
+                ".buildkite/scripts/bootstrap.sh",
+                ".buildkite/scripts/configs/pipeline_config.sh",
+                ".buildkite/scripts/setup_docker_env.sh",
+                ".buildkite/kubernetes/run.sh",
+                ".buildkite/kubernetes/common.sh",
+            }
+        ):
+            return SelectionPlan()
+
+    run_test_steps: set[str] = set()
+    run_integration_steps: set[str] = set()
+    general_test_files: list[str] = []
+    multichip_test_files: list[str] = []
+    full_general_tests = False
+    full_multichip_tests = False
+    reasons: list[str] = []
+
+    for f in active_files:
+        if _is_cpu_only_file(f):
+            run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
+            reasons.append("CPU/tooling changes")
+            continue
+
+        if _is_omni_file(f):
+            run_test_steps.update(
+                {"typecheck_full", "unit_tests_cpu_pr", "unit_tests_omni_pr"}
+            )
+            reasons.append("Omni changes")
+            continue
+
+        if f in INTEGRATION_FILE_TO_STEPS:
+            run_integration_steps.update(INTEGRATION_FILE_TO_STEPS[f])
+            if f.endswith(".py"):
+                run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
+            reasons.append("integration script/manifest changes")
+            continue
+
+        if f in {
+            ".buildkite/pipeline_integration.yml",
+            ".buildkite/pipeline_integration_kube.yml",
+        }:
+            run_integration_steps.update(ALL_PR_INTEGRATION_STEPS)
+            reasons.append("integration pipeline YAML changes")
+            continue
+
+        if f in {
+            ".buildkite/pipeline_tests.yml",
+            ".buildkite/pipeline_tests_kube.yml",
+        }:
+            run_test_steps.update(ALL_PR_TEST_STEPS)
+            full_general_tests = True
+            full_multichip_tests = True
+            reasons.append("tests pipeline YAML changes")
+            continue
+
+        if f.startswith("tests/"):
+            run_test_steps.update({"typecheck_full", "unit_tests_cpu_pr"})
+            if f == SPEC_DECODE_TEST_FILE:
+                run_test_steps.update(
+                    {
+                        "unit_tests_spec_decode_pr",
+                        "unit_tests_spec_decode_multichip_pr",
+                    }
+                )
+                reasons.append("spec-decode unit test changes")
+            elif f == "tests/conftest.py" or not (
+                Path(f).name.startswith("test_") or Path(f).name.endswith("_test.py")
+            ):
+                run_test_steps.update(
+                    {
+                        "unit_tests_general_pr",
+                        "unit_tests_multichip_pr",
+                        "unit_tests_spec_decode_pr",
+                        "unit_tests_spec_decode_multichip_pr",
+                    }
+                )
+                full_general_tests = True
+                full_multichip_tests = True
+                reasons.append("shared test fixture changes")
+            elif _is_cpu_only_unit_test(f, repo_root):
+                reasons.append("CPU unit test changes")
+            else:
+                has_gen, has_multi = _classify_unit_test_file(f, repo_root)
+                if has_gen:
+                    run_test_steps.add("unit_tests_general_pr")
+                    general_test_files.append(f)
+                if has_multi:
+                    run_test_steps.add("unit_tests_multichip_pr")
+                    multichip_test_files.append(f)
+                reasons.append("TPU unit test changes")
+            continue
+
+        if f.startswith("src/vllm_torchtpu/spec_decode/"):
+            run_test_steps.update(
+                {
+                    "typecheck_full",
+                    "unit_tests_cpu_pr",
+                    "unit_tests_general_pr",
+                    "unit_tests_multichip_pr",
+                    "unit_tests_spec_decode_pr",
+                    "unit_tests_spec_decode_multichip_pr",
+                }
+            )
+            full_general_tests = True
+            full_multichip_tests = True
+            reasons.append("spec_decode module changes")
+            continue
+
+        if f.startswith(
+            (
+                "src/vllm_torchtpu/tracing/",
+                "src/vllm_torchtpu/structured_decoding/",
+                "src/vllm_torchtpu/models/vllm/deepseek_v4/",
+                "src/vllm_torchtpu/kernels/deepseek_v4/",
+                "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/",
+                "src/vllm_torchtpu/kernels/experimental/",
+                "src/vllm_torchtpu/models/vllm/qwen4_exp/",
+            )
+        ):
+            run_test_steps.update(
+                {
+                    "typecheck_full",
+                    "unit_tests_cpu_pr",
+                    "unit_tests_general_pr",
+                    "unit_tests_multichip_pr",
+                }
+            )
+            full_general_tests = True
+            full_multichip_tests = True
+            reasons.append("isolated model/feature module changes")
+            continue
+
+        if f.startswith(
+            (
+                "src/vllm_torchtpu/models/vllm/kimi_k3/",
+                "src/vllm_torchtpu/kernels/mla/",
+                "src/vllm_torchtpu/offload/",
+            )
+        ):
+            run_test_steps.update(
+                {
+                    "typecheck_full",
+                    "unit_tests_cpu_pr",
+                    "unit_tests_general_pr",
+                    "unit_tests_multichip_pr",
+                }
+            )
+            run_integration_steps.update(K3_OFFLOAD_INTEGRATION_STEPS)
+            full_general_tests = True
+            full_multichip_tests = True
+            reasons.append("Kimi-K3/MLA/offload module changes")
+            continue
+
+        if f.startswith("src/vllm_torchtpu/distributed/kv_transfer/"):
+            run_test_steps.update(
+                {
+                    "typecheck_full",
+                    "unit_tests_cpu_pr",
+                    "unit_tests_general_pr",
+                    "unit_tests_multichip_pr",
+                }
+            )
+            run_integration_steps.update(DISAGG_KV_INTEGRATION_STEPS)
+            full_general_tests = True
+            full_multichip_tests = True
+            reasons.append("KV-transfer module changes")
+            continue
+
+        run_test_steps.update(
+            {
+                "typecheck_full",
+                "unit_tests_cpu_pr",
+                "unit_tests_general_pr",
+                "unit_tests_multichip_pr",
+                "unit_tests_spec_decode_pr",
+                "unit_tests_spec_decode_multichip_pr",
+            }
+        )
+        run_integration_steps.update(ALL_PR_INTEGRATION_STEPS)
+        full_general_tests = True
+        full_multichip_tests = True
+        reasons.append("core runtime changes")
+
+    general_pattern = DEFAULT_TEST_PATTERN
+    general_parallelism = 3
+    if (
+        "unit_tests_general_pr" in run_test_steps
+        and not full_general_tests
+        and general_test_files
+    ):
+        general_pattern = _format_brace_pattern(general_test_files)
+        general_parallelism = min(3, len(set(general_test_files)))
+
+    multichip_pattern = DEFAULT_TEST_PATTERN
+    if (
+        "unit_tests_multichip_pr" in run_test_steps
+        and not full_multichip_tests
+        and multichip_test_files
+    ):
+        multichip_pattern = _format_brace_pattern(multichip_test_files)
+
+    unique_reasons = list(dict.fromkeys(reasons))
+    reason_str = ", ".join(unique_reasons[:2]) if unique_reasons else "PR diff"
+    if len(unique_reasons) > 2:
+        reason_str += f" (+{len(unique_reasons) - 2} more)"
+
+    return _finalize_plan(
+        run_test_steps=run_test_steps,
+        run_integration_steps=run_integration_steps,
+        reason=f"Skipped: only {reason_str}."[:70],
+        general_test_pattern=general_pattern,
+        general_test_parallelism=general_parallelism,
+        multichip_test_pattern=multichip_pattern,
+    )
+
+
+def filter_yaml_content(
+    yaml_text: str,
+    skip_steps: dict[str, str],
+    general_test_pattern: str = DEFAULT_TEST_PATTERN,
+    general_test_parallelism: int = 3,
+    multichip_test_pattern: str = DEFAULT_TEST_PATTERN,
+) -> str:
+    """Injects `skip:` and narrowed `test-file-pattern:` into a pipeline YAML."""
+    if (
+        not skip_steps
+        and general_test_pattern == DEFAULT_TEST_PATTERN
+        and general_test_parallelism == 3
+        and multichip_test_pattern == DEFAULT_TEST_PATTERN
+    ):
+        return yaml_text
+
+    key_re = re.compile(r'^(?P<indent>[ \t]*)key:[ \t]*"(?P<key>[^"]+)"[ \t]*$')
+    parallelism_re = re.compile(r"^(?P<indent>[ \t]*)parallelism:[ \t]*\d+[ \t]*$")
+    plugin_defaults_re = re.compile(
+        r"^(?P<indent>[ \t]*)<<:[ \t]*\*tests_plugin_defaults[ \t]*$"
+    )
+
+    current_key: str | None = None
+    out_lines: list[str] = []
+
+    for line in yaml_text.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        eol = line[len(stripped) :] or "\n"
+
+        m_key = key_re.match(stripped)
+        if m_key:
+            current_key = m_key.group("key")
+            out_lines.append(line)
+            if current_key in skip_steps:
+                indent = m_key.group("indent")
+                reason = skip_steps[current_key][:70]
+                out_lines.append(f"{indent}skip: {json.dumps(reason)}{eol}")
+            continue
+
+        if current_key == "unit_tests_general_pr" and general_test_parallelism != 3:
+            m_par = parallelism_re.match(stripped)
+            if m_par:
+                indent = m_par.group("indent")
+                out_lines.append(
+                    f"{indent}parallelism: {general_test_parallelism}{eol}"
+                )
+                continue
+
+        if current_key in {"unit_tests_general_pr", "unit_tests_multichip_pr"}:
+            m_plug = plugin_defaults_re.match(stripped)
+            if m_plug:
+                out_lines.append(line)
+                pattern = (
+                    general_test_pattern
+                    if current_key == "unit_tests_general_pr"
+                    else multichip_test_pattern
+                )
+                if pattern and pattern != DEFAULT_TEST_PATTERN:
+                    indent = m_plug.group("indent")
+                    out_lines.append(
+                        f"{indent}test-file-pattern: {json.dumps(pattern)}{eol}"
+                    )
+                continue
+
+        out_lines.append(line)
+
+    return "".join(out_lines)
+
+
+def format_shell(plan: SelectionPlan) -> str:
+    """Formats SelectionPlan as bash assignments for `eval` in bootstrap.sh."""
+    lines = [
+        f"PR_SKIP_ALL_CI={shlex.quote('1' if plan.skip_all_ci else '0')}",
+        f"PR_SKIP_ALL_REASON={shlex.quote(plan.skip_all_reason)}",
+        f"PR_SELECTED_LANES={shlex.quote(' '.join(plan.lanes))}",
+        f"OMNI_IMAGE_SKIP={shlex.quote(plan.omni_image_skip)}",
+        f"PR_TEST_SELECTION_ANNOTATION={shlex.quote(plan.annotation)}",
+        (
+            "export PR_SKIP_STEPS_JSON="
+            f"{shlex.quote(json.dumps(plan.skip_steps, sort_keys=True))}"
+        ),
+        (f"export GENERAL_TEST_FILE_PATTERN={shlex.quote(plan.general_test_pattern)}"),
+        (
+            "export GENERAL_TEST_PARALLELISM="
+            f"{shlex.quote(str(plan.general_test_parallelism))}"
+        ),
+        (
+            "export MULTICHIP_TEST_FILE_PATTERN="
+            f"{shlex.quote(plan.multichip_test_pattern)}"
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def run_backtest(num_commits: int, repo_root: Path = REPO_ROOT) -> int:
+    """Backtests selection plans across recent commits on the current branch."""
+    log_out = subprocess.check_output(
+        ["git", "log", f"-n{num_commits}", "--format=%H %s"],
+        cwd=repo_root,
+        text=True,
+    )
+    commits = [line.split(" ", 1) for line in log_out.splitlines() if line.strip()]
+    skip_all = 0
+    narrowed = 0
+    omni_skipped = 0
+    full = 0
+    for sha, subject in commits:
+        diff_out = subprocess.check_output(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", sha],
+            cwd=repo_root,
+            text=True,
+        )
+        files = [f for f in diff_out.splitlines() if f.strip()]
+        plan = select_for_files(files, repo_root)
+        if plan.skip_all_ci:
+            skip_all += 1
+        elif (
+            plan.lanes != ("verify", "integration", "tests")
+            or len(plan.skip_steps) > 1
+            or plan.general_test_pattern != DEFAULT_TEST_PATTERN
+            or plan.multichip_test_pattern != DEFAULT_TEST_PATTERN
+        ):
+            narrowed += 1
+        elif plan.omni_image_skip:
+            omni_skipped += 1
+        else:
+            full += 1
+        print(
+            f"{sha[:8]} | skip_all={plan.skip_all_ci} | "
+            f"lanes={' '.join(plan.lanes) or 'NONE'} | "
+            f"skipped_steps={len(plan.skip_steps)} | {subject[:60]}"
+        )
+    total = len(commits) or 1
+    print(
+        f"\nBacktest summary ({len(commits)} commits): "
+        f"skip_all={skip_all} ({skip_all * 100 // total}%), "
+        f"narrowed_lanes_or_steps={narrowed} ({narrowed * 100 // total}%), "
+        f"omni_skipped={omni_skipped} ({omni_skipped * 100 // total}%), "
+        f"full={full} ({full * 100 // total}%)"
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--shell",
+        action="store_true",
+        help="Emit shell variable assignments from changed files on stdin.",
+    )
+    parser.add_argument(
+        "--filter-yaml",
+        metavar="YAML_FILE",
+        help="Filter a Buildkite pipeline YAML file using exported env vars.",
+    )
+    parser.add_argument(
+        "--backtest",
+        type=int,
+        metavar="N",
+        help="Run a backtest over the last N git commits.",
+    )
+    args = parser.parse_args()
+
+    if args.filter_yaml:
+        yaml_path = Path(args.filter_yaml)
+        yaml_text = yaml_path.read_text(encoding="utf-8")
+        raw_skip = os.environ.get("PR_SKIP_STEPS_JSON", "")
+        skip_steps = json.loads(raw_skip) if raw_skip else {}
+        general_pattern = os.environ.get(
+            "GENERAL_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+        )
+        general_parallelism = int(os.environ.get("GENERAL_TEST_PARALLELISM", "3"))
+        multichip_pattern = os.environ.get(
+            "MULTICHIP_TEST_FILE_PATTERN", DEFAULT_TEST_PATTERN
+        )
+        sys.stdout.write(
+            filter_yaml_content(
+                yaml_text=yaml_text,
+                skip_steps=skip_steps,
+                general_test_pattern=general_pattern,
+                general_test_parallelism=general_parallelism,
+                multichip_test_pattern=multichip_pattern,
+            )
+        )
+        return 0
+
+    if args.backtest:
+        return run_backtest(args.backtest)
+
+    changed_files = [line.strip() for line in sys.stdin if line.strip()]
+    plan = select_for_files(changed_files)
+    if args.shell:
+        print(format_shell(plan))
+    else:
+        print(json.dumps(plan.__dict__, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

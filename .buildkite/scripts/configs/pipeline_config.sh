@@ -40,7 +40,8 @@ export PR_TPU_JOBS_PER_AUTHOR=40
 upload_with_priority() {
   local yaml_file=$1
   local JOB_PRIORITY=$2
-  local capped
+  local config_dir capped
+  config_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   echo "--- :pipeline: Uploading $yaml_file with priority ${JOB_PRIORITY:-$PRIORITY_DEFAULT}"
   # A pull-request build's TPU steps go in its author's concurrency group (set
   # by bootstrap.sh). The file is read once by the agent, so that the group is
@@ -50,7 +51,7 @@ upload_with_priority() {
   if [[ -n "${PR_TPU_CONCURRENCY_GROUP:-}" ]]; then
     if capped=$({
         echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-        cat "$yaml_file";
+        python3 "${config_dir}/../select_pr_tests.py" --filter-yaml "$yaml_file";
       } | buildkite-agent pipeline upload --dry-run --format json \
         | python3 "$(dirname "${BASH_SOURCE[0]}")/../cap_pr_tpu_concurrency.py" \
             "$PR_TPU_CONCURRENCY_GROUP" "$PR_TPU_JOBS_PER_AUTHOR"); then
@@ -61,7 +62,7 @@ upload_with_priority() {
   fi
   {
     echo "priority: ${JOB_PRIORITY:-$PRIORITY_DEFAULT}";
-    cat "$yaml_file";
+    python3 "${config_dir}/../select_pr_tests.py" --filter-yaml "$yaml_file";
   } | buildkite-agent pipeline upload
 }
 
