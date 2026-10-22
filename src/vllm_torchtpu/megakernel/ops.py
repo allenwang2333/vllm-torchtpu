@@ -87,8 +87,8 @@ def rope_partial(
     x1, x2, rest = x[:, :half], x[:, half:rot_dim], x[:, rot_dim:]
     return jnp.concatenate(
         (
-            rnd(rnd(x1 * cos) - rnd(x2 * sin)),
-            rnd(rnd(x2 * cos) + rnd(x1 * sin)),
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin,
             rest,
         ),
         axis=-1,
@@ -96,12 +96,8 @@ def rope_partial(
 
 
 def silu_mul(gate: jax.Array, up: jax.Array) -> jax.Array:
-    """SwiGLU activation `rnd(silu(gate)) * up` rounded to BF16.
-
-    `silu(gate)` is rounded to bfloat16 before multiplying by `up` to match
-    `F.silu(x[..., :d]) * x[..., d:]` evaluated on bfloat16 tensors.
-    """
-    return (rnd(jax.nn.silu(gate)) * up).astype(BF16)
+    """SwiGLU activation `silu(gate) * up` rounded to BF16."""
+    return (jax.nn.silu(gate) * up).astype(BF16)
 
 
 def scope_fn(enabled: bool):
