@@ -874,6 +874,183 @@ def zero_out_end(
     ).wait()
 
 
+#: Whole-expert weight buffers of the decode path; DECODE_SLOTS - 1 experts
+#: are fetched ahead of the one being multiplied.
+DECODE_SLOTS = 3
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class DecodeRefs:
+    """Scratch of the decode path (see `decode_kernel`)."""
+
+    lhs: Any  # [size_m, size_k]
+    lhs_q: Any  # [size_m, size_k] in the lhs quant dtype
+    lhs_scale: Any  # [size_k // lhs quant block, size_m, 1]
+    weight: Any  # [DECODE_SLOTS, size_k, size_n]
+    scale: Any  # [DECODE_SLOTS, 1, 1, size_n]
+    lhs_sem: Any  # DMA[1]
+    weight_sems: Any  # DMA[DECODE_SLOTS]
+    scale_sems: Any  # DMA[DECODE_SLOTS]
+
+
+def use_decode_path(cfgs: GmmConfigs) -> bool:
+    """Whether `kernel_main` runs `decode_kernel` instead of `inner_kernel`.
+
+    Holds when one tile covers every lhs row and a whole expert (single m
+    bucket, single k and n tile) on the lhs-quantized path with one per-column
+    rhs scale block, so each expert is one contiguous weight DMA.
+    """
+    dims, tiles = cfgs.dims, cfgs.tiles
+    lhs_cfgs, rhs_cfgs = cfgs.lhs_cfgs, cfgs.rhs_cfgs
+    return (
+        tiles.tile_m >= dims.size_m
+        and tiles.tile_m == tiles.bucket_base
+        and tiles.tile_k == dims.size_k
+        and tiles.tile_n == cfgs.out_size_n
+        and lhs_cfgs.should_quantize
+        and dims.size_k % lhs_cfgs.quant_block_size == 0
+        and rhs_cfgs.should_dequantize_after_matmul
+        and rhs_cfgs.quant_block_size == dims.size_k
+        and not rhs_cfgs.has_bias
+        and not rhs_cfgs.should_unpack
+        and cfgs.out_size_n % pltpu.get_tpu_info().num_lanes == 0
+    )
+
+
+def decode_kernel(
+    # Out
+    out_ref: jax.Array,  # [size_m, aligned out_size_n], VMEM
+    # Scratch
+    metadata_ref: MetadataRef,
+    dec: DecodeRefs,
+    *,
+    num_gm: jax.Array,
+    lhs_hbm_ref: jax.Array,  # [size_m, size_k]
+    rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
+    cfgs: GmmConfigs,
+):
+    """Whole-call body of a one-step pipeline that only writes the output back.
+
+    lhs is fetched and quantized once for every expert. Each gm tile's expert
+    arrives as one contiguous weight DMA plus one scale DMA through
+    DECODE_SLOTS rotating buffers, and is multiplied over every lhs row, of
+    which the tile's rows are kept in the VMEM-resident output. Each output
+    element sees the same ops in the same order as `inner_kernel`.
+    """
+    dims = cfgs.dims
+    sublane = dims.size_lhs_sublane
+    rows = dims.size_m
+    lookahead = DECODE_SLOTS - 1
+
+    def weight_copy(gm):
+        slot = gm % DECODE_SLOTS
+        group_id = metadata_ref.gm_id_to_group_id[gm]
+        return pltpu.make_async_copy(
+            rhs_hbm_ref.weight.at[group_id],
+            dec.weight.at[slot],
+            dec.weight_sems.at[slot],
+        )
+
+    def scale_copy(gm):
+        slot = gm % DECODE_SLOTS
+        group_id = metadata_ref.gm_id_to_group_id[gm]
+        return pltpu.make_async_copy(
+            rhs_hbm_ref.scale.at[group_id],
+            dec.scale.at[slot],
+            dec.scale_sems.at[slot],
+        )
+
+    def start_fetch(gm):
+        @pl.when(gm < num_gm)
+        def _():
+            weight_copy(gm).start()
+            scale_copy(gm).start()
+
+    lhs_copy = pltpu.make_async_copy(lhs_hbm_ref, dec.lhs, dec.lhs_sem.at[0])
+    lhs_copy.start()
+    for gm in range(lookahead):
+        start_fetch(gm)
+
+    tpu_info = pltpu.get_tpu_info()
+    mxu_size = tpu_info.mxu_column_size
+    lhs_q_dtype = cfgs.lhs_cfgs.quant_dtype
+    q_block_size = cfgs.lhs_cfgs.quant_block_size
+    if jnp.issubdtype(lhs_q_dtype, jnp.floating):
+        dtype_max = float(jnp.finfo(lhs_q_dtype).max)
+        preferred_element_type = jnp.float32
+    else:
+        dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
+        preferred_element_type = jnp.int32
+    acc_dtype = cfgs.acc_dtype
+    rhs_n = dims.size_n
+
+    out_ref[...] = jnp.zeros_like(out_ref)
+
+    lhs_copy.wait()
+    for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
+        block_lhs = dec.lhs[:, pl.ds(start_k, q_block_size)]
+        block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
+        block_scale = block_abs_max / dtype_max
+        block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+        dec.lhs_q[:, pl.ds(start_k, q_block_size)] = (
+            block_lhs * block_scale_inv
+        ).astype(lhs_q_dtype)
+        dec.lhs_scale[b_id] = block_scale
+
+    def gm_body(gm, carry):
+        start_fetch(gm + lookahead)
+        weight_copy(gm).wait()
+        scale_copy(gm).wait()
+
+        slot = gm % DECODE_SLOTS
+        rhs_ref = WeightsRef(
+            weight=dec.weight.at[slot], scale=dec.scale.at[slot], bias=None
+        )
+        if cfgs.fuse_act is not None:
+            rhs_ref = FusedWeightsRef(
+                gate=jax.tree.map(lambda x: x.at[..., : cfgs.out_size_n], rhs_ref),
+                up=jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref),
+            )
+        rhs = rhs_ref.get_weight()
+        rhs_scale_replicated = rhs_ref.get_scale(replicate_size=rows)
+
+        acc_list = []
+        for start_n in range(0, rhs_n, mxu_size):
+            end_n = min(rhs_n, start_n + mxu_size)
+            acc_n = jnp.zeros((rows, end_n - start_n), dtype=acc_dtype)
+            for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
+                block_rhs = rhs[start_k : start_k + q_block_size, start_n:end_n]
+                if not tpu_info.is_matmul_supported(lhs_q_dtype, block_rhs.dtype):
+                    block_rhs = block_rhs.astype(lhs_q_dtype)
+                block_acc = jnp.matmul(
+                    dec.lhs_q[:, pl.ds(start_k, q_block_size)],
+                    block_rhs,
+                    preferred_element_type=preferred_element_type,
+                ).astype(acc_dtype)
+                block_acc *= dec.lhs_scale[b_id].astype(acc_dtype)
+                block_acc *= rhs_scale_replicated[0, :, start_n:end_n].astype(
+                    acc_dtype
+                )
+                acc_n += block_acc
+            acc_list.append(acc_n)
+        acc = apply_act_fn(jnp.concatenate(acc_list, axis=1), cfgs.fuse_act)
+        acc = acc.astype(out_ref.dtype)
+
+        m_start = metadata_ref.gm_id_to_m_offset[gm]
+        m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
+        first_row = m_start - m_start % sublane
+        iota = lax.broadcasted_iota(jnp.int32, out_ref.shape, 0)
+        out = jnp.where((m_start <= iota) & (iota < m_end), acc, out_ref[...])
+        # `inner_kernel` adds its previous partial rows (or zeros) into the first
+        # sublane row of every tile, which turns -0.0 into +0.0 there.
+        is_first_row = (first_row <= iota) & (iota < first_row + sublane)
+        out_ref[...] = jnp.where(is_first_row, out + jnp.zeros_like(out), out)
+        return carry
+
+    lax.fori_loop(0, num_gm, gm_body, 0)
+
+
 def kernel_main(
     # Scalar prefetch
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
@@ -889,6 +1066,7 @@ def kernel_main(
     metadata_ref: MetadataRef,
     zero_ref: jax.Array | None,  # [tile_zero_m, num_lanes]
     semaphore_ref: jax.Array | None,  # [1]
+    decode_refs: DecodeRefs | None,
     *,
     cfgs: GmmConfigs,
 ):
@@ -933,6 +1111,23 @@ def kernel_main(
         metadata_ref,
         cfgs=cfgs,
     )
+
+    if decode_refs is not None:
+        # The output block spans every row and zeroes those no group owns, so
+        # zero initialization needs no DMAs of its own.
+        body = functools.partial(
+            decode_kernel,
+            num_gm=num_gm,
+            lhs_hbm_ref=lhs_ref,
+            rhs_hbm_ref=rhs_ref,
+            cfgs=cfgs,
+        )
+        out_spec = pl.BlockSpec(out_ref.shape, lambda i: (0, 0))
+        pipeline_fn = pltpu.emit_pipeline(
+            body, grid=(1,), in_specs=(), out_specs=out_spec
+        )
+        pipeline_fn(out_ref, scratches=[metadata_ref, decode_refs])
+        return
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
@@ -1462,6 +1657,27 @@ def gmm_v2(
         ]
     else:
         scratch_shapes += [None, None]
+
+    if use_decode_path(cfgs):
+        num_q_blocks = dims.size_k // cfgs.lhs_cfgs.quant_block_size
+        scratch_shapes.append(
+            DecodeRefs(
+                lhs=pltpu.VMEM((dims.size_m, dims.size_k), cfgs.lhs_cfgs.dtype),
+                lhs_q=pltpu.VMEM(
+                    (dims.size_m, dims.size_k), cfgs.lhs_cfgs.quant_dtype
+                ),
+                lhs_scale=pltpu.VMEM(
+                    (num_q_blocks, dims.size_m, 1), cfgs.lhs_cfgs.dtype
+                ),
+                weight=pltpu.VMEM((DECODE_SLOTS, dims.size_k, dims.size_n), rhs.dtype),
+                scale=pltpu.VMEM((DECODE_SLOTS, 1, 1, dims.size_n), jnp.float32),
+                lhs_sem=pltpu.SemaphoreType.DMA((1,)),
+                weight_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
+                scale_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
+            )
+        )
+    else:
+        scratch_shapes.append(None)
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
