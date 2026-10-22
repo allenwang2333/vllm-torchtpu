@@ -429,7 +429,12 @@ def patch_runai_sharded_expert_streaming() -> None:
         finally:
             self._loading_model = None
 
-    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+    def _get_weights_iterator(
+        self,
+        model_or_path: str,
+        revision: str | None,
+        is_unused_weight: Callable[[str], bool] | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -447,7 +452,9 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
-            return original_get_iterator(self, model_or_path, revision)
+            return original_get_iterator(
+                self, model_or_path, revision, is_unused_weight
+            )
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
             # broadcast mode would corrupt the chunk-id maps. Sharded

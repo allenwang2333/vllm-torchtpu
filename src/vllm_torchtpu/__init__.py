@@ -836,7 +836,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     from dataclasses import replace
 
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_planning, kv_cache_utils
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
         FullAttentionSpec,
@@ -1101,7 +1101,7 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
     # per-group block sizing). We patch it to catch ValueError and return an
     # empty dict so initialization falls back cleanly to the TPU hybrid/PCP
     # cache coordinator without crashing.
-    original_promote = getattr(kv_cache_utils, "_promote_local_kv_cache_specs", None)
+    original_promote = getattr(kv_cache_planning, "_promote_local_kv_cache_specs", None)
     if original_promote is not None and not getattr(
         original_promote, "_tpu_hybrid_promote_patch", False
     ):
@@ -1113,8 +1113,11 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 return {}
 
         patched_promote._tpu_hybrid_promote_patch = True
-        kv_cache_utils._promote_local_kv_cache_specs = patched_promote
-        for module_name in ("vllm.v1.engine.core", "vllm.v1.core.kv_cache_utils"):
+        kv_cache_planning._promote_local_kv_cache_specs = patched_promote
+        for module_name in (
+            "vllm.v1.engine.core",
+            "vllm.v1.core.kv_cache_planning",
+        ):
             mod = sys.modules.get(module_name)
             if mod is not None and hasattr(mod, "_promote_local_kv_cache_specs"):
                 mod._promote_local_kv_cache_specs = patched_promote

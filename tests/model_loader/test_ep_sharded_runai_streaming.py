@@ -330,7 +330,7 @@ def test_patch_falls_back_when_filter_inactive():
         with patch.object(mlp, "_compute_local_expert_ids", return_value=None):
             loader = FakeLoader()
             FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
-        original.assert_called_once_with(loader, "gs://b/m", None)
+        original.assert_called_once_with(loader, "gs://b/m", None, None)
 
 
 def test_layer_finisher_runs_after_consumer_receives_tensor():

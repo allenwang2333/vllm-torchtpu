@@ -201,21 +201,6 @@
       "concise_description": "No attribute `_torchtpu_fori_patch_applied` in module `jax._src.pallas.mosaic.lowering`"
     },
     {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "bad-assignment",
-      "concise_description": "`None` is not assignable to attribute `model_weights` with type `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "bad-override",
-      "concise_description": "Class member `RayDistributedExecutor.get_kv_connector_handshake_metadata` overrides parent class `RayDistributedExecutor` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/executors/ray_distributed_executor.py",
-      "name": "invalid-inheritance",
-      "concise_description": "Invalid base class: `RayWorkerWrapper | None`"
-    },
-    {
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `get_node_and_physical_gpu_ids`"
