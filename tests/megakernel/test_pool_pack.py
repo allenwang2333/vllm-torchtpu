@@ -155,3 +155,19 @@ def test_states_to_pool_roundtrip(name: str, ckpt_ndim: int):
     np.testing.assert_array_equal(
         np.asarray(out["conv"][:, :, :, 0]), np.asarray(st["conv"])
     )
+
+
+def test_pack_rejects_ctx_not_divisible_by_page_size():
+    lay = _layout(0)
+    ex = _exec(R=1, B=1, T=1, ctx=256)
+    st = _random_states(lay, ex, seed=19)
+    pt, _, _ = _tables(lay, ex, 3)
+    raw_pools = pool.states_to_pool(lay, ex, st, pt)
+
+    bad_ex = _exec(R=1, B=1, T=1, ctx=200)
+    with pytest.raises(AssertionError, match="multiple of page_size"):
+        pool.allocate_test_layout(lay, bad_ex)
+    with pytest.raises(AssertionError, match="multiple of page_size"):
+        pool.states_to_pool(lay, bad_ex, st, pt)
+    with pytest.raises(AssertionError, match="multiple of page_size"):
+        pool.pool_to_states(lay, bad_ex, raw_pools, pt)

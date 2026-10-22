@@ -156,6 +156,15 @@ def raw_page_to_conv(
     return jnp.asarray(bf16_page).reshape(lay.conv_taps, QKV).astype(F32)
 
 
+def _pages_per_seq(ex: ExecSpec) -> int:
+    """Pages per sequence (`ex.ctx // page_size`); requires `ctx % page_size == 0`."""
+    page_size = cache_exec(ex).page_size
+    assert page_size > 0 and ex.ctx > 0 and ex.ctx % page_size == 0, (
+        f"ex.ctx ({ex.ctx}) must be a positive multiple of page_size ({page_size})"
+    )
+    return ex.ctx // page_size
+
+
 def allocate_test_layout(
     layout: PoolLayout, ex: ExecSpec
 ) -> tuple[jax.Array, jax.Array, jax.Array, int]:
@@ -165,12 +174,13 @@ def allocate_test_layout(
     or inactive rows that default to page index `0` or checkpoint slot `0` never
     overwrite active sequence `0` (whose KV pages start at `reserved_pages`).
     Checkpoint slots start at `base_slot >= 1` so `ckpt[0, s, 0] > 0` holds for
-    all active sequences under `active_seqs="from_ckpt"`.
+    all active sequences under `active_seqs="from_ckpt"`. `ckpt_indices` and
+    `min_pages` are sized for the 3D checkpoint table `(slots_per_pool, NS, T)`.
     """
     G_PER_ATT = layout.slots_per_pool
     pps = layout.pages_per_slot
     reserved_pages = layout.reserved_pages
-    pages_per_seq = ex.ctx // cache_exec(ex).page_size
+    pages_per_seq = _pages_per_seq(ex)
     kv_pages_total = reserved_pages + ex.NS * pages_per_seq
     pt_cols = max(resolved_max_pages_per_seq(ex), pages_per_seq)
     pt = np.zeros((ex.NS, pt_cols), dtype=np.int32)
@@ -211,7 +221,7 @@ def states_to_pool(
     G_PER_ATT = layout.slots_per_pool
     page_shape = layout.kv_page_shape
     pt = np.asarray(page_table)
-    pages_per_seq = ex.ctx // cache_exec(ex).page_size
+    pages_per_seq = _pages_per_seq(ex)
 
     kc = states["kc"]
     vc = states["vc"]
@@ -310,7 +320,7 @@ def pool_to_states(
     G_PER_ATT = layout.slots_per_pool
     page_shape = layout.kv_page_shape
     pt = np.asarray(page_table)
-    pages_per_seq = ex.ctx // cache_exec(ex).page_size
+    pages_per_seq = _pages_per_seq(ex)
     natt, hd = layout.num_pools, layout.hd
 
     kc_out = np.zeros((R, natt, NS, ex.ctx, hd), dtype=jnp.dtype(FP8))

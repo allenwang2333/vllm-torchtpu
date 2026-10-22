@@ -62,7 +62,16 @@ if TYPE_CHECKING:
 LANES = 128
 
 # Geometry the pool I/O paths (split gather / scatter, the in-kernel GPR
-# path, and fused pool I/O) are validated for.
+# path, and fused pool I/O) are validated for. They are written in terms of
+# `PoolLayout`, but these combinations are the only ones exercised on TPU;
+# `PoolLayout.validate` rejects anything else instead of guessing.
+# - `hd == 256`, `page_size == 128`, `kvh == 1`: KV page `(2, 64, 4, 128)` and
+#   one `(K, V)` head pair per rank and page.
+# - `rec_pages_per_slot == 4`, `conv_pages_per_slot == 1`: the only slot
+#   geometry exercised on TPU.
+# - `KD == VD == LANES`, `conv_taps == 3`: recurrent rows are one lane-row wide
+#   and the recurrent conv state shapes (`rup(3 * B, 8)`, `rup(3 + T, 8)`)
+#   hard-code the 3-tap window.
 VALIDATED_HD = 256
 VALIDATED_PAGE_SIZE = 128
 VALIDATED_KVH = 1
@@ -73,7 +82,12 @@ VALIDATED_CONV_TAPS = 3
 
 @dataclass(frozen=True)
 class PoolLayout:
-    """Unified raw-pool layout: KV page packing plus recurrent checkpoint slots."""
+    """Unified raw-pool layout: KV page packing plus recurrent checkpoint slots.
+
+    The defaults describe a single KV-only pool with the validated page geometry.
+    Callers build their layout explicitly for their attention and recurrent head
+    counts.
+    """
 
     # Pool topology.
     num_pools: int = 1
@@ -126,7 +140,10 @@ class PoolLayout:
         return max(1, self.pages_per_slot * self.slots_per_pool)
 
     def page_base(self, slot: Any, sub: Any, ndim: int) -> Any:
-        """First page of checkpoint `slot` for sub-layer `sub` (`ckpt_indices.ndim`)."""
+        """First page of checkpoint `slot` for sub-layer `sub` (`ckpt_indices.ndim`).
+
+        Works on Python ints and traced scalars alike.
+        """
         pps = self.pages_per_slot
         if ndim == 3:
             return slot * pps
@@ -172,7 +189,8 @@ class PoolLayout:
     def gpr_conv_rows(self, T: int, R: int) -> int | None:
         """`(rows, 4, page_size)` fp8 page rows of the in-kernel gather (GPR)
         conv window `(rup(conv_taps + T, 8), QKV)` per rank, or None when the
-        window does not fill whole rows."""
+        window does not fill whole rows. GPR copies only the K half of the conv
+        page (`kv_page_shape[1]` rows), so the window must fit there."""
         hr = rup(self.conv_taps + T, 8)
         conv_bytes = hr * self.qkv_per_rank(R) * jnp.dtype(self.conv_dtype).itemsize
         row_bytes = self.kv_page_shape[2] * self.page_size
@@ -206,7 +224,13 @@ class PoolLayout:
 
     # -------------------------------------------------------------- validation
     def validate(self, ex: ExecSpec | None = None) -> None:
-        """Raise `MegakernelConfigError` for layouts the pool kernels can't run."""
+        """Raise `MegakernelConfigError` for layouts the pool kernels can't run.
+
+        With `ex`, also checks that its `CacheExec.page_size` matches the layout
+        and that the per-rank recurrent state and the conv window of every pool
+        I/O path `ex` selects (split, in-kernel gather `GPR`, fused `FUSED`)
+        fit their slot pages.
+        """
 
         def _need(ok: bool, msg: str) -> None:
             if not ok:
@@ -218,6 +242,7 @@ class PoolLayout:
             jnp.dtype(self.page_dtype) == jnp.dtype(FP8),
             "pool pages must be float8_e4m3fn",
         )
+        # Only validated geometry (see the VALIDATED_* constants above).
         _need(
             self.hd == VALIDATED_HD and self.page_size == VALIDATED_PAGE_SIZE,
             f"pool kernels are only validated for hd={VALIDATED_HD}, "
@@ -281,6 +306,9 @@ class PoolLayout:
             f"per-rank conv window ({conv_rows_pad} rows) exceeds one conv "
             f"page ({self.conv_page_rows} rows)",
         )
+        # In-kernel paths stage the whole `(rup(conv_taps + T, 8), QKV)` verify
+        # window: GPR in the K half of the conv page (`gpr_conv_fits`),
+        # fused pool I/O (at least 16 rows) in the whole conv page.
         qkv_rows = self.qkv_per_rank(R) // LANES
         hr = rup(self.conv_taps + ex.T, 8)
         _need(
