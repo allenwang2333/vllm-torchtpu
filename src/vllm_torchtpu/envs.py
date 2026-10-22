@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
+    VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -437,6 +439,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
+    ),
+    # Qwen4-exp QSA decode/verify indexer: score all query tokens of a
+    # request (e.g. the K+1 MTP verify tokens) in one query block of this many
+    # tokens, sharing one stream over the request's compressed keys instead of
+    # re-streaming it once per token. Each token keeps its per-token scoring
+    # expression, so top-k selections match the per-token path. 0 (default)
+    # keeps the per-token path; 4 or 8 covers MTP K <= 3 or K <= 7 per block.
+    "VLLM_TPU_QSA_DECODE_QUERY_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_QUERY_BLOCK", 0
+    ),
+    # Compressed keys per KV block of the shared-stream pass above (a multiple
+    # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
+    "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

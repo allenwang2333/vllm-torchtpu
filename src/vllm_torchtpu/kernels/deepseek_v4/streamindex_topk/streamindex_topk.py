@@ -123,6 +123,7 @@ class _BlockedPrefillConfig:
         num_q_heads: int,
         q_dtype: Any,
         seq_batch_size: int,
+        per_token_scores: bool = False,
     ) -> "_BlockedPrefillConfig":
         """Computes the blocked-prefill layout parameters for a kernel pass."""
         tok_blk = math.gcd(bq_sz, 32)
@@ -135,7 +136,12 @@ class _BlockedPrefillConfig:
         tiles_per_chunk = lane_chunk // 128
 
         q_sublane_tiling = 8 * get_dtype_packing(q_dtype)
-        enabled = seq_batch_size == 1 and bq_sz > 1 and tok_blk % q_sublane_tiling == 0
+        enabled = (
+            seq_batch_size == 1
+            and bq_sz > 1
+            and tok_blk % q_sublane_tiling == 0
+            and not per_token_scores
+        )
 
         # Scores are written straight into the [bq, nsub, 128] block with strided
         # stores when every token owns whole (8, 128) tiles of it.
@@ -222,6 +228,10 @@ def kernel(
     """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
     scores_hbm_ref = score_refs[-1]
     buffer_cnt = buffer_count
+    # One-token blocks already use the decode expression.
+    per_token_scores = (
+        components is not None and components.per_token_scores and bq_sz > 1
+    )
     seq_along_lane = kv_layout == KVLayout.SEQ_ALONG_LANE
 
     _, num_q_heads, head_dim = q_hbm_ref.shape
@@ -278,6 +288,7 @@ def kernel(
         num_q_heads=num_q_heads,
         q_dtype=q_hbm_ref.dtype,
         seq_batch_size=seq_batch_size,
+        per_token_scores=per_token_scores,
     )
 
     q_spec = pl.BlockSpec(
@@ -459,6 +470,51 @@ def kernel(
             acc = acc + relu_st * w[:, h : h + 1]  # fused multiply-add.
         return acc
 
+    def score_tokens(bq, bkv, scale_val, bq_weights, bq_pos_compressed, k_span, kv_len):
+        """Decode scores of each token of a multi-token block, one at a time.
+
+        One q @ k matmul covers the whole block; each output row depends only on
+        its own query row, so slicing a token's `num_q_heads` rows reproduces its
+        one-token decode product. The head reduction, scaling and masking then
+        repeat the `n_tok == 1` decode expression per token, and the rows are
+        stacked along the untiled leading axis, as the batched decode pass does.
+
+        Args:
+          bq: [n_tok * num_q_heads, head_dim] queries, head-minor.
+          bkv: the packed key block for this step.
+          scale_val: [1, bkv_sz] per-position key scales.
+          bq_weights: [n_tok, num_q_heads] indexer weights.
+          bq_pos_compressed: [n_tok] compressed causal positions.
+          k_span: [1, bkv_sz] global compressed positions of this KV block.
+          kv_len: completed compressed positions of the sequence.
+
+        Returns:
+          [n_tok, num_sublanes_bkv, 128] f32 masked scores.
+        """
+        n_tok = bq_weights.shape[0]
+        w = bq_weights.astype(jnp.float32)
+        if seq_along_lane:
+            st_all = jnp.einsum(
+                "nd,dm->nm", bq, bkv, preferred_element_type=jnp.float32
+            )
+        else:
+            st_all = jnp.einsum(
+                "nd,md->nm", bq, bkv, preferred_element_type=jnp.float32
+            )
+        valid_mask = k_span < kv_len
+        ret = []
+        for t in range(n_tok):
+            st = st_all[t * num_q_heads : (t + 1) * num_q_heads].reshape(
+                1, num_q_heads, -1
+            )
+            st = jnp.maximum(st, 0.0) * w[t : t + 1, :, None]
+            s_summed = st.sum(axis=1) * scale_val
+            causal_mask = k_span <= bq_pos_compressed[t : t + 1][:, None]
+            mask = jnp.logical_and(valid_mask, causal_mask)
+            s_summed = jnp.where(mask, s_summed, -jnp.inf)
+            ret.append(s_summed.reshape(-1, num_sublanes_bkv, 128))
+        return jnp.concatenate(ret, axis=0)
+
     def compute_scores(
         bq_vec,
         bkv_vec,
@@ -483,6 +539,25 @@ def kernel(
             scale_val = scale_val_vec[batch_idx]
             bq_weights = bq_weights_vec[batch_idx]
             bq_pos_compressed = bq_pos_compressed_vec[batch_idx]
+
+            if per_token_scores:
+                k_local = bkv_idx * bkv_sz + lax.broadcasted_iota(
+                    jnp.int32, (1, bkv_sz), 1
+                )
+                k_span = cp_local_to_global(k_local, cp_rank, cp_size, interleave_c)
+                seq_len = seq_lens_ref[batch_start_seq_idx + batch_idx]
+                ret.append(
+                    score_tokens(
+                        bq,
+                        bkv,
+                        scale_val,
+                        bq_weights,
+                        bq_pos_compressed,
+                        k_span,
+                        seq_len >> shift_comp,
+                    )
+                )
+                continue
 
             s_summed = reduce_heads(bq, bkv, bq_weights, head_major=q_is_head_major)
             s_summed = s_summed * scale_val
@@ -814,7 +889,7 @@ def kernel(
                 prefill_cfg.wb_dtype,
             ),
         )
-    elif seq_batch_size == 1 and bq_sz > 1:
+    elif seq_batch_size == 1 and bq_sz > 1 and not per_token_scores:
         pl.run_scoped(
             _run_all,
             pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),

@@ -77,7 +77,9 @@ class QSAIndexSchedule:
         )
 
 
-def qsa_indexing(causal_position_offset: int = 0) -> StreamIndexComponents:
+def qsa_indexing(
+    causal_position_offset: int = 0, per_token_scores: bool = False
+) -> StreamIndexComponents:
     return StreamIndexComponents(
-        BF16KeyReader(), QSAIndexSchedule(causal_position_offset)
+        BF16KeyReader(), QSAIndexSchedule(causal_position_offset), per_token_scores
     )
