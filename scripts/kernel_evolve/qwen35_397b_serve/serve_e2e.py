@@ -12,7 +12,7 @@ holds only `src/vllm_torchtpu`. The serve and client commands live here, not in
 the arm, so a candidate changes the code behind the server and nothing about
 what is served or how it is measured.
 
-Two departures from the recipe's literal text, both outside what is timed:
+Three departures from the recipe's literal text:
 - Weights stream from the cluster's GCS copy of the checkpoint
   (`--load-format runai_streamer`, served under the model's own name, each
   rank fetching only its own experts) because the pod has no disk that holds
@@ -21,6 +21,10 @@ Two departures from the recipe's literal text, both outside what is timed:
   samples symmetrically around its length, so it is given the midpoint and the
   ratio that span the same range, as run_benchmarks.sh does for
   RANGE_RATIO_STYLE=min. Requests are greedy, as the recipe's client is.
+- One API frontend (`--api-server-count=1`), as run_benchmarks.sh starts for
+  every DP>1 config. vLLM's default of one per DP rank has all eight pull the
+  checkpoint's config files from object storage into one directory at once,
+  and a frontend that reads a half-written config.json dies at startup.
 
 Timing: one short warmup sweep, then SWEEPS timed sweeps on the same server.
 The control reports their median and any other arm their lower median; the
@@ -210,6 +214,7 @@ def server_cmd(profile_dir: Path | None) -> list[str]:
         "fp8",
         "--attention-backend",
         "CUSTOM",
+        "--api-server-count=1",
         "--block-size",
         "256",
         "--language-model-only",
