@@ -23,14 +23,13 @@ scheduler:
   ahead of the rest;
 * holds back, for this step, the longest running prefill chunks needed for the
   request upstream admits next (the first admissible request in
-  ``kv_holding_waiting``, then ``waiting``) to fit in the remaining budget,
+  ``skipped_waiting``, then ``waiting``) to fit in the remaining budget,
   when that request has fewer uncached tokens and free KV blocks cover the
   kept requests plus it, so a hold does not cause preemption.
 
-Held chunks keep their KV blocks; ``max_num_running_reqs`` and
-``max_num_active_reqs`` are lowered by the number held during the step so
-admission never exceeds ``max_num_seqs``. A hold whose target is not
-admitted backs off exponentially for that target.
+Held chunks keep their KV blocks; ``max_num_running_reqs`` is lowered by the
+number held during the step so admission never exceeds ``max_num_seqs``. A hold
+whose target is not admitted backs off exponentially for that target.
 
 Anti-starvation: a running prefill chunk that goes
 ``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS`` steps in a row without getting at least
@@ -55,6 +54,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.long_prefill_threshold import scheduler_long_prefill_threshold
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -92,12 +92,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         held_ids = {r.request_id for r in held}
         self.running[:] = [r for r in self.running if r.request_id not in held_ids]
         self.max_num_running_reqs -= len(held)
-        self.max_num_active_reqs -= len(held)
         try:
             output = super().schedule(throttle_prefills)
         finally:
             self.max_num_running_reqs += len(held)
-            self.max_num_active_reqs += len(held)
             self.running.extend(held)
 
         # One KV cache block of the main attention group; not self.block_size,
@@ -141,9 +139,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             k: v for k, v in self._stalled_steps.items() if k in prefilling
         }
         if self._hold_backoff:
-            waiting = {
-                r.request_id for r in chain(self.kv_holding_waiting, self.waiting)
-            }
+            waiting = {r.request_id for r in chain(self.skipped_waiting, self.waiting)}
             self._hold_backoff = {
                 k: v for k, v in self._hold_backoff.items() if k in waiting
             }
@@ -162,20 +158,10 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
 
     def _long_prefill_threshold(self, num_eligible_reqs: int) -> int:
-        # Mirrors the long_prefill_token_threshold computation inline in
-        # Scheduler.schedule() (vLLM v0.31.0, scheduler.py ~L611-626). Re-sync
-        # on vLLM upgrades.
-        lptt = (
-            self.scheduler_config.long_prefill_token_threshold
-            if num_eligible_reqs > 1
-            else 0
-        )
-        if lptt > 0 and self.adaptive_long_prefill_threshold:
-            lptt = max(
-                lptt,
-                self.scheduler_config.max_num_batched_tokens // num_eligible_reqs,
-            )
-        return lptt
+        # The cap Scheduler.schedule() applies this step: vLLM v0.29.0 caps
+        # every request, and VLLM_TPU_LONG_PREFILL_THRESHOLD_POLICY selects
+        # vLLM v0.32.0's per-step cap (core/long_prefill_threshold.py).
+        return scheduler_long_prefill_threshold(self, num_eligible_reqs)
 
     def _plan_running(
         self, reqs: list[Request], lptt: int
@@ -184,7 +170,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         and the budget it leaves for WAITING.
 
         Mirrors the per-request ``num_new_tokens`` math inline in that pass
-        (vLLM v0.31.0, scheduler.py ~L628-722); re-sync on vLLM upgrades.
+        (vLLM v0.29.0, scheduler.py ~L551-640); re-sync on vLLM upgrades.
         Encoder, Mamba-alignment and KV-allocation limits are not modelled, so
         a misestimate only makes a hold miss, which the backoff absorbs.
         """
@@ -231,7 +217,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         return next(
             (
                 r
-                for r in chain(self.kv_holding_waiting, self.waiting)
+                for r in chain(self.skipped_waiting, self.waiting)
                 if not self._is_blocked_waiting_status(r.status)
             ),
             None,
@@ -252,7 +238,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             return [], None
         if (
             len(self.running) + self.num_waiting_for_streaming_input
-            >= self.max_num_active_reqs
+            >= self.max_num_running_reqs
         ):
             return [], None
         target = self._next_waiting()
@@ -330,7 +316,6 @@ class SrptPrefillScheduler(AsyncScheduler):
                 total_computed_tokens=computed_tokens,
                 num_local_computed_tokens=computed_tokens,
                 num_tokens_main_model=num_tokens_main,
-                prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
             )
 
         needed = sum(
@@ -353,15 +338,14 @@ class SrptPrefillScheduler(AsyncScheduler):
                     num_local_computed_tokens=hit_tokens,
                     num_tokens_main_model=full_num_tokens,
                     apply_admission_cap=True,
-                    prefill_end=max(target.num_prompt_tokens, target.num_tokens - 1),
                 ),
             )
         needed += target_blocks
         if kept:
             # allocate_slots() adds the watermark when others are scheduled.
             needed += self.kv_cache_manager.watermark_blocks
-        reserved = (
-            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks()
-        )
+        # vLLM v0.29.0 admission reserves in-flight prefills only (no
+        # spec-decode step blocks).
+        reserved = self._inflight_prefill_reserved_blocks()
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         return free - reserved >= needed

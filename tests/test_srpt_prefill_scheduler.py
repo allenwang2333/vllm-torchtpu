@@ -324,7 +324,6 @@ def test_hold_never_exceeds_max_num_seqs(shared_model_config):
     assert "short_2" not in out.num_scheduled_tokens
     assert len(scheduler.running) == 4
     assert scheduler.max_num_running_reqs == 4
-    assert scheduler.max_num_active_reqs == 4
 
 
 def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):

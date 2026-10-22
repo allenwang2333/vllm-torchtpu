@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Platform gates for the pipeline chunk scheduler."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -73,9 +74,17 @@ def test_the_dp_scheduler_with_one_dp_rank_does_not_gate(monkeypatch):
 def test_custom_scheduler_logs_configured_scheduler_when_dp_sched_env_set(
     monkeypatch, caplog
 ):
-    _env(monkeypatch, dp_sched=True)
-    config = _config(dp=2, cls="x.Y")
-    hook = _configure(config)
+    # vLLM's logging config stops records at the `vllm` logger
+    # (propagate=False), so caplog's root handler misses them once vLLM is
+    # imported; listen on the platform logger itself.
+    tpu_platform.logger.addHandler(caplog.handler)
+    monkeypatch.setattr(tpu_platform.logger, "level", logging.WARNING)
+    try:
+        _env(monkeypatch, dp_sched=True)
+        config = _config(dp=2, cls="x.Y")
+        hook = _configure(config)
+    finally:
+        tpu_platform.logger.removeHandler(caplog.handler)
     assert config.scheduler_config.scheduler_cls == "x.Y"
     hook.assert_not_called()
     assert "scheduler x.Y is configured" in caplog.text
