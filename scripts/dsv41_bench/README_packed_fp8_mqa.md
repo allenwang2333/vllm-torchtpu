@@ -50,6 +50,9 @@ block IDs and gathers their scores before top-k. The public sparse entry point,
 FP32 scores and their canonical block IDs. For 2048 eight-token blocks this is
 16384 columns. Top-k maps compact column indices back to logical token IDs;
 duplicate candidate IDs do not duplicate tokens in the result.
+The model's unordered selection uses `packed_fp8_sparse_mqa_topk`: the same
+16K candidate scores stay in SparseCore VMEM through selection, and only logical
+TopK IDs are written back. Ordered selection retains the compact-logit route.
 Candidate publishers still score the full visible context. The whole-batch
 short-context bypass and the existing all-blocks-fit identity are preserved.
 
@@ -371,6 +374,8 @@ candidate distributions. Both have a 16K-column compact score output.
 | Compact scores, first run | 880.809 | 880.567 |
 | Compact scores and empty-tile bypass, second run | 872.366 | 881.827 |
 | Metadata and empty-tile prefetch fixes, third run | 618.784 | 735.342 |
+| Fused compaction and selection, fourth run | 596.299 | 715.920 |
+| Fused selection with vector copy and loop unrolling, fifth run | 552.375 | 672.085 |
 
 Numbers are means of the two seed medians, each with 30 XProf device samples.
 Declared operator analyses are `an-07cf7q2xvw` and `an-9e885t80wd`; stage-sample
@@ -397,8 +402,21 @@ the faster seed. The compute-region bundle counts remain unchanged from the
 second run. Commit `0ebac7883` adds the public sparse API wrapper to measured
 commit `f004121e5`; its normalized scorer LLO is identical.
 
-Experiment `exp-5whv0q7crg` separately tests a benchmark-only fusion of score
-compaction and TopK against the third version. It is not enabled in the model.
+Experiments `exp-5whv0q7crg` and `exp-n4clwbtmj2` test fusion of score compaction
+and TopK, then replace serial candidate packing with a vector copy and unroll
+the selection loops. The fifth run's seed medians are 542.5/562.3 microseconds
+for clustered candidates and 669.8/674.4 for scattered candidates. Analyses
+`an-t044oyh8al` and `an-b1asisa722` expose its metrics and stage samples. Its
+clustered seed-2026 trace has 195.4 microseconds of scoring and 158.5 of fused
+candidate selection. Both cache banks, selected IDs and candidates match the
+third version exactly; separate TPU checks cover empty rows, score ties,
+short rows and noncontiguous block IDs.
+
+Commit `d4b5c6c19` moves this selector into the kernel package and connects the
+model's unordered path directly, removing the benchmark's temporary wiring.
+Forty CPU tests and the relevant pre-commit hooks pass. The same-shape TensorCore
+scorer LLO and SparseCore dispatch LLO match the measured source after stripping
+comments. A full model forward still requires the real vLLM/torch-tpu runtime.
 The 500-microsecond target has **not** been demonstrated. These timings cover JAX
 cache writes, Q quantization, metadata, scoring and selection; they exclude
 projections, RoPE, Torch dispatch and TP collectives.

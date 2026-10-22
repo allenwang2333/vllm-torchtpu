@@ -22,6 +22,7 @@ from ._packed_fp8_compact import candidate_topk, compact_candidate_scores
 
 
 def select_candidate_scores(scores, candidates, *, k: int, block_size: int):
+    """Select logical IDs from unique ascending candidates, padded with -1."""
     rows, width = scores.shape
     count = candidates.shape[1]
 
@@ -108,6 +109,8 @@ def select_candidate_scores(scores, candidates, *, k: int, block_size: int):
                     unroll=unroll,
                 )
 
+                # Selecting padding is harmless when fewer than k values exist;
+                # remove those IDs before sorting so -1 remains a suffix.
                 @plsc.parallel_loop(0, k, lanes, unroll=unroll)
                 def remove_invalid(i):
                     ids[pl.ds(i, lanes)] = jnp.where(
