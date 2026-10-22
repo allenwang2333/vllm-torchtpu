@@ -116,7 +116,7 @@ fi
 
 FILES_CHANGED=""
 DIFF_RESOLVED=0
-if [[ "${NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
+if [[ "${NIGHTLY:-0}" == "1" || "${TORCHTPU_NIGHTLY:-0}" == "1" || "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   : # Nightly and LKG integration builds test the full suite regardless of last commit diff.
 elif [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
@@ -254,6 +254,7 @@ fi
 
 # pipeline_build.yml skips the -omni image build when this is non-empty.
 # Buildkite rejects the upload if a skip reason is over 70 characters.
+OMNI_IMAGE_SKIP="${OMNI_IMAGE_SKIP:-}"
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
 fi

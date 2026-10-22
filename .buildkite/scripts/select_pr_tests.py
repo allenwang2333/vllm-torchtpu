@@ -41,9 +41,7 @@ ALL_PR_TEST_STEPS: tuple[str, ...] = (
 
 ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
     "integration_qwen35_pcp4_dp4_disagg_correctness",
-    "integration_disagg_correctness",
     "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-    "integration_dcp_correctness",
     "presubmit_disagg_single_host",
     "integration_qwen35_apc_correctness",
     "integration_qwen35_gpc_global_dram_pool",
@@ -57,9 +55,7 @@ ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
 DISAGG_KV_INTEGRATION_STEPS: frozenset[str] = frozenset(
     {
         "integration_qwen35_pcp4_dp4_disagg_correctness",
-        "integration_disagg_correctness",
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-        "integration_dcp_correctness",
         "presubmit_disagg_single_host",
         "integration_qwen35_pcp8_dp8_disagg_correctness",
         "integration_qwen35_gpc_correctness",
@@ -73,31 +69,32 @@ K3_OFFLOAD_INTEGRATION_STEPS: frozenset[str] = frozenset(
 
 INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
     "scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh": (
-        frozenset(
-            {
-                "integration_qwen35_pcp4_dp4_disagg_correctness",
-                "integration_disagg_correctness",
-            }
-        )
+        frozenset({"integration_qwen35_pcp4_dp4_disagg_correctness"})
+    ),
+    "examples/disagg/launch_qwen35_p4d2_v2_baseline.sh": frozenset(
+        {"integration_qwen35_pcp4_dp4_disagg_correctness"}
     ),
     "scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh": (
-        frozenset(
-            {
-                "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-                "integration_dcp_correctness",
-            }
-        )
+        frozenset({"integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"})
     ),
     "examples/disagg/run_disagg_single_host.sh": frozenset(
-        {"presubmit_disagg_single_host", "integration_disagg_correctness"}
+        {"presubmit_disagg_single_host"}
     ),
     "examples/disagg/toy_proxy_server.py": frozenset(
-        {"presubmit_disagg_single_host", "integration_disagg_correctness"}
+        {
+            "presubmit_disagg_single_host",
+            "integration_qwen35_pcp4_dp4_disagg_correctness",
+            "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+        }
     ),
     "scripts/vllm/integration/run_qwen35_apc_correctness.sh": frozenset(
         {"integration_qwen35_apc_correctness"}
     ),
     "scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh": frozenset(
+        {"integration_qwen35_gpc_global_dram_pool"}
+    ),
+    "scripts/vllm/integration/smoke_gpc_global_dram_pool.py": frozenset(
         {"integration_qwen35_gpc_global_dram_pool"}
     ),
     "scripts/vllm/integration/run_compilation_cache_e2e.sh": frozenset(
@@ -106,24 +103,88 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
     "scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh": (
         frozenset({"integration_k3_pruned75_apc_offload_correctness"})
     ),
-    "scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh": (
-        frozenset({"integration_qwen35_pcp8_dp8_disagg_correctness"})
+    "scripts/vllm/integration/smoke_prefix_multiturn_and_eviction_recall.py": (
+        frozenset({"integration_k3_pruned75_apc_offload_correctness"})
     ),
-    ".buildkite/kubernetes/manifests/qwen3.5-p8d8-disagg.yaml": frozenset(
-        {"integration_qwen35_pcp8_dp8_disagg_correctness"}
+    "scripts/vllm/integration/smoke_basic_offload_correctness.py": frozenset(
+        {"integration_k3_pruned75_apc_offload_correctness"}
+    ),
+    "scripts/vllm/integration/smoke_mamba_state_contamination.py": frozenset(
+        {
+            "integration_qwen35_apc_correctness",
+            "integration_k3_pruned75_apc_offload_correctness",
+        }
+    ),
+    "scripts/vllm/integration/smoke_prefix_cache_correctness.py": frozenset(
+        {
+            "integration_qwen35_pcp4_dp4_disagg_correctness",
+            "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+            "integration_qwen35_apc_correctness",
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+        }
+    ),
+    "scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py": frozenset(
+        {
+            "integration_qwen35_pcp4_dp4_disagg_correctness",
+            "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+            "integration_qwen35_apc_correctness",
+            "integration_k3_pruned75_apc_offload_correctness",
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+        }
+    ),
+    "scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh": (
+        frozenset(
+            {
+                "integration_qwen35_pcp8_dp8_disagg_correctness",
+                "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+            }
+        )
+    ),
+    "examples/disagg/launch_qwen35_disagg_multihost.sh": frozenset(
+        {
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
+        }
+    ),
+    ".buildkite/kubernetes/manifests/workloads/qwen3.5-p8d8-disagg.yaml": (
+        frozenset({"integration_qwen35_pcp8_dp8_disagg_correctness"})
     ),
     "scripts/vllm/integration/run_qwen35_gpc_correctness.sh": frozenset(
         {"integration_qwen35_gpc_correctness"}
     ),
-    ".buildkite/kubernetes/manifests/qwen3.5-gpc-two-replica.yaml": frozenset(
+    "scripts/vllm/integration/smoke_gpc_global_offloading.py": frozenset(
         {"integration_qwen35_gpc_correctness"}
     ),
-    "examples/offline_inference.py": frozenset({"vllm_torchtpu_multihost_presubmit"}),
-    ".buildkite/scripts/run_multihost_presubmit.sh": frozenset(
+    ".buildkite/kubernetes/manifests/workloads/qwen3.5-gpc-two-replica.yaml": (
+        frozenset({"integration_qwen35_gpc_correctness"})
+    ),
+    ".buildkite/kubernetes/single_host_engine.sh": frozenset(
+        {
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_gpc_correctness",
+        }
+    ),
+    "examples/offline_inference.py": frozenset(
+        {"vllm_torchtpu_multihost_presubmit", "integration_compilation_cache_e2e"}
+    ),
+    ".buildkite/kubernetes/manifests/workloads/ray-multihost-slice.yaml": (
+        frozenset({"vllm_torchtpu_multihost_presubmit"})
+    ),
+    ".buildkite/kubernetes/multihost_entry.sh": frozenset(
         {"vllm_torchtpu_multihost_presubmit"}
     ),
-    ".buildkite/kubernetes/manifests/ray-multihost.yaml": frozenset(
+    ".buildkite/kubernetes/manifests/workloads/mp-multihost-slice.yaml": (
+        frozenset({"vllm_torchtpu_multihost_presubmit"})
+    ),
+    ".buildkite/kubernetes/mp_multihost_entry.sh": frozenset(
         {"vllm_torchtpu_multihost_presubmit"}
+    ),
+    ".buildkite/kubernetes/multihost_lib.sh": frozenset(
+        {
+            "vllm_torchtpu_multihost_presubmit",
+            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_gpc_correctness",
+        }
     ),
     ".buildkite/kubernetes/run_multihost.sh": frozenset(
         {
@@ -136,29 +197,44 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
 
 CPU_TESTED_BENCHMARK_FILES: frozenset[str] = frozenset(
     {
-        "scripts/vllm/benchmarking/run_benchmark_suite.py",
-        "scripts/vllm/benchmarking/verify_regression.py",
+        "scripts/vllm/benchmarking/check_regression.py",
+        "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-flat-json.sh",
+        "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-complex-ast.sh",
+        "scripts/vllm/benchmarking/configs/qwen3-0.6b-structured-character-dataset.sh",
+        "scripts/vllm/benchmarking/structured_schemas/flat_json.json",
+        "scripts/vllm/benchmarking/structured_schemas/complex_ast.json",
+        "scripts/vllm/benchmarking/structured_schemas/character_schema.json",
+        "scripts/vllm/benchmarking/datasets/character_benchmark.json",
+        "scripts/vllm/benchmark/inferencex/sweep_summary.py",
+        "scripts/vllm/benchmark/inferencex/sweep_lib.sh",
+        "scripts/vllm/integration/lm_eval_accuracy.py",
+        "scripts/ci_failure_metrics.py",
+        "scripts/find_owners.py",
     }
 )
 
 NIGHTLY_ONLY_INTEGRATION_EXACT: frozenset[str] = frozenset(
     {
         "scripts/vllm/integration/test_accuracy.py",
-        "scripts/vllm/integration/test_serving_performance.py",
-        "scripts/vllm/integration/pcp_disagg_test.sh",
+        "scripts/vllm/integration/test_safety_model_accuracy.py",
         "scripts/vllm/integration/run_dsv4_offload_correctness.sh",
-        "scripts/vllm/integration/run_dsv4_pd_disagg_correctness.sh",
+        "scripts/vllm/integration/run_dsv4_pd_correctness.sh",
+        "scripts/vllm/integration/check_dsv4_stage3_log.py",
         "scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh",
+        "scripts/vllm/integration/run_k3_1p1d_disagg_correctness.sh",
+        "scripts/vllm/integration/run_pcp_correctness.sh",
         "scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh",
-        ".buildkite/kubernetes/manifests/dsv4-pd-disagg.yaml",
+        "scripts/vllm/integration/smoke_block_major_offload.py",
         ".buildkite/kubernetes/manifests/workloads/dsv4-pd-disagg.yaml",
+        ".buildkite/kubernetes/manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml",
+        ".buildkite/kubernetes/manifests/workloads/kimi-k3-agentx-1p1d.yaml",
+        ".buildkite/kubernetes/manifests/workloads/qwen3.5-397b-1p1d.yaml",
+        ".buildkite/kubernetes/disagg_benchmark.sh",
+        ".buildkite/kubernetes/disagg_engine.sh",
+        ".buildkite/kubernetes/k3_1p1d.sh",
+        ".buildkite/kubernetes/k3_agentx_client_pod.sh",
+        ".buildkite/kubernetes/benchmark_with_profile.sh",
     }
-)
-
-NIGHTLY_ONLY_INTEGRATION_PREFIXES: tuple[str, ...] = (
-    "scripts/vllm/integration/mm/",
-    "scripts/vllm/integration/spec_decode/",
-    "scripts/vllm/integration/structured_outputs/",
 )
 
 NON_PR_BUILDKITE_PREFIXES: tuple[str, ...] = (
@@ -173,26 +249,27 @@ NON_PR_BUILDKITE_PREFIXES: tuple[str, ...] = (
 NON_PR_BUILDKITE_EXACT: frozenset[str] = frozenset(
     {
         ".buildkite/pipeline_perf.yml",
-        ".buildkite/pipeline_perf_kube.yml",
         ".buildkite/pipeline_promote.yml",
         ".buildkite/pipeline_nightly_image.yml",
         ".buildkite/pipeline_dynamic.yml",
         ".buildkite/pipeline_dev.yml",
-        ".buildkite/pipeline_k3_sweep.yml",
+        ".buildkite/pipeline_coverage.yml",
+        ".buildkite/pipeline_release_pypi.yml",
         ".buildkite/scripts/bootstrap_dev.sh",
         ".buildkite/scripts/upload_models_and_features.sh",
-        ".buildkite/scripts/run_support_matrices.sh",
         ".buildkite/scripts/record_step_result.sh",
-        ".buildkite/scripts/generate_support_matrix.sh",
-        ".buildkite/scripts/check_results.sh",
+        ".buildkite/scripts/generate_support_matrices.sh",
+        ".buildkite/scripts/commit_support_matrices.sh",
+        ".buildkite/scripts/commit_verified_commit_hashes.sh",
+        ".buildkite/scripts/nightly_report.sh",
+        ".buildkite/scripts/notify_test_results.sh",
         ".buildkite/scripts/update_lkg_version.sh",
         ".buildkite/scripts/publish_nightly_images.sh",
-        ".buildkite/kubernetes/manifests/kimi-k3-agentx-1p1d.yaml",
-        ".buildkite/kubernetes/manifests/workloads/kimi-k3-agentx-1p1d.yaml",
-        ".buildkite/kubernetes/k3_1p1d.sh",
-        ".buildkite/kubernetes/k3_agentx_client_pod.sh",
-        ".buildkite/scripts/k3_agentx_client_pod.sh",
         ".buildkite/scripts/build_k3_engine_image.sh",
+        ".buildkite/scripts/build_core_wheel.sh",
+        ".buildkite/scripts/build_vllm_torchtpu.sh",
+        ".buildkite/scripts/publish_wheel.sh",
+        ".buildkite/scripts/upload_profile.sh",
     }
 )
 
@@ -235,10 +312,14 @@ def _is_doc_or_non_pr_file(path: str) -> bool:
         return True
     if path in NIGHTLY_ONLY_INTEGRATION_EXACT:
         return True
-    if path.startswith(NIGHTLY_ONLY_INTEGRATION_PREFIXES):
-        return True
     return (
-        path.startswith(("scripts/vllm/benchmarking/", "scripts/vllm/benchmarks/"))
+        path.startswith(
+            (
+                "scripts/vllm/benchmarking/",
+                "scripts/vllm/benchmark/",
+                "scripts/vllm/benchmarks/",
+            )
+        )
         and path not in CPU_TESTED_BENCHMARK_FILES
     )
 
@@ -273,7 +354,7 @@ def _classify_unit_test_file(
     """Returns (has_tpu_general, has_multichip) for a unit test file."""
     full_path = repo_root / rel_path
     if not full_path.is_file():
-        return (True, True)
+        return (False, False)
     try:
         content = full_path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -387,7 +468,6 @@ def select_for_files(
             in {
                 ".buildkite/pipeline_build.yml",
                 ".buildkite/pipeline_verify.yml",
-                ".buildkite/pipeline_verify_kube.yml",
                 ".buildkite/scripts/bootstrap.sh",
                 ".buildkite/scripts/configs/pipeline_config.sh",
                 ".buildkite/scripts/setup_docker_env.sh",
@@ -425,18 +505,12 @@ def select_for_files(
             reasons.append("integration script/manifest changes")
             continue
 
-        if f in {
-            ".buildkite/pipeline_integration.yml",
-            ".buildkite/pipeline_integration_kube.yml",
-        }:
+        if f == ".buildkite/pipeline_integration.yml":
             run_integration_steps.update(ALL_PR_INTEGRATION_STEPS)
             reasons.append("integration pipeline YAML changes")
             continue
 
-        if f in {
-            ".buildkite/pipeline_tests.yml",
-            ".buildkite/pipeline_tests_kube.yml",
-        }:
+        if f == ".buildkite/pipeline_tests.yml":
             run_test_steps.update(ALL_PR_TEST_STEPS)
             full_general_tests = True
             full_multichip_tests = True
@@ -467,6 +541,8 @@ def select_for_files(
                 full_general_tests = True
                 full_multichip_tests = True
                 reasons.append("shared test fixture changes")
+            elif not (repo_root / f).is_file():
+                reasons.append("deleted unit test file")
             elif _is_cpu_only_unit_test(f, repo_root):
                 reasons.append("CPU unit test changes")
             else:

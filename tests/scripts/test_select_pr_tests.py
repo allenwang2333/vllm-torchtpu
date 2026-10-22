@@ -30,11 +30,11 @@ sys.modules["select_pr_tests"] = select_pr_tests
 spec.loader.exec_module(select_pr_tests)
 
 
-_SAMPLE_TESTS_KUBE_YAML = """\
+_SAMPLE_TESTS_YAML = """\
 steps:
-  - group: ":kubernetes: Unit Tests on TPU"
+  - group: "Unit Tests on TPU"
     steps:
-      - label: ":kubernetes: Unit Tests - General (PR)"
+      - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -47,7 +47,7 @@ steps:
               <<: *tests_plugin_defaults
               test-cmd: "pytest -sv"
 
-      - label: ":kubernetes: Unit Tests - Speculative Decoding (PR)"
+      - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
@@ -76,9 +76,9 @@ class SelectPrTestsTest(unittest.TestCase):
     def test_cpu_only_tooling_skips_integration_and_tpu_unit_tests(self) -> None:
         plan = select_pr_tests.select_for_files(
             [
-                "tools/check_comment_language.py",
-                "tests/scripts/test_verify_regression.py",
-                "scripts/vllm/benchmarking/verify_regression.py",
+                "tools/check_env_reads.py",
+                "tests/scripts/test_check_regression.py",
+                "scripts/vllm/benchmarking/check_regression.py",
             ]
         )
         self.assertFalse(plan.skip_all_ci)
@@ -136,13 +136,31 @@ class SelectPrTestsTest(unittest.TestCase):
     def test_single_general_unit_test_narrows_pattern_and_parallelism(
         self,
     ) -> None:
-        plan = select_pr_tests.select_for_files(["tests/lora/test_lora.py"])
+        test_file = "tests/entrypoints/llm/test_structured_output.py"
+        plan = select_pr_tests.select_for_files([test_file])
         self.assertFalse(plan.skip_all_ci)
         self.assertEqual(plan.lanes, ("verify", "tests"))
-        self.assertEqual(plan.general_test_pattern, "tests/lora/test_lora.py")
+        self.assertEqual(plan.general_test_pattern, test_file)
         self.assertEqual(plan.general_test_parallelism, 1)
         self.assertNotIn("unit_tests_general_pr", plan.skip_steps)
+        self.assertIn("unit_tests_multichip_pr", plan.skip_steps)
         self.assertIn("unit_tests_spec_decode_pr", plan.skip_steps)
+
+    def test_deleted_unit_test_file_does_not_narrow_to_missing_file(
+        self,
+    ) -> None:
+        plan = select_pr_tests.select_for_files(
+            ["tests/entrypoints/llm/test_deleted_nonexistent.py"]
+        )
+        self.assertFalse(plan.skip_all_ci)
+        self.assertEqual(plan.lanes, ("verify", "tests"))
+        self.assertEqual(
+            plan.general_test_pattern, select_pr_tests.DEFAULT_TEST_PATTERN
+        )
+        self.assertIn("unit_tests_general_pr", plan.skip_steps)
+        self.assertIn("unit_tests_multichip_pr", plan.skip_steps)
+        self.assertNotIn("typecheck_full", plan.skip_steps)
+        self.assertNotIn("unit_tests_cpu_pr", plan.skip_steps)
 
     def test_dsv4_custom_ops_skips_integration_and_spec_decode(self) -> None:
         plan = select_pr_tests.select_for_files(
@@ -189,22 +207,23 @@ class SelectPrTestsTest(unittest.TestCase):
         self.assertEqual(plan.omni_image_skip, "")
 
     def test_filter_yaml_injects_skip_and_test_pattern(self) -> None:
-        yaml_inputs = [_SAMPLE_TESTS_KUBE_YAML]
-        tests_kube_path = REPO_ROOT / ".buildkite" / "pipeline_tests_kube.yml"
-        if tests_kube_path.exists():
-            yaml_inputs.append(tests_kube_path.read_text(encoding="utf-8"))
+        yaml_inputs = [_SAMPLE_TESTS_YAML]
+        tests_yaml_path = REPO_ROOT / ".buildkite" / "pipeline_tests.yml"
+        if tests_yaml_path.exists():
+            yaml_inputs.append(tests_yaml_path.read_text(encoding="utf-8"))
 
-        plan = select_pr_tests.select_for_files(["tests/lora/test_lora.py"])
-        for tests_kube in yaml_inputs:
+        test_file = "tests/entrypoints/llm/test_structured_output.py"
+        plan = select_pr_tests.select_for_files([test_file])
+        for tests_yaml in yaml_inputs:
             filtered = select_pr_tests.filter_yaml_content(
-                yaml_text=tests_kube,
+                yaml_text=tests_yaml,
                 skip_steps=plan.skip_steps,
                 general_test_pattern=plan.general_test_pattern,
                 general_test_parallelism=plan.general_test_parallelism,
                 multichip_test_pattern=plan.multichip_test_pattern,
             )
             self.assertIn(
-                '              test-file-pattern: "tests/lora/test_lora.py"\n',
+                f'              test-file-pattern: "{test_file}"\n',
                 filtered,
             )
             self.assertIn("        parallelism: 1\n", filtered)
@@ -214,6 +233,46 @@ class SelectPrTestsTest(unittest.TestCase):
             )
         for reason in plan.skip_steps.values():
             self.assertLessEqual(len(reason), 70)
+
+    def test_mapped_repo_paths_and_step_keys_exist(self) -> None:
+        for rel_path, steps in select_pr_tests.INTEGRATION_FILE_TO_STEPS.items():
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"Mapped integration file does not exist: {rel_path}",
+            )
+            self.assertTrue(
+                steps.issubset(select_pr_tests.ALL_PR_INTEGRATION_STEPS),
+                f"Unknown integration steps for {rel_path}: {steps}",
+            )
+        for rel_path in select_pr_tests.CPU_TESTED_BENCHMARK_FILES:
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"CPU-tested benchmark file does not exist: {rel_path}",
+            )
+        for rel_path in select_pr_tests.NIGHTLY_ONLY_INTEGRATION_EXACT:
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"Nightly integration file does not exist: {rel_path}",
+            )
+        for rel_path in select_pr_tests.NON_PR_BUILDKITE_EXACT:
+            if rel_path.startswith(".buildkite/pipeline_"):
+                continue
+            self.assertTrue(
+                (REPO_ROOT / rel_path).is_file(),
+                f"Non-PR Buildkite script does not exist: {rel_path}",
+            )
+
+        tests_yaml_path = REPO_ROOT / ".buildkite" / "pipeline_tests.yml"
+        if tests_yaml_path.is_file():
+            tests_yaml = tests_yaml_path.read_text(encoding="utf-8")
+            for step_key in select_pr_tests.ALL_PR_TEST_STEPS:
+                self.assertIn(f'key: "{step_key}"', tests_yaml)
+
+        integ_yaml_path = REPO_ROOT / ".buildkite" / "pipeline_integration.yml"
+        if integ_yaml_path.is_file():
+            integ_yaml = integ_yaml_path.read_text(encoding="utf-8")
+            for step_key in select_pr_tests.ALL_PR_INTEGRATION_STEPS:
+                self.assertIn(f'key: "{step_key}"', integ_yaml)
 
 
 if __name__ == "__main__":
