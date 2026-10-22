@@ -14,7 +14,9 @@ noise floor is the widest |golden/golden_aa - 1| over every job and config.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import math
 from pathlib import Path
 
 
@@ -22,8 +24,39 @@ def arms_of(out: dict) -> dict:
     return {a["name"]: a for a in out.get("arms") or []}
 
 
+def traced_configs() -> set[str]:
+    """bench.py's configs that name a served-trace op name, read without importing it."""
+    tree = ast.parse((Path(__file__).parent / "bench.py").read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "CONFIGS":
+            return {n for n, c in ast.literal_eval(node.value).items() if c.get("trace_signature")}
+    raise SystemExit("bench.py has no CONFIGS literal")
+
+
+def weighted_score(arm: dict, ref: dict, weights: dict[str, float]) -> float:
+    """The campaign's geomean: prod (ref/arm)^w over the weighted configs, w normalised."""
+    total = sum(weights.values())
+    return math.prod((ref[c]["latency_us"] / arm[c]["latency_us"]) ** (w / total)
+                     for c, w in weights.items())
+
+
+def score_noise(outs: list[dict], weights: dict[str, float]) -> list[tuple[str, float]]:
+    """golden_aa's weighted score against golden's reading in every job, its own and the others.
+
+    The campaign scores a job without golden against golden's readings from
+    earlier jobs, so the cross-job pairs are the noise a candidate is judged in.
+    """
+    out = []
+    for i, oi in enumerate(outs, 1):
+        aa = arms_of(oi)["golden_aa"]["configs"]
+        for j, oj in enumerate(outs, 1):
+            out.append((f"aa{i}/golden{j}", weighted_score(aa, arms_of(oj)["golden"]["configs"], weights)))
+    return out
+
+
 def judge(outs: list[dict], configs: list[str], tolerance: float) -> tuple[bool, list[str], float]:
     bad, lines, spreads = [], [], []
+    traced = traced_configs()
     lines.append(f"{'job':<4}{'config':<18}{'golden us':>10}{'g err':>8}{'A/A':>8}"
                  f"{'wrong err':>11}{'slow ratio':>11}")
     slow_ratios = []
@@ -46,7 +79,7 @@ def judge(outs: list[dict], configs: list[str], tolerance: float) -> tuple[bool,
                          f"{w[c]['worst_error']:>11.3e}{slow_r:>11.4f}")
             if g[c]["worst_error"] > tolerance or g[c].get("declined"):
                 bad.append(f"job {j} {c}: golden fails the tolerance {tolerance:g}")
-            if g[c].get("metrics", {}).get("signature_matches_trace") == 0.0 and c.startswith("decode"):
+            if c in traced and g[c].get("metrics", {}).get("signature_matches_trace") != 1.0:
                 bad.append(f"job {j} {c}: golden's op name is not the served trace's")
             if aa[c]["checksum"] != g[c]["checksum"] or aa[c]["dispatched"] != g[c]["dispatched"]:
                 bad.append(f"job {j} {c}: golden_aa does not reproduce golden's output or identity")
@@ -67,10 +100,16 @@ def main(argv=None) -> int:
     p.add_argument("outputs", nargs="+", type=Path)
     p.add_argument("--configs", default="decode_gate_up,decode_down,prefill_gate_up,prefill_down")
     p.add_argument("--tolerance", type=float, required=True)
+    p.add_argument("--weights", default="", help="config=w,... : also report the weighted A/A score noise")
     a = p.parse_args(argv)
-    ok, lines, _ = judge([json.loads(f.read_text()) for f in a.outputs], a.configs.split(","),
-                         a.tolerance)
+    outs = [json.loads(f.read_text()) for f in a.outputs]
+    ok, lines, _ = judge(outs, a.configs.split(","), a.tolerance)
     print("\n".join(lines))
+    if a.weights:
+        weights = {k: float(v) for k, v in (kv.split("=") for kv in a.weights.split(","))}
+        pairs = score_noise(outs, weights)
+        print("weighted A/A scores: " + ", ".join(f"{n} {v:.4f}" for n, v in pairs))
+        print(f"score noise floor (widest |score-1|): {max(abs(v - 1) for _, v in pairs):.4f}")
     print("calibration PASSED" if ok else "calibration FAILED")
     return 0 if ok else 1
 
