@@ -45,9 +45,11 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2_ffn import make_ffn_configs
 
-# Weight slots: the expert being computed plus PREFETCH experts in flight.
-_NBUF = 3
-_PREFETCH = _NBUF - 1
+# Most weight slots: the expert being computed plus experts in flight. Fewer
+# are used when the token-sized buffers leave no room for this many.
+MAX_NBUF = 3
+# Most routed rows one expert matmul takes; an expert with more runs in chunks.
+ROW_CHUNK = 128
 # Indices into an expert's (w1, w1 scale, w2, w2 scale) copies.
 _UP, _DOWN = (0, 1), (2, 3)
 # A route is stored as token << _K_BITS | top-k slot.
@@ -63,8 +65,15 @@ def _padded_rows(num_tokens: int, dtype: jnp.dtype) -> int:
     return align_to(num_tokens, pltpu.get_tpu_info().get_sublane_tiling(dtype))
 
 
-def _vmem_estimate(up: GmmConfigs, down: GmmConfigs) -> int:
-    rows = up.dims.size_m
+def _chunk_rows(num_tokens: int, dtype: jnp.dtype) -> int:
+    """Rows per expert matmul: a power of two, so chunk counts are shifts."""
+    rows = _padded_rows(num_tokens, dtype)
+    return min(ROW_CHUNK, 1 << (rows - 1).bit_length())
+
+
+def _vmem_estimate(up: GmmConfigs, down: GmmConfigs, nbuf: int) -> int:
+    tokens = up.dims.size_m
+    rows = _chunk_rows(tokens, up.lhs_cfgs.dtype)
     hidden, inter = down.out_size_n, up.out_size_n
     weight_bits = jax.dtypes.itemsize_bits(up.rhs_cfgs.quant_dtype or up.rhs_cfgs.dtype)
     weights = (up.dims.size_k * 2 * inter + inter * hidden) * weight_bits // 8
@@ -72,8 +81,10 @@ def _vmem_estimate(up: GmmConfigs, down: GmmConfigs) -> int:
     scale_lanes = up.num_quant_blocks_per_tile_k * 2 * inter
     scale_lanes += down.num_quant_blocks_per_tile_k * hidden
     scales = 8 * 4 * scale_lanes
-    total = _NBUF * (weights + scales)
-    total += 4 * rows * hidden * 4  # f32 tokens, rows and accumulator; in and out
+    total = nbuf * (weights + scales)
+    # Tokens (bf16, reused for the output), f32 tokens and the f32 accumulator.
+    total += tokens * hidden * (2 + 4 + 4)
+    total += rows * hidden * 4  # one chunk's gathered rows, then its outputs
     total += rows * 2 * inter * (4 + 4) + rows * hidden * 4  # tile values
     return int(total)
 
@@ -87,11 +98,12 @@ def make_routed_ffn_configs(
     *,
     fuse_act: str,
     vmem_limit_bytes: int | None = None,
-) -> tuple[GmmConfigs, GmmConfigs] | None:
-    """gmm_v2 configs for both legs over all padded token rows, or None.
+) -> tuple[GmmConfigs, GmmConfigs, int] | None:
+    """gmm_v2 configs for both legs over all padded token rows and the number
+    of expert weight slots, or None.
 
-    None when the expert weights do not fit one tile per leg or three experts'
-    weights do not fit in VMEM together.
+    None when the expert weights do not fit one tile per leg or two experts'
+    weights and the token buffers do not fit in VMEM together.
     """
     if vmem_limit_bytes is None:
         vmem_limit_bytes = _default_vmem_limit()
@@ -114,9 +126,12 @@ def make_routed_ffn_configs(
         out_dtype=hidden_states.dtype,
         vmem_limit_bytes=vmem_limit_bytes,
     )
-    if cfgs is None or _vmem_estimate(*cfgs) > vmem_limit_bytes:
+    if cfgs is None:
         return None
-    return cfgs
+    for nbuf in range(MAX_NBUF, 1, -1):
+        if _vmem_estimate(*cfgs, nbuf) <= vmem_limit_bytes:
+            return (*cfgs, nbuf)
+    return None
 
 
 def _row_buckets(rows: int, base: int) -> list[int]:
@@ -130,8 +145,8 @@ def _row_buckets(rows: int, base: int) -> list[int]:
 def _routed_ffn_kernel(
     # Scalar prefetch
     start_sm: jax.Array,  # int32[1]: global id of local expert 0
-    ids_sm: jax.Array,  # int32[T, topk]: global expert ids
-    weights_sm: jax.Array,  # f32[T, topk] routing weights
+    ids_sm: jax.Array,  # int32[T * topk]: global expert ids, token-major
+    weights_sm: jax.Array,  # f32[T * topk] routing weights
     # In
     x_hbm: jax.Array,  # [T, H]
     w1_hbm: jax.Array,  # [E, H, 2 * I]: gate then up
@@ -139,17 +154,17 @@ def _routed_ffn_kernel(
     w2_hbm: jax.Array,  # [E, I, H]
     s2_hbm: jax.Array,  # f32[E, blocks, 1, H]
     # Out
-    out_ref: jax.Array,  # [T, H]
+    out_hbm: jax.Array,  # [T, H]
     # Scratch
-    w1_vm: jax.Array,  # [NBUF, H, 2 * I]
-    s1_vm: jax.Array,  # [NBUF, blocks, 1, 2 * I]
-    w2_vm: jax.Array,  # [NBUF, I, H]
-    s2_vm: jax.Array,  # [NBUF, blocks, 1, H]
-    sems: jax.Array,  # DMA[4, NBUF]
-    x_vm: jax.Array,  # [T, H]
+    w1_vm: jax.Array,  # [nbuf, H, 2 * I]
+    s1_vm: jax.Array,  # [nbuf, blocks, 1, 2 * I]
+    w2_vm: jax.Array,  # [nbuf, I, H]
+    s2_vm: jax.Array,  # [nbuf, blocks, 1, H]
+    sems: jax.Array,  # DMA[4, nbuf]
+    x_vm: jax.Array,  # [T, H]: the tokens, then the output
     x_sem: jax.Array,  # DMA
     x32_vm: jax.Array,  # f32[T, H]
-    rows_vm: jax.Array,  # f32[rows, H]: one expert's gathered rows, then its outputs
+    rows_vm: jax.Array,  # f32[rows, H]: one chunk's gathered rows, then outputs
     acc_vm: jax.Array,  # f32[T, H]
     count_sm: jax.Array,  # int32[E]: routes per expert
     visit_sm: jax.Array,  # int32[E]
@@ -157,26 +172,28 @@ def _routed_ffn_kernel(
     *,
     up: GmmConfigs,
     down: GmmConfigs,
+    topk: int,
+    nbuf: int,
     skip_zero_weights: bool,
 ):
-    num_tokens, topk = ids_sm.shape
+    num_tokens = x_vm.shape[0]
     num_experts = count_sm.shape[0]
+    num_rows = rows_vm.shape[0]
     inter = up.out_size_n
+    prefetch = nbuf - 1
     pairs = ((w1_hbm, w1_vm), (s1_hbm, s1_vm), (w2_hbm, w2_vm), (s2_hbm, s2_vm))
 
-    def copies(expert, slot):
-        return [
-            pltpu.make_async_copy(src.at[expert], dst.at[slot], sems.at[i, slot])
-            for i, (src, dst) in enumerate(pairs)
-        ]
+    def copy(i, expert, slot):
+        src, dst = pairs[i]
+        return pltpu.make_async_copy(src.at[expert], dst.at[slot], sems.at[i, slot])
 
     def start(expert, slot, operands):
         for i in operands:
-            copies(expert, slot)[i].start()
+            copy(i, expert, slot).start()
 
     def wait(slot, operands):
         for i in operands:
-            copies(0, slot)[i].wait()
+            copy(i, 0, slot).wait()
 
     # The token rows are first read after the scan, so their copy runs under it.
     x_copy = pltpu.make_async_copy(x_hbm, x_vm, x_sem)
@@ -195,10 +212,10 @@ def _routed_ffn_kernel(
     def scan_token(carry):
         t, n_visit = carry
         for k in range(topk):
-            expert = ids_sm[t, k] - first_expert
+            expert = ids_sm[t * topk + k] - first_expert
             is_local = jnp.logical_and(expert >= 0, expert < num_experts)
             if skip_zero_weights:
-                is_local = jnp.logical_and(is_local, weights_sm[t, k] != 0)
+                is_local = jnp.logical_and(is_local, weights_sm[t * topk + k] != 0)
             clamped = jnp.where(is_local, expert, 0)
             count = count_sm[clamped]
             is_new = jnp.logical_and(is_local, count == 0)
@@ -222,9 +239,9 @@ def _routed_ffn_kernel(
             carry,
         )
 
-    # Stop the scan at each of the first PREFETCH experts to request its weights.
+    # Stop the scan at each of the first `prefetch` experts to request its weights.
     carry = (jnp.int32(0), jnp.int32(0))
-    for slot in range(min(_PREFETCH, num_experts)):
+    for slot in range(min(prefetch, num_experts)):
         carry = scan_until(carry, slot + 1)
 
         @pl.when(carry[1] > slot)
@@ -236,33 +253,26 @@ def _routed_ffn_kernel(
     x_copy.wait()
     x32_vm[...] = x_vm[...].astype(jnp.float32)
     acc_vm[...] = jnp.zeros_like(acc_vm)
+    buckets = _row_buckets(num_rows, _padded_rows(1, x_vm.dtype))
+    chunk_shift = num_rows.bit_length() - 1
 
     def visit(j, carry):
         expert = visit_sm[j]
-        slot = lax.rem(j, _NBUF)
+        slot = lax.rem(j, nbuf)
         count = count_sm[expert]
         base = expert * num_tokens
 
-        # The slot PREFETCH ahead was last read by expert j - 1, whose
+        # The slot `prefetch` ahead was last read by expert j - 1, whose
         # contribution was stored into acc_vm before this iteration. An
         # expert's down weights are requested one visit after its gate/up
         # weights, so they are the last bytes of the last expert to land.
-        @pl.when(j + _PREFETCH < n_visit)
+        @pl.when(j + prefetch < n_visit)
         def _():
-            start(visit_sm[j + _PREFETCH], lax.rem(j + _PREFETCH, _NBUF), _UP)
+            start(visit_sm[j + prefetch], lax.rem(j + prefetch, nbuf), _UP)
 
         @pl.when(j + 1 < n_visit)
         def _():
-            start(visit_sm[j + 1], lax.rem(j + 1, _NBUF), _DOWN)
-
-        # Rows go through f32 because a single bf16 row is not addressable at a
-        # dynamic offset; bf16 -> f32 -> bf16 is exact.
-        @pl.loop(0, count)
-        def _(i):
-            token = route_sm[base + i] >> _K_BITS
-            rows_vm[pl.ds(i, 1), :] = x32_vm[pl.ds(token, 1), :]
-
-        wait(slot, _UP)
+            start(visit_sm[j + 1], lax.rem(j + 1, nbuf), _DOWN)
 
         w13 = WeightsRef(weight=w1_vm.at[slot], scale=s1_vm.at[slot], bias=None)
         w13 = FusedWeightsRef(
@@ -271,34 +281,61 @@ def _routed_ffn_kernel(
         )
         w2 = WeightsRef(weight=w2_vm.at[slot], scale=s2_vm.at[slot], bias=None)
 
-        # Rows past `count` are stale. Every op is row-local and the combine
-        # reads only the first `count` rows, so they never reach the output.
-        def run_rows(bucket_m: int):
-            matmul = functools.partial(
-                tile_matmul, bucket_m=bucket_m, is_last_k_step=True
-            )
-            lhs = rows_vm[:bucket_m, :].astype(x_vm.dtype)
-            hidden = apply_act_fn(matmul(lhs, w13, cfgs=up), up.fuse_act)
-            # The last expert's gate/up runs while its down weights still land.
-            wait(slot, _DOWN)
-            acc = matmul(hidden.astype(up.out_dtype), w2, cfgs=down)
-            # The per-route output is rounded where the grouped path stores it.
-            rows_vm[:bucket_m, :] = acc.astype(down.out_dtype).astype(jnp.float32)
+        def chunk(c, carry):
+            first = base + (c << chunk_shift)
+            n = jnp.minimum(count - (c << chunk_shift), num_rows)
 
-        buckets = _row_buckets(rows_vm.shape[0], _padded_rows(1, x_vm.dtype))
-        bucket_idx = sum((count > b).astype(jnp.int32) for b in buckets[:-1])
-        lax.switch(bucket_idx, [functools.partial(run_rows, b) for b in buckets])
+            # Rows go through f32 because a single bf16 row is not addressable
+            # at a dynamic offset; bf16 -> f32 -> bf16 is exact.
+            @pl.loop(0, n)
+            def _(i):
+                token = route_sm[first + i] >> _K_BITS
+                rows_vm[pl.ds(i, 1), :] = x32_vm[pl.ds(token, 1), :]
 
-        @pl.loop(0, count)
-        def _(i):
-            route = route_sm[base + i]
-            token, k = route >> _K_BITS, route & ((1 << _K_BITS) - 1)
-            acc_vm[pl.ds(token, 1), :] += weights_sm[token, k] * rows_vm[pl.ds(i, 1), :]
+            @pl.when(c == 0)
+            def _():
+                wait(slot, _UP)
 
+            # Rows past `n` are stale. Every op is row-local and the combine
+            # reads only the first `n` rows, so they never reach the output.
+            def run_rows(bucket_m: int):
+                matmul = functools.partial(
+                    tile_matmul, bucket_m=bucket_m, is_last_k_step=True
+                )
+                lhs = rows_vm[:bucket_m, :].astype(x_vm.dtype)
+                hidden = apply_act_fn(matmul(lhs, w13, cfgs=up), up.fuse_act)
+
+                # The last expert's gate/up runs while its down weights land.
+                @pl.when(c == 0)
+                def _():
+                    wait(slot, _DOWN)
+
+                acc = matmul(hidden.astype(up.out_dtype), w2, cfgs=down)
+                # The per-route output is rounded where the grouped path stores it.
+                rows_vm[:bucket_m, :] = acc.astype(down.out_dtype).astype(jnp.float32)
+
+            bucket_idx = sum((n > b).astype(jnp.int32) for b in buckets[:-1])
+            lax.switch(bucket_idx, [functools.partial(run_rows, b) for b in buckets])
+
+            @pl.loop(0, n)
+            def _(i):
+                route = route_sm[first + i]
+                token, k = route >> _K_BITS, route & ((1 << _K_BITS) - 1)
+                acc_vm[pl.ds(token, 1), :] += (
+                    weights_sm[token * topk + k] * rows_vm[pl.ds(i, 1), :]
+                )
+
+            return carry
+
+        num_chunks = (count + num_rows - 1) >> chunk_shift
+        lax.fori_loop(0, num_chunks, chunk, 0)
         return carry
 
     lax.fori_loop(0, n_visit, visit, 0)
-    out_ref[...] = acc_vm[...].astype(out_ref.dtype)
+    x_vm[...] = acc_vm[...].astype(x_vm.dtype)
+    out_copy = pltpu.make_async_copy(x_vm, out_hbm, x_sem)
+    out_copy.start()
+    out_copy.wait()
 
 
 def _f32_scale(scale: jax.Array) -> jax.Array:
@@ -346,19 +383,19 @@ def moe_routed_ffn(
             f"{w2.shape=} {topk_ids.shape=}; check make_routed_ffn_configs and "
             "MAX_TOPK before calling it."
         )
-    up, down = cfgs
+    up, down, nbuf = cfgs
     num_tokens, hidden = hidden_states.shape
+    topk = topk_ids.shape[1]
     num_experts = w1.shape[0]
-    rows = up.dims.size_m
+    rows = _chunk_rows(num_tokens, hidden_states.dtype)
 
-    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     scratch_shapes = [
-        pltpu.VMEM((_NBUF, *w1.shape[1:]), w1.dtype),
-        pltpu.VMEM((_NBUF, *w1_scale.shape[1:]), jnp.float32),
-        pltpu.VMEM((_NBUF, *w2.shape[1:]), w2.dtype),
-        pltpu.VMEM((_NBUF, *w2_scale.shape[1:]), jnp.float32),
-        pltpu.SemaphoreType.DMA((4, _NBUF)),
+        pltpu.VMEM((nbuf, *w1.shape[1:]), w1.dtype),
+        pltpu.VMEM((nbuf, *w1_scale.shape[1:]), jnp.float32),
+        pltpu.VMEM((nbuf, *w2.shape[1:]), w2.dtype),
+        pltpu.VMEM((nbuf, *w2_scale.shape[1:]), jnp.float32),
+        pltpu.SemaphoreType.DMA((4, nbuf)),
         pltpu.VMEM((num_tokens, hidden), hidden_states.dtype),
         pltpu.SemaphoreType.DMA(()),
         pltpu.VMEM((num_tokens, hidden), jnp.float32),
@@ -374,17 +411,22 @@ def moe_routed_ffn(
     )
     name = (
         f"gmm_v2_routed_ffn-g_{num_experts}-m_{num_tokens}-k_{hidden}"
-        f"-i_{up.out_size_n}-n_{down.out_size_n}-act_{fuse_act}"
+        f"-i_{up.out_size_n}-n_{down.out_size_n}-act_{fuse_act}-b_{nbuf}"
     )
     return pl.pallas_call(
         functools.partial(
-            _routed_ffn_kernel, up=up, down=down, skip_zero_weights=skip_zero_weights
+            _routed_ffn_kernel,
+            up=up,
+            down=down,
+            topk=topk,
+            nbuf=nbuf,
+            skip_zero_weights=skip_zero_weights,
         ),
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), hidden_states.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[hbm, hbm, hbm, hbm, hbm],
-            out_specs=vmem,
+            out_specs=hbm,
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
@@ -393,7 +435,7 @@ def moe_routed_ffn(
         name=name,
         cost_estimate=pl.CostEstimate(
             # Upper bound: every local expert active.
-            flops=2 * rows * hidden * 3 * up.out_size_n * num_experts,
+            flops=2 * num_tokens * hidden * 3 * up.out_size_n * num_experts,
             bytes_accessed=weight_bytes + 2 * hidden_states.size * 2,
             transcendentals=0,
         ),
@@ -401,8 +443,8 @@ def moe_routed_ffn(
         jnp.zeros((1,), jnp.int32)
         if experts_start is None
         else jnp.reshape(experts_start, (1,)).astype(jnp.int32),
-        topk_ids.astype(jnp.int32),
-        topk_weights.astype(jnp.float32),
+        topk_ids.astype(jnp.int32).reshape(-1),
+        topk_weights.astype(jnp.float32).reshape(-1),
         hidden_states,
         w1,
         w1_scale,

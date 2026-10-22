@@ -223,9 +223,10 @@ def gmm_wrapper(
     )
 
 
-# The routed kernel multiplies every token by each visited expert, so it is kept
-# to decode-sized batches.
-_ROUTED_FFN_MAX_TOKENS = 64
+# Tokens after the EP all-gather: DP8 decode at 64 sequences per rank is 512.
+# Past this the routed kernel's token-sized VMEM buffers crowd out the expert
+# weight slots, and prefill-sized batches keep the grouped GEMM.
+_ROUTED_FFN_MAX_TOKENS = 512
 
 
 def _use_routed_ffn(

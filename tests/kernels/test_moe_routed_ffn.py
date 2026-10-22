@@ -59,10 +59,11 @@ def _grouped_reference(x, ids, weights, w1, w1_scale, w2, w2_scale):
     return out
 
 
-@pytest.mark.parametrize("num_tokens", [4, 8, 16, 32, 48])
+@pytest.mark.parametrize("num_tokens", [4, 8, 16, 32, 48, 160, 512])
 @pytest.mark.parametrize("seed", [0, 1])
 @pytest.mark.parametrize("rank", [0, 2])
-def test_moe_routed_ffn_matches_grouped_path(num_tokens, seed, rank):
+@pytest.mark.parametrize("concentrated", [False, True])
+def test_moe_routed_ffn_matches_grouped_path(num_tokens, seed, rank, concentrated):
     _require_tpu()
     rng = np.random.default_rng(seed)
     x = jnp.asarray(rng.standard_normal((num_tokens, SIZE_K)), jnp.bfloat16)
@@ -82,6 +83,10 @@ def test_moe_routed_ffn_matches_grouped_path(num_tokens, seed, rank):
     global_ids = np.stack(
         [rng.permutation(EP * NUM_EXPERTS)[:TOPK] for _ in range(num_tokens)]
     ).astype(np.int32)
+    if concentrated:
+        # Warmup's identical dummy tokens: every token on the same experts, so
+        # an expert's routes span several row chunks.
+        global_ids[:] = global_ids[0]
     weights = rng.uniform(0, 0.5, (num_tokens, TOPK))
     weights[num_tokens * 3 // 4 :] = 0  # padded tokens
     weights = jnp.asarray(weights, jnp.bfloat16)
