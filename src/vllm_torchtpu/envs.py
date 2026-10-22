@@ -777,12 +777,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
-    # Compute rotary cos/sin on the TPU from positions and inv_freq inside the
-    # compiled graph instead of indexing a host-built [max_position, rotary_dim]
-    # cos_sin_cache buffer, and drop that buffer. Applies to RotaryEmbedding
-    # variants whose cache is a pure function of position and inv_freq
-    # (layers/adapter/rotary_embedding.py); others keep the cache.
-    "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH"),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),

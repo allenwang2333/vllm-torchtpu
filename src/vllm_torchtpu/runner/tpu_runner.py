@@ -1334,15 +1334,10 @@ class TPUModelRunner(GPUModelRunner):
         num_eligible = 0
         num_truncated = 0
         for name, module in self.model.named_modules():
-            # isinstance, not an exact type match: on TPU these are the
-            # out-of-tree subclasses from layers/adapter/rotary_embedding.py.
-            if not isinstance(
-                module,
-                (
-                    RotaryEmbedding,
-                    MRotaryEmbedding,
-                    MRotaryEmbeddingInterleaved,
-                ),
+            if type(module) not in (
+                RotaryEmbedding,
+                MRotaryEmbedding,
+                MRotaryEmbeddingInterleaved,
             ):
                 continue
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):

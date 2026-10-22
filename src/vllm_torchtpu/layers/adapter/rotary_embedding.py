@@ -40,35 +40,17 @@ upstream class name, so each upstream class that needs the fix gets one entry:
 ``forward_native`` is overridden as well as ``forward_oot``/``forward_tpu`` so
 the numerics do not depend on ``CompilationConfig.custom_ops`` enabling the op:
 CUDA runs the FP32 kernel in both cases, and so should TPU.
-
-In-graph cos/sin (``TPU_ROPE_IN_GRAPH=1``)
-------------------------------------------
-Upstream builds a ``[max_position_embeddings, rotary_dim]`` ``cos_sin_cache``
-buffer on the host and the compiled graph gathers rows from it. That buffer is
-an input of every compiled program (tens of MB at long context) and is pure
-math. With the flag on, eligible modules instead keep only the ``[rotary_dim/2]``
-``inv_freq`` vector and compute ``cos``/``sin`` of ``positions * inv_freq`` on
-the TPU, inside the graph; the big buffer is dropped. Eligible means the cache
-is a pure function of position and ``inv_freq``, i.e. the class does not
-override ``_compute_cos_sin_cache`` (plain, Llama3, NTK, Gemma4 scaling; not
-linear / dynamic-NTK / YaRN, which keep the cache path). The in-graph values
-are rounded to the cache dtype before the FP32 rotation, so the numerics stay
-those of the CUDA kernel reading an activation-dtype cache.
 """
 
 import torch
 from vllm.model_executor.custom_op import CustomOp, op_registry_oot
 from vllm.model_executor.layers import rotary_embedding as upstream_rope
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-_INV_FREQ_BUFFER = "tpu_rope_inv_freq"
 
 
 @CustomOp.register_oot(name="ApplyRotaryEmb")
@@ -100,55 +82,6 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
     forward_tpu = forward_oot
 
 
-def in_graph_cos_sin(
-    positions: torch.Tensor, inv_freq: torch.Tensor, cache_dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``cos``/``sin`` of ``positions * inv_freq`` computed on device.
-
-    Same arithmetic as ``RotaryEmbeddingBase._compute_cos_sin_cache`` (FP32
-    product, FP32 trig), then rounded to ``cache_dtype`` exactly like the
-    stored cache rows would be, so swapping the gather for in-graph compute
-    does not move the reference numerics.
-    """
-    freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
-    return freqs.cos().to(cache_dtype), freqs.sin().to(cache_dtype)
-
-
-def is_in_graph_eligible(cls: type[RotaryEmbedding]) -> bool:
-    """Cache is a pure function of position and ``inv_freq``."""
-    return cls._compute_cos_sin_cache is RotaryEmbeddingBase._compute_cos_sin_cache
-
-
-def _enable_in_graph_rope(self: RotaryEmbedding, base_cls: type) -> None:
-    """After upstream init: switch the instance to in-graph cos/sin if asked."""
-    self._tpu_rope_in_graph = False
-    cache = getattr(self, "cos_sin_cache", None)
-    if not envs.TPU_ROPE_IN_GRAPH or not isinstance(cache, torch.Tensor):
-        return
-    if not is_in_graph_eligible(base_cls):
-        logger.warning_once(
-            "TPU_ROPE_IN_GRAPH: %s overrides _compute_cos_sin_cache; keeping its "
-            "cos_sin_cache buffer.",
-            base_cls.__name__,
-        )
-        return
-    inv_freq = self._compute_inv_freq(self.base).to(
-        device=cache.device, dtype=torch.float32
-    )
-    self.register_buffer(_INV_FREQ_BUFFER, inv_freq, persistent=False)
-    self._tpu_rope_cache_dtype = cache.dtype
-    self._tpu_rope_in_graph = True
-    # Drop the host-built table; nothing on the in-graph path reads it.
-    for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
-        self._buffers.pop(buf_name, None)
-        self.__dict__.pop(buf_name, None)
-    logger.info_once(
-        "TPU_ROPE_IN_GRAPH: %s computes cos/sin in-graph (dropped %s cache).",
-        base_cls.__name__,
-        tuple(cache.shape),
-    )
-
-
 def _rotary_forward_fp32(
     self: RotaryEmbedding,
     positions: torch.Tensor,
@@ -157,22 +90,15 @@ def _rotary_forward_fp32(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``RotaryEmbedding.forward_static`` with ``enable_fp32_compute=True``.
 
-    cos/sin come either from the cache matched to the query dtype or, with
-    ``TPU_ROPE_IN_GRAPH``, from in-graph trig rounded to that same dtype: the
-    CUDA kernel reads an activation-dtype cache and upcasts the loaded
-    entries, so the rounded values are part of the reference numerics.
+    The cos/sin cache is still matched to the query dtype first: the CUDA
+    kernel reads the activation-dtype cache and upcasts the loaded entries,
+    so the rounded cache values are part of the reference numerics.
     """
+    cos_sin_cache = self._match_cos_sin_cache_dtype(query)
     positions = positions.flatten()
     num_tokens = positions.shape[0]
-    if getattr(self, "_tpu_rope_in_graph", False):
-        cos, sin = in_graph_cos_sin(
-            positions, getattr(self, _INV_FREQ_BUFFER), self._tpu_rope_cache_dtype
-        )
-        cos, sin = cos.to(query.dtype), sin.to(query.dtype)
-    else:
-        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
-        cos_sin = cos_sin_cache.index_select(0, positions)
-        cos, sin = cos_sin.chunk(2, dim=-1)
+    cos_sin = cos_sin_cache.index_select(0, positions)
+    cos, sin = cos_sin.chunk(2, dim=-1)
 
     query_shape = query.shape
     query = query.view(num_tokens, -1, self.head_size)
@@ -242,18 +168,12 @@ def _make_tpu_rope_class(base: type[RotaryEmbedding]) -> type[RotaryEmbedding]:
         f"{base.__name__} defines its own forward_native; it needs its own TPU "
         "override instead of the shared RotaryEmbedding.forward_static replay."
     )
-
-    def __init__(self, *args, **kwargs) -> None:
-        base.__init__(self, *args, **kwargs)
-        _enable_in_graph_rope(self, base)
-
     tpu_cls = type(
         f"Tpu{base.__name__}",
         (base,),
         {
             "__module__": __name__,
             "__doc__": f"``{base.__name__}`` rotating in FP32 (CUDA numerics).",
-            "__init__": __init__,
             "forward_native": _rotary_forward_fp32,
             "forward_oot": _rotary_forward_fp32,
             "forward_tpu": _rotary_forward_fp32,
