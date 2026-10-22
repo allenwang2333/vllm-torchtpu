@@ -173,6 +173,97 @@ def store_state_region(
         )
 
 
+def _state_head_rows(
+    slot_ref: jax.Ref, region: config.StateRegion, num_heads: int, head_size: int
+) -> tuple[int, int, int]:
+    """(typed rows per head, typed rows per source block, bf16 values per word)."""
+    assert region.rows_perm is None
+    rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
+    packing = num_heads * head_size // (region.rows_used * out_lanes)
+    # A bf16 state rides a uint32 view, two values per word (see load_state_region).
+    assert packing == 1 or (packing == 2 and region.view_dtype == jnp.uint32), packing
+    rows_ph = region.rows_used // num_heads
+    assert rows_ph * num_heads == region.rows_used and rows_pb % rows_ph == 0
+    return rows_ph, rows_pb, packing
+
+
+def load_state_head(
+    slot_ref: jax.Ref,
+    region: config.StateRegion,
+    head: int,
+    shape: tuple[int, int, int],
+    has_initial_state: jax.Array,
+) -> jax.Array:
+    """Loads one head of one slot's state in its storage dtype.
+
+    A sequence without an initial state reads zeros.
+
+    Args:
+        slot_ref: One slot's raw source-layout tile, as for load_state_region.
+        region: The region's copy-plan.
+        head: Static head index.
+        shape: Logical state shape [num_heads, kq_head_dim, v_head_dim].
+        has_initial_state: Scalar predicate; False reads zeros.
+    """
+    num_heads, *head_shape = shape
+    rows_ph, rows_pb, packing = _state_head_rows(
+        slot_ref, region, num_heads, math.prod(head_shape)
+    )
+    block, row = divmod(head * rows_ph, rows_pb)
+    raw = typed_ldst.load_typed_rows(
+        slot_ref.at[block],
+        row,
+        rows_ph,
+        view_dtype=region.view_dtype,
+        lane_split=region.lane_split,
+    )
+    raw = jnp.where(has_initial_state, raw, 0)
+    if packing == 2:
+        raw = pltpu.bitcast(raw, jnp.bfloat16)
+    return raw.reshape(head_shape)
+
+
+def store_state_head(
+    slot_ref: jax.Ref,
+    region: config.StateRegion,
+    head: int,
+    num_heads: int,
+    values: jax.Array,
+) -> None:
+    """Stores one head of one slot's state; the per-head inverse of load_state_head.
+
+    Callers that store every head also call zero_state_padding, which leaves
+    the tile's bytes as store_state_region would.
+    """
+    rows_ph, rows_pb, packing = _state_head_rows(
+        slot_ref, region, num_heads, values.size
+    )
+    if packing == 2:
+        arr = pltpu.bitcast(values.astype(jnp.bfloat16), jnp.uint32)
+    else:
+        arr = values.astype(region.view_dtype)
+    block, row = divmod(head * rows_ph, rows_pb)
+    typed_ldst.store_typed_rows(
+        slot_ref.at[block],
+        row,
+        arr.reshape(rows_ph, -1),
+        lane_split=region.lane_split,
+    )
+
+
+def zero_state_padding(slot_ref: jax.Ref, region: config.StateRegion) -> None:
+    """Zeroes the typed rows past ``region.rows_used``, as store_state_region does."""
+    rows_pb, out_lanes = _region_rows_per_block(slot_ref, region)
+    for block in range(region.rows_used // rows_pb, region.nblocks):
+        start = max(region.rows_used - block * rows_pb, 0)
+        typed_ldst.store_typed_rows(
+            slot_ref.at[block],
+            start,
+            jnp.zeros((rows_pb - start, out_lanes), region.view_dtype),
+            lane_split=region.lane_split,
+        )
+
+
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
@@ -202,11 +293,11 @@ def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
     conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    recurrent_slot_ref: jax.Ref | None,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Load correct states from HBM or prior tile, and masks invalid states.
 
     Reference metadata to select the appropriate prior states. If `is_first_tile`
@@ -224,7 +315,8 @@ def load_and_select_states(
         conv_state_slot_ref: Convolution state read from HBM of shape
             [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
         recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
+            window_size, num_v_heads, kq_head_dim, v_head_dim]. None leaves
+            the recurrent state to the caller (no carry only).
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -236,8 +328,9 @@ def load_and_select_states(
         prev_conv_state: Selected convolution state of shape [seq_tile_size,
         prev_kernel_size, 1, dim_size] in float32.
         prev_recurrent_state: Selected recurrent state of shape [seq_tile_size,
-        num_v_heads, kq_head_dim, v_head_dim].
+        num_v_heads, kq_head_dim, v_head_dim], None without recurrent_slot_ref.
     """
+    assert recurrent_slot_ref is not None or carry_recurrent_scratch_ref is None
 
     real_sizes_list = []
     prev_conv_state_list = []
@@ -258,11 +351,13 @@ def load_and_select_states(
             prev_conv_state = jnp.where(
                 has_initial_state, _load_conv_state(conv_state_slot_ref, cfg, idx), 0
             )
-            prev_recurrent_state = jnp.where(
-                has_initial_state,
-                _load_recurrent_state(recurrent_slot_ref, cfg, idx),
-                0,
-            )
+            prev_recurrent_state = None
+            if recurrent_slot_ref is not None:
+                prev_recurrent_state = jnp.where(
+                    has_initial_state,
+                    _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                    0,
+                )
             if carry_conv_scratch_ref is not None:
                 prev_conv_state = jnp.where(
                     is_first_tile, prev_conv_state, carry_conv_scratch_ref[idx]
@@ -298,9 +393,21 @@ def load_and_select_states(
 
     real_sizes = jnp.stack(real_sizes_list, axis=0)
     prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
-    prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
+    prev_recurrent_state = None
+    if recurrent_slot_ref is not None:
+        prev_recurrent_state = jnp.stack(prev_recurrent_state_list, axis=0)
 
     return real_sizes, prev_conv_state, prev_recurrent_state
+
+
+def has_initial_states(
+    metadata_ref: memory_ref.MetadataRef, p_id: jax.Array, cfg: config.GDNConfig
+) -> list[jax.Array]:
+    """Per tile sequence, whether its state is read from the source or zero."""
+    return [
+        metadata_ref.s_idx_has_initial_state[metadata_ref.p_id_to_s_idx[p_id, idx]]
+        for idx in range(cfg.seq_tile_size)
+    ]
 
 
 def load_activation_as_compact(

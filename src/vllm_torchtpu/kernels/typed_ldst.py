@@ -47,3 +47,18 @@ def store_typed(block_ref, values: jax.Array, *, lane_split: int = 1) -> None:
     the raw block ref, which is fully written."""
     ref = _typed_view(block_ref, values.dtype, lane_split)
     ref[...] = values.reshape(ref.shape)
+
+
+def load_typed_rows(
+    block_ref, start: int, size: int, *, view_dtype, lane_split: int = 1
+) -> jax.Array:
+    """Reads typed rows ``[start, start + size)`` of a raw block ref."""
+    return _typed_view(block_ref, view_dtype, lane_split)[start : start + size]
+
+
+def store_typed_rows(
+    block_ref, start: int, values: jax.Array, *, lane_split: int = 1
+) -> None:
+    """Inverse of ``load_typed_rows``: writes ``values`` from typed row ``start``."""
+    ref = _typed_view(block_ref, values.dtype, lane_split)
+    ref[start : start + values.shape[0]] = values

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +29,47 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     metadata,
     vmem_ldst,
 )
+
+
+def _decode_state_head_ldst(
+    recurrent_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[
+    Callable[[int, int], jax.Array], Callable[[int, int, jax.Array], None]
+]:
+    """Per-head (load, store) of the BATCHED tile's single recurrent checkpoint.
+
+    The load reads zeros for a sequence without an initial state; each
+    sequence's typed padding rows are zeroed up front, as the whole-state store
+    would leave them.
+    """
+    has_initial_state = vmem_ldst.has_initial_states(metadata_ref, p_id, cfg)
+    shape = (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim)
+    region = None if cfg.state_plan is None else cfg.state_plan.recurrent
+
+    def load(idx: int, head: int) -> jax.Array:
+        if region is None:
+            return jnp.where(
+                has_initial_state[idx], recurrent_slot_ref[idx, 0, head], 0
+            )
+        return vmem_ldst.load_state_head(
+            recurrent_slot_ref.at[idx, 0], region, head, shape, has_initial_state[idx]
+        )
+
+    def store(idx: int, head: int, values: jax.Array) -> None:
+        if region is None:
+            recurrent_slot_ref[idx, 0, head] = values.astype(recurrent_slot_ref.dtype)
+        else:
+            vmem_ldst.store_state_head(
+                recurrent_slot_ref.at[idx, 0], region, head, cfg.num_v_heads, values
+            )
+
+    if region is not None:
+        for idx in range(cfg.seq_tile_size):
+            vmem_ldst.zero_state_padding(recurrent_slot_ref.at[idx, 0], region)
+    return load, store
 
 
 def inner_kernel(
@@ -79,12 +121,21 @@ def inner_kernel(
     if p_id is None:
         p_id = pl.program_id(0)
 
+    # Single-token GDN decode streams the recurrent state head by head
+    # (compute_gdn.recurrent_gdn_decode_fused) instead of loading it whole.
+    fused_decode = (
+        cfg.mode == config.GDNMode.BATCHED
+        and cfg.window_size == 1
+        and not cfg.is_kda
+        and carry_recurrent_scratch_ref is None
+    )
+
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
         metadata_ref=metadata_ref,
         p_id=p_id,
         conv_state_slot_ref=conv_state_slot_ref,
-        recurrent_slot_ref=recurrent_slot_ref,
+        recurrent_slot_ref=None if fused_decode else recurrent_slot_ref,
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
@@ -164,6 +215,35 @@ def inner_kernel(
     # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
+    if fused_decode:
+        q_compact, k_compact, v_compact, b_compact, a_compact = (
+            vmem_ldst.load_activation_as_compact(
+                qkv_vreg=qkv_out_compact,
+                qkv_vmem_ref=qkv_slot_ref,
+                b_vmem_ref=b_slot_ref,
+                a_vmem_ref=a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+        load_state, store_state = _decode_state_head_ldst(
+            recurrent_slot_ref, metadata_ref, p_id, cfg
+        )
+        out = compute_gdn.recurrent_gdn_decode_fused(
+            real_sizes=real_sizes,
+            q_compact=q_compact,
+            k_compact=k_compact,
+            v_compact=v_compact,
+            b_compact=b_compact,
+            a_compact=a_compact,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            load_state=load_state,
+            store_state=store_state,
+            cfg=cfg,
+        )
+        out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+        return
+
     if cfg.use_recurrent:
         recurrent_fn = (
             compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn

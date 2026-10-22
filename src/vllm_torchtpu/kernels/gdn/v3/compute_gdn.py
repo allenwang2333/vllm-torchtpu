@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 
@@ -401,24 +403,23 @@ def recurrent_gdn_per_seq(
     return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
-def recurrent_gdn(
+def _prepare_recurrent_inputs(
     real_sizes: jax.Array,
     q_compact: jax.Array,
     k_compact: jax.Array,
     v_compact: jax.Array,
     b_compact: jax.Array,
     a_compact: jax.Array,
-    state_prev: jax.Array,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
-) -> tuple[jax.Array, jax.Array]:
-    """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
+) -> tuple[jax.Array, ...]:
+    """Mask, normalize and gate the recurrent inputs.
 
-    The returned state has one checkpoint per window position: [seq,
-    window_size, num_v_heads, kq_head_dim, v_head_dim]. Positions >=
-    real_sizes repeat the last valid state; they are never written back to
-    HBM.
+    Returns (q, k, v, gating, beta): q/k [seq, num_kq_heads, chunk, 1,
+    kq_head_dim], v [seq, num_v_heads, chunk, 1, v_head_dim], gating (the
+    decay, exp'd) and beta [seq, 1, chunk, 1, aligned_num_v_heads], one head
+    per lane.
     """
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
@@ -444,7 +445,6 @@ def recurrent_gdn(
     q_scale = cfg.kq_head_dim**-0.5
     q_compact *= q_scale
     k_compact = l2_norm(k_compact)
-    k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
     beta = jax.nn.sigmoid(b_compact)
     gating_log = -jnp.exp(a_log) * jax.nn.softplus(a_compact + dt_bias)
@@ -455,6 +455,42 @@ def recurrent_gdn(
     # will be 1 (i.e., no decay) if current row is invalid.
     gating_log = jnp.where(mask, gating_log, 0)
     gating_log = jnp.exp(gating_log)
+
+    return q_compact, k_compact, v_compact, gating_log, beta
+
+
+def recurrent_gdn(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    state_prev: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
+
+    The returned state has one checkpoint per window position: [seq,
+    window_size, num_v_heads, kq_head_dim, v_head_dim]. Positions >=
+    real_sizes repeat the last valid state; they are never written back to
+    HBM.
+    """
+
+    q_compact, k_compact, v_compact, gating_log, beta = _prepare_recurrent_inputs(
+        real_sizes,
+        q_compact,
+        k_compact,
+        v_compact,
+        b_compact,
+        a_compact,
+        a_log,
+        dt_bias,
+        cfg,
+    )
+    k_compact_t = fused_transpose_broadcast(k_compact, src_dim=4, dst_dim=3)
 
     beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
     beta = beta[:, : cfg.num_v_heads]
@@ -482,3 +518,84 @@ def recurrent_gdn(
     new_recurrent_state = jnp.stack(new_state_list, axis=0)
 
     return out, new_recurrent_state
+
+
+def recurrent_gdn_decode_fused(
+    real_sizes: jax.Array,
+    q_compact: jax.Array,
+    k_compact: jax.Array,
+    v_compact: jax.Array,
+    b_compact: jax.Array,
+    a_compact: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    load_state: Callable[[int, int], jax.Array],
+    store_state: Callable[[int, int, jax.Array], None],
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """One-token recurrent GDN that reads and writes each head's state once.
+
+    With S the previous state, g the decay and v_new = beta * (v - g * k.S),
+    the new state is S' = g * S + k^T v_new and the output q.S' is computed as
+    g * q.S + (q.k) * v_new, so one matmul of [k; q] against S gives both
+    matvecs. Each head's state therefore goes load -> matmul -> update ->
+    store once, instead of the batched path's full-state passes. All math is
+    fp32; against recurrent_gdn only the association of the matvecs changes.
+
+    Args:
+        load_state: (seq, head) -> that head's previous state [kq_head_dim,
+            v_head_dim] in its storage dtype.
+        store_state: (seq, head, new_state) -> None.
+
+    Returns:
+        out: [seq, 1, num_v_heads, v_head_dim], as recurrent_gdn's.
+    """
+    assert cfg.chunk_size == 1 and cfg.window_size == 1 and not cfg.is_kda
+
+    q_compact, k_compact, v_compact, gating, beta = _prepare_recurrent_inputs(
+        real_sizes,
+        q_compact,
+        k_compact,
+        v_compact,
+        b_compact,
+        a_compact,
+        a_log,
+        dt_bias,
+        cfg,
+    )
+
+    out_list = []
+    for idx in range(cfg.seq_tile_size):
+        head_out_list = []
+        for kq_head in range(cfg.num_kq_heads):
+            # [1, kq_head_dim]
+            q_row = q_compact[idx, kq_head, 0]
+            k_row = k_compact[idx, kq_head, 0]
+            # [2, kq_head_dim]: one MXU weight load of S serves both matvecs.
+            kq_rows = jnp.concat([k_row, q_row], axis=0)
+            # [1, 1]
+            q_dot_k = jnp.sum(q_row * k_row, axis=-1, keepdims=True)
+            # [kq_head_dim, v_head_dim], row i holds k[i].
+            k_cols = jnp.transpose(
+                jnp.broadcast_to(k_row, (cfg.v_head_dim, cfg.kq_head_dim))
+            )
+            for v_head in range(
+                kq_head * cfg.v_per_kq_head, (kq_head + 1) * cfg.v_per_kq_head
+            ):
+                # [1, 1]
+                gating_curr = gating[idx, 0, 0, :, v_head : v_head + 1]
+                beta_curr = beta[idx, 0, 0, :, v_head : v_head + 1]
+                # [kq_head_dim, v_head_dim]
+                state = load_state(idx, v_head).astype(jnp.float32)
+                # [2, v_head_dim]
+                k_state_q_state = jax.lax.dot(
+                    kq_rows, state, preferred_element_type=jnp.float32
+                )
+                k_state, q_state = jnp.split(k_state_q_state, 2, axis=0)
+                # [1, v_head_dim]
+                v_new = beta_curr * (v_compact[idx, v_head, 0] - gating_curr * k_state)
+                head_out_list.append(gating_curr * q_state + q_dot_k * v_new)
+                store_state(idx, v_head, gating_curr * state + k_cols * v_new)
+        # [1, num_v_heads, v_head_dim]
+        out_list.append(jnp.concat(head_out_list, axis=0)[jnp.newaxis])
+    return jnp.stack(out_list, axis=0)
