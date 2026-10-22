@@ -1411,6 +1411,9 @@ MIXED_BODY_LEVERS = (
     "q128",
     "pair",
     "xqk",
+    # cg7-1 stage-A levers, documented at `_attention_kernel`.
+    "pk",
+    "am",
 )
 # The exact (bitwise) default set for TPU_DCP_MLA_MIXED_BODY=1.
 MIXED_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf")
@@ -1453,9 +1456,13 @@ DECODE_BODY_DEFAULT = ("tr", "zu", "pv512", "noinf", "quad", "fxskip", "lrows", 
 # "q128" is not among them: at 32 q heads it slowed the capped-overflow
 # fix-up path by ~5 % for a null gain on the body (t4-mla-mixed probe 05).
 MIXED_KERNEL_V2_LEVERS = ("fxskip", "pair")
-# Buckets up to this many tokens keep the plain live body: at 64 tokens the
-# levers measured within noise to +2.5 % (partly filled bucket).
-MIXED_BODY_MAX_SKIP_TOKENS = 64
+# Buckets up to this many tokens keep the plain live body (`T <= 32`; such
+# buckets take the decode path when the fused window prep serves them); every
+# larger live-group bucket (`T > 32`) runs the lever body. The earlier edge 64
+# was measured on the r2 lever set, before "pair" and "fxskip": with them the
+# T = 64 bucket's lever body is 223 vs 308 bundles per token and gates its
+# fix-up loop (cg7-1 stage A, lever A0).
+MIXED_BODY_MAX_SKIP_TOKENS = 32
 
 # TPU_DCP_MLA_SEND_LAYOUT: the decode kernel writes the DCP merge's packed
 # real-rows all-to-all send buffer itself. Each of the `world` destination
@@ -1766,6 +1773,18 @@ def _attention_kernel(
     #   "xqk"    transposed scores: s^T = kv . q^T [w, heads], softmax over
     #            sublanes, PV with a transposed-LHS contraction; the lse
     #            arrives lane-dense (not bit-exact: reduction order).
+    #   "pk"     (replaces "tr"'s shuffle) the same 4x4 byte transpose with
+    #            `pltpu.unpack_elementwise` / `pltpu.pack_elementwise` on the
+    #            four stride-4 row loads: byte b of keys 4s..4s+3 packed into
+    #            one word (vshrl + vpack instead of and/or/shift chains).
+    #   "am"     (with "tr" or "pk") atom-major live staging: the NOPE / ROPE
+    #            VMEM rings are [2, atoms, bsz, 64, 128] / [2, atoms, bsz, 16,
+    #            128] and a grid step's A(g) live atom blocks arrive in ONE
+    #            traced-extent DMA per cache (`live_*_hbm_ref[off : off + A]`
+    #            -> ring[slot, 0 : A]) instead of one predicated DMA per
+    #            (atom, cache); a whole group (every atom live) still moves
+    #            one strided DMA per (atom, cache) from its token-major rows.
+    #            The body reads token t of atom a at ring[slot, a, t].
     # Every stage-A lever except "xqk" is bitwise-identical.
     assert not body_levers or group_tab_ref is not None or row_widths
     assert set(body_levers) <= set(MIXED_BODY_LEVERS) | {
@@ -1775,6 +1794,11 @@ def _attention_kernel(
         "step8",
     }, body_levers
     assert not ("quad" in body_levers and "pair" in body_levers)
+    # "am": atom-major live rings (live-group mode, with a "tr"/"pk" body).
+    am = "am" in body_levers
+    assert not am or (
+        group_tab_ref is not None and ("tr" in body_levers or "pk" in body_levers)
+    ), body_levers
     q128 = "q128" in body_levers
     assert not q128 or q_rope
     fix_refs = None
@@ -2055,6 +2079,11 @@ def _attention_kernel(
         # A whole group (every atom live) sits token-major at block `off`:
         # the incumbent's one DMA per cache from its first token row.
         whole_row = off * (batch_size * atom_rows // bkv_sz)
+        if am:
+            _fetch_live_atom_major(
+                live, off, whole_row, nope_dst, rope_dst, sem_nope, sem_rope, wait
+            )
+            return
 
         @pl.when(live == num_atoms)
         def _copy_whole():
@@ -2090,6 +2119,65 @@ def _attention_kernel(
                     )
                     _async_copy(
                         live_rope_hbm_ref.at[off + a], rope_slot, sem_rope, False
+                    )
+
+    def _fetch_live_atom_major(
+        live, off, whole_row, nope_dst, rope_dst, sem_nope, sem_rope, wait
+    ):
+        """Lever "am": the step's live atoms into the atom-major rings.
+
+        nope_dst / rope_dst: ring slots [atoms, bsz, 64, 128] / [atoms, bsz,
+        16, 128]. Live blocks off .. off + live - 1 are already atom-major in
+        HBM ([blocks, bsz, rows, 128]): ONE DMA per cache, traced extent
+        `live`, waited with the same descriptor. A whole group is token-major
+        at row `whole_row`: one strided DMA per (atom, cache)."""
+        assert live_nope_hbm_ref is not None and live_rope_hbm_ref is not None
+        atom_rows = live_nope_hbm_ref.shape[2]
+        rope_atom_rows = live_rope_hbm_ref.shape[2]
+        num_atoms = bkv_sz // atom_rows
+        assert nope_dst.shape[0] == num_atoms and rope_dst.shape[0] == num_atoms
+
+        @pl.when((live > 0) & (live < num_atoms))
+        def _copy_live():
+            nope_slot = nope_dst.at[pl.ds(0, live)]
+            rope_slot = rope_dst.at[pl.ds(0, live)]
+            if wait:
+                _async_copy(nope_slot, nope_slot, sem_nope, True)
+                _async_copy(rope_slot, rope_slot, sem_rope, True)
+            else:
+                _async_copy(
+                    live_nope_hbm_ref.at[pl.ds(off, live)], nope_slot, sem_nope, False
+                )
+                _async_copy(
+                    live_rope_hbm_ref.at[pl.ds(off, live)], rope_slot, sem_rope, False
+                )
+
+        @pl.when(live == num_atoms)
+        def _copy_whole_atoms():
+            for a in range(num_atoms):
+                nope_slot = nope_dst.at[a]
+                rope_slot = rope_dst.at[a]
+                if wait:
+                    _async_copy(nope_slot, nope_slot, sem_nope, True)
+                    _async_copy(rope_slot, rope_slot, sem_rope, True)
+                else:
+                    _async_copy(
+                        cache_kv_nope_hbm_ref.at[
+                            pl.ds(whole_row, batch_size),
+                            pl.ds(a * atom_rows, atom_rows),
+                        ],
+                        nope_slot,
+                        sem_nope,
+                        False,
+                    )
+                    _async_copy(
+                        cache_kv_rope_hbm_ref.at[
+                            pl.ds(whole_row, batch_size),
+                            pl.ds(a * rope_atom_rows, rope_atom_rows),
+                        ],
+                        rope_slot,
+                        sem_rope,
+                        False,
                     )
 
     def _fetch_bq_batch(seq_idx_start, bq_sem_idx, *, wait=False):
@@ -2558,23 +2646,64 @@ def _attention_kernel(
     def load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers):
         """`load_bkv` for the live body with `body_levers` (see above)."""
         rows = bkv_sz if rows is None else rows
-        nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
-        rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
-        rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
+        if am:
+            # Atom-major rings: token batch_idx's rows are atoms 0 .. n_at-1.
+            n_at = rows // live_nope_hbm_ref.shape[2]
+            nope_atoms = [
+                bkv_nope_x2_ref.at[bkv_sem_idx, a, batch_idx] for a in range(n_at)
+            ]
+            rope_words = jnp.concatenate(
+                [bkv_rope_x2_ref.at[bkv_sem_idx, a, batch_idx][...] for a in range(n_at)],
+                axis=0,
+            )
+        else:
+            nope_ref = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx]
+            rope_ref = bkv_rope_x2_ref.at[bkv_sem_idx, batch_idx]
+            rope_ref = rope_ref.at[pl.ds(0, rows * rope_ref.shape[0] // bkv_sz)]
+            rope_words = rope_ref[...]
         kv_len = kv_lens_ref[batch_start_seq_idx + batch_idx]
         zu = "zu" in levers
-        if "tr" in levers:
+        xs = None
+        if "tr" in levers or "pk" in levers:
             # Row r of the NOPE tile holds key r's 512 bytes as 128 words;
             # the fp8 tile wants each word to hold one byte column of four
             # consecutive keys. xs[j] = keys 4s + j (stride-4 rows).
             quarter = rows // 4
-            xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
+            if am:
+                # Per atom: 16 stride-4 rows of a [64, 128] block (a 128-lane
+                # memref), stacked in atom order -> the same keys 4s + j.
+                xs = [
+                    jnp.concatenate(
+                        [r[pl.ds(j, r.shape[0] // 4, stride=4), :] for r in nope_atoms],
+                        axis=0,
+                    )
+                    for j in range(4)
+                ]
+            else:
+                xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
             if zu:
                 key4 = lax.broadcasted_iota(jnp.int32, xs[0].shape, 0) * 4
                 xs = [
                     jnp.where(key4 < kv_len - j, x, jnp.uint32(0))
                     for j, x in enumerate(xs)
                 ]
+        if xs is not None and "pk" in levers:
+            # Word s of column b = byte b of keys 4s, 4s+1, 4s+2, 4s+3 (byte
+            # j <- key 4s + j): unpack byte b of each key's word, pack four.
+            xi = [pltpu.bitcast(x, jnp.int32) for x in xs]
+            cols = [
+                pltpu.pack_elementwise(
+                    [
+                        pltpu.unpack_elementwise(
+                            x, index=b, packed_dtype=jnp.int8, unpacked_dtype=jnp.int32
+                        )
+                        for x in xi
+                    ],
+                    packed_dtype=jnp.int8,
+                )
+                for b in range(4)
+            ]
+        elif xs is not None:
             lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
             ev8, od8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
             a0 = (xs[0] & lo16) | (xs[2] << 16)
@@ -2587,6 +2716,7 @@ def _attention_kernel(
                 (a2 & ev8) | ((a3 & ev8) << 8),  # byte 2
                 ((a2 >> 8) & ev8) | (a3 & od8),  # byte 3
             ]
+        if xs is not None:
             bkv_nope = jnp.concatenate(
                 [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
             )
@@ -2597,7 +2727,7 @@ def _attention_kernel(
                 words = jnp.where(key < kv_len, words, jnp.uint32(0))
             bkv_nope = pltpu.bitcast(words, jnp.uint8).reshape(rows, nope_dim)
             bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
-        bkv_rope = pltpu.bitcast(rope_ref[...], jnp.uint8).reshape(rows, 128)
+        bkv_rope = pltpu.bitcast(rope_words, jnp.uint8).reshape(rows, 128)
         bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
         bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
         if bkv.shape[-1] < head_dim:
@@ -2620,6 +2750,21 @@ def _attention_kernel(
             rope_ref,
             lambda: kv_lens_ref[batch_start_seq_idx + batch_idx],
         )
+
+    def unpack_bkv_words(nope_words, rope_words, kv_len):
+        """`unpack_bkv` (SparseCore layout) on already-loaded words: NOPE
+        u32[rows, 128], ROPE u32[rows / 4, 128] (lever "am"'s fix-up)."""
+        assert sparsecore_layout
+        rows = nope_words.shape[0]
+        bkv_nope = pltpu.bitcast(nope_words, jnp.uint8).reshape(rows, nope_dim)
+        bkv_nope = pltpu.bitcast(bkv_nope, jnp.float8_e4m3fn)
+        bkv_rope = pltpu.bitcast(rope_words, jnp.uint8).reshape(rows, 128)
+        bkv_rope = pltpu.bitcast(bkv_rope, jnp.float8_e4m3fn)
+        bkv = jnp.concatenate([bkv_nope, bkv_rope], axis=-1)
+        if bkv.shape[-1] < head_dim:
+            bkv = jnp.pad(bkv, ((0, 0), (0, head_dim - bkv.shape[-1])))
+        k_span = lax.broadcasted_iota(jnp.int32, bkv.shape, 0)
+        return jnp.where(k_span < kv_len, bkv, 0)
 
     def unpack_bkv(bkv_nope_ref, bkv_rope_ref, get_kv_len):
         bkv_nope = bkv_nope_ref[...]
@@ -2719,15 +2864,34 @@ def _attention_kernel(
                 fix_m_ref[...] = jnp.full(fix_m_ref.shape, f32_min, jnp.float32)
                 fix_l_ref[...] = jnp.zeros(fix_l_ref.shape, jnp.float32)
                 fix_acc_ref[...] = jnp.zeros(fix_acc_ref.shape, jnp.float32)
-                accumulate(
-                    q,
-                    unpack_bkv(
+                if am:
+                    # Window 0 of an overflowing token: its group is whole
+                    # (A = every atom), staged atom-major.
+                    n_at = bkv_nope_x2_ref.shape[1]
+                    kv0 = unpack_bkv_words(
+                        jnp.concatenate(
+                            [
+                                bkv_nope_x2_ref.at[bi_sem_idx, a, batch_idx][...]
+                                for a in range(n_at)
+                            ],
+                            axis=0,
+                        ),
+                        jnp.concatenate(
+                            [
+                                bkv_rope_x2_ref.at[bi_sem_idx, a, batch_idx][...]
+                                for a in range(n_at)
+                            ],
+                            axis=0,
+                        ),
+                        kv_len,
+                    )
+                else:
+                    kv0 = unpack_bkv(
                         bkv_nope_x2_ref.at[bi_sem_idx, batch_idx],
                         bkv_rope_x2_ref.at[bi_sem_idx, batch_idx],
                         lambda: kv_len,
-                    ),
-                    kv_len,
-                )
+                    )
+                accumulate(q, kv0, kv_len)
 
                 def window(j, window_carry):
                     slot = lax.rem(j, 2)
@@ -3662,6 +3826,12 @@ def sparse_ragged_paged_attention(
         raise ValueError(
             f"mixed_body_levers {mixed_body_levers} not in {MIXED_BODY_LEVERS}"
         )
+    if "am" in mixed_body_levers and (
+        not ({"tr", "pk"} & set(mixed_body_levers)) or mixed_union_gather
+    ):
+        raise ValueError(
+            "mixed_body_levers: 'am' needs 'tr' or 'pk' and no mixed_union_gather"
+        )
     if mixed_union_gather_fault not in native_sc_gather.UNION_FAULTS:
         raise ValueError(f"unknown mixed_union_gather_fault {mixed_union_gather_fault}")
     if "pair" in mixed_body_levers and "xqk" in mixed_body_levers:
@@ -4322,6 +4492,20 @@ def sparse_attention_chunk(
             (2, batch_size, *rope_tile),
             cache_kv_rope.dtype,
         )
+        if live_views is not None and "am" in group_levers:
+            # Body lever "am": the same bytes, atom-major [2, atoms, bsz,
+            # rows, 128] (the live block views' [bsz, rows, 128] per atom).
+            nope_atom = live_views[0].shape[2:]
+            rope_atom = live_views[1].shape[2:]
+            n_atoms = nope_tile[0] // nope_atom[0]
+            assert n_atoms * nope_atom[0] == nope_tile[0]
+            assert n_atoms * rope_atom[0] == rope_tile[0]
+            bkv_nope_double_buf = pltpu.VMEM(
+                (2, n_atoms, batch_size, *nope_atom), cache_kv_nope.dtype
+            )
+            bkv_rope_double_buf = pltpu.VMEM(
+                (2, n_atoms, batch_size, *rope_atom), cache_kv_rope.dtype
+            )
 
         bq_double_buf = pltpu.VMEM(
             (2, batch_size, num_q_heads, q.shape[-1]),
