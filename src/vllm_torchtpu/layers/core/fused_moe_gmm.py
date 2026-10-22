@@ -29,6 +29,13 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.megablox.moe_routed_ffn import (
+    MAX_TOPK as ROUTED_FFN_MAX_TOPK,
+)
+from vllm_torchtpu.kernels.megablox.moe_routed_ffn import (
+    make_routed_ffn_configs,
+    moe_routed_ffn,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -213,6 +220,59 @@ def gmm_wrapper(
         preferred_element_type=preferred_element_type,
         maybe_quantize_lhs=_quantize_lhs_for(rhs),
         rhs_quant_dtype=rhs_quant_dtype,
+    )
+
+
+# The routed kernel multiplies every token by each visited expert, so it is kept
+# to decode-sized batches.
+_ROUTED_FFN_MAX_TOKENS = 64
+
+
+def _use_routed_ffn(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    *,
+    topk: int,
+    activation: str,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype: jnp.dtype | None,
+) -> bool:
+    """Whether the EP decode step can skip routing prep, permute and combine.
+
+    Limited to the one-hot regime the grouped-GEMM path takes at decode, with
+    fp8 per-block-scaled weights and no biases.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    if not (
+        use_ep
+        and use_sparse_core
+        and num_tokens <= _ROUTED_FFN_MAX_TOKENS
+        # An enabled dense-expert threshold keeps the batches it covers.
+        and not 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+        and topk <= ROUTED_FFN_MAX_TOPK
+        and num_tokens * topk <= onehot_moe_permute_threshold
+        and rhs_quant_dtype is None
+        and w1_bias is None
+        and w2_bias is None
+        and w1_scale is not None
+        and w2_scale is not None
+        and hidden_size == w1.shape[1]
+        and _quantize_lhs_for(w1)
+        and _quantize_lhs_for(w2)
+    ):
+        return False
+    return (
+        make_routed_ffn_configs(
+            hidden_states, w1, w1_scale, w2, w2_scale, fuse_act=activation
+        )
+        is not None
     )
 
 
@@ -652,6 +712,38 @@ def fused_moe_func(
     # reduce, and `where` propagate in BF16 — some custom_routing_fn
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
+
+    if (
+        experts_start is not None
+        and use_ep
+        and _use_routed_ffn(
+            hidden_states,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+    ):
+        return moe_routed_ffn(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            experts_start,
+            fuse_act=activation,
+            skip_zero_weights=skip_padded_tokens,
+        )
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
