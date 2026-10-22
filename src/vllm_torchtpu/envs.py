@@ -796,14 +796,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
     # cost ~36 ms per 4096-token step).
     "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
-    # Under qrep, replicate o_proj over the DCP group too (and W_UV, as with
-    # TPU_DCP_MLA_UV_BEFORE_MERGE), so backbone steps of at least
+    # Where W_UV is replicated over the DCP group (TPU_DCP_MLA_UV_BEFORE_MERGE),
+    # replicate o_proj too, so the backbone buckets that apply W_UV before the
+    # merge (TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS) and have at least
     # TPU_DCP_MLA_OPROJ_ALL_REDUCE_MIN_TOKENS tokens skip the merge's
     # reduce-scatter: each rank runs o_proj on its weighted partial of every
-    # group head, and o_proj's all-reduce sums the ranks. Smaller steps keep
-    # the merge and the sharded o_proj. On by default; a no-op unless o_proj is
-    # per-channel FP8 from an FP8 checkpoint, and with an output gate. Costs one
-    # o_proj per layer of HBM.
+    # group head, and o_proj's all-reduce sums the ranks. Every other step
+    # keeps the merge and o_proj itself. On by default; a no-op without
+    # TPU_DCP_MLA_UV_BEFORE_MERGE, unless o_proj is per-channel FP8 from an FP8
+    # checkpoint, and with an output gate. Costs one o_proj per layer of HBM.
     "TPU_DCP_MLA_OPROJ_ALL_REDUCE": env_bool(
         "TPU_DCP_MLA_OPROJ_ALL_REDUCE", default=True
     ),

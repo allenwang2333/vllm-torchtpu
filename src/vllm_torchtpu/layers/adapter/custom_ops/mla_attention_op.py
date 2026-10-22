@@ -78,6 +78,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
+    _retain_buffers,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
     DCP_ROWS_ATTR,
@@ -90,8 +91,6 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     _fp8_linear_pallas_jax,
     get_prequantized_matmul_op,
     prequantized_matmul,
-    quantized_matmul,
-    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -1819,12 +1818,11 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
-            # o_proj's own rows, followed by the group's, so a large step can
-            # skip the reduce-scatter (TPU_DCP_MLA_OPROJ_ALL_REDUCE), as the FP8
-            # loader gathered them from the checkpoint (DCP_ROWS_ATTR): both
-            # sides of the token-count branch slice the same buffers. Without
-            # them (o_proj not per-channel FP8 from an FP8 checkpoint) every
-            # step keeps the reduce-scatter.
+            # The group's o_proj rows, so a large step can skip the
+            # reduce-scatter (TPU_DCP_MLA_OPROJ_ALL_REDUCE), as the FP8 loader
+            # gathered them from the checkpoint (DCP_ROWS_ATTR); o_proj itself
+            # is untouched. Without them (o_proj not per-channel FP8 from an
+            # FP8 checkpoint) every step keeps the reduce-scatter.
             o = getattr(self, "o_proj", None)
             if o is not None and (
                 getattr(o, "weight_dcp", None) is None
@@ -1836,27 +1834,12 @@ class VllmTPUMLAAttention(MLAAttention):
                     "from an FP8 checkpoint; keeping the reduce-scatter."
                 )
             elif o is not None:
-                w = torch.cat(
-                    [o.weight.view(torch.int8), o.weight_dcp.view(torch.int8)]
-                )
-                self.W_O_dcp_qrep = fresh_buffer(w.view(o.weight.dtype))
-                # 1-D, so o_proj's own scale is a contiguous prefix: a row of a
-                # 2-D scale is a strided copy every step.
-                self.W_O_dcp_qrep_scale = fresh_buffer(
-                    torch.cat([o.weight_scale, o.weight_scale_dcp])
-                )
+                self.W_O_dcp_qrep = o.weight_dcp
+                self.W_O_dcp_qrep_scale = o.weight_scale_dcp
                 del o.weight_dcp, o.weight_scale_dcp
-                # o_proj keeps views of its rows there and frees its own copy;
-                # the forward reads only W_O_dcp_qrep.
-                rows, n = o.weight.shape
-                for name, t in (
-                    ("weight", self.W_O_dcp_qrep[:rows]),
-                    ("weight_scale", self.W_O_dcp_qrep_scale[:n]),
-                ):
-                    o.register_parameter(name, Parameter(t, requires_grad=False))
                 get_prequantized_matmul_op()  # built outside Dynamo
             # The group's W_UV too, so W_UV can run before the merge.
-            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE or self.W_O_dcp_qrep is not None:
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
                 self.W_UV_dcp_qrep = fresh_buffer(
                     dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
                 )
@@ -2064,13 +2047,16 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         )
         if (
             envs.TPU_DCP_MLA_OPROJ_ALL_REDUCE
+            and envs.TPU_DCP_MLA_UV_BEFORE_MERGE
             and self.mla_attn.dcp_q_replicate
             and self.g_proj is None
             and not self.gate_is_fused
         ):
             # The FP8 loader also gathers o_proj over the DCP group; the
-            # attention picks it up in process_weights_after_loading. Not with
-            # an output gate, which spans only this rank's heads.
+            # attention picks it up in process_weights_after_loading. Only
+            # where W_UV is replicated too: the path takes the W_UV-projected
+            # partial. Not with an output gate, which spans only this rank's
+            # heads.
             setattr(self.o_proj, DCP_ROWS_ATTR, True)
             self.mla_attn.o_proj = self.o_proj
 
@@ -2361,31 +2347,34 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             attn_out *= self.g_proj(hidden_states)[0].sigmoid()
         w_o = getattr(self.mla_attn, "W_O_dcp_qrep", None)
         if w_o is not None:
-            # TPU_DCP_MLA_OPROJ_ALL_REDUCE: W_O_dcp_qrep is this rank's o_proj
-            # rows, then the group's (VllmTPUMLAAttention), so both sides of its
-            # token-count branch lift the same buffers, as the bucket warmup
-            # requires, and slice them at the same offsets on every rank.
+            # TPU_DCP_MLA_OPROJ_ALL_REDUCE: the large buckets run the group's
+            # o_proj (W_O_dcp_qrep), the others o_proj itself, as with the flag
+            # off. Each side also lifts the other's weights, as the bucket
+            # warmup requires (_retain_buffers: no data is read).
             s_o = self.mla_attn.W_O_dcp_qrep_scale
             assert s_o is not None
-            rows, n = self.num_heads * self.v_head_dim, w_o.shape[1]
-            if isinstance(attn_out, torch.Tensor):  # merged: this rank's o_proj
-                pallas = getattr(self.o_proj, FP8_PALLAS_N_ATTR, None) is not None
-                mm = quantized_matmul_pallas if pallas else quantized_matmul
-                out = mm(attn_out, w_o[:rows], s_o[:n])
-                return tensor_model_parallel_all_reduce(out)
-            # Every group head, unmerged and quantized by token chunk
-            # (`weight_lse_partials`): the group's o_proj, whose all-reduce also
-            # sums the DCP ranks. A chunk's all-reduce overlaps the next chunk's
-            # o_proj; each all-reduce is ordered after the one before, or XLA
-            # combines them after the last o_proj.
-            w_o, s_o = w_o[rows:], s_o[n:]
-            outs: list[torch.Tensor] = []
-            for x, x_scale in attn_out:
-                y = prequantized_matmul(x, x_scale, w_o, s_o)
-                if outs:
-                    y = _after(y, outs[-1])
-                outs.append(tensor_model_parallel_all_reduce(y))
-            return outs[0] if len(outs) == 1 else torch.cat(outs)
+            if isinstance(attn_out, torch.Tensor):  # merged
+                attn_out = _retain_buffers(attn_out, w_o, s_o)
+            else:
+                # Every group head, unmerged and quantized by token chunk
+                # (`weight_lse_partials`): the group's o_proj, whose all-reduce
+                # also sums the DCP ranks. A chunk's all-reduce overlaps the
+                # next chunk's o_proj; each all-reduce is ordered after the one
+                # before, or XLA combines them after the last o_proj.
+                outs: list[torch.Tensor] = []
+                for x, x_scale in attn_out:
+                    y = prequantized_matmul(x, x_scale, w_o, s_o)
+                    if outs:
+                        y = _after(y, outs[-1])
+                    outs.append(tensor_model_parallel_all_reduce(y))
+                out = outs[0] if len(outs) == 1 else torch.cat(outs)
+                return _retain_buffers(
+                    out,
+                    self.o_proj.weight,
+                    self.o_proj.weight_scale,
+                    getattr(self.o_proj, FP8_PALLAS_WEIGHT, None),
+                    getattr(self.o_proj, FP8_PALLAS_SCALE, None),
+                )
         if prefill_group is not None:
             return prefill_group.project_reduce_scatter(attn_out, self.o_proj)
         if envs.TPU_FUSED_OPROJ_AR:
