@@ -20,6 +20,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -215,11 +216,27 @@ def compile_arm(modules, variant, mode, requests, queries, width, out):
 
     run.__name__ = f"indexer_layer_{variant}_{mode}"
     started = time.monotonic()
-    compiled = (
-        jax.jit(run, donate_argnums=(1, 2))
-        .lower(*abstract_inputs(requests, queries, width, variant))
-        .compile()
-    )
+
+    def compile_run():
+        return (
+            jax.jit(run, donate_argnums=(1, 2))
+            .lower(*abstract_inputs(requests, queries, width, variant))
+            .compile()
+        )
+
+    if variant == "packed_fp8_scatter":
+        from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_fp8_cache
+
+        def scatter(bank, bases, columns, values):
+            rows = bases[:, None] + jnp.arange(values.shape[1])[None, :]
+            valid = (bases >= 0) & (bases + values.shape[1] <= bank.shape[0])
+            rows = jnp.where(valid[:, None], rows, bank.shape[0])
+            return bank.at[rows, columns[:, None]].set(values, mode="drop")
+
+        with mock.patch.object(packed_fp8_cache, "write_packed_pages", scatter):
+            compiled = compile_run()
+    else:
+        compiled = compile_run()
     (out / f"{variant}_{mode}.hlo.txt").write_text(compiled.as_text())
     print(
         json.dumps(dict(compiled=run.__name__, seconds=time.monotonic() - started)),
@@ -295,7 +312,11 @@ def validate_outputs(outputs, lengths, candidates, filtering):
                 {i // 8 for i in row} <= set(allowed.tolist())
                 for row, allowed in zip(sets[variant], np.asarray(candidates))
             )
-    overlap = [len(a & b) / 512 for a, b in zip(sets["bf16"], sets["packed_fp8"])]
+    reference, candidate = sets.values()
+    overlap = [len(a & b) / 512 for a, b in zip(reference, candidate)]
+    if "packed_fp8_scatter" in outputs:
+        for before, after in zip(outputs["packed_fp8_scatter"], outputs["packed_fp8"]):
+            assert bool(jnp.array_equal(before, after)), "Cache writer changed output"
     return dict(
         topk_overlap_mean=float(np.mean(overlap)), topk_overlap_min=min(overlap)
     )
@@ -323,7 +344,8 @@ def measure(runs, pools, common, candidates, case, seed, out, profile):
         pools[variant] = result[:2]
         outputs[variant] = result
 
-    order = ["bf16", "packed_fp8", "packed_fp8", "bf16"]
+    reference, candidate = runs
+    order = [reference, candidate, candidate, reference]
     for variant in order * 3:
         call(variant)
     correctness = validate_outputs(
@@ -391,11 +413,15 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[2026, 2027])
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--compare-cache-writers", action="store_true")
     args = parser.parse_args()
     modules = load_model()
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
-    variants = ("bf16", "packed_fp8")
+    variants = (
+        "packed_fp8_scatter" if args.compare_cache_writers else "bf16",
+        "packed_fp8",
+    )
     compiled = {
         mode: {
             variant: compile_arm(
@@ -440,6 +466,11 @@ def main():
             pools, common, candidates = fixture(
                 args.requests, args.queries, args.width, seed
             )
+            if args.compare_cache_writers:
+                del pools["bf16"]
+                pools["packed_fp8_scatter"] = tuple(
+                    x.copy() for x in pools["packed_fp8"]
+                )
             for mode, distribution in (
                 ("full", "scattered"),
                 ("publish", "scattered"),

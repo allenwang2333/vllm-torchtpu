@@ -28,8 +28,11 @@ vllm serve /path/to/checkpoint --block-size 512
 Allocation retains upstream shared-owner placements and supports one or two
 native banks. The index view reserves 132 bytes per key (FP8 values plus FP32
 scale), and the adapter maps this view to the transposed page format below.
-Incremental writes quantize only incoming K vectors and scatter their 33 words
-into the corresponding token columns. Query projection/rotation feeds the
+Incremental writes quantize only incoming K vectors and update their 33 words
+in the corresponding token columns. TPU writes group updates by physical page,
+read each affected page once, merge its columns in VMEM, and DMA it back into
+the aliased cache. Eight page slots are staged together; untouched pages and
+neighboring shared-owner regions are preserved. Query projection/rotation feeds the
 scorer without the old FP8-to-BF16 round trip; the JAX bridge quantizes Q once
 and passes its scales to the maintained kernel.
 
@@ -143,6 +146,7 @@ call.
 | File | Responsibility |
 | --- | --- |
 | `packed_fp8_cache.py` | Page placement, byte format, complete-page encoder and incremental writer |
+| `_packed_fp8_write.py` | Grouped page read/modify/write with batched DMA |
 | `packed_fp8_mqa.py` | Public API, metadata preparation, per-query operations and DMA descriptors |
 | `packed_fp8_sparse.py` | Candidate page validity and per-query block masks |
 | `_packed_fp8_math.py` | Head permutation and BF16 products / FP32 head accumulation |
@@ -286,6 +290,13 @@ the cache update trace added loops and large copies. The two scatter helpers
 have been restored byte-for-byte to measured best commit `a7225b918`. The timing
 table above remains the retained implementation's result. The SparseCore mask
 prototype has only compiled under sim-pjrt and is not integrated.
+
+The subsequent page-DMA writer replaces the TPU cache scatter with explicit
+Pallas reads and writes. Local interpreted byte-preservation tests and the
+complete filter-path sim-pjrt compilation pass. Hardware results are pending.
+Use `bench_packed_fp8_layer.py --compare-cache-writers --profile --out <dir>`
+to compare both FP8 writers in the same run. The benchmark checks exact equality
+of both cache banks, selected IDs and published candidates before measuring.
 
 ## Reproduce
 

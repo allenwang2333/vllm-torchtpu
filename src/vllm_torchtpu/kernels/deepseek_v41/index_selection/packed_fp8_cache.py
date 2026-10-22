@@ -15,6 +15,8 @@ import jax.numpy as jnp
 
 from vllm_torchtpu.kernels.deepseek_v41.index_quantization import quantize_index_rows
 
+from ._packed_fp8_write import write_packed_pages
+
 PAGE_RECORDS = 128
 PAGE_ROWS = 33
 
@@ -75,14 +77,21 @@ def write_fp8_records(
         axis=1,
     )
     base, columns, valid = _record_addresses(records, layout)
-    rows = base[:, None] + jnp.arange(PAGE_ROWS)[None, :]
     updated = []
     offset = 0
     for bank in banks:
-        local = rows - offset
-        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
-        local = jnp.where(active, local, bank.shape[0])
-        updated.append(bank.at[local, columns[:, None]].set(values, mode="drop"))
+        if jax.default_backend() == "tpu":
+            updated.append(
+                write_packed_pages(
+                    bank, jnp.where(valid, base - offset, -1), columns, values
+                )
+            )
+        else:
+            rows = base[:, None] + jnp.arange(PAGE_ROWS)[None, :]
+            local = rows - offset
+            active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
+            local = jnp.where(active, local, bank.shape[0])
+            updated.append(bank.at[local, columns[:, None]].set(values, mode="drop"))
         offset += bank.shape[0]
     return tuple(updated)
 

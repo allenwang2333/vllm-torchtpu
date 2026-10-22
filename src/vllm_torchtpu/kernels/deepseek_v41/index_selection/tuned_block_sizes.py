@@ -57,6 +57,9 @@ class PagedMQAConfig:
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 32768, 8, 6, 4)
 
+# Stage eight 16.5 KiB pages so their reads and writes can be issued together.
+PACKED_FP8_WRITE_BATCH = 8
+
 
 @dataclass(frozen=True)
 class PersistentScoreConfig:

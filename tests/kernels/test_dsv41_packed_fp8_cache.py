@@ -108,3 +108,40 @@ def test_native_fp8_layout_rejects_pages_crossing_bank_boundaries():
         PackedFP8Layout(pages=2, page_stride=40, page_offset=5).validate((60, 60))
     with pytest.raises(ValueError, match="exceed their owners"):
         PackedFP8Layout(pages=4, page_stride=40, page_offset=5).validate((80,))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("case", ["empty", "invalid", "mixed", "full_page"])
+def test_page_dma_preserves_unwritten_bytes(case):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_write import (
+        write_packed_pages,
+    )
+
+    rng = np.random.default_rng(23)
+    bank = rng.integers(-1000, 1000, (645, 128), dtype=np.int32)
+    if case == "empty":
+        records = np.empty((0,), np.int32)
+    elif case == "invalid":
+        records = np.array([-1, 16 * 128], np.int32)
+    elif case == "full_page":
+        records = rng.permutation(np.arange(131, dtype=np.int32))
+    else:
+        records = np.concatenate(
+            (np.arange(16, dtype=np.int32) * 128 + 17, [0, 127, 128, -1, 16 * 128])
+        ).astype(np.int32)
+        rng.shuffle(records)
+    values = rng.integers(-(2**31), 2**31, (records.size, 33), dtype=np.int32)
+    bases = np.where((records >= 0) & (records < 16 * 128), 5 + records // 128 * 40, -1)
+    columns = records % 128
+    expected = bank.copy()
+    for base, column, words in zip(bases, columns, values):
+        if base >= 0:
+            expected[base : base + 33, column] = words
+    actual = write_packed_pages(
+        jnp.asarray(bank),
+        jnp.asarray(bases, jnp.int32),
+        jnp.asarray(columns, jnp.int32),
+        jnp.asarray(values),
+        interpret=jax.default_backend() == "cpu",
+    )
+    np.testing.assert_array_equal(actual, expected)
