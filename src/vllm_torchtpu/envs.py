@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     FUSED_MOE_PREFILL_KERNEL_V2: bool = False
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_SEGMENT_MEGAKERNEL: bool = False
     TPU_MOE_TP_DECODE_FAST: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
     TPU_MOE_TP_DECODE_SHARED_META: bool = False
@@ -1197,6 +1198,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the usual path. Remove once the path is the default for these layers or
     # is replaced by another fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # At decode token buckets of at most 32, run each MoE layer whose next
+    # layer is a skip layer (sparse MLA reusing the shared top-k, no indexer)
+    # as one Pallas call from its merged DCP attention output to the next
+    # layer's KV write rows: W_UV, o_proj, both TP all-reduces, the norms,
+    # routing, the MoE, q_a/kv_a and the KV pack
+    # (kernels/experimental/segment_megakernel,
+    # layers/adapter/segment_megakernel.py). Armed once after load, after
+    # USE_MOE_TP_DECODE_KERNEL's arming, on TP16 x DCP8 with
+    # VLLM_DCP_Q_REPLICATE, TPU_DCP_MLA_SEND_LAYOUT, TPU_SMALL_ALL_REDUCE
+    # and the fp8 sites it reproduces; any other setup, bucket or layer keeps
+    # the usual path. Remove once the path is the default or replaced.
+    "TPU_SEGMENT_MEGAKERNEL": env_bool("TPU_SEGMENT_MEGAKERNEL"),
     # With USE_MOE_TP_DECODE_KERNEL: the kernel's fast schedule (same arithmetic,
     # bit-identical output): top-k without the per-pick index reduction (exact
     # fallback on ties), the expert compaction on the vector units, ring primes

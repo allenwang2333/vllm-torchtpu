@@ -79,6 +79,9 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _OP_ATTR = "_moe_tp_decode_op"
+# On an armed layer: the op's statics (routing, scale) and experts_start, read
+# by the segment megakernel's arming (TPU_SEGMENT_MEGAKERNEL).
+STATICS_ATTR = "_moe_tp_decode_statics"
 # TPU_FUSED_ADD_RMSNORM_QUANT_MOE: the op variant that also takes the norm's fp8
 # rows and scales (set by rmsnorm.arm_prequant_moe), and the slot it reads them
 # from on the FusedMoE layer.
@@ -826,6 +829,7 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         if mode == "all" or (mode == "drafter" and id(runner) not in known):
             statics = dataclasses.replace(statics, hbm_operands=True)
         setattr(layer.quant_method, _OP_ATTR, _get_op(topo.mesh, statics))
+        setattr(layer, STATICS_ATTR, (statics, adm.experts_start))
         runner._shared_experts = None
         runner._forward_entry = runner._select_forward()
         runner.routed_scaling_factor = 1.0
