@@ -23,8 +23,8 @@ tokens routed to it, and each token's routing-weighted expert output is
 accumulated in f32. No EP mask, sort, permute or combine runs around it.
 
 Each route's expert output is rounded to the out dtype before weighting, as
-the grouped-GEMM path rounds `gmm2_res`, so only the f32 summation order of a
-token's experts differs from that path.
+the grouped-GEMM path rounds `gmm2_res`, and a token's experts are summed in
+ascending expert id, the order of that path's expert-sorted combine rows.
 """
 
 import functools
@@ -180,7 +180,6 @@ def _routed_ffn_kernel(
     num_experts = count_sm.shape[0]
     num_rows = rows_vm.shape[0]
     inter = up.out_size_n
-    prefetch = nbuf - 1
     pairs = ((w1_hbm, w1_vm), (s1_hbm, s1_vm), (w2_hbm, w2_vm), (s2_hbm, s2_vm))
 
     def copy(i, expert, slot):
@@ -203,14 +202,17 @@ def _routed_ffn_kernel(
     def _(e):
         count_sm[e] = 0
 
-    # Visit order is first appearance in the token-major ids. The DMA starts sit
-    # outside the per-token body: inside it they are if-converted, and every
-    # token then pays the issue cost of all of them. A token's top-k routes are
-    # unrolled into one loop step, which halves the scan's bundles per route.
+    # The lowest local experts are the first visits whenever they are active,
+    # which at decode batch sizes is almost always, so their weights are
+    # requested before the scan and land while it runs.
+    for slot in range(min(nbuf, num_experts)):
+        start(slot, slot, _UP + _DOWN)
+
+    # A token's top-k routes are unrolled into one loop step, which halves the
+    # scan's bundles per route.
     first_expert = start_sm[0]
 
-    def scan_token(carry):
-        t, n_visit = carry
+    def scan_token(t, carry):
         for k in range(topk):
             expert = ids_sm[t * topk + k] - first_expert
             is_local = jnp.logical_and(expert >= 0, expert < num_experts)
@@ -218,37 +220,35 @@ def _routed_ffn_kernel(
                 is_local = jnp.logical_and(is_local, weights_sm[t * topk + k] != 0)
             clamped = jnp.where(is_local, expert, 0)
             count = count_sm[clamped]
-            is_new = jnp.logical_and(is_local, count == 0)
 
             @pl.when(is_local)
             def _():
                 route_sm[clamped * num_tokens + count] = (t << _K_BITS) | k
                 count_sm[clamped] = count + 1
 
-            @pl.when(is_new)
-            def _():
-                visit_sm[n_visit] = clamped
+        return carry
 
-            n_visit = n_visit + is_new.astype(jnp.int32)
-        return t + 1, n_visit
+    lax.fori_loop(0, num_tokens, scan_token, 0)
 
-    def scan_until(carry, target):
-        return lax.while_loop(
-            lambda c: jnp.logical_and(c[0] < num_tokens, c[1] < target),
-            scan_token,
-            carry,
-        )
+    # Visit order is ascending expert id: each token then accumulates its
+    # experts in the order of the grouped path's expert-sorted rows.
+    def list_expert(e, n_visit):
+        visit_sm[n_visit] = e
+        return n_visit + (count_sm[e] > 0).astype(jnp.int32)
 
-    # Stop the scan at each of the first `prefetch` experts to request its weights.
-    carry = (jnp.int32(0), jnp.int32(0))
-    for slot in range(min(prefetch, num_experts)):
-        carry = scan_until(carry, slot + 1)
+    n_visit = lax.fori_loop(0, num_experts, list_expert, jnp.int32(0))
 
-        @pl.when(carry[1] > slot)
+    # Re-request a slot whose speculative expert is not its visit.
+    for slot in range(min(nbuf, num_experts)):
+        hit = jnp.logical_and(slot < n_visit, visit_sm[slot] == slot)
+
+        @pl.when(jnp.logical_not(hit))
         def _(slot=slot):
-            start(visit_sm[slot], slot, _UP if slot else _UP + _DOWN)
+            wait(slot, _UP + _DOWN)
 
-    _, n_visit = scan_until(carry, num_experts + 1)
+            @pl.when(slot < n_visit)
+            def _():
+                start(visit_sm[slot], slot, _UP + _DOWN)
 
     x_copy.wait()
     x32_vm[...] = x_vm[...].astype(jnp.float32)
@@ -261,18 +261,7 @@ def _routed_ffn_kernel(
         slot = lax.rem(j, nbuf)
         count = count_sm[expert]
         base = expert * num_tokens
-
-        # The slot `prefetch` ahead was last read by expert j - 1, whose
-        # contribution was stored into acc_vm before this iteration. An
-        # expert's down weights are requested one visit after its gate/up
-        # weights, so they are the last bytes of the last expert to land.
-        @pl.when(j + prefetch < n_visit)
-        def _():
-            start(visit_sm[j + prefetch], lax.rem(j + prefetch, nbuf), _UP)
-
-        @pl.when(j + 1 < n_visit)
-        def _():
-            start(visit_sm[j + 1], lax.rem(j + 1, nbuf), _DOWN)
+        num_chunks = (count + num_rows - 1) >> chunk_shift
 
         w13 = WeightsRef(weight=w1_vm.at[slot], scale=s1_vm.at[slot], bias=None)
         w13 = FusedWeightsRef(
@@ -317,6 +306,12 @@ def _routed_ffn_kernel(
             bucket_idx = sum((n > b).astype(jnp.int32) for b in buckets[:-1])
             lax.switch(bucket_idx, [functools.partial(run_rows, b) for b in buckets])
 
+            # The slot's weights are read for the last time; refill it with
+            # the expert `nbuf` visits ahead while this chunk is combined.
+            @pl.when(jnp.logical_and(c == num_chunks - 1, j + nbuf < n_visit))
+            def _():
+                start(visit_sm[j + nbuf], slot, _UP + _DOWN)
+
             @pl.loop(0, n)
             def _(i):
                 route = route_sm[first + i]
@@ -327,7 +322,6 @@ def _routed_ffn_kernel(
 
             return carry
 
-        num_chunks = (count + num_rows - 1) >> chunk_shift
         lax.fori_loop(0, num_chunks, chunk, 0)
         return carry
 
