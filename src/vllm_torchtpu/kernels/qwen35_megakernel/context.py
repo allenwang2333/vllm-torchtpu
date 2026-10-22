@@ -604,10 +604,11 @@ class MKBuildContext:
         if QV:  # row-vector layout: [g, lane chunk j, row b * SR + head, 128 lanes]
             scratch["qg"] = pltpu.VMEM((G if SPLIT and not GQ else 1, NHH, QVR, 128), F32)
             scratch["ost"] = pltpu.VMEM((NHH, QVR, 128), F32)  # att_new: rnd(out) of row b, head h
+        VSR = nh  # VATT: rows per row b in qg / ost (row b * VSR + head)
         if VATT:  # per virtual rank [v, ...]
-            assert QV and not SPLIT and SR == 8, (QV, SPLIT, SR)
-            scratch["qg"] = pltpu.VMEM((NV, NHH, QVR, 128), F32)
-            scratch["ost"] = pltpu.VMEM((NV, NHH, QVR, 128), F32)
+            assert QV and not SPLIT, (QV, SPLIT)
+            scratch["qg"] = pltpu.VMEM((NV, NHH, B * VSR + 8, 128), F32)
+            scratch["ost"] = pltpu.VMEM((NV, NHH, B * VSR + 8, 128), F32)
             scratch["gate"] = pltpu.VMEM((NV, MR, nh * HD), F32)
         if GQ:
             del scratch["pso"]
@@ -734,7 +735,7 @@ class MKBuildContext:
             and 128 % self.ER == 0
         )
         self.WIDE_MB, self.N_MB, self.BW, self.BWP, self.CAP = WIDE_MB, N_MB, BW, BWP, CAP
-        self.DP, self.DPG, self.NV, self.VATT = DP, DPG, NV, VATT
+        self.DP, self.DPG, self.NV, self.VATT, self.VSR = DP, DPG, NV, VATT, VSR
         self.vr: Any = jnp.int32(0)  # dp: the virtual rank whose mixer is being built
         self.MB_GDN, self.MB_ATT = MB_GDN, MB_ATT
         self.WIDE_DYN_ROW = WIDE_DYN_ROW

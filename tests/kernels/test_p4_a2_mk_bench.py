@@ -244,6 +244,9 @@ VARIANTS = {
     "no_dense_v63": (frozenset({"dense"}), 0, {"vmem_mib": 63}, {}),
     # dp: each virtual rank runs the TP8 attention block (its own KV pass) instead of one shared
     "v1att": (frozenset(), 0, {}, {("context", "DP_VATT"): False}),
+    "nbe18": (frozenset(), 0, {"nbe": 18}, {}),
+    "nbe16": (frozenset(), 0, {"nbe": 16}, {}),
+    "nbe14": (frozenset(), 0, {"nbe": 14}, {}),
 }
 
 
@@ -994,13 +997,21 @@ def test_parity_wide(world, wide, split, variant):
 # experts, router, shared expert and pools are reused (the dp EP layout is the TP8 one; pool
 # pages are random bytes either way); only the per-core mixer weights (the four virtual ranks'
 # TP8 slices) and smalls rows are the dp's own.
-DP_CASES = {"d24": 96, "d32": 128, "d48": 192, "d64": 256}
+DP_CASES = {"d24": (96,), "d32": (128,), "d48": (192,), "d64": (256,),
+            # dp split plan above 256 tokens (the single call's all-rows MoE buffers fill VMEM
+            # there, as the TP8 wide step's do): calls of at most 256 rows on their own sequences,
+            # against the TP8 split plan r128 / r200 on the same rows
+            "ds128": (256, 256), "ds200": (256, 256, 256, 32)}
+DP_RKEY = {"ds128": 512, "ds200": 800}
 DPG = 4
+
+
+DP_MB = int(os.environ.get("P3_MK_DP_MB", WIDE_MB))  # dp microbatch rows (per chip)
 
 
 def _dp_cfg(b_all: int, e_slots: int = E_SLOTS) -> C.MKConfig:
     bg = b_all // DPG
-    mb = min(WIDE_MB, -(-bg // 16) * 16)
+    mb = min(DP_MB, -(-bg // 16) * 16)
     return dataclasses.replace(_cfg(bg, e_slots, wide=True), mb_rows=mb, dp=DPG, dcp=1)
 
 
@@ -1020,10 +1031,11 @@ def _dp_weights(world):
     return world.dp_w
 
 
-def _dp_inputs(world, case):
-    """Per-rank operands of dp case `case`: chip g serves sequences g * NSg .. (the rows of the
-    TP8 case w<n>, chip-major), its routing-bias rows at g * BW (BW: the chip's padded rows)."""
-    b_all = DP_CASES[case]
+def _dp_inputs(world, case, b_all, s0=0, rkey=None):
+    """Per-rank operands of a dp call of b_all rows on sequences s0 .. s0 + b_all / T - 1:
+    chip g serves s0 + g * NSg .. (the rows of the TP8 case on them, chip-major), its
+    routing-bias rows at g * BW (BW: the chip's padded rows). rkey: the routing bucket holding
+    the case's rows (rows s0 * T ..)."""
     c = _dp_cfg(b_all, world.e_slots)
     bg, nsg = c.B, c.NS
     bw = c.n_mb * c.mb_rows
@@ -1037,13 +1049,15 @@ def _dp_inputs(world, case):
     m_rb = -(-(DPG * bw) // 128) * 128
     rb = np.full((L, m_rb, c.E), 1e-3, np.float32)
     rb += np.arange(c.E, dtype=np.float32)[None, None, :] * 1e-6
-    rkey = CASE_RKEY.get("w" + case[1:]) or b_all
-    picks_all = world.routing[f"b{rkey}"][:L, :b_all]
+    if rkey is None:
+        rkey = CASE_RKEY.get("w" + case[1:]) or b_all
+    picks_all = world.routing[f"b{rkey}"][:L, s0 * T:s0 * T + b_all]
     for g in range(DPG):
         for r in (2 * g, 2 * g + 1):
-            hid[r, :bg] = world.hidden_rows[g * bg:(g + 1) * bg]
+            hid[r, :bg] = world.hidden_rows[(s0 + g * nsg) * T:(s0 + (g + 1) * nsg) * T]
         for j in range(nsg):
-            s = g * nsg + j
+            s = s0 + g * nsg + j
+            jc = s0 // DPG + j  # the sequence's index among its chip's checkpoint slots
             n_ctx = int(world.ctx[s])
             for r in (2 * g, 2 * g + 1):
                 pos[r, j * T:(j + 1) * T] = n_ctx + np.arange(T)
@@ -1053,7 +1067,7 @@ def _dp_inputs(world, case):
                     for v in range(nv):
                         # per chip: the TP8 checkpoint region holds 3 x NV x NSEQ_MAX / 4 slots
                         ck[r, sub, v * nsw + j] = (
-                            CKPT0 + (((sub * nv + v) * (NSEQ_MAX // DPG) + j) * T) + np.arange(T))
+                            CKPT0 + (((sub * nv + v) * (NSEQ_MAX // DPG) + jc) * T) + np.arange(T))
         picks = picks_all[:, g * bg:(g + 1) * bg]
         for k in range(picks.shape[-1]):
             np.put_along_axis(rb[:, g * bw:g * bw + bg], picks[:, :, k:k + 1].astype(np.int64),
@@ -1072,28 +1086,33 @@ def test_step_dp(world, case, variant):
 
     skip, scopes, tile_over, patch = VARIANTS[variant]
     t_build = time.time()
-    c, args = _dp_inputs(world, case)
-    tiles = C.default_tiles(c)
-    if tile_over:
-        tiles = dataclasses.replace(tiles, **tile_over)
-    saved = {}
-    for (m, name), v in (patch or {}).items():
-        obj = getattr(_THIS, m)
-        saved[(m, name)] = getattr(obj, name)
-        setattr(obj, name, v)
-    try:
-        fn, _ = dp_step.make_dp_step(world.mesh, c, tiles, forced_routing=True, skip=skip,
-                                     scopes=scopes)
-    finally:
-        for (m, name), v in saved.items():
-            setattr(getattr(_THIS, m), name, v)
-    fn = jax.jit(fn, donate_argnums=(3,))
+    calls, s0 = [], 0
+    for b_call in DP_CASES[case]:
+        c, args = _dp_inputs(world, case, b_call, s0, DP_RKEY.get(case))
+        s0 += b_call // T
+        tiles = C.default_tiles(c)
+        if tile_over:
+            tiles = dataclasses.replace(tiles, **tile_over)
+        saved = {}
+        for (m, name), v in (patch or {}).items():
+            obj = getattr(_THIS, m)
+            saved[(m, name)] = getattr(obj, name)
+            setattr(obj, name, v)
+        try:
+            fn, _ = dp_step.make_dp_step(world.mesh, c, tiles, forced_routing=True, skip=skip,
+                                         scopes=scopes)
+        finally:
+            for (m, name), v in saved.items():
+                setattr(getattr(_THIS, m), name, v)
+        calls.append((jax.jit(fn, donate_argnums=(3,)), args, c, tiles))
     w = _dp_weights(world)
-    pos, hid_in, pt, ck, ro, rb = args
     pools = world.pools
 
     def one(pools):
-        return fn(pos, hid_in, w, pools, pt, ck, ro, rb)
+        hid = None
+        for fn, (pos, hid_in, pt, ck, ro, rb), _, _ in calls:
+            hid, pools = fn(pos, hid_in, w, pools, pt, ck, ro, rb)
+        return hid, pools
 
     hid, pools = one(pools)
     jax.block_until_ready(pools)
@@ -1119,13 +1138,15 @@ def test_step_dp(world, case, variant):
     jax.block_until_ready(pools)
     jax.profiler.stop_trace()
     world.pools = pools
+    c = calls[-1][2]
     h = np.stack(_local_rows(hid, c.B))
     _record({
         "label": "dp", "placement": world.placement, "case": case, "variant": variant,
-        "rows": DP_CASES[case], "rows_per_chip": c.B, "mb_rows": c.mb_rows,
+        "rows": list(DP_CASES[case]), "rows_per_chip": [x[2].B for x in calls],
+        "mb_rows": [x[2].mb_rows for x in calls],
         "loop_ms": round(loop_ms, 4), "single_ms": [round(x, 4) for x in sorted(single)],
         "n_steps": N_STEPS, "compile_s": round(t_compile, 1),
         "hidden_finite": bool(np.isfinite(h).all()),
         "cores_agree": bool(all(np.array_equal(h[2 * g], h[2 * g + 1]) for g in range(len(h) // 2))),
-        "tiles": dataclasses.asdict(tiles), "trace": trace_dir,
+        "tiles": [dataclasses.asdict(x[3]) for x in calls], "trace": trace_dir,
     })

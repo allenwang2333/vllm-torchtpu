@@ -57,12 +57,12 @@ class DPAttention:
         dmatmul = self.rings.dmatmul
         kv_dma = self.kv_dma
         AE, B, T, NS, H, NV = ctx.AE, ctx.B, ctx.T, ctx.NS, ctx.H, ctx.NV
-        nh, HD, NHH, QR, TQ, SR = ctx.nh, ctx.HD, ctx.NHH, ctx.QR, ctx.TQ, ctx.SR
+        nh, HD, NHH, QR, TQ, SR = ctx.nh, ctx.HD, ctx.NHH, ctx.QR, ctx.TQ, ctx.VSR
         BLK, SUB, NKV, NKVR, KVE = ctx.BLK, ctx.SUB, ctx.NKV, ctx.NKVR, ctx.KVE
         KV_ITEM, EBROWS, PAIR_KV = ctx.KV_ITEM, ctx.EBROWS, ctx.PAIR_KV
         nt, skip, interpret = ctx.nt, ctx.skip, ctx.interpret
         assert ctx.VATT and c.paged_kv and ctx.FUSED and ctx.QV and not ctx.SPLIT and T > 1
-        assert QR == NV * nh and SR == 8, (QR, NV, nh, SR)
+        assert QR == NV * nh and SR == nh, (QR, NV, nh, SR)
         n_ai, n_ao = nt["att_in"], nt["att_out"]
         a = l // AE
         ksem = scr["kv_sem"]
