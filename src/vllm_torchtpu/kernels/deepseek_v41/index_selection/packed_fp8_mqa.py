@@ -64,6 +64,7 @@ class MQAOps:
     page_sem: Ref
     skip_invalid_pages: bool
     next_tiles: jax.Array = field(init=False)
+    next_group: jax.Array = field(init=False)
     live_tiles: jax.Array = field(init=False)
     row_lengths: jax.Array = field(init=False)
     minimum_length: jax.Array = field(init=False)
@@ -100,6 +101,7 @@ class MQAOps:
 
     def begin_query(self, following: QueryTile, lookahead: QueryTile) -> None:
         c = self.plan.config
+        self.next_group = following.key_group
         next_limit = jnp.int32(0)
         for local in range(c.query_tile):
             row = jnp.minimum(following.start + local, self.q.shape[0] - 1)

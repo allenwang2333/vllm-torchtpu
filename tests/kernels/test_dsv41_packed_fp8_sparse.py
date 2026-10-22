@@ -17,8 +17,10 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("following", [False, True])
-def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
+@pytest.mark.parametrize(
+    "following, nonempty", [(False, False), (True, False), (True, True)]
+)
+def test_empty_tile_keeps_prefetch_and_output_lifetimes(following, nonempty):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
         _packed_fp8_pipeline as pipeline,
     )
@@ -34,7 +36,8 @@ def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
         state=pipeline.QueryState(pipeline.QueryTile(0, 6, 0), 0, 0),
         live_tiles=3,
         next_tiles=3 if following else 0,
-        tile_flags=jnp.zeros((1, 3), jnp.int32),
+        next_group=1,
+        tile_flags=jnp.array([[0, 0, 0], [128 if nonempty else 0, 0, 0]], jnp.int32),
         metadata_slot=0,
         skip_invalid_pages=True,
         key_slot=lambda tile: tile & 3,
@@ -46,7 +49,7 @@ def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
     with jax.disable_jit():
         pipeline.Pipeline(plan).step(ops, jnp.int32(0))
     expected = [("wait", 0)]
-    if following:
+    if following and nonempty:
         expected.append(("fetch", 0, 1, 3, {"unroll": True}))
     expected.extend((("clear", 0), ("publish", 0, {})))
     assert calls == expected
