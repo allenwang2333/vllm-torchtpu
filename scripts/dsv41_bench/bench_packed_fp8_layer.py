@@ -192,6 +192,7 @@ def fixture(requests, queries, width, seed):
 def compile_arm(modules, variant, mode, requests, queries, width, out):
     baseline, candidate = modules
     if variant in (
+        "packed_fp8_baseline",
         "packed_fp8_full_scores",
         "packed_fp8_separate_selection",
         "packed_fp8_unsplit",
@@ -357,6 +358,7 @@ def validate_outputs(outputs, lengths, candidates, filtering):
     reference, candidate = sets.values()
     overlap = [len(a & b) / 512 for a, b in zip(reference, candidate)]
     for baseline in (
+        "packed_fp8_baseline",
         "packed_fp8_scatter",
         "packed_fp8_full_scores",
         "packed_fp8_separate_selection",
@@ -463,24 +465,14 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compare-cache-writers", action="store_true")
     parser.add_argument("--sparse-baseline", type=Path)
-    parser.add_argument("--query-chunks", type=int, default=1)
     args = parser.parse_args()
     modules = load_model()
     if args.sparse_baseline is not None:
         modules = (load_sparse_baseline(args.sparse_baseline), modules[1])
-    if args.query_chunks > 1:
-        from _split_indexer_queries import split_score_and_select
-
-        assert args.sparse_baseline is not None
-        modules[1]._score_and_select = split_score_and_select(
-            modules[1]._score_and_select, args.query_chunks
-        )
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (
-        "packed_fp8_unsplit"
-        if args.query_chunks > 1
-        else "packed_fp8_full_scores"
+        "packed_fp8_baseline"
         if args.sparse_baseline is not None
         else "packed_fp8_scatter"
         if args.compare_cache_writers

@@ -29,6 +29,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import
     packed_fp8_sparse_mqa_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
+    PACKED_FP8_INDEXER_QUERY_ROWS,
     PACKED_FP8_MQA_CONFIG,
 )
 
@@ -214,15 +215,14 @@ def _score_and_select(
     )
     order = jnp.argsort(inputs[-1], stable=True)
     inputs = tuple(x[order] for x in inputs)
-    output = jnp.full((padded, min(topk, width)), -1, jnp.int32)
-    published = jnp.full((padded, candidates.shape[1]), -1, jnp.int32)
+    counts = jnp.bincount(inputs[-1], length=records.shape[0])
+    query_offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
 
-    def body(index, outputs):
+    def block(start, rows, sparse_mode):
         queries, row_weights, row_lengths, row_candidates, owners = tuple(
-            jax.lax.dynamic_slice_in_dim(x, index * rows, rows) for x in inputs
+            jax.lax.dynamic_slice_in_dim(x, start, rows) for x in inputs
         )
-        counts = jnp.bincount(owners, length=records.shape[0])
-        offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)))
+        offsets = jnp.clip(query_offsets - start, 0, rows)
         quantized, scales, _ = quantize_index_rows(queries)
         pool = banks[0] if len(banks) == 1 else banks
 
@@ -301,20 +301,46 @@ def _score_and_select(
             )
             return selected, row_candidates
 
-        if candidate_filter and candidates.shape[1] * block_size < width:
-            # Match upstream's whole-batch short-context bypass, including TP
-            # query shards and chunks whose local lengths are all short.
-            selected, candidate_rows = jax.lax.cond(
-                jnp.minimum(batch_max.max(), width) <= topk, dense, sparse
+        return sparse() if sparse_mode else dense()
+
+    def run(sparse_mode):
+        output = jnp.full((padded, min(topk, width)), -1, jnp.int32)
+        published = jnp.full((padded, candidates.shape[1]), -1, jnp.int32)
+
+        def body(index, outputs):
+            result = block(index * rows, rows, sparse_mode)
+            return tuple(
+                jax.lax.dynamic_update_slice_in_dim(dst, src, index * rows, axis=0)
+                for dst, src in zip(outputs, result)
             )
-        else:
-            selected, candidate_rows = dense()
-        return tuple(
-            jax.lax.dynamic_update_slice_in_dim(dst, src, index * rows, axis=0)
-            for dst, src in zip(outputs, (selected, candidate_rows))
+
+        return jax.lax.fori_loop(0, padded // rows, body, (output, published))
+
+    def sparse():
+        chunk_rows = PACKED_FP8_INDEXER_QUERY_ROWS.get(
+            (tokens, width, candidates.shape[1], topk, block_size, len(banks))
+        )
+        if chunk_rows is None or chunk_rows > rows or padded != tokens or not unordered:
+            return run(True)
+        starts = range(0, padded, chunk_rows)
+
+        def independent_chunks():
+            parts = [block(i, chunk_rows, True) for i in starts]
+            return tuple(jnp.concatenate(values, axis=0) for values in zip(*parts))
+
+        # Moving a query between the four-row and two-row head reductions can
+        # change BF16 rounding. Split only complete six-query request groups.
+        return jax.lax.cond(
+            jnp.all(counts % query_tile == 0), independent_chunks, lambda: run(True)
         )
 
-    output, published = jax.lax.fori_loop(0, padded // rows, body, (output, published))
+    if candidate_filter and candidates.shape[1] * block_size < width:
+        # Keep the original whole-batch short-context bypass outside the chunks.
+        output, published = jax.lax.cond(
+            jnp.minimum(batch_max.max(), width) <= topk, lambda: run(False), sparse
+        )
+    else:
+        output, published = run(False)
     inverse = jnp.argsort(order)
     return output[inverse][:tokens], published[inverse][:tokens]
 

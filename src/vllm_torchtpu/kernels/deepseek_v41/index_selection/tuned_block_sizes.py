@@ -57,6 +57,11 @@ class PagedMQAConfig:
 # TPU v7, H32/D128, transposed packed FP8 pages; measured at P-state 7.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 32768, 8, 6, 4)
 
+# (queries, context, candidate blocks, topk, block size, cache banks).
+# 96 = lcm(6 query rows, 32 SparseCore subcores). Three independent chunks
+# expose TC/SC overlap without changing each query's six-row head grouping.
+PACKED_FP8_INDEXER_QUERY_ROWS = {(288, 98304, 2048, 512, 8, 2): 96}
+
 # Stage eight 16.5 KiB pages so their reads and writes can be issued together.
 PACKED_FP8_WRITE_BATCH = 8
 

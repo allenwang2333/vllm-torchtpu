@@ -14,6 +14,54 @@ import torch
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("request_sizes,expected_rows", [([6, 6], 6), ([5, 7], 12)])
+def test_query_chunks_preserve_six_query_head_groups(
+    monkeypatch, request_sizes, expected_rows
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
+        PackedFP8Layout,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import packed_fp8_indexer as model
+
+    # The production table targets the large hardware fixture. Exercise the
+    # same dispatch contract with a small scorer spy; this is not a numeric
+    # replacement for the TPU scorer.
+    monkeypatch.setitem(model.PACKED_FP8_INDEXER_QUERY_ROWS, (12, 256, 8, 8, 8, 2), 6)
+
+    def scorer(
+        q, weights, pool, pages, lengths, owners, candidates, offsets, *, k, **kw
+    ):
+        return jnp.full((q.shape[0], k), q.shape[0], jnp.int32), candidates
+
+    monkeypatch.setattr(model, "packed_fp8_sparse_mqa_topk", scorer)
+    # lax.cond traces the unused dense arm as well; this test only checks dispatch.
+    monkeypatch.setattr(
+        model,
+        "packed_fp8_mqa_logits",
+        lambda q, *args, **kw: jnp.zeros((q.shape[0], 256), jnp.float32),
+    )
+    requests = jnp.repeat(jnp.arange(2), jnp.asarray(request_sizes))
+    candidates = jnp.tile(jnp.arange(8), (12, 1))
+    selected, published = model._score_and_select(
+        jnp.zeros((12, 32, 128), jnp.bfloat16),
+        (jnp.zeros((1, 128), jnp.int32),) * 2,
+        jnp.tile(jnp.arange(256), (2, 1)),
+        jnp.ones((12, 32), jnp.float32),
+        jnp.full((12,), 256, jnp.int32),
+        candidates,
+        requests,
+        jnp.array([256], jnp.int32),
+        PackedFP8Layout(2),
+        8,
+        8,
+        False,
+        True,
+        True,
+    )
+    np.testing.assert_array_equal(selected, np.full((12, 8), expected_rows))
+    np.testing.assert_array_equal(published, candidates)
+
+
 @pytest.fixture
 def cpu_cache_ops(monkeypatch):
     """Run the production JAX callbacks without the TPU/Torch bridge."""
