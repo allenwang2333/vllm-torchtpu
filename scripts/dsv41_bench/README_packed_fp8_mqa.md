@@ -266,6 +266,15 @@ The scorer, math and pipeline sources are unchanged. Same-shape sim-pjrt LLO
 comparisons retain all 17,536 sparse and 17,545 dense bundles instruction-for-
 instruction after removing debug identities.
 
+### Scatter follow-up awaiting hardware measurements
+
+Commit `18c83ac12` batches candidate membership construction by query and
+expresses each cache record as one nonoverlapping 33-word column scatter window.
+It passes the same 42 CPU tests. Same-shape sim-pjrt scorer LLO remains identical
+at 17536 sparse / 17545 dense bundles. The P-state-7 experiment is queued for TPU
+capacity; these changes have no measured performance claim yet. The timing table
+above still describes commit `a7225b918`.
+
 ## Reproduce
 
 ```bash
