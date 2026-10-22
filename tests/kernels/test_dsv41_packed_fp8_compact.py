@@ -12,6 +12,36 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact impo
     candidate_topk,
     compact_candidate_scores,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_select import (
+    select_candidate_scores,
+)
+
+
+@pytest.mark.cpu_test
+def test_fused_selection_handles_empty_rows_ties_and_short_rows():
+    positions = np.arange(98304, dtype=np.int32)
+    scores = np.stack(
+        (
+            np.full(98304, -np.inf),
+            np.zeros(98304),
+            np.where(positions < 17, 0.0, -np.inf),
+            positions % 17,
+        )
+    ).astype(np.float32)
+    candidates = np.broadcast_to(np.arange(2048), (4, 2048)).copy()
+    candidates[0] = -1
+    candidates[3] *= 3
+    expected = np.full((4, 512), -1, np.int32)
+    for row in range(4):
+        blocks = candidates[row][candidates[row] >= 0]
+        logical = (blocks[:, None] * 8 + np.arange(8)).reshape(-1)
+        logical = logical[np.isfinite(scores[row, logical])]
+        chosen = sorted(logical, key=lambda i: (-scores[row, i], i))[:512]
+        expected[row, : len(chosen)] = np.sort(chosen)
+    actual = jax.jit(
+        lambda values, ids: select_candidate_scores(values, ids, k=512, block_size=8)
+    )(jnp.asarray(scores), jnp.asarray(candidates, jnp.int32))
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.cpu_test

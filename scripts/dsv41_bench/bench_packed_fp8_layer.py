@@ -93,6 +93,8 @@ def load_sparse_baseline(source: Path):
     if hasattr(sparse, "packed_fp8_sparse_mqa_logits"):
         sparse.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
         indexer.packed_fp8_sparse_mqa_logits = sparse.packed_fp8_sparse_mqa_logits
+    if hasattr(sparse, "packed_fp8_sparse_mqa_topk"):
+        indexer.packed_fp8_sparse_mqa_topk = sparse.packed_fp8_sparse_mqa_topk
     return indexer
 
 
@@ -454,33 +456,14 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compare-cache-writers", action="store_true")
     parser.add_argument("--sparse-baseline", type=Path)
-    parser.add_argument("--fused-candidate-select", action="store_true")
-    parser.add_argument("--unroll-candidate-selection", action="store_true")
     args = parser.parse_args()
     modules = load_model()
     if args.sparse_baseline is not None:
         modules = (load_sparse_baseline(args.sparse_baseline), modules[1])
-    if args.fused_candidate_select:
-        from _fused_candidate_select import fused_select
-
-        from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_fp8_sparse
-
-        # Benchmark-only fusion: pass the scorer's temporary directly to SC
-        # selection. The public compact-logit entry point is otherwise unchanged.
-        assert args.sparse_baseline is not None
-        assert args.width == 98304
-        packed_fp8_sparse.compact_candidate_scores = (
-            lambda scores, candidates, *, block_size: scores
-        )
-        modules[1].candidate_topk = functools.partial(
-            fused_select, unroll_selection=args.unroll_candidate_selection
-        )
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (
-        "packed_fp8_separate_selection"
-        if args.fused_candidate_select
-        else "packed_fp8_full_scores"
+        "packed_fp8_full_scores"
         if args.sparse_baseline is not None
         else "packed_fp8_scatter"
         if args.compare_cache_writers
@@ -531,10 +514,6 @@ def main():
         )
     )
     with jax.default_device(jax.devices()[0]):
-        if args.fused_candidate_select:
-            from _fused_candidate_select import verify_fused_selection
-
-            verify_fused_selection(unroll_selection=args.unroll_candidate_selection)
         for seed in args.seeds:
             pools, common, candidates = fixture(
                 args.requests, args.queries, args.width, seed

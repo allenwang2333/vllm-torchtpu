@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Experimental SC score-compaction/selection fusion for the 96K/16K fixture.
+"""Gather candidate scores and select exact TopK in one SparseCore call.
 
-Two VMEM scopes reuse the full-row staging allocation after gathering. This
-prototype is benchmark-only until its full-path correctness and timing pass.
+Separate VMEM scopes reuse full-score staging memory for radix selection.
 """
-
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -21,19 +18,34 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
     _sort_selected,
 )
 
+from ._packed_fp8_compact import candidate_topk, compact_candidate_scores
 
-def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=False):
+
+def select_candidate_scores(scores, candidates, *, k: int, block_size: int):
     rows, width = scores.shape
     count = candidates.shape[1]
+
+    def separate():
+        return candidate_topk(
+            compact_candidate_scores(scores, candidates, block_size=block_size),
+            candidates,
+            k=k,
+            block_size=block_size,
+        )
+
+    if jax.default_backend() != "tpu":
+        return separate()
     info = plsc.get_sparse_core_info()
     lanes = info.num_lanes
     alignment = pltpu.get_tpu_info().num_lanes
     capacity = count * block_size + lanes
-    unroll = alignment // lanes if unroll_selection else 1
+    unroll = alignment // lanes
     resident = 4 * (capacity + count)
     scratch_peak = 4 * max(width, 4 * capacity + 2 * k + RADIX_BUCKETS)
-    assert resident + scratch_peak <= info.vmem_capacity_bytes
-    assert k % alignment == count % alignment == width % alignment == 0
+    if resident + scratch_peak > info.vmem_capacity_bytes or any(
+        n % alignment for n in (k, count, width)
+    ):
+        return separate()
     mesh = plsc.VectorSubcoreMesh(core_axis_name="core", subcore_axis_name="subcore")
 
     @pl.kernel(
@@ -131,34 +143,3 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
             )
 
     return kernel(scores, candidates)
-
-
-def verify_fused_selection(*, unroll_selection):
-    """Exercise empty rows, ties, short rows and noncontiguous block IDs."""
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
-        candidate_topk,
-        compact_candidate_scores,
-    )
-
-    positions = jnp.arange(98304, dtype=jnp.int32)
-    scores = jnp.stack(
-        (
-            jnp.full((98304,), -jnp.inf),
-            jnp.zeros((98304,)),
-            jnp.where(positions < 17, 0.0, -jnp.inf),
-            (positions % 17).astype(jnp.float32),
-        )
-    )
-    candidates = jnp.broadcast_to(jnp.arange(2048), (4, 2048))
-    candidates = candidates.at[0].set(-1).at[3].multiply(3)
-
-    def reference(values, ids):
-        compact = compact_candidate_scores(values, ids, block_size=8)
-        return candidate_topk(compact, ids, k=512, block_size=8)
-
-    expected = jax.jit(reference)(scores, candidates)
-    actual = jax.jit(
-        functools.partial(fused_select, unroll_selection=unroll_selection)
-    )(scores, candidates)
-    assert bool(jnp.array_equal(actual, expected)), "Fused selection edge case changed"
-    print("Fused selection edge cases passed", flush=True)

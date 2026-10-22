@@ -7,6 +7,7 @@ one byte format. The TPU page stores feature words by token column; it is
 not NVIDIA's token-major page layout.
 """
 
+import functools
 from typing import Any, cast
 
 import jax
@@ -14,9 +15,6 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.index_quantization import quantize_index_rows
-from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
-    candidate_topk,
-)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PAGE_RECORDS,
     PackedFP8Layout,
@@ -28,6 +26,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_mqa import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import (
     packed_fp8_sparse_mqa_logits,
+    packed_fp8_sparse_mqa_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     PACKED_FP8_MQA_CONFIG,
@@ -253,7 +252,12 @@ def _score_and_select(
         def sparse():
             if row_candidates.shape[1] == 0:
                 return jnp.full((rows, min(topk, width)), -1, jnp.int32), row_candidates
-            scores, canonical = packed_fp8_sparse_mqa_logits(
+            operation = (
+                functools.partial(packed_fp8_sparse_mqa_topk, k=min(topk, width))
+                if unordered
+                else packed_fp8_sparse_mqa_logits
+            )
+            result, canonical = operation(
                 quantized,
                 row_weights.astype(jnp.float32),
                 pool,
@@ -267,21 +271,15 @@ def _score_and_select(
                 block_size=block_size,
             )
             if unordered:
-                selected = candidate_topk(
-                    scores,
-                    canonical,
-                    k=min(topk, scores.shape[1]),
-                    block_size=block_size,
-                )
                 selected = jnp.pad(
-                    selected,
-                    ((0, 0), (0, min(topk, width) - selected.shape[1])),
+                    result,
+                    ((0, 0), (0, min(topk, width) - result.shape[1])),
                     constant_values=-1,
                 )
                 return selected, row_candidates
             selected, _ = attention_kernels.select_indices_jax(
-                scores,
-                jnp.full_like(row_lengths, scores.shape[1]),
+                result,
+                jnp.full_like(row_lengths, result.shape[1]),
                 canonical,
                 min(topk, width),
                 block_size,
