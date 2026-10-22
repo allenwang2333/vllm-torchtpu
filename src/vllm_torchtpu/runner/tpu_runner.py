@@ -5364,6 +5364,11 @@ class TPUModelRunner(GPUModelRunner):
                 )
 
                 arm_runner_models(self)
+            if envs.TPU_SEGMENT_MEGAKERNEL:
+                # After moe_tp_decode: it reuses that arming's buffers and mesh.
+                from vllm_torchtpu.layers.adapter import segment_megakernel
+
+                segment_megakernel.arm(self.model, self.vllm_config)
 
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
