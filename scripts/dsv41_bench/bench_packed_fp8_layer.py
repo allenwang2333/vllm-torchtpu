@@ -90,6 +90,9 @@ def load_sparse_baseline(source: Path):
     indexer.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
     indexer.candidate_pages = sparse.candidate_pages
     indexer.mask_candidate_scores = sparse.mask_candidate_scores
+    if hasattr(sparse, "packed_fp8_sparse_mqa_logits"):
+        sparse.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
+        indexer.packed_fp8_sparse_mqa_logits = sparse.packed_fp8_sparse_mqa_logits
     return indexer
 
 
@@ -186,7 +189,7 @@ def fixture(requests, queries, width, seed):
 
 def compile_arm(modules, variant, mode, requests, queries, width, out):
     baseline, candidate = modules
-    if variant == "packed_fp8_full_scores":
+    if variant in ("packed_fp8_full_scores", "packed_fp8_separate_selection"):
         candidate = baseline
     write, filtering = mode == "publish", mode == "filter"
 
@@ -345,7 +348,11 @@ def validate_outputs(outputs, lengths, candidates, filtering):
             )
     reference, candidate = sets.values()
     overlap = [len(a & b) / 512 for a, b in zip(reference, candidate)]
-    for baseline in ("packed_fp8_scatter", "packed_fp8_full_scores"):
+    for baseline in (
+        "packed_fp8_scatter",
+        "packed_fp8_full_scores",
+        "packed_fp8_separate_selection",
+    ):
         if baseline in outputs:
             for before, after in zip(outputs[baseline], outputs["packed_fp8"]):
                 assert bool(jnp.array_equal(before, after)), "FP8 output changed"
@@ -447,14 +454,30 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compare-cache-writers", action="store_true")
     parser.add_argument("--sparse-baseline", type=Path)
+    parser.add_argument("--fused-candidate-select", action="store_true")
     args = parser.parse_args()
     modules = load_model()
     if args.sparse_baseline is not None:
         modules = (load_sparse_baseline(args.sparse_baseline), modules[1])
+    if args.fused_candidate_select:
+        from _fused_candidate_select import fused_select
+
+        from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_fp8_sparse
+
+        # Benchmark-only fusion: pass the scorer's temporary directly to SC
+        # selection. The public compact-logit entry point is otherwise unchanged.
+        assert args.sparse_baseline is not None
+        assert args.width == 98304
+        packed_fp8_sparse.compact_candidate_scores = (
+            lambda scores, candidates, *, block_size: scores
+        )
+        modules[1].candidate_topk = fused_select
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (
-        "packed_fp8_full_scores"
+        "packed_fp8_separate_selection"
+        if args.fused_candidate_select
+        else "packed_fp8_full_scores"
         if args.sparse_baseline is not None
         else "packed_fp8_scatter"
         if args.compare_cache_writers
