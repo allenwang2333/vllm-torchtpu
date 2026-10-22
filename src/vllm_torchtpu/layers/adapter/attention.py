@@ -3066,6 +3066,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             output_partition_specs=(P(DCP_AXIS_NAME),) * (2 * num_skip),
         )
 
+        # The default fake lowers the op at concrete shapes, which pins the
+        # backbone's dynamic token dim; size the outputs from the top-k
+        # instead: per rank [T * topk, 128] nope and a quarter of that rope.
+        def _fake_group_gather(*args, **kwargs):
+            del kwargs
+            topk = args[2 * num_skip + 1]
+            rows = topk.shape[0] * topk.shape[1]
+            outs = []
+            for _ in range(num_skip):
+                outs.append(topk.new_empty((rows, 128), dtype=torch.uint32))
+                outs.append(topk.new_empty((rows // 4, 128), dtype=torch.uint32))
+            return tuple(outs)
+
+        op.register_fake(_fake_group_gather)
+
         def group_gather_impl(skip_caches, head_nope_cache, local_topk_indices, md):
             flat = [t for pair in skip_caches for t in pair]
             return op(
