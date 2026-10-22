@@ -48,7 +48,7 @@ ALL_PR_INTEGRATION_STEPS: tuple[str, ...] = (
     "integration_compilation_cache_e2e",
     "integration_k3_pruned75_apc_offload_correctness",
     "vllm_torchtpu_multihost_presubmit",
-    "integration_qwen35_pcp8_dp8_disagg_correctness",
+    "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
     "integration_qwen35_gpc_correctness",
 )
 
@@ -57,7 +57,7 @@ DISAGG_KV_INTEGRATION_STEPS: frozenset[str] = frozenset(
         "integration_qwen35_pcp4_dp4_disagg_correctness",
         "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
         "presubmit_disagg_single_host",
-        "integration_qwen35_pcp8_dp8_disagg_correctness",
+        "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
         "integration_qwen35_gpc_correctness",
         "integration_qwen35_gpc_global_dram_pool",
     }
@@ -85,7 +85,7 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
             "presubmit_disagg_single_host",
             "integration_qwen35_pcp4_dp4_disagg_correctness",
             "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
         }
     ),
     "scripts/vllm/integration/run_qwen35_apc_correctness.sh": frozenset(
@@ -120,7 +120,7 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
             "integration_qwen35_pcp4_dp4_disagg_correctness",
             "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
             "integration_qwen35_apc_correctness",
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
         }
     ),
     "scripts/vllm/integration/smoke_prefix_cache_e2e_divergence.py": frozenset(
@@ -129,25 +129,25 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
             "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
             "integration_qwen35_apc_correctness",
             "integration_k3_pruned75_apc_offload_correctness",
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
         }
     ),
     "scripts/vllm/integration/run_qwen35_p8d8_disagg_correctness.sh": (
         frozenset(
             {
-                "integration_qwen35_pcp8_dp8_disagg_correctness",
+                "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
                 "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
             }
         )
     ),
     "examples/disagg/launch_qwen35_disagg_multihost.sh": frozenset(
         {
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
             "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness",
         }
     ),
     ".buildkite/kubernetes/manifests/workloads/qwen3.5-p8d8-disagg.yaml": (
-        frozenset({"integration_qwen35_pcp8_dp8_disagg_correctness"})
+        frozenset({"integration_qwen35_pcp8_2tp4dp_disagg_correctness"})
     ),
     "scripts/vllm/integration/run_qwen35_gpc_correctness.sh": frozenset(
         {"integration_qwen35_gpc_correctness"}
@@ -160,7 +160,7 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
     ),
     ".buildkite/kubernetes/single_host_engine.sh": frozenset(
         {
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
             "integration_qwen35_gpc_correctness",
         }
     ),
@@ -182,14 +182,14 @@ INTEGRATION_FILE_TO_STEPS: dict[str, frozenset[str]] = {
     ".buildkite/kubernetes/multihost_lib.sh": frozenset(
         {
             "vllm_torchtpu_multihost_presubmit",
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
             "integration_qwen35_gpc_correctness",
         }
     ),
     ".buildkite/kubernetes/run_multihost.sh": frozenset(
         {
             "vllm_torchtpu_multihost_presubmit",
-            "integration_qwen35_pcp8_dp8_disagg_correctness",
+            "integration_qwen35_pcp8_2tp4dp_disagg_correctness",
             "integration_qwen35_gpc_correctness",
         }
     ),
@@ -469,6 +469,7 @@ def select_for_files(
                 ".buildkite/pipeline_build.yml",
                 ".buildkite/pipeline_verify.yml",
                 ".buildkite/scripts/bootstrap.sh",
+                ".buildkite/scripts/cap_pr_tpu_concurrency.py",
                 ".buildkite/scripts/configs/pipeline_config.sh",
                 ".buildkite/scripts/setup_docker_env.sh",
                 ".buildkite/kubernetes/run.sh",
