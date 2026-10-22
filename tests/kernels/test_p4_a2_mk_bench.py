@@ -252,6 +252,7 @@ VARIANTS = {
     "nbe18": (frozenset(), 0, {"nbe": 18}, {}),
     "nbe16": (frozenset(), 0, {"nbe": 16}, {}),
     "nbe14": (frozenset(), 0, {"nbe": 14}, {}),
+    "nbe20": (frozenset(), 0, {"nbe": 20}, {}),
 }
 
 
