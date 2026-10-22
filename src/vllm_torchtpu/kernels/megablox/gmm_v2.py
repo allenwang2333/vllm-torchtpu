@@ -887,6 +887,11 @@ DECODE_SLOTS = 3
 #: Group sizes `start_first_decode_fetch` tests per scan step.
 FIRST_SCAN_CHUNK = 8
 
+#: Column panels per projection of a decode expert. Each is its own weight
+#: DMA, multiplied as soon as it lands, so only the last panel's work is
+#: exposed after the last expert's weights arrive.
+DECODE_COL_SPLIT = 2
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -903,21 +908,35 @@ class DecodeRefs:
     scale_sems: Any  # DMA[DECODE_SLOTS]
 
 
-def decode_weight_copies(rhs_hbm_ref: WeightsRef, dec: DecodeRefs, group_id, slot):
-    """`(weight DMA per column panel, scale DMA)` of `group_id` into decode slot `slot`.
+def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
+    """`(first weight column, width)` of each decode weight panel, in fetch order.
 
-    A fused gate/up expert has a gate and an up panel, each its own DMA, so
-    the gate columns can be multiplied while the up columns still land.
+    A fused expert's gate panel comes right before the up panel of the same
+    output columns, so each pair is activated once its up panel is multiplied.
     """
-    num_panels = dec.weight_sems.shape[-1]
-    panel_n = dec.weight.shape[-1] // num_panels
+    halves = 1 if cfgs.fuse_act is None else 2
+    half_n = cfgs.dims.size_n // halves
+    width = half_n // DECODE_COL_SPLIT
+    assert width * DECODE_COL_SPLIT == half_n
+    assert width % pltpu.get_tpu_info().mxu_column_size == 0, width
+    return tuple(
+        (h * half_n + s * width, width)
+        for s in range(DECODE_COL_SPLIT)
+        for h in range(halves)
+    )
+
+
+def decode_weight_copies(
+    rhs_hbm_ref: WeightsRef, dec: DecodeRefs, group_id, slot, panels
+):
+    """`(weight DMA per panel of `panels`, scale DMA)` of `group_id` into `slot`."""
     weights = tuple(
         pltpu.make_async_copy(
-            rhs_hbm_ref.weight.at[group_id, :, pl.ds(p * panel_n, panel_n)],
-            dec.weight.at[slot, :, pl.ds(p * panel_n, panel_n)],
+            rhs_hbm_ref.weight.at[group_id, :, pl.ds(col, width)],
+            dec.weight.at[slot, :, pl.ds(col, width)],
             dec.weight_sems.at[slot, p],
         )
-        for p in range(num_panels)
+        for p, (col, width) in enumerate(panels)
     )
     scale = pltpu.make_async_copy(
         rhs_hbm_ref.scale.at[group_id], dec.scale.at[slot], dec.scale_sems.at[slot]
@@ -961,7 +980,9 @@ def start_first_decode_fetch(
 
     @pl.when(first_group < size_group)
     def _():
-        weights, scale = decode_weight_copies(rhs_hbm_ref, dec, first_group, 0)
+        weights, scale = decode_weight_copies(
+            rhs_hbm_ref, dec, first_group, 0, decode_panels(cfgs)
+        )
         for copy in (*weights, scale):
             copy.start()
 
@@ -1029,11 +1050,14 @@ def decode_kernel(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
     )
 
-    num_panels = dec.weight_sems.shape[-1]
+    panels = decode_panels(cfgs)
+    num_panels = len(panels)
 
     def copies(gm):
         group_id = metadata_ref.gm_id_to_group_id[gm]
-        return decode_weight_copies(rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS)
+        return decode_weight_copies(
+            rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS, panels
+        )
 
     def start_fetch(gm, panels=range(num_panels)):
         """Starts tile gm's weight panels `panels`; panel 0 brings the scale."""
@@ -1062,7 +1086,9 @@ def decode_kernel(
 
     @pl.when(first_started & jnp.logical_not(first_is_tile0))
     def _():
-        weights, scale = decode_weight_copies(rhs_hbm_ref, dec, first_group, 0)
+        weights, scale = decode_weight_copies(
+            rhs_hbm_ref, dec, first_group, 0, panels
+        )
         for copy in (*weights, scale):
             copy.wait()
 
@@ -1098,11 +1124,10 @@ def decode_kernel(
         ).astype(lhs_q_dtype)
         dec.lhs_scale[b_id] = block_scale
 
-    panel_n = dims.size_n // num_panels
-
     def matmul_panel(slot, panel):
-        """acc_dtype[rows, panel_n] of weight columns [panel * panel_n, +panel_n)."""
-        cols = pl.ds(panel * panel_n, panel_n)
+        """acc_dtype[rows, width] of `panels[panel]`'s weight columns."""
+        col, panel_n = panels[panel]
+        cols = pl.ds(col, panel_n)
         rhs_ref = WeightsRef(
             weight=dec.weight.at[slot, :, cols],
             scale=dec.scale.at[slot, :, :, cols],
@@ -1136,20 +1161,23 @@ def decode_kernel(
         slot = gm % DECODE_SLOTS
         weights, scale = copies(gm)
         # Fused gate and up are multiplied as separate contiguous column panels
-        # and paired at the end; each column sees the same ops as interleaved.
-        # A panel of the tile `lookahead` ahead is started as each panel here
-        # begins, so its gate DMA is queued ahead of its up DMA.
-        panels = []
+        # and paired per output panel; each column sees the same ops as
+        # interleaved. A panel of the tile `lookahead` ahead is started as the
+        # same panel here begins, so its DMAs are queued in panel order.
+        outs, gate = [], None
         for p in range(num_panels):
             start_fetch(gm + lookahead, panels=(p,))
             weights[p].wait()
             if p == 0:
                 scale.wait()
-            panels.append(matmul_panel(slot, p))
-        if cfgs.fuse_act is None:
-            (acc,) = panels
-        else:
-            acc = apply_gated_act(*panels, cfgs.fuse_act)
+            acc_p = matmul_panel(slot, p)
+            if cfgs.fuse_act is None:
+                outs.append(acc_p)
+            elif p % 2 == 0:
+                gate = acc_p
+            else:
+                outs.append(apply_gated_act(gate, acc_p, cfgs.fuse_act))
+        acc = jnp.concatenate(outs, axis=1)
         acc = acc[: out_ref.shape[0]].astype(out_ref.dtype)
 
         m_start = metadata_ref.gm_id_to_m_offset[gm]
@@ -1795,7 +1823,7 @@ def gmm_v2(
                 scale=pltpu.VMEM((DECODE_SLOTS, 1, 1, dims.size_n), jnp.float32),
                 lhs_sem=pltpu.SemaphoreType.DMA((1,)),
                 weight_sems=pltpu.SemaphoreType.DMA(
-                    (DECODE_SLOTS, dims.size_n // cfgs.out_size_n)
+                    (DECODE_SLOTS, len(decode_panels(cfgs)))
                 ),
                 scale_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
             )
