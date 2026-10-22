@@ -125,6 +125,14 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
+class _BlockTables(list):
+    """A list of block tables with `MultiGroupBlockTable.block_tables`."""
+
+    @property
+    def block_tables(self):
+        return self
+
+
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -135,6 +143,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     split = 384 // kernel_page_size
     pages = spec.max_num_blocks_per_req(config, 1048576) * split
     table = SimpleNamespace(
+        block_size=384,
         max_num_blocks_per_req=pages,
         blocks_per_kv_block=split,
         get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
@@ -146,7 +155,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         block_size=384,
         max_num_blocks_per_req=pages,
         most_model_len=most_model_len,
-        input_batch=SimpleNamespace(block_table=[table]),
+        input_batch=SimpleNamespace(block_table=_BlockTables([table])),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),
@@ -231,13 +240,15 @@ def test_smem_caps_follow_widest_attention_group():
 def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner = _smem_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
-    runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
+    runner.input_batch.block_table[0] = SimpleNamespace(
+        block_size=384, max_num_blocks_per_req=2731
+    )
     runner.max_num_blocks_per_req = 2731
     runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
     runner._refresh_smem_request_caps()
     assert runner.num_reqs_max_model_len == 47
 
-    def rebuild(_self, _config, _sizes):
+    def rebuild(_self, _config):
         runner.input_batch.block_table[0] = final_table
 
     monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
@@ -254,6 +265,13 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.max_num_blocks_per_req == 342
     assert real_runner.block_table_cpu.shape == (64, 342)
     assert real_runner.num_reqs_most_model_len is None
+
+
+def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
+    # Without them, split groups would hand manager block ids to the kernels.
+    runner = object.__new__(TPUModelRunner)
+    with pytest.raises(ValueError, match="kernel_block_sizes is required"):
+        TPUModelRunner.may_reinitialize_input_batch(runner, SimpleNamespace())
 
 
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
@@ -562,13 +580,19 @@ def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
 
 
 def test_only_the_last_pipeline_stage_hosts_a_drafter():
-    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
-    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
     assert TPUModelRunner._is_async_drafter.fget(last) is True
     assert TPUModelRunner._is_async_drafter.fget(middle) is False
 
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
@@ -1703,6 +1727,33 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_static_verify_windows_lead_verify_segment(self):
+        """With a static verify length (DeepSeek-V4, 1 + K), full-length
+        windows lead the verify segment and are counted; a short window
+        (fewer drafts scheduled) stays behind them."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["pf", "short", "dc", "full", "full2"])
+        sched = self._sched(
+            {"pf": 16, "short": 2, "dc": 1, "full": 4, "full2": 4},
+            spec_reqs=("short", "full", "full2"),
+        )
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert (num_decode, num_windowed) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "dc"
+        assert set(ids[1:3]) == {"full", "full2"}
+        assert ids[3] == "short"
+        assert ids[4] == "pf"
+
+    def test_no_static_verify_without_static_length(self):
+        runner = self._make_runner()
+        self._batch(runner, ["vr", "dc"])
+        sched = self._sched({"vr": 4, "dc": 1}, spec_reqs=("vr",))
+        assert runner._reorder_batch_for_rpa(sched) == (1, 2)
+        assert runner._num_static_verify_reqs == 0
 
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
