@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from itertools import islice
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -37,11 +38,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.mamba_utils import (
-    MambaStateCopyFunc,
-    MambaStateCopyFuncCalculator,
-    MambaStateDtypeCalculator,
-)
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateDtypeCalculator
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
@@ -52,7 +49,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
     IsAttentionFree,
-    SupportsMambaPrefixCaching,
     SupportsPP,
 )
 from vllm.model_executor.models.utils import (
@@ -167,7 +163,8 @@ class Mamba3Config(PretrainedConfig):
         if not kwargs.get("architectures"):
             kwargs["architectures"] = ["Mamba3ForCausalLM"]
 
-        super().__init__(tie_word_embeddings=resolved_tie, **kwargs)
+        kwargs["tie_word_embeddings"] = resolved_tie
+        super().__init__(**kwargs)
 
 
 def _patch_mamba3_transformers_config() -> None:
@@ -364,12 +361,12 @@ class Mamba3GatedMLP(nn.Module):
         )
 
         fc1_loader = self._make_fc1_weight_loader()
-        _override_weight_loader(self.fc1.weight, fc1_loader)
+        _override_weight_loader(cast(nn.Parameter, self.fc1.weight), fc1_loader)
         if getattr(self.fc1, "bias", None) is not None:
-            _override_weight_loader(self.fc1.bias, fc1_loader)
+            _override_weight_loader(cast(nn.Parameter, self.fc1.bias), fc1_loader)
 
         fc2_loader = self._make_fc2_weight_loader()
-        _override_weight_loader(self.fc2.weight, fc2_loader)
+        _override_weight_loader(cast(nn.Parameter, self.fc2.weight), fc2_loader)
 
     def _make_fc1_weight_loader(self):
         padded_inter = self.intermediate_size
@@ -545,35 +542,20 @@ class Mamba3Model(nn.Module):
         )
         self.embeddings = self.embedding
 
-        def _layer_fn(layer_prefix: str) -> Mamba3DecoderLayer:
+        def _layer_fn(prefix: str) -> Mamba3DecoderLayer:
             return Mamba3DecoderLayer(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=layer_prefix,
+                prefix=prefix,
             )
 
-        try:
-            pp_world_size = get_pp_group().world_size
-        except Exception:
-            pp_world_size = 1
-
-        if pp_world_size > 1:
-            self.start_layer, self.end_layer, self.layers = make_layers(
-                params["num_hidden_layers"],
-                _layer_fn,
-                prefix=f"{prefix}.layers",
-            )
-        else:
-            self.start_layer = 0
-            self.end_layer = params["num_hidden_layers"]
-            self.layers = nn.ModuleList(
-                [
-                    _layer_fn(f"{prefix}.layers.{i}")
-                    for i in range(params["num_hidden_layers"])
-                ]
-            )
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            params["num_hidden_layers"],
+            _layer_fn,
+            prefix=f"{prefix}.layers",
+        )
 
         self.norm_f = RMSNorm(self.hidden_size, eps=params["rms_norm_eps"])
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -590,15 +572,8 @@ class Mamba3Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        try:
-            pp_group = get_pp_group()
-            is_first_rank = pp_group.is_first_rank
-            is_last_rank = pp_group.is_last_rank
-        except Exception:
-            is_first_rank = True
-            is_last_rank = True
-
-        if is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -607,13 +582,13 @@ class Mamba3Model(nn.Module):
             residual = None
         else:
             assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden_states = cast(torch.Tensor, intermediate_tensors["hidden_states"])
+            residual = cast(torch.Tensor, intermediate_tensors["residual"])
 
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(hidden_states, residual)
 
-        if not is_last_rank:
+        if not pp_group.is_last_rank:
             assert residual is not None
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
@@ -628,7 +603,6 @@ class Mamba3ForCausalLM(
     HasInnerState,
     IsAttentionFree,
     SupportsPP,
-    SupportsMambaPrefixCaching,
 ):
     """vLLM causal LM wrapper for Mamba-3 (SISO and MIMO)."""
 
@@ -711,12 +685,6 @@ class Mamba3ForCausalLM(
         )
         return aux_shape, ssm_shape
 
-    @classmethod
-    def get_mamba_state_copy_func(
-        cls,
-    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-        return MambaStateCopyFuncCalculator.mamba2_state_copy_func()
-
     @staticmethod
     def _normalize_weight_name(name: str) -> str:
         if name.startswith("model."):
@@ -742,9 +710,6 @@ class Mamba3ForCausalLM(
 
         for raw_name, loaded_weight in weights:
             name = self._normalize_weight_name(raw_name)
-
-            if "A_log" in name:
-                name = name.replace("A_log", "A")
 
             if tie_embeddings and name.startswith("lm_head."):
                 if "backbone.embedding.weight" not in loaded_params:

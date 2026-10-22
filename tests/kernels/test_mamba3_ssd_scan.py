@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Correctness tests for Mamba-3 SSD-3 hybrid JAX/Pallas scan kernel."""
+"""Correctness tests for Mamba-3 SSD-3 JAX scan kernel."""
 
 import jax
 import jax.numpy as jnp
@@ -22,12 +22,8 @@ from jax._src import test_util as jtu
 
 from vllm_torchtpu.layers.core.mamba3_ssd_scan import (
     _segsum_strict_jax,
-    mamba3_fused_chunk_pallas,
     ssd3_minimal_discrete_hybrid,
 )
-
-# Ensure highest precision for matmuls on TPU to match float32 references.
-jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def ssd3_sequential_reference(
@@ -84,6 +80,9 @@ def ssd3_sequential_reference(
 
 
 class Mamba3SSDScanKernelTest(jtu.JaxTestCase):
+    def test_import_does_not_override_global_matmul_precision(self):
+        self.assertIsNone(jax.config.jax_default_matmul_precision)
+
     @parameterized.parameters(
         # (batch, seqlen, block_len, n_heads, d_head, d_state)
         (2, 64, 16, 4, 16, 8),
@@ -187,67 +186,6 @@ class Mamba3SSDScanKernelTest(jtu.JaxTestCase):
 
         self.assertAllClose(y_hybrid, y_ref, rtol=1e-4, atol=1e-4)
         self.assertAllClose(final_state_hybrid, final_state_ref, rtol=1e-4, atol=1e-4)
-
-    def test_mamba3_fused_chunk_pallas_with_head_group_tiling(self):
-        batch, seqlen, chunk_size, n_heads, d_head, d_state = 2, 32, 16, 16, 8, 8
-        rng = jax.random.key(123)
-        k1, k2, k3, k4, k5 = jax.random.split(rng, 5)
-
-        x = jax.random.normal(k1, (batch, seqlen, n_heads, d_head))
-        adt = -jax.nn.softplus(jax.random.normal(k2, (batch, seqlen, n_heads))) * 0.1
-        k_scaled = jax.random.normal(k3, (batch, seqlen, n_heads, d_state))
-        q_rot = jax.random.normal(k4, (batch, seqlen, n_heads, d_state))
-        init_state = jax.random.normal(k5, (batch, n_heads, d_head, d_state))
-
-        y_fused, s_fused = mamba3_fused_chunk_pallas(
-            x,
-            adt,
-            k_scaled,
-            q_rot,
-            init_state,
-            chunk_size=chunk_size,
-            head_group=8,
-        )
-
-        # Compare against ssd3_minimal_discrete_hybrid
-        n_chunks_per_seq = seqlen // chunk_size
-        n_chunks = batch * n_chunks_per_seq
-        X_c = x.reshape(batch, n_chunks_per_seq, chunk_size, n_heads, d_head)
-        X_c = X_c.transpose(0, 1, 3, 2, 4).reshape(
-            n_chunks, n_heads, chunk_size, d_head
-        )
-        A_c = adt.reshape(batch, n_chunks_per_seq, chunk_size, n_heads)
-        A_c = A_c.transpose(0, 1, 3, 2).reshape(n_chunks, n_heads, chunk_size)
-        B_c = k_scaled.reshape(batch, n_chunks_per_seq, chunk_size, n_heads, d_state)
-        B_c = B_c.transpose(0, 1, 3, 2, 4).reshape(
-            n_chunks, n_heads, chunk_size, d_state
-        )
-        C_c = q_rot.reshape(batch, n_chunks_per_seq, chunk_size, n_heads, d_state)
-        C_c = C_c.transpose(0, 1, 3, 2, 4).reshape(
-            n_chunks, n_heads, chunk_size, d_state
-        )
-
-        initial_states = jnp.zeros((n_chunks, n_heads, d_head, d_state))
-        reset_mask = jnp.zeros((n_chunks,), dtype=bool)
-        for b in range(batch):
-            initial_states = initial_states.at[b * n_chunks_per_seq].set(init_state[b])
-            reset_mask = reset_mask.at[b * n_chunks_per_seq].set(True)
-        last_chunk_indices = jnp.array(
-            [b * n_chunks_per_seq + n_chunks_per_seq - 1 for b in range(batch)],
-            dtype=jnp.int32,
-        )
-
-        y_hybrid_c, s_hybrid = ssd3_minimal_discrete_hybrid(
-            X_c, A_c, B_c, C_c, last_chunk_indices, initial_states, reset_mask
-        )
-        y_hybrid = (
-            y_hybrid_c.reshape(batch, n_chunks_per_seq, n_heads, chunk_size, d_head)
-            .transpose(0, 1, 3, 2, 4)
-            .reshape(batch, seqlen, n_heads, d_head)
-        )
-
-        self.assertAllClose(y_fused, y_hybrid, rtol=1e-4, atol=1e-4)
-        self.assertAllClose(s_fused, s_hybrid, rtol=1e-4, atol=1e-4)
 
     def test_segsum_strict_excludes_diagonal(self):
         x = jnp.ones((2, 4), dtype=jnp.float32)

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""JAX/Pallas implementation of Mamba-3 Mixer core for TPU."""
+"""JAX implementation of Mamba-3 Mixer core for TPU."""
 
 import functools
 
@@ -20,7 +20,6 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.layers.core.mamba3_ssd_scan import ssd3_minimal_discrete_hybrid
-from vllm_torchtpu.utils import get_mesh_shape_product
 
 _HEAD_SHARDING_AXIS = "model"
 
@@ -56,10 +55,7 @@ def jax_gated_rms_norm_mamba3(
     gate: jnp.ndarray | None,
     weight: jnp.ndarray | None,
     eps: float,
-    shard_groups: bool,
-    tp_size: int,
     n_groups: int = 1,
-    head_axis_name: str | None = _HEAD_SHARDING_AXIS,
 ) -> jnp.ndarray:
     """Applies SiLU gating (for SISO) and optional RMSNorm."""
     input_dtype = x.dtype
@@ -69,20 +65,11 @@ def jax_gated_rms_norm_mamba3(
     if weight is None:
         return x_val.astype(input_dtype)
 
-    if shard_groups or tp_size <= 1 or head_axis_name is None:
-        orig_shape = x_val.shape
-        if n_groups > 1:
-            x_val = x_val.reshape(
-                *orig_shape[:-1], n_groups, orig_shape[-1] // n_groups
-            )
-        variance = jnp.mean(jnp.square(x_val), axis=-1, keepdims=True)
-        x_norm = (x_val * jax.lax.rsqrt(variance + eps)).reshape(orig_shape)
-    else:
-        local_sum = jnp.sum(jnp.square(x_val), axis=-1, keepdims=True)
-        global_sum = jax.lax.psum(local_sum, axis_name=head_axis_name)
-        count = tp_size * x.shape[-1]
-        variance = global_sum / count
-        x_norm = x_val * jax.lax.rsqrt(variance + eps)
+    orig_shape = x_val.shape
+    if n_groups > 1:
+        x_val = x_val.reshape(*orig_shape[:-1], n_groups, orig_shape[-1] // n_groups)
+    variance = jnp.mean(jnp.square(x_val), axis=-1, keepdims=True)
+    x_norm = (x_val * jax.lax.rsqrt(variance + eps)).reshape(orig_shape)
 
     return (weight.astype(jnp.float32) * x_norm).astype(input_dtype)
 
@@ -326,123 +313,57 @@ def pack_inputs_mamba3(
     )
 
 
-def run_jax_mamba_mixer3_local(
+def _project_and_norm_qkv(
     j_projected_states: jnp.ndarray,
-    aux_state: jnp.ndarray,
-    recurrent_state: jnp.ndarray,
     j_B_norm_weight: jnp.ndarray,
     j_C_norm_weight: jnp.ndarray,
     j_B_bias: jnp.ndarray,
     j_C_bias: jnp.ndarray,
-    j_D: jnp.ndarray,
-    j_dt_bias: jnp.ndarray,
-    j_norm_weight: jnp.ndarray | None,
-    j_psi: jnp.ndarray | None,
-    j_phi: jnp.ndarray | None,
-    j_zeta: jnp.ndarray | None,
-    state_indices: jnp.ndarray,
-    query_start_loc: jnp.ndarray,
-    distribution: jnp.ndarray,
-    seq_lens: jnp.ndarray,
     *,
     num_heads: int,
     head_dim: int,
     n_groups: int,
     d_state: int,
-    num_rope_angles: int,
-    chunk_size: int,
-    is_mimo: bool = False,
-    mimo_rank: int = 1,
-    A_floor: float = 1e-4,
-    shard_groups: bool = True,
-    tp_size: int = 1,
-    rms_norm_eps: float = 1e-5,
-    apply_rms_norm: bool = True,
-    head_axis_name: str | None = _HEAD_SHARDING_AXIS,
-) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
-    """Runs the local device execution of Mamba-3 Mixer."""
-    r = mimo_rank if is_mimo else 1
+    r: int,
+    is_mimo: bool,
+    rms_norm_eps: float,
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """Splits projected states and computes RMS-normalized Q/K pre-rotations."""
+    num_tokens = j_projected_states.shape[0]
     local_intermediate = num_heads * head_dim
     local_bc = r * n_groups * d_state
 
-    if shard_groups or tp_size <= 1 or head_axis_name is None:
-        s1 = local_intermediate
-        s2 = s1 + local_intermediate
-        s3 = s2 + local_bc
-        s4 = s3 + local_bc
-        s5 = s4 + num_heads
-        s6 = s5 + num_heads
-        s7 = s6 + num_heads
-        (
-            z_raw,
-            v_raw,
-            B_raw,
-            C_raw,
-            dd_dt,
-            dd_A,
-            trap_raw,
-            angle_raw,
-        ) = jnp.split(
-            j_projected_states,
-            [s1, s2, s3, s4, s5, s6, s7],
-            axis=-1,
-        )
-    else:
-        rank = jax.lax.axis_index(head_axis_name)
-        global_intermediate = local_intermediate * tp_size
-        global_heads = num_heads * tp_size
-
-        z_raw = jax.lax.dynamic_slice_in_dim(
-            j_projected_states,
-            rank * local_intermediate,
-            local_intermediate,
-            axis=-1,
-        )
-        v_raw = jax.lax.dynamic_slice_in_dim(
-            j_projected_states,
-            global_intermediate + rank * local_intermediate,
-            local_intermediate,
-            axis=-1,
-        )
-        bc_start = 2 * global_intermediate
-        B_raw = j_projected_states[..., bc_start : bc_start + local_bc]
-        C_raw = j_projected_states[..., bc_start + local_bc : bc_start + 2 * local_bc]
-
-        dt_start = bc_start + 2 * local_bc
-        dd_dt = jax.lax.dynamic_slice_in_dim(
-            j_projected_states, dt_start + rank * num_heads, num_heads, axis=-1
-        )
-        A_start = dt_start + global_heads
-        dd_A = jax.lax.dynamic_slice_in_dim(
-            j_projected_states, A_start + rank * num_heads, num_heads, axis=-1
-        )
-        trap_start = A_start + global_heads
-        trap_raw = jax.lax.dynamic_slice_in_dim(
-            j_projected_states, trap_start + rank * num_heads, num_heads, axis=-1
-        )
-        angle_start = trap_start + global_heads
-        angle_raw = j_projected_states[..., angle_start : angle_start + num_rope_angles]
-
-    num_tokens = j_projected_states.shape[0]
-    max_reqs = seq_lens.shape[0]
-    num_valid_seqs = distribution[2]
-
-    valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
-    last_valid_loc = query_start_loc[num_valid_seqs]
-    effective_query_start_loc = jnp.where(
-        valid_loc_mask, query_start_loc, last_valid_loc
+    s1 = local_intermediate
+    s2 = s1 + local_intermediate
+    s3 = s2 + local_bc
+    s4 = s3 + local_bc
+    s5 = s4 + num_heads
+    s6 = s5 + num_heads
+    s7 = s6 + num_heads
+    (
+        z_raw,
+        v_raw,
+        B_raw,
+        C_raw,
+        dd_dt,
+        dd_A,
+        trap_raw,
+        angle_raw,
+    ) = jnp.split(
+        j_projected_states,
+        [s1, s2, s3, s4, s5, s6, s7],
+        axis=-1,
     )
-    query_lens = (
-        effective_query_start_loc[1 : max_reqs + 1]
-        - effective_query_start_loc[:max_reqs]
-    )
-    has_initial_state = (seq_lens - query_lens) > 0
-    active_nonempty_seq = (jnp.arange(max_reqs) < num_valid_seqs) & (query_lens > 0)
-    is_decode_seq = active_nonempty_seq & (query_lens == 1)
-    is_prefill_seq = active_nonempty_seq & (query_lens > 1)
-    is_pure_decode = ~jnp.any(is_prefill_seq)
 
-    # 1. Reshape v, B, C and apply RMSNorm on B and C
     v = v_raw.reshape(num_tokens, num_heads, head_dim)
     if is_mimo:
         B_grouped = jax_rms_norm_per_feature(
@@ -469,11 +390,44 @@ def run_jax_mamba_mixer3_local(
 
     B_normed = broadcast_groups_to_heads(B_grouped, num_heads)
     C_normed = broadcast_groups_to_heads(C_grouped, num_heads)
-
     q_pre = C_normed + j_C_bias.astype(C_normed.dtype)[None, ...]
     k_pre = B_normed + j_B_bias.astype(B_normed.dtype)[None, ...]
+    return z_raw, v, q_pre, k_pre, dd_dt, dd_A, trap_raw, angle_raw
 
-    # 2. Data-dependent decay A_t, timestep dt_t, and trapezoidal parameters
+
+def _discretize_and_apply_rope(
+    v: jnp.ndarray,
+    q_pre: jnp.ndarray,
+    k_pre: jnp.ndarray,
+    dd_dt: jnp.ndarray,
+    dd_A: jnp.ndarray,
+    trap_raw: jnp.ndarray,
+    angle_raw: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    j_psi: jnp.ndarray | None,
+    prev_angle_seqs: jnp.ndarray,
+    effective_query_start_loc: jnp.ndarray,
+    active_nonempty_seq: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
+    *,
+    num_rope_angles: int,
+    chunk_size: int,
+    A_floor: float,
+    is_mimo: bool,
+) -> tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+    """Computes trapezoidal discretization and segmented cumulative 2D RoPE."""
+    num_tokens = v.shape[0]
+    max_reqs = active_nonempty_seq.shape[0]
+
     A = jnp.minimum(-jax.nn.softplus(dd_A.astype(jnp.float32)), -A_floor)
     dt = jax.nn.softplus(dd_dt.astype(jnp.float32) + j_dt_bias.astype(jnp.float32))
     adt = A * dt
@@ -481,15 +435,6 @@ def run_jax_mamba_mixer3_local(
     gamma = dt * trap
     beta = dt * (1.0 - trap)
 
-    # 3. Unpack per-sequence initial boundary state from aux_state
-    dim_x_aux = r * head_dim
-    dim_k_aux = r * d_state
-    aux_for_seqs = aux_state[state_indices].astype(jnp.float32)
-    prev_x_seqs = aux_for_seqs[..., :dim_x_aux]
-    prev_k_seqs = aux_for_seqs[..., dim_x_aux : dim_x_aux + dim_k_aux]
-    prev_angle_seqs = aux_for_seqs[..., dim_x_aux + dim_k_aux :]
-
-    # 4. Segmented cumulative RoPE angle across ragged sequences
     token_indices = jnp.arange(num_tokens)
     seq_id = (
         jnp.searchsorted(effective_query_start_loc, token_indices, side="right") - 1
@@ -526,13 +471,12 @@ def run_jax_mamba_mixer3_local(
     cos = jnp.cos(angle_cumsum)
     sin = jnp.sin(angle_cumsum)
 
-    # 5. Rotate q_pre and k_pre, compute trapezoidal scale
     is_last_token_in_seq = token_indices == (seq_end_for_token - 1)
     beta_shifted = jnp.pad(beta[1:], ((0, 1), (0, 0)))
     scale = gamma + jnp.where(is_last_token_in_seq[:, None], 0.0, beta_shifted)
 
     if is_mimo:
-        assert j_psi is not None and j_phi is not None and j_zeta is not None
+        assert j_psi is not None
         cos_mimo = cos[:, :, None, :]
         sin_mimo = sin[:, :, None, :]
         q_rot = _rotate_split_half_mimo(q_pre, cos_mimo, sin_mimo, num_rope_angles)
@@ -547,13 +491,29 @@ def run_jax_mamba_mixer3_local(
         k_scaled = (k_rot.astype(jnp.float32) * scale[:, :, None]).astype(v.dtype)
         X_scan = v
 
-    # 6. Prepare initial states per sequence, including cross-step trapezoidal tail
-    #    beta_{start} * outer(prev_x, prev_k_rot) when has_initial_state is True
+    return X_scan, q_rot, k_rot, k_scaled, adt, gamma, beta, angle_cumsum
+
+
+def _augment_initial_states_trapezoidal(
+    recurrent_state: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    prev_x_seqs: jnp.ndarray,
+    prev_k_seqs: jnp.ndarray,
+    beta: jnp.ndarray,
+    safe_start_tokens: jnp.ndarray,
+    active_nonempty_seq: jnp.ndarray,
+    has_initial_state: jnp.ndarray,
+    *,
+    num_heads: int,
+    head_dim: int,
+    d_state: int,
+    r: int,
+    is_mimo: bool,
+) -> jnp.ndarray:
+    """Adds cross-step trapezoidal tail beta_{start} * outer(prev_x, prev_k)."""
+    max_reqs = active_nonempty_seq.shape[0]
     init_states_for_seqs = recurrent_state[state_indices].astype(jnp.float32)
-    safe_start_tokens = jnp.clip(
-        effective_query_start_loc[:max_reqs], 0, jnp.maximum(num_tokens - 1, 0)
-    )
-    beta_at_seq_start = beta[safe_start_tokens]  # (max_reqs, num_heads)
+    beta_at_seq_start = beta[safe_start_tokens]
 
     if is_mimo:
         prev_x_r = prev_x_seqs.reshape(max_reqs, num_heads, r, head_dim)
@@ -563,6 +523,7 @@ def run_jax_mamba_mixer3_local(
                 "shrp,shrn->shpn",
                 prev_x_r,
                 prev_k_r,
+                precision=jax.lax.Precision.HIGHEST,
                 preferred_element_type=jnp.float32,
             )
             * beta_at_seq_start[:, :, None, None]
@@ -574,13 +535,26 @@ def run_jax_mamba_mixer3_local(
             * beta_at_seq_start[:, :, None, None]
         )
 
-    init_states_augmented = jnp.where(
+    return jnp.where(
         (active_nonempty_seq & has_initial_state)[:, None, None, None],
         init_states_for_seqs + trap_tail,
         0.0,
     )
 
-    # 7. Vectorized 1-token decode evaluation for single-token sequences
+
+def _eval_single_token_decode(
+    X_scan: jnp.ndarray,
+    k_scaled: jnp.ndarray,
+    q_rot: jnp.ndarray,
+    adt: jnp.ndarray,
+    init_states_augmented: jnp.ndarray,
+    safe_start_tokens: jnp.ndarray,
+    is_decode_seq: jnp.ndarray,
+    *,
+    is_mimo: bool,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Evaluates single-token decode sequences in vectorized form."""
+    num_tokens = X_scan.shape[0]
     adt_0 = adt[safe_start_tokens]
     decay_0 = jnp.exp(adt_0)
     S_decayed_1tok = init_states_augmented * decay_0[:, :, None, None]
@@ -593,12 +567,14 @@ def run_jax_mamba_mixer3_local(
             "shrn,shpn->shrp",
             C_0,
             S_decayed_1tok.astype(C_0.dtype),
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
         kv_0 = jnp.einsum(
             "shrp,shrn->shpn",
             X_0,
             B_0,
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
     else:
@@ -606,6 +582,7 @@ def run_jax_mamba_mixer3_local(
             "shn,shpn->shp",
             C_0,
             S_decayed_1tok.astype(C_0.dtype),
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
         kv_0 = (
@@ -614,91 +591,123 @@ def run_jax_mamba_mixer3_local(
         )
     new_rec_1tok = S_decayed_1tok + kv_0
     decode_tok_indices = jnp.where(is_decode_seq, safe_start_tokens, num_tokens)
+    return Y_scan_1tok, new_rec_1tok, decode_tok_indices
 
-    # 8. Dispatch pure decode vs general ragged (prefill / mixed prefill+decode)
-    def _pure_decode_branch(_: None) -> tuple[jnp.ndarray, jnp.ndarray]:
-        y_zeros = jnp.zeros(X_scan.shape, dtype=jnp.float32)
-        y_scan_out = y_zeros.at[decode_tok_indices].set(Y_scan_1tok, mode="drop")
-        return y_scan_out, new_rec_1tok
 
-    def _general_ragged_branch(_: None) -> tuple[jnp.ndarray, jnp.ndarray]:
-        (
-            X_c,
-            B_c,
-            C_c,
-            decay_c,
-            reset_mask,
-            last_chunk_indices,
-            start_chunk_indices,
-            padded_indices_valid,
-        ) = pack_inputs_mamba3(
-            X_scan,
-            k_scaled,
-            q_rot,
-            adt,
-            query_start_loc,
-            distribution,
-            chunk_size,
-            compute_dtype=v.dtype,
-            skip_single_token_seqs=True,
+def _run_ragged_ssd3_scan(
+    X_scan: jnp.ndarray,
+    k_scaled: jnp.ndarray,
+    q_rot: jnp.ndarray,
+    adt: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    init_states_augmented: jnp.ndarray,
+    Y_scan_1tok: jnp.ndarray,
+    new_rec_1tok: jnp.ndarray,
+    decode_tok_indices: jnp.ndarray,
+    is_decode_seq: jnp.ndarray,
+    *,
+    num_heads: int,
+    head_dim: int,
+    d_state: int,
+    chunk_size: int,
+    r: int,
+    is_mimo: bool,
+    compute_dtype: jnp.dtype,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Runs chunked SSD-3 scan for prefill sequences and merges 1-token decodes."""
+    (
+        X_c,
+        B_c,
+        C_c,
+        decay_c,
+        reset_mask,
+        last_chunk_indices,
+        start_chunk_indices,
+        padded_indices_valid,
+    ) = pack_inputs_mamba3(
+        X_scan,
+        k_scaled,
+        q_rot,
+        adt,
+        query_start_loc,
+        distribution,
+        chunk_size,
+        compute_dtype=compute_dtype,
+        skip_single_token_seqs=True,
+    )
+    num_chunks_total = X_c.shape[0]
+    init_h_per_chunk = jnp.zeros(
+        (num_chunks_total, num_heads, head_dim, d_state),
+        dtype=jnp.float32,
+    )
+    init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(
+        init_states_augmented, mode="drop"
+    )
+    Y_c, new_rec_chunk = ssd3_minimal_discrete_hybrid(
+        X_c,
+        decay_c,
+        B_c,
+        C_c,
+        last_chunk_indices,
+        init_h_per_chunk,
+        reset_mask,
+        mimo_rank=r,
+    )
+    if is_mimo:
+        Y_packed = (
+            Y_c.reshape(num_chunks_total, num_heads, chunk_size, r, head_dim)
+            .transpose(0, 2, 1, 3, 4)
+            .reshape(-1, num_heads, r, head_dim)
         )
-        num_chunks_total = X_c.shape[0]
-        init_h_per_chunk = jnp.zeros(
-            (num_chunks_total, num_heads, head_dim, d_state),
-            dtype=jnp.float32,
-        )
-        init_h_per_chunk = init_h_per_chunk.at[start_chunk_indices].set(
-            init_states_augmented, mode="drop"
-        )
-        Y_c, new_rec_chunk = ssd3_minimal_discrete_hybrid(
-            X_c,
-            decay_c,
-            B_c,
-            C_c,
-            last_chunk_indices,
-            init_h_per_chunk,
-            reset_mask,
-            mimo_rank=r,
-        )
-        if is_mimo:
-            Y_packed = (
-                Y_c.reshape(num_chunks_total, num_heads, chunk_size, r, head_dim)
-                .transpose(0, 2, 1, 3, 4)
-                .reshape(-1, num_heads, r, head_dim)
-            )
-            Y_scan_chunk = Y_packed[padded_indices_valid].astype(jnp.float32)
-        else:
-            Y_flat = Y_c.transpose(0, 2, 1, 3).reshape(-1, num_heads, head_dim)
-            Y_scan_chunk = Y_flat[padded_indices_valid].astype(jnp.float32)
-
-        Y_scan_merged = Y_scan_chunk.at[decode_tok_indices].set(
-            Y_scan_1tok, mode="drop"
-        )
-        new_rec_merged = jnp.where(
-            is_decode_seq[:, None, None, None], new_rec_1tok, new_rec_chunk
-        )
-        return Y_scan_merged, new_rec_merged
-
-    if num_tokens <= 1:
-        Y_scan, new_recurrent_states = _pure_decode_branch(None)
+        Y_scan_chunk = Y_packed[padded_indices_valid].astype(jnp.float32)
     else:
-        Y_scan, new_recurrent_states = jax.lax.cond(
-            is_pure_decode, _pure_decode_branch, _general_ragged_branch, operand=None
-        )
+        Y_flat = Y_c.transpose(0, 2, 1, 3).reshape(-1, num_heads, head_dim)
+        Y_scan_chunk = Y_flat[padded_indices_valid].astype(jnp.float32)
 
-    # 9. Apply diagonal trapezoidal correction + gating
+    Y_scan_merged = Y_scan_chunk.at[decode_tok_indices].set(Y_scan_1tok, mode="drop")
+    new_rec_merged = jnp.where(
+        is_decode_seq[:, None, None, None], new_rec_1tok, new_rec_chunk
+    )
+    return Y_scan_merged, new_rec_merged
+
+
+def _apply_mamba3_diag_skip_and_gate(
+    Y_scan: jnp.ndarray,
+    v: jnp.ndarray,
+    X_scan: jnp.ndarray,
+    q_pre: jnp.ndarray,
+    k_pre: jnp.ndarray,
+    gamma: jnp.ndarray,
+    z_raw: jnp.ndarray,
+    j_D: jnp.ndarray,
+    j_psi: jnp.ndarray | None,
+    j_phi: jnp.ndarray | None,
+    j_zeta: jnp.ndarray | None,
+    *,
+    num_heads: int,
+    head_dim: int,
+    is_mimo: bool,
+    output_dtype: jnp.dtype,
+) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    """Applies analytical trapezoidal diagonal, D skip, and MIMO rank-gating."""
+    num_tokens = v.shape[0]
+    local_intermediate = num_heads * head_dim
+
     if is_mimo:
         assert j_psi is not None and j_phi is not None and j_zeta is not None
         qk_pre = jnp.einsum(
             "thrn,thsn->thrs",
             q_pre,
             k_pre,
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
         psi_contract = jnp.einsum(
             "thrs,hsp->thrp",
             qk_pre.astype(q_pre.dtype),
             j_psi.astype(q_pre.dtype),
+            precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
         diag = (
@@ -718,24 +727,41 @@ def run_jax_mamba_mixer3_local(
         Y_combined = jnp.sum(
             gated * j_phi[None, ...].astype(jnp.float32), axis=2
         ).reshape(num_tokens, local_intermediate)
-        Y_final = Y_combined.astype(j_projected_states.dtype)
-        gate_for_norm = None
-    else:
-        qk_dot_gamma = (
-            jnp.sum(q_pre.astype(jnp.float32) * k_pre.astype(jnp.float32), axis=-1)
-            * gamma
-        )
-        diag_plus_d = (j_D.astype(jnp.float32)[None, :] + qk_dot_gamma)[
-            :, :, None
-        ] * v.astype(jnp.float32)
-        Y_final = (
-            (Y_scan + diag_plus_d)
-            .reshape(num_tokens, local_intermediate)
-            .astype(j_projected_states.dtype)
-        )
-        gate_for_norm = z_raw
+        return Y_combined.astype(output_dtype), None
 
-    # 10. Update recurrent_state and aux_state for active sequences only
+    qk_dot_gamma = (
+        jnp.sum(q_pre.astype(jnp.float32) * k_pre.astype(jnp.float32), axis=-1) * gamma
+    )
+    diag_plus_d = (j_D.astype(jnp.float32)[None, :] + qk_dot_gamma)[
+        :, :, None
+    ] * v.astype(jnp.float32)
+    Y_final = (
+        (Y_scan + diag_plus_d)
+        .reshape(num_tokens, local_intermediate)
+        .astype(output_dtype)
+    )
+    return Y_final, z_raw
+
+
+def _update_mamba3_states(
+    aux_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    new_recurrent_states: jnp.ndarray,
+    X_scan: jnp.ndarray,
+    k_rot: jnp.ndarray,
+    angle_cumsum: jnp.ndarray,
+    state_indices: jnp.ndarray,
+    effective_query_start_loc: jnp.ndarray,
+    active_nonempty_seq: jnp.ndarray,
+    *,
+    num_heads: int,
+    dim_x_aux: int,
+    dim_k_aux: int,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Updates recurrent and boundary auxiliary caches for active sequences."""
+    num_tokens = X_scan.shape[0]
+    max_reqs = active_nonempty_seq.shape[0]
+
     scatter_state_indices = jnp.where(
         active_nonempty_seq, state_indices, recurrent_state.shape[0]
     )
@@ -765,23 +791,218 @@ def run_jax_mamba_mixer3_local(
     updated_aux_state = aux_state.at[scatter_state_indices].set(
         new_aux_for_seqs, mode="drop"
     )
+    return updated_aux_state, updated_recurrent_state
 
-    # 11. Output gating and optional RMSNorm
+
+def run_jax_mamba_mixer3_local(
+    j_projected_states: jnp.ndarray,
+    aux_state: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_B_norm_weight: jnp.ndarray,
+    j_C_norm_weight: jnp.ndarray,
+    j_B_bias: jnp.ndarray,
+    j_C_bias: jnp.ndarray,
+    j_D: jnp.ndarray,
+    j_dt_bias: jnp.ndarray,
+    j_norm_weight: jnp.ndarray | None,
+    j_psi: jnp.ndarray | None,
+    j_phi: jnp.ndarray | None,
+    j_zeta: jnp.ndarray | None,
+    state_indices: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    *,
+    num_heads: int,
+    head_dim: int,
+    n_groups: int,
+    d_state: int,
+    num_rope_angles: int,
+    chunk_size: int,
+    is_mimo: bool = False,
+    mimo_rank: int = 1,
+    A_floor: float = 1e-4,
+    rms_norm_eps: float = 1e-5,
+    apply_rms_norm: bool = True,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Runs the local device execution of Mamba-3 Mixer."""
+    r = mimo_rank if is_mimo else 1
+    num_tokens = j_projected_states.shape[0]
+    max_reqs = seq_lens.shape[0]
+    num_valid_seqs = distribution[2]
+
+    valid_loc_mask = jnp.arange(query_start_loc.shape[0]) <= num_valid_seqs
+    last_valid_loc = query_start_loc[num_valid_seqs]
+    effective_query_start_loc = jnp.where(
+        valid_loc_mask, query_start_loc, last_valid_loc
+    )
+    query_lens = (
+        effective_query_start_loc[1 : max_reqs + 1]
+        - effective_query_start_loc[:max_reqs]
+    )
+    has_initial_state = (seq_lens - query_lens) > 0
+    active_nonempty_seq = (jnp.arange(max_reqs) < num_valid_seqs) & (query_lens > 0)
+    is_decode_seq = active_nonempty_seq & (query_lens == 1)
+    is_prefill_seq = active_nonempty_seq & (query_lens > 1)
+    is_pure_decode = ~jnp.any(is_prefill_seq)
+
+    # 1. Split projected states and compute RMS-normalized Q/K pre-rotations
+    z_raw, v, q_pre, k_pre, dd_dt, dd_A, trap_raw, angle_raw = _project_and_norm_qkv(
+        j_projected_states,
+        j_B_norm_weight,
+        j_C_norm_weight,
+        j_B_bias,
+        j_C_bias,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        n_groups=n_groups,
+        d_state=d_state,
+        r=r,
+        is_mimo=is_mimo,
+        rms_norm_eps=rms_norm_eps,
+    )
+
+    # 2. Unpack per-sequence boundary auxiliary state
+    dim_x_aux = r * head_dim
+    dim_k_aux = r * d_state
+    aux_for_seqs = aux_state[state_indices].astype(jnp.float32)
+    prev_x_seqs = aux_for_seqs[..., :dim_x_aux]
+    prev_k_seqs = aux_for_seqs[..., dim_x_aux : dim_x_aux + dim_k_aux]
+    prev_angle_seqs = aux_for_seqs[..., dim_x_aux + dim_k_aux :]
+
+    # 3. Discretization, cumulative 2D RoPE, and trapezoidal key scaling
+    X_scan, q_rot, k_rot, k_scaled, adt, gamma, beta, angle_cumsum = (
+        _discretize_and_apply_rope(
+            v,
+            q_pre,
+            k_pre,
+            dd_dt,
+            dd_A,
+            trap_raw,
+            angle_raw,
+            j_dt_bias,
+            j_psi,
+            prev_angle_seqs,
+            effective_query_start_loc,
+            active_nonempty_seq,
+            has_initial_state,
+            num_rope_angles=num_rope_angles,
+            chunk_size=chunk_size,
+            A_floor=A_floor,
+            is_mimo=is_mimo,
+        )
+    )
+
+    # 4. Augment initial states with cross-step trapezoidal tail
+    safe_start_tokens = jnp.clip(
+        effective_query_start_loc[:max_reqs], 0, jnp.maximum(num_tokens - 1, 0)
+    )
+    init_states_augmented = _augment_initial_states_trapezoidal(
+        recurrent_state,
+        state_indices,
+        prev_x_seqs,
+        prev_k_seqs,
+        beta,
+        safe_start_tokens,
+        active_nonempty_seq,
+        has_initial_state,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        d_state=d_state,
+        r=r,
+        is_mimo=is_mimo,
+    )
+
+    # 5. Evaluate single-token decode fast path and dispatch ragged scan
+    Y_scan_1tok, new_rec_1tok, decode_tok_indices = _eval_single_token_decode(
+        X_scan,
+        k_scaled,
+        q_rot,
+        adt,
+        init_states_augmented,
+        safe_start_tokens,
+        is_decode_seq,
+        is_mimo=is_mimo,
+    )
+
+    def _pure_decode_branch(_: None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        y_zeros = jnp.zeros(X_scan.shape, dtype=jnp.float32)
+        y_scan_out = y_zeros.at[decode_tok_indices].set(Y_scan_1tok, mode="drop")
+        return y_scan_out, new_rec_1tok
+
+    def _general_ragged_branch(_: None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return _run_ragged_ssd3_scan(
+            X_scan,
+            k_scaled,
+            q_rot,
+            adt,
+            query_start_loc,
+            distribution,
+            init_states_augmented,
+            Y_scan_1tok,
+            new_rec_1tok,
+            decode_tok_indices,
+            is_decode_seq,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            d_state=d_state,
+            chunk_size=chunk_size,
+            r=r,
+            is_mimo=is_mimo,
+            compute_dtype=v.dtype,
+        )
+
+    if num_tokens <= 1:
+        Y_scan, new_recurrent_states = _pure_decode_branch(None)
+    else:
+        Y_scan, new_recurrent_states = jax.lax.cond(
+            is_pure_decode, _pure_decode_branch, _general_ragged_branch, operand=None
+        )
+
+    # 6. Apply diagonal trapezoidal correction, D skip, and MIMO rank-gating
+    Y_final, gate_for_norm = _apply_mamba3_diag_skip_and_gate(
+        Y_scan,
+        v,
+        X_scan,
+        q_pre,
+        k_pre,
+        gamma,
+        z_raw,
+        j_D,
+        j_psi,
+        j_phi,
+        j_zeta,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        is_mimo=is_mimo,
+        output_dtype=j_projected_states.dtype,
+    )
+
+    # 7. Update recurrent and auxiliary state caches for active sequences
+    updated_aux_state, updated_recurrent_state = _update_mamba3_states(
+        aux_state,
+        recurrent_state,
+        new_recurrent_states,
+        X_scan,
+        k_rot,
+        angle_cumsum,
+        state_indices,
+        effective_query_start_loc,
+        active_nonempty_seq,
+        num_heads=num_heads,
+        dim_x_aux=dim_x_aux,
+        dim_k_aux=dim_k_aux,
+    )
+
+    # 8. Output gating and optional RMSNorm (in Python when TP all-reduce needed)
     if apply_rms_norm:
         Y_out = jax_gated_rms_norm_mamba3(
             x=Y_final,
             gate=gate_for_norm,
             weight=j_norm_weight,
             eps=rms_norm_eps,
-            shard_groups=shard_groups,
-            tp_size=tp_size,
             n_groups=n_groups,
-            head_axis_name=head_axis_name,
         )
-    elif gate_for_norm is not None:
-        Y_out = (
-            Y_final.astype(jnp.float32) * jax.nn.silu(gate_for_norm.astype(jnp.float32))
-        ).astype(j_projected_states.dtype)
     else:
         Y_out = Y_final.astype(j_projected_states.dtype)
 
@@ -817,18 +1038,14 @@ def run_jax_mamba_mixer3(
     is_mimo: bool = False,
     mimo_rank: int = 1,
     A_floor: float = 1e-4,
-    shard_groups: bool = True,
     rms_norm_eps: float = 1e-5,
     apply_rms_norm: bool = True,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the sharded JAX Mamba-3 Mixer over the given TPU mesh."""
     data_axis = "attn_dp" if "attn_dp" in mesh.axis_names else None
     head_axis = _HEAD_SHARDING_AXIS if _HEAD_SHARDING_AXIS in mesh.axis_names else None
-    tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
 
-    projected_states_spec = (
-        P(data_axis, head_axis) if shard_groups else P(data_axis, None)
-    )
+    projected_states_spec = P(data_axis, head_axis)
     bias_spec = P(head_axis, None, None) if is_mimo else P(head_axis, None)
     mimo_param_spec = P(head_axis, None, None)
     norm_weight_spec = P(head_axis) if j_norm_weight is not None else None
@@ -872,11 +1089,8 @@ def run_jax_mamba_mixer3(
         is_mimo=is_mimo,
         mimo_rank=mimo_rank,
         A_floor=A_floor,
-        shard_groups=shard_groups,
-        tp_size=tp_size,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
-        head_axis_name=head_axis,
     )
 
     mapped_fn = jax.shard_map(

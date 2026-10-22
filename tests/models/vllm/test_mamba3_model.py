@@ -32,8 +32,13 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.interfaces import (
+    SupportsMambaPrefixCaching,
+    supports_mamba_prefix_caching,
+)
 from vllm.platforms import current_platform
 
+from vllm_torchtpu.layers.adapter.custom_ops import mamba_mixer3_op
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op import (
     VllmMambaMixer3,
 )
@@ -46,6 +51,12 @@ from vllm_torchtpu.models.vllm.mamba3 import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
+
+
+@pytest.fixture(autouse=True)
+def _empty_shared_mamba3_ops(monkeypatch):
+    """Isolate shared Mamba-3 jax_op cache across unit tests."""
+    monkeypatch.setattr(mamba_mixer3_op, "_shared_mamba3_ops", {})
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -139,9 +150,9 @@ def _build_mamba3_model(
             ]
             new_aux, new_rec, out = fn(*jax_args)
             return (
-                torch.from_numpy(np.asarray(new_aux)),
-                torch.from_numpy(np.asarray(new_rec)),
-                torch.from_numpy(np.asarray(out)),
+                torch.from_numpy(np.array(new_aux, copy=True)),
+                torch.from_numpy(np.array(new_rec, copy=True)),
+                torch.from_numpy(np.array(out, copy=True)),
             )
 
         _op.register_fake = lambda _: None
@@ -307,8 +318,9 @@ class TestMamba3RegistrationAndConfig:
                 == mixer.get_state_dtype()
             )
 
-        copy_funcs = Mamba3ForCausalLM.get_mamba_state_copy_func()
-        assert len(copy_funcs) == 2
+        assert SupportsMambaPrefixCaching not in Mamba3ForCausalLM.__mro__
+        assert not supports_mamba_prefix_caching(Mamba3ForCausalLM)
+        assert not hasattr(Mamba3ForCausalLM, "get_mamba_state_copy_func")
 
 
 class TestMamba3ArchitectureAndWeights:

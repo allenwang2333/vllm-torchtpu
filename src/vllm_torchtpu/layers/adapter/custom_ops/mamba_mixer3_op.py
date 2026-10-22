@@ -14,19 +14,24 @@
 """Out-of-tree TPU custom operation and layer registration for MambaMixer3."""
 
 import functools
+import itertools
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import jax
 import torch
 from torch import nn
 from torch_tpu._internal import pallas
-from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -43,7 +48,15 @@ from vllm_torchtpu.layers.core.mamba_mixer3 import run_jax_mamba_mixer3
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import get_dp_size, get_mesh_shape_product
+
+if TYPE_CHECKING:
+
+    class _Mamba3AttentionMetadata(Protocol):
+        block_tables: torch.Tensor
+        seq_lens: torch.Tensor
+        query_start_loc: torch.Tensor
+        request_distribution: torch.Tensor
+        mamba_state_indices: torch.Tensor | None
 
 
 def mamba_mixer3_core_tpu(
@@ -75,7 +88,6 @@ def mamba_mixer3_core_tpu(
     is_mimo: bool,
     mimo_rank: int,
     A_floor: float,
-    shard_groups: bool,
     rms_norm_eps: float,
     apply_rms_norm: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -115,13 +127,67 @@ def mamba_mixer3_core_tpu(
         is_mimo=is_mimo,
         mimo_rank=mimo_rank,
         A_floor=A_floor,
-        shard_groups=shard_groups,
         rms_norm_eps=rms_norm_eps,
         apply_rms_norm=apply_rms_norm,
     )
     if aux_dim > target_aux_dim:
         new_aux_state = aux_state.at[..., :target_aux_dim].set(new_aux_state)
     return new_aux_state, new_recurrent_state, output
+
+
+@CustomOp.register("mamba3_gated_rms_norm")
+class Mamba3RMSNormGated(Mixer2RMSNormGated):
+    """Gate-optional RMSNorm for Mamba-3 (SISO passes gate, MIMO passes None)."""
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        if gate is not None:
+            x = x * nn.functional.silu(gate.to(torch.float32))
+        if not self.use_rms_norm or self.weight is None:
+            return x.to(input_dtype)
+
+        if self.n_groups == 1:
+            if self.tp_size > 1:
+                local_sums = x.pow(2).sum(dim=-1, keepdim=True)
+                global_sums = tensor_model_parallel_all_reduce(local_sums)
+                count = self.tp_size * x.shape[-1]
+                variance = global_sums / count
+            else:
+                variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.variance_epsilon)
+        else:
+            redundant_tp = self.n_groups % self.tp_size != 0
+            if redundant_tp:
+                x = tensor_model_parallel_all_gather(x, -1)
+
+            *prefix_dims, hidden_dim = x.shape
+            group_count = hidden_dim // self.group_size
+            x_grouped = x.reshape(*prefix_dims, group_count, self.group_size)
+            variance = x_grouped.pow(2).mean(-1, keepdim=True)
+            x_grouped = x_grouped * torch.rsqrt(variance + self.variance_epsilon)
+            x = x_grouped.reshape(*prefix_dims, hidden_dim)
+
+            if redundant_tp:
+                start = self.per_rank_hidden_size * self.tp_rank
+                end = start + self.per_rank_hidden_size
+                x = x[..., start:end]
+
+        weight = cast(torch.Tensor, self.weight)
+        return (weight.to(torch.float32) * x).to(input_dtype)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if gate is None:
+            return self.forward_native(x, None)
+        return super().forward_cuda(x, gate)
 
 
 @PluggableLayer.register("mamba_mixer3")
@@ -213,9 +279,13 @@ class MambaMixer3(MambaBase, PluggableLayer):
             prefix=f"{prefix}.in_proj",
         )
         in_proj_loader = self._make_in_proj_weight_loader()
-        self._set_param_weight_loader(self.in_proj.weight, in_proj_loader)
+        self._set_param_weight_loader(
+            cast(nn.Parameter, self.in_proj.weight), in_proj_loader
+        )
         if getattr(self.in_proj, "bias", None) is not None:
-            self._set_param_weight_loader(self.in_proj.bias, in_proj_loader)
+            self._set_param_weight_loader(
+                cast(nn.Parameter, self.in_proj.bias), in_proj_loader
+            )
 
         self.B_norm_weight = nn.Parameter(torch.ones(ssm_state_size))
         self.C_norm_weight = nn.Parameter(torch.ones(ssm_state_size))
@@ -257,7 +327,7 @@ class MambaMixer3(MambaBase, PluggableLayer):
         set_weight_attrs(self.D, {"weight_loader": head_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": head_loader})
 
-        self.norm = Mixer2RMSNormGated(
+        self.norm = Mamba3RMSNormGated(
             intermediate_size, n_groups, self.use_rms_norm, eps=rms_norm_eps
         )
 
@@ -270,18 +340,16 @@ class MambaMixer3(MambaBase, PluggableLayer):
             prefix=f"{prefix}.out_proj",
         )
 
-        try:
-            vllm_config = get_current_vllm_config()
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
             compilation_config = vllm_config.compilation_config
             if prefix and prefix not in compilation_config.static_forward_context:
                 compilation_config.static_forward_context[prefix] = self
-        except Exception:
-            pass
 
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
 
     @staticmethod
-    def _set_param_weight_loader(param: nn.Parameter, loader) -> None:
+    def _set_param_weight_loader(param: nn.Parameter, loader: Any) -> None:
         if isinstance(param, BasevLLMParameter):
             param.weight_loader = loader
         else:
@@ -386,12 +454,39 @@ class MambaMixer3(MambaBase, PluggableLayer):
         return MambaAttentionBackendEnum.MAMBA2
 
 
+# Mamba-3 custom ops shared across layers with identical static configs. A
+# JaxCallable caches its jax.export per instance, so registering one op per
+# layer would re-trace and re-lower the identical kernel for every layer.
+_shared_mamba3_ops: dict[tuple[Any, ...], Any] = {}
+_shared_mamba3_op_ids = itertools.count()
+
+
+def _get_shared_mamba3_op(key: tuple[Any, ...], build: Callable[[str], Any]) -> Any:
+    """Return the ``pallas::mamba_mixer3_<n>`` op for ``key``, building it once."""
+    op = _shared_mamba3_ops.get(key)
+    if op is None:
+        op = build(f"pallas::mamba_mixer3_{next(_shared_mamba3_op_ids)}")
+        _shared_mamba3_ops[key] = op
+    return op
+
+
 @MambaMixer3.register_oot
 class VllmMambaMixer3(MambaMixer3):
-    """Out-of-tree TPU implementation of MambaMixer3 backed by Pallas/JAX."""
+    """Out-of-tree TPU implementation of MambaMixer3 backed by JAX."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        cache_config = getattr(self, "cache_config", None)
+        if (
+            cache_config is not None
+            and (
+                getattr(cache_config, "enable_prefix_caching", False) is True
+                or getattr(cache_config, "mamba_cache_mode", "none") in ("all", "align")
+            )
+        ) or getattr(self, "mamba_cache_mode", "none") in ("all", "align"):
+            raise NotImplementedError(
+                "Prefix caching is not yet supported for MambaMixer3 on TPU."
+            )
         self._apply_py_norm = False
         self.mamba_op = self._build_mamba_op()
 
@@ -399,96 +494,79 @@ class VllmMambaMixer3(MambaMixer3):
         _, ssm_state_dtype = super().get_state_dtype()
         return torch.float32, ssm_state_dtype
 
-    def _use_fused_jax_rms_norm(self, jax_tp_size: int) -> bool:
-        if getattr(self.norm, "weight", None) is None:
+    def _use_fused_jax_rms_norm(self) -> bool:
+        if self.norm.weight is None:
             return True
-        orig_single_group_replicated = (
-            self.tp_size > 1
-            and jax_tp_size == 1
-            and (self.n_groups // self.tp_size) == 1
-            and getattr(self.norm, "n_groups", self.n_groups) == 1
-        )
-        return not orig_single_group_replicated
+        return not (self.tp_size > 1 and self.n_groups == 1)
 
     def _build_mamba_op(self):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = vllm_context.mesh
-        parallel_config = getattr(vllm_context.vllm_config, "parallel_config", None)
-        dp_enabled = parallel_config is not None and get_dp_size(parallel_config) > 1
 
-        head_axis = "model" if "model" in mesh.axis_names else None
-        jax_tp_size = get_mesh_shape_product(mesh, head_axis) if head_axis else 1
-
-        is_mimo = getattr(self, "is_mimo", False)
-        mimo_rank = getattr(self, "mimo_rank", 1) if is_mimo else 1
-        num_rope_angles = getattr(self, "num_rope_angles", self.ssm_state_size // 2)
-
-        tp_n_groups = getattr(
-            self,
-            "tp_n_groups",
-            self.n_groups // self.tp_size
-            if self.n_groups % self.tp_size == 0
-            else self.n_groups,
-        )
-        if tp_n_groups % jax_tp_size == 0 and jax_tp_size == 1:
-            shard_groups = True
-            local_n_groups = tp_n_groups // jax_tp_size
-        else:
-            shard_groups = False
-            local_n_groups = tp_n_groups
-
-        local_num_heads = (self.num_heads // self.tp_size) // jax_tp_size
-        chunk_size = getattr(self, "chunk_size", 32 if dp_enabled else 64)
-        rms_norm_eps = getattr(self.norm, "variance_epsilon", 1e-5)
-        apply_rms_norm = self._use_fused_jax_rms_norm(jax_tp_size)
+        apply_rms_norm = self._use_fused_jax_rms_norm()
         self._apply_py_norm = not apply_rms_norm
-        A_floor = getattr(self, "A_floor", 1e-4)
+        rms_norm_eps = self.norm.variance_epsilon
+        out_dim = self.tped_dt_size * self.head_dim
 
-        op_name = f"pallas::mamba_mixer3_{self.prefix.replace('.', '_')}"
-        wrapped_fn = functools.partial(
-            mamba_mixer3_core_tpu,
-            mesh=mesh,
-            num_heads=local_num_heads,
-            head_dim=self.head_dim,
-            n_groups=local_n_groups,
-            d_state=self.ssm_state_size,
-            num_rope_angles=num_rope_angles,
-            chunk_size=chunk_size,
-            is_mimo=is_mimo,
-            mimo_rank=mimo_rank,
-            A_floor=A_floor,
-            shard_groups=shard_groups,
-            rms_norm_eps=rms_norm_eps,
-            apply_rms_norm=apply_rms_norm,
+        op_key = (
+            id(mesh),
+            self.tped_dt_size,
+            self.head_dim,
+            self.tp_n_groups,
+            self.ssm_state_size,
+            self.num_rope_angles,
+            self.chunk_size,
+            self.is_mimo,
+            self.mimo_rank,
+            self.A_floor,
+            rms_norm_eps,
+            apply_rms_norm,
         )
 
-        mamba_jax_op = pallas.jax_op(
-            op_name,
-            wrapped_fn,
-            donate_argnums=(1, 2),
-        )
-
-        out_dim = (self.num_heads // self.tp_size) * self.head_dim
-
-        def _fake_mamba3(
-            projected_states: torch.Tensor,
-            aux_state: torch.Tensor,
-            recurrent_state: torch.Tensor,
-            *args,
-            **kwargs,
-        ):
-            num_tokens = projected_states.size(0)
-            return (
-                torch.empty_like(aux_state),
-                torch.empty_like(recurrent_state),
-                torch.empty(
-                    (num_tokens, out_dim),
-                    dtype=projected_states.dtype,
-                    device=projected_states.device,
-                ),
+        def _build_jax_op(op_name: str) -> Any:
+            wrapped_fn = functools.partial(
+                mamba_mixer3_core_tpu,
+                mesh=mesh,
+                num_heads=self.tped_dt_size,
+                head_dim=self.head_dim,
+                n_groups=self.tp_n_groups,
+                d_state=self.ssm_state_size,
+                num_rope_angles=self.num_rope_angles,
+                chunk_size=self.chunk_size,
+                is_mimo=self.is_mimo,
+                mimo_rank=self.mimo_rank,
+                A_floor=self.A_floor,
+                rms_norm_eps=rms_norm_eps,
+                apply_rms_norm=apply_rms_norm,
+            )
+            jax_op = pallas.jax_op(
+                op_name,
+                wrapped_fn,
+                donate_argnums=(1, 2),
             )
 
-        mamba_jax_op.register_fake(_fake_mamba3)
+            def _fake_mamba3(
+                projected_states: torch.Tensor,
+                aux_state: torch.Tensor,
+                recurrent_state: torch.Tensor,
+                *args: Any,
+                **kwargs: Any,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                num_tokens = projected_states.size(0)
+                return (
+                    torch.empty_like(aux_state),
+                    torch.empty_like(recurrent_state),
+                    torch.empty(
+                        (num_tokens, out_dim),
+                        dtype=projected_states.dtype,
+                        device=projected_states.device,
+                    ),
+                )
+
+            jax_op.register_fake(_fake_mamba3)
+            return jax_op
+
+        mamba_jax_op = _get_shared_mamba3_op(op_key, _build_jax_op)
 
         def mamba3_impl(
             projected_states: torch.Tensor,
@@ -541,7 +619,7 @@ class VllmMambaMixer3(MambaMixer3):
         mup_vector: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        out_dim = (self.num_heads // self.tp_size) * self.head_dim
+        out_dim = self.tped_dt_size * self.head_dim
 
         projected_states, _ = self.in_proj(hidden_states)
         if mup_vector is not None:
@@ -557,7 +635,9 @@ class VllmMambaMixer3(MambaMixer3):
             apply_py_norm = True
         else:
             fc = get_forward_context()
-            attn_metadata = fc.attn_metadata[self.prefix]
+            attn_metadata = cast(
+                "dict[str, _Mamba3AttentionMetadata]", fc.attn_metadata
+            )[self.prefix]
             aux_state, recurrent_state = kv_cache
 
             if attn_metadata.mamba_state_indices is not None:
@@ -578,8 +658,8 @@ class VllmMambaMixer3(MambaMixer3):
             if mamba_request_distribution is not None:
                 request_distribution = mamba_request_distribution
 
-            apply_py_norm = getattr(self, "_apply_py_norm", False)
-            norm_weight = getattr(self.norm, "weight", None)
+            apply_py_norm = self._apply_py_norm
+            norm_weight = cast(torch.Tensor | None, self.norm.weight)
 
             ssm_output = self.mamba_op(
                 projected_states,
@@ -592,25 +672,30 @@ class VllmMambaMixer3(MambaMixer3):
                 self.D,
                 self.dt_bias,
                 norm_weight,
-                getattr(self, "Psi", None),
-                getattr(self, "Phi", None),
-                getattr(self, "Zeta", None),
+                self.Psi,
+                self.Phi,
+                self.Zeta,
                 state_indices,
                 attn_metadata.query_start_loc,
                 request_distribution,
                 attn_metadata.seq_lens,
             )
 
-        if (
-            apply_py_norm
-            and not getattr(self, "is_mimo", False)
-            and getattr(self.norm, "weight", None) is not None
-        ):
-            gate = projected_states[..., : self.tped_intermediate_size]
-            hidden_states = self.norm(ssm_output, gate)
-        elif apply_py_norm and not getattr(self, "is_mimo", False):
-            gate = projected_states[..., : self.tped_intermediate_size]
-            hidden_states = ssm_output * torch.nn.functional.silu(gate)
+        if apply_py_norm:
+            gate = (
+                None
+                if self.is_mimo
+                else projected_states[..., : self.tped_intermediate_size]
+            )
+            if self.norm.weight is not None:
+                hidden_states = self.norm(ssm_output, gate)
+            elif gate is not None:
+                hidden_states = (
+                    ssm_output.to(torch.float32)
+                    * nn.functional.silu(gate.to(torch.float32))
+                ).to(projected_states.dtype)
+            else:
+                hidden_states = ssm_output
         else:
             hidden_states = ssm_output
 

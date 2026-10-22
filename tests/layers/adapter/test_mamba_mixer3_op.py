@@ -19,10 +19,18 @@ from unittest.mock import MagicMock, patch
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 from jax.sharding import Mesh
+from vllm.config import (
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op import (
+    Mamba3RMSNormGated,
     MambaMixer3,
     VllmMambaMixer3,
     mamba_mixer3_core_tpu,
@@ -51,6 +59,7 @@ def _mamba3_layer(
     n_groups: int = 1,
     is_mimo: bool = False,
     mimo_rank: int = 4,
+    use_rms_norm: bool = True,
 ):
     layer = VllmMambaMixer3.__new__(VllmMambaMixer3)
     torch.nn.Module.__init__(layer)
@@ -67,16 +76,23 @@ def _mamba3_layer(
     layer.A_floor = 1e-4
     layer.chunk_size = 8
     layer.rms_norm_eps = 1e-5
-    layer.use_rms_norm = True
+    layer.use_rms_norm = use_rms_norm
     layer.model_config = None
     layer.cache_config = None
+    layer._apply_py_norm = False
 
     layer.intermediate_size = layer.num_heads * layer.head_dim
     layer.tped_intermediate_size = layer.intermediate_size // layer.tp_size
     layer.tped_dt_size = layer.num_heads // layer.tp_size
+    layer.tp_n_groups = (
+        layer.n_groups // layer.tp_size
+        if layer.n_groups % layer.tp_size == 0
+        else layer.n_groups
+    )
     layer.groups_ssm_state_size = (
         layer.mimo_rank * layer.n_groups * layer.ssm_state_size
     )
+    layer.tped_bc_size = layer.mimo_rank * layer.tp_n_groups * layer.ssm_state_size
     layer.aux_dim = (
         layer.mimo_rank * (layer.head_dim + layer.ssm_state_size)
         + layer.num_rope_angles
@@ -116,7 +132,7 @@ def _mamba3_layer(
     layer.D = torch.nn.Parameter(torch.ones(layer.tped_dt_size))
     layer.dt_bias = torch.nn.Parameter(torch.zeros(layer.tped_dt_size))
     layer.norm = SimpleNamespace(
-        weight=torch.ones(layer.tped_intermediate_size),
+        weight=(torch.ones(layer.tped_intermediate_size) if use_rms_norm else None),
         variance_epsilon=1e-5,
         n_groups=n_groups,
     )
@@ -138,13 +154,39 @@ class TestVllmMambaMixer3:
         mock_build.assert_called_once_with()
         assert layer.mamba_op is mock_op
 
-    def test_build_mamba_op_registers_pallas_jax_op_and_fake(self):
-        layer0 = _mamba3_layer("model.layers.0.mixer")
-        layer1 = _mamba3_layer("model.layers.1.mixer", is_mimo=True)
-        fake_jax_op = MagicMock()
+    @pytest.mark.parametrize(
+        "cache_kwargs",
+        [
+            {"enable_prefix_caching": True, "mamba_cache_mode": "none"},
+            {"enable_prefix_caching": False, "mamba_cache_mode": "all"},
+            {"enable_prefix_caching": False, "mamba_cache_mode": "align"},
+        ],
+    )
+    def test_init_rejects_prefix_caching(self, cache_kwargs):
+        def _fake_base_init(self, *args, **kwargs):
+            self.cache_config = SimpleNamespace(**cache_kwargs)
 
         with (
             set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch.object(MambaMixer3, "__init__", _fake_base_init),
+            pytest.raises(
+                NotImplementedError,
+                match="Prefix caching is not yet supported for MambaMixer3 on TPU",
+            ),
+        ):
+            VllmMambaMixer3()
+
+    def test_build_mamba_op_caches_shared_jax_op_and_registers_fake(self):
+        layer0 = _mamba3_layer("model.layers.0.mixer")
+        layer1 = _mamba3_layer("model.layers.1.mixer")
+        layer2 = _mamba3_layer("model.layers.2.mixer", is_mimo=True)
+        fake_jax_op = MagicMock()
+        shared_mesh = _mesh()
+
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=shared_mesh, vllm_config=_vllm_config()
+            ),
             patch(
                 "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.pallas.jax_op",
                 return_value=fake_jax_op,
@@ -152,23 +194,25 @@ class TestVllmMambaMixer3:
         ):
             layer0._build_mamba_op()
             layer1._build_mamba_op()
+            assert mock_jax_op.call_count == 1
+            assert fake_jax_op.register_fake.call_count == 1
 
-        assert mock_jax_op.call_count == 2
+            layer2._build_mamba_op()
+            assert mock_jax_op.call_count == 2
+            assert fake_jax_op.register_fake.call_count == 2
+
+        assert mock_jax_op.call_args_list[0].args[0].startswith("pallas::mamba_mixer3_")
+        assert mock_jax_op.call_args_list[1].args[0].startswith("pallas::mamba_mixer3_")
         assert (
             mock_jax_op.call_args_list[0].args[0]
-            == "pallas::mamba_mixer3_model_layers_0_mixer"
-        )
-        assert (
-            mock_jax_op.call_args_list[1].args[0]
-            == "pallas::mamba_mixer3_model_layers_1_mixer"
+            != mock_jax_op.call_args_list[1].args[0]
         )
         assert mock_jax_op.call_args_list[0].kwargs["donate_argnums"] == (1, 2)
-        assert fake_jax_op.register_fake.call_count == 2
 
         fake_fn = fake_jax_op.register_fake.call_args_list[0].args[0]
         total_proj_dim = (
             2 * layer0.tped_intermediate_size
-            + 2 * layer0.groups_ssm_state_size
+            + 2 * layer0.tped_bc_size
             + 3 * layer0.tped_dt_size
             + layer0.num_rope_angles
         )
@@ -182,6 +226,222 @@ class TestVllmMambaMixer3:
         assert fake_out.shape == (16, layer0.tped_intermediate_size)
         assert layer0.get_state_dtype() == (torch.float32, torch.float32)
 
+    def test_use_fused_jax_rms_norm_multiprocess_tp_single_group(self):
+        layer_tp2_g1 = _mamba3_layer(tp_size=2, n_groups=1, use_rms_norm=True)
+        assert layer_tp2_g1._use_fused_jax_rms_norm() is False
+
+        layer_tp2_g1_no_norm = _mamba3_layer(tp_size=2, n_groups=1, use_rms_norm=False)
+        assert layer_tp2_g1_no_norm._use_fused_jax_rms_norm() is True
+
+        layer_tp2_g2 = _mamba3_layer(tp_size=2, n_groups=2, use_rms_norm=True)
+        assert layer_tp2_g2._use_fused_jax_rms_norm() is True
+
+        layer_tp1_g1 = _mamba3_layer(tp_size=1, n_groups=1, use_rms_norm=True)
+        assert layer_tp1_g1._use_fused_jax_rms_norm() is True
+
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.pallas.jax_op",
+                return_value=MagicMock(),
+            ) as mock_jax_op,
+        ):
+            layer_tp2_g1._build_mamba_op()
+
+        assert layer_tp2_g1._apply_py_norm is True
+        wrapped_fn = mock_jax_op.call_args.args[1]
+        assert wrapped_fn.keywords["apply_rms_norm"] is False
+
+    def test_siso_apply_py_norm_avoids_double_silu_gating(self):
+        """Verifies _apply_py_norm=True matches fused JAX norm without double SiLU."""
+        devices = np.asarray(jax.devices()[:1]).reshape((1,))
+        mesh = Mesh(devices, axis_names=("model",))
+
+        def _passthrough_jax_op(op_name, fn, donate_argnums=()):
+            def _op(*torch_args):
+                jax_args = [
+                    jnp.asarray(t.detach().cpu().numpy())
+                    if isinstance(t, torch.Tensor)
+                    else None
+                    for t in torch_args
+                ]
+                new_aux, new_rec, out = fn(*jax_args)
+                return (
+                    torch.from_numpy(np.array(new_aux, copy=True)),
+                    torch.from_numpy(np.array(new_rec, copy=True)),
+                    torch.from_numpy(np.array(out, copy=True)),
+                )
+
+            _op.register_fake = lambda _: None
+            return _op
+
+        torch.manual_seed(77)
+        layer_fused = _mamba3_layer("model.layers.0.mixer", tp_size=1, n_groups=1)
+        layer_py = _mamba3_layer("model.layers.1.mixer", tp_size=1, n_groups=1)
+
+        vllm_cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        vllm_cfg.compilation_config.mode = CompilationMode.NONE
+        with (
+            set_current_vllm_config(vllm_cfg),
+            patch(
+                "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_world_size",
+                return_value=1,
+            ),
+            patch(
+                "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+        ):
+            norm_weight = torch.linspace(0.5, 1.5, layer_fused.tped_intermediate_size)
+            real_norm = Mamba3RMSNormGated(
+                layer_fused.intermediate_size, 1, True, eps=1e-5
+            )
+            real_norm.weight.data.copy_(norm_weight)
+            layer_fused.norm = real_norm
+            layer_py.norm = real_norm
+
+        total_proj_dim = (
+            2 * layer_fused.tped_intermediate_size
+            + 2 * layer_fused.tped_bc_size
+            + 3 * layer_fused.tped_dt_size
+            + layer_fused.num_rope_angles
+        )
+        proj_tensor = torch.randn(6, total_proj_dim)
+        layer_fused.in_proj = MagicMock(return_value=(proj_tensor.clone(), None))
+        layer_py.in_proj = MagicMock(return_value=(proj_tensor.clone(), None))
+        layer_fused.out_proj = MagicMock(side_effect=lambda x: (x, None))
+        layer_py.out_proj = MagicMock(side_effect=lambda x: (x, None))
+
+        with (
+            set_vllm_model_wrapper_context(mesh=mesh, vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.pallas.jax_op",
+                side_effect=_passthrough_jax_op,
+            ),
+        ):
+            layer_fused.mamba_op = layer_fused._build_mamba_op()
+            with patch.object(layer_py, "_use_fused_jax_rms_norm", return_value=False):
+                layer_py.mamba_op = layer_py._build_mamba_op()
+
+        assert layer_fused._apply_py_norm is False
+        assert layer_py._apply_py_norm is True
+
+        aux_shape, ssm_shape = layer_fused.get_state_shape()
+        layer_fused.kv_cache = (
+            torch.zeros((2, *aux_shape)),
+            torch.zeros((2, *ssm_shape)),
+        )
+        layer_py.kv_cache = (
+            torch.zeros((2, *aux_shape)),
+            torch.zeros((2, *ssm_shape)),
+        )
+        meta = SimpleNamespace(
+            mamba_state_indices=torch.tensor([0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([6], dtype=torch.int32),
+            block_tables=None,
+        )
+        fc = SimpleNamespace(
+            attn_metadata={
+                layer_fused.prefix: meta,
+                layer_py.prefix: meta,
+            }
+        )
+        with patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.get_forward_context",
+            return_value=fc,
+        ):
+            out_fused = layer_fused.forward(torch.zeros(6, 64))
+            out_py = layer_py.forward(torch.zeros(6, 64))
+
+        torch.testing.assert_close(out_py, out_fused, rtol=1e-4, atol=1e-4)
+
+    def test_mimo_apply_py_norm_runs_ungated_tp_rmsnorm(self):
+        """Verifies MIMO with tp_size=2, n_groups=1 runs ungated TP all-reduce norm."""
+        layer = _mamba3_layer(
+            "model.layers.0.mixer",
+            tp_size=2,
+            n_groups=1,
+            is_mimo=True,
+            use_rms_norm=True,
+        )
+        vllm_cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+        vllm_cfg.compilation_config.mode = CompilationMode.NONE
+        with (
+            set_current_vllm_config(vllm_cfg),
+            patch(
+                "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm.model_executor.layers.mamba.mamba_mixer2.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+        ):
+            norm = Mamba3RMSNormGated(layer.intermediate_size, 1, True, eps=1e-5)
+            norm.weight.data.copy_(
+                torch.linspace(0.75, 1.25, layer.tped_intermediate_size)
+            )
+            layer.norm = norm
+
+        ssm_rank0 = torch.randn(4, layer.tped_intermediate_size)
+        ssm_rank1 = torch.randn(4, layer.tped_intermediate_size)
+        other_rank_sq_sum = ssm_rank1.pow(2).sum(dim=-1, keepdim=True)
+
+        aux_shape, ssm_shape = layer.get_state_shape()
+        aux_state = torch.zeros((2, *aux_shape))
+        rec_state = torch.zeros((2, *ssm_shape))
+        layer.kv_cache = (aux_state, rec_state)
+
+        fake_jax_op = MagicMock(return_value=(aux_state, rec_state, ssm_rank0))
+        with (
+            set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.pallas.jax_op",
+                return_value=fake_jax_op,
+            ),
+        ):
+            layer.mamba_op = layer._build_mamba_op()
+
+        assert layer._apply_py_norm is True
+
+        total_proj_dim = (
+            2 * layer.tped_intermediate_size
+            + 2 * layer.tped_bc_size
+            + 3 * layer.tped_dt_size
+            + layer.num_rope_angles
+        )
+        layer.in_proj = MagicMock(return_value=(torch.randn(4, total_proj_dim), None))
+        layer.out_proj = MagicMock(side_effect=lambda x: (x, None))
+
+        meta = SimpleNamespace(
+            mamba_state_indices=torch.tensor([0], dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+            request_distribution=torch.tensor([0, 1, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([4], dtype=torch.int32),
+            block_tables=None,
+        )
+        fc = SimpleNamespace(attn_metadata={layer.prefix: meta})
+
+        with (
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.get_forward_context",
+                return_value=fc,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.custom_ops.mamba_mixer3_op.tensor_model_parallel_all_reduce",
+                side_effect=lambda local_sum: local_sum + other_rank_sq_sum,
+            ) as mock_all_reduce,
+        ):
+            out_rank0 = layer.forward(torch.zeros(4, 64))
+
+        mock_all_reduce.assert_called_once()
+        full_x = torch.cat([ssm_rank0, ssm_rank1], dim=-1)
+        global_var = full_x.pow(2).mean(dim=-1, keepdim=True)
+        expected_rank0 = norm.weight * (ssm_rank0 * torch.rsqrt(global_var + 1e-5))
+        torch.testing.assert_close(out_rank0, expected_rank0, rtol=1e-5, atol=1e-5)
+
     def test_forward_warmup_with_unallocated_kv_cache(self):
         layer = _mamba3_layer()
         layer.kv_cache = (torch.tensor([]), torch.tensor([]))
@@ -189,7 +449,7 @@ class TestVllmMambaMixer3:
 
         total_proj_dim = (
             2 * layer.tped_intermediate_size
-            + 2 * layer.groups_ssm_state_size
+            + 2 * layer.tped_bc_size
             + 3 * layer.tped_dt_size
             + layer.num_rope_angles
         )
@@ -238,7 +498,7 @@ class TestVllmMambaMixer3:
 
             total_proj_dim = (
                 2 * layer.tped_intermediate_size
-                + 2 * layer.groups_ssm_state_size
+                + 2 * layer.tped_bc_size
                 + 3 * layer.tped_dt_size
                 + layer.num_rope_angles
             )
@@ -334,7 +594,6 @@ class TestVllmMambaMixer3:
             chunk_size=chunk_size,
             is_mimo=False,
             mimo_rank=1,
-            shard_groups=True,
             apply_rms_norm=True,
         )
 
@@ -372,7 +631,6 @@ class TestVllmMambaMixer3:
             chunk_size=chunk_size,
             is_mimo=False,
             mimo_rank=1,
-            shard_groups=True,
             apply_rms_norm=True,
         )
 
@@ -406,7 +664,6 @@ class TestVllmMambaMixer3:
                 chunk_size=chunk_size,
                 is_mimo=False,
                 mimo_rank=1,
-                shard_groups=True,
                 apply_rms_norm=True,
             )
             y_decodes.append(y_dec)
@@ -486,7 +743,6 @@ class TestVllmMambaMixer3:
             chunk_size=chunk_size,
             is_mimo=True,
             mimo_rank=mimo_rank,
-            shard_groups=True,
             apply_rms_norm=False,
         )
 
@@ -522,7 +778,6 @@ class TestVllmMambaMixer3:
             is_mimo=True,
             mimo_rank=mimo_rank,
             A_floor=1e-4,
-            shard_groups=True,
             rms_norm_eps=1e-5,
             apply_rms_norm=False,
         )
@@ -557,7 +812,6 @@ class TestVllmMambaMixer3:
                 is_mimo=True,
                 mimo_rank=mimo_rank,
                 A_floor=1e-4,
-                shard_groups=True,
                 rms_norm_eps=1e-5,
                 apply_rms_norm=False,
             )
@@ -629,7 +883,6 @@ class TestVllmMambaMixer3:
                 is_mimo=False,
                 mimo_rank=1,
                 A_floor=1e-4,
-                shard_groups=True,
                 rms_norm_eps=1e-5,
                 apply_rms_norm=apply_rms_norm,
             )
@@ -729,7 +982,6 @@ class TestVllmMambaMixer3:
                 chunk_size=chunk_size,
                 is_mimo=is_mimo,
                 mimo_rank=r,
-                shard_groups=True,
                 apply_rms_norm=not is_mimo,
             )
 
@@ -762,7 +1014,6 @@ class TestVllmMambaMixer3:
                     chunk_size=chunk_size,
                     is_mimo=is_mimo,
                     mimo_rank=r,
-                    shard_groups=True,
                     apply_rms_norm=not is_mimo,
                 )
                 np.testing.assert_allclose(y_batch[i], y_i[0], rtol=1e-4, atol=1e-4)
@@ -867,7 +1118,6 @@ class TestVllmMambaMixer3:
                 chunk_size=chunk_size,
                 is_mimo=is_mimo,
                 mimo_rank=r,
-                shard_groups=True,
                 apply_rms_norm=not is_mimo,
             )
 
@@ -903,7 +1153,6 @@ class TestVllmMambaMixer3:
                     chunk_size=chunk_size,
                     is_mimo=is_mimo,
                     mimo_rank=r,
-                    shard_groups=True,
                     apply_rms_norm=not is_mimo,
                 )
                 np.testing.assert_allclose(
