@@ -16,7 +16,6 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41.index_quantization import quantize_index_rows
 from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
     candidate_topk,
-    compact_candidate_scores,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PAGE_RECORDS,
@@ -28,7 +27,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_mqa import (
     packed_fp8_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import (
-    candidate_pages,
+    packed_fp8_sparse_mqa_logits,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     PACKED_FP8_MQA_CONFIG,
@@ -254,35 +253,23 @@ def _score_and_select(
         def sparse():
             if row_candidates.shape[1] == 0:
                 return jnp.full((rows, min(topk, width)), -1, jnp.int32), row_candidates
-            tasks = candidate_pages(
-                row_candidates,
-                row_lengths,
-                owners,
-                pages[:, : (width + PAGE_RECORDS - 1) // PAGE_RECORDS],
-                block_size=block_size,
-                cache_pages=layout.pages,
-                query_start_loc=offsets,
-            )
-            scores = packed_fp8_mqa_logits(
+            scores, canonical = packed_fp8_sparse_mqa_logits(
                 quantized,
                 row_weights.astype(jnp.float32),
                 pool,
-                tasks.physical,
-                tasks.lengths,
-                tasks.query_offsets,
+                pages[:, : (width + PAGE_RECORDS - 1) // PAGE_RECORDS],
+                row_lengths,
+                owners,
+                row_candidates,
+                offsets,
                 q_scale=scales,
                 cache_layout=layout,
-                skip_invalid_pages=True,
-            )
-            scores = compact_candidate_scores(
-                scores,
-                tasks.candidates,
                 block_size=block_size,
             )
             if unordered:
                 selected = candidate_topk(
                     scores,
-                    tasks.candidates,
+                    canonical,
                     k=min(topk, scores.shape[1]),
                     block_size=block_size,
                 )
@@ -295,7 +282,7 @@ def _score_and_select(
             selected, _ = attention_kernels.select_indices_jax(
                 scores,
                 jnp.full_like(row_lengths, scores.shape[1]),
-                tasks.candidates,
+                canonical,
                 min(topk, width),
                 block_size,
                 False,
@@ -309,7 +296,7 @@ def _score_and_select(
                 constant_values=-1,
             )
             blocks = jnp.take_along_axis(
-                tasks.candidates, jnp.maximum(selected, 0) // block_size, axis=1
+                canonical, jnp.maximum(selected, 0) // block_size, axis=1
             )
             selected = jnp.where(
                 selected >= 0, blocks * block_size + selected % block_size, -1

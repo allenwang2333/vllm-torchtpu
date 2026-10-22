@@ -8,8 +8,9 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from ._packed_fp8_compact import candidate_membership
-from .packed_fp8_cache import PAGE_RECORDS
+from ._packed_fp8_compact import candidate_membership, compact_candidate_scores
+from .packed_fp8_cache import PAGE_RECORDS, PackedFP8Layout
+from .packed_fp8_mqa import packed_fp8_mqa_logits
 from .tuned_block_sizes import PACKED_FP8_MQA_CONFIG
 
 
@@ -19,6 +20,53 @@ class CandidatePages(NamedTuple):
     lengths: jax.Array
     block_mask: jax.Array
     candidates: jax.Array
+
+
+def packed_fp8_sparse_mqa_logits(
+    q: jax.Array,
+    weights: jax.Array,
+    pool: jax.Array | tuple[jax.Array, jax.Array],
+    page_table: jax.Array,
+    lengths: jax.Array,
+    requests: jax.Array,
+    candidates: jax.Array,
+    query_start_loc: jax.Array,
+    *,
+    q_scale: jax.Array,
+    cache_layout: PackedFP8Layout,
+    block_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Return FP32 [T,C*block_size] scores and canonical [T,C] block IDs.
+
+    Queries are grouped by request. Token column j maps to
+    ``canonical[row,j // block_size] * block_size + j % block_size``.
+    Invalid or invisible columns are -inf. TensorCore scoring currently uses
+    full-context HBM scratch, then SparseCore gathers only candidate columns.
+    """
+    tasks = candidate_pages(
+        candidates,
+        lengths,
+        requests,
+        page_table,
+        block_size=block_size,
+        cache_pages=cache_layout.pages,
+        query_start_loc=query_start_loc,
+    )
+    scores = packed_fp8_mqa_logits(
+        q,
+        weights,
+        pool,
+        tasks.physical,
+        tasks.lengths,
+        tasks.query_offsets,
+        q_scale=q_scale,
+        cache_layout=cache_layout,
+        skip_invalid_pages=True,
+    )
+    return (
+        compact_candidate_scores(scores, tasks.candidates, block_size=block_size),
+        tasks.candidates,
+    )
 
 
 def candidate_pages(

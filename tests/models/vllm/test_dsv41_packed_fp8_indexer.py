@@ -127,6 +127,9 @@ def test_chunked_ragged_queries_restore_order_and_global_candidate_policy(
     )
 
     monkeypatch.setattr(packed_fp8_indexer, "packed_fp8_mqa_logits", _routing_scorer)
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import packed_fp8_sparse
+
+    monkeypatch.setattr(packed_fp8_sparse, "packed_fp8_mqa_logits", _routing_scorer)
     monkeypatch.setattr(attention_kernels, "_INDEX_UNTILED_SCORE_ELEMENTS", 6 * 32768)
     layout = PackedFP8Layout(4, 40, 5)
     values = jnp.asarray(
