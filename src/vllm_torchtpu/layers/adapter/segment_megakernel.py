@@ -142,6 +142,8 @@ SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 # these sizes each got a serial copy there (j-7694e3a5).
 _STACKS: dict[str, torch.Tensor] = {}
 STACK_MIN_ROWS = 32
+# What the stacks were built from: (decoder layers, [(boundary index N, statics)]).
+_STACK_PLAN: list[tuple[list, list]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -774,11 +776,8 @@ def _consts_row(st: _Statics, layer: Any, nxt: Any) -> torch.Tensor:
     return torch.cat(parts)
 
 
-def _build_stacks(layers: list, plan: list) -> None:
-    """The constant stacks, one row / slice per armed boundary, as fresh
-    buffers (a view would be re-materialized every forward)."""
-    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
-
+def _stack_values(layers: list, plan: list) -> dict[str, torch.Tensor]:
+    """The constant stacks' values from the layers' current tensors."""
     rows, s13s, sw13s, sw2s = [], [], [], []
     for i, st in plan:
         layer, nxt = layers[i], layers[i + 1]
@@ -800,11 +799,42 @@ def _build_stacks(layers: list, plan: list) -> None:
         out = torch.stack(xs)
         return out.view(sw13s[0].dtype) if view8 else out
 
-    _STACKS["fstack"] = fresh_buffer(stack(rows)[:, None, :])
-    _STACKS["s13s"] = fresh_buffer(stack(s13s).to(torch.float32))
-    _STACKS["sw13s"] = fresh_buffer(stack(sw13s, view8=True))
-    _STACKS["sw2s"] = fresh_buffer(stack(sw2s, view8=True))
+    return {
+        "fstack": stack(rows)[:, None, :],
+        "s13s": stack(s13s).to(torch.float32),
+        "sw13s": stack(sw13s, view8=True),
+        "sw2s": stack(sw2s, view8=True),
+    }
+
+
+def _build_stacks(layers: list, plan: list) -> None:
+    """The constant stacks, one row / slice per armed boundary, as fresh
+    buffers (a view would be re-materialized every forward)."""
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+    for name, value in _stack_values(layers, plan).items():
+        _STACKS[name] = fresh_buffer(value)
+    _STACK_PLAN[:] = [(layers, list(plan))]
     synchronize_tensors(list(_STACKS.values()))
+
+
+def refresh_stacks() -> int:
+    """Copy the armed boundaries' current constants into the stacks, in
+    place (compiled programs keep reading the same buffers); returns the
+    boundaries refreshed. The stacks are copies taken at arming, so a
+    parameter changed in place after `arm` (the routing correction bias, the
+    norm weights, the scales) would otherwise reach the megakernel stale while
+    the usual path reads it live. Serving changes none after loading; a caller
+    that does (the microbenchmark twin re-draws the routers) calls this after."""
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    if not _STACK_PLAN:
+        return 0
+    layers, plan = _STACK_PLAN[0]
+    for name, value in _stack_values(layers, plan).items():
+        _STACKS[name].copy_(value.to(_STACKS[name].dtype))
+    synchronize_tensors(list(_STACKS.values()))
+    return len(plan)
 
 
 def arm(model: torch.nn.Module, vllm_config: Any) -> int:
