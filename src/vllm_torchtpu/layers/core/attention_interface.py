@@ -1,6 +1,6 @@
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import jax
@@ -1160,6 +1160,99 @@ def fused_small_a2a_bucket_config(num_tokens: int) -> tuple[bool | tuple, int]:
     return bool(pin), int(vmem_mib)
 
 
+def group_gather_applies(
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    num_tokens: int,
+    topk: int,
+) -> bool:
+    """Whether TPU_GROUP_BATCHED_GATHER takes this DCP bucket: the skip_topk
+    layers' attention runs the TPU_MLA_KV_WRITE_IN_GATHER fused-prep decode
+    gather, which `sparse_mla_group_gather_dcp` replays at the group head."""
+    return bool(
+        envs.TPU_GROUP_BATCHED_GATHER
+        and envs.TPU_MLA_KV_WRITE_IN_GATHER
+        and envs.TPU_DCP_MLA_MASK_IN_KERNEL
+        and envs.TPU_DCP_MLA_FUSED_PREP
+        and kv_write_in_gather_supported(nope_spec, rope_spec, num_tokens, topk)
+        and sparse_mla_kernel.group_gather_supported(
+            num_tokens,
+            topk,
+            envs.TPU_DCP_MLA_TOPK_CAP,
+            envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+        )
+    )
+
+
+def sparse_mla_group_gather_dcp(
+    skip_caches: Sequence[tuple[jax.Array, jax.Array]],
+    after: jax.Array,
+    local_topk_indices: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    *,
+    dcp_size: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, ...]:
+    """TPU_GROUP_BATCHED_GATHER at a group head: every skip_topk layer's
+    decode gather of the group in one SparseCore call per rank.
+
+    `skip_caches`: the skip layers' (nope, rope) cache shards, read only;
+    `after`: the head's updated nope cache (the gather is ordered after the
+    head's own gather + KV write, so that one is not queued behind this).
+    `local_topk_indices` .. `request_distribution` exactly as the skip layers'
+    `sparse_mla_attention_dcp` receives them. Returns `(nope_0, rope_0, ...)`
+    per skip layer, sharded over `dcp_axis_name`: that layer's
+    `group_pre_gathered`.
+    """
+    num_layers = len(skip_caches)
+    cache_spec = P(dcp_axis_name)
+    in_specs = (cache_spec,) * (2 * num_layers) + (
+        cache_spec,  # after
+        P(dcp_axis_name, None),  # local_topk_indices
+        P(None),  # block_tables
+        P(None),  # query_start_loc
+        P(None),  # request_distribution
+    )
+    out_specs = (cache_spec,) * (2 * num_layers)
+
+    def _local(*args):
+        caches = [(args[2 * g], args[2 * g + 1]) for g in range(num_layers)]
+        after_, topk_idx, block_tables_, query_start_loc_, request_distribution_ = args[
+            2 * num_layers :
+        ]
+        outs = sparse_mla_kernel.group_gather_decode(
+            caches,
+            topk_idx,
+            # The same expression the attention resolves its pages with.
+            jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages)),
+            query_start_loc_,
+            request_distribution_,
+            topk_cap=envs.TPU_DCP_MLA_TOPK_CAP,
+            gather_and_attention_chunk_size=envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+            small_chunk_batch_size=envs.TPU_DCP_MLA_SMALL_CHUNK_BATCH,
+            small_chunk_tokens=envs.TPU_DCP_MLA_SMALL_CHUNK_TOKENS,
+            after=after_.reshape(-1)[:1],
+        )
+        return tuple(x for pair in outs for x in pair)
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        *(x for pair in skip_caches for x in pair),
+        after,
+        local_topk_indices,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1189,6 +1282,8 @@ def sparse_mla_attention_dcp(
     fused_exchange: bool = False,
     dcp_lane_ids: jax.Array | None = None,
     fused_merge: bool = False,
+    group_pre_gathered: tuple[jax.Array, jax.Array] | None = None,
+    group_fault: str | None = None,
 ) -> tuple[jax.Array, ...]:
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
@@ -1236,6 +1331,14 @@ def sparse_mla_attention_dcp(
         num_heads // dcp_size, lkv_dim]` and f32 `[dcp_size * dcp_size,
         num_tokens * num_heads // dcp_size]`, each rank's `[dcp_size, ...]`
         block sender-major, partial rows past the real ones zero.
+
+      group_pre_gathered: TPU_GROUP_BATCHED_GATHER, a skip_topk layer on a
+        bucket `group_gather_applies` takes: this layer's rows from its group
+        head's `sparse_mla_group_gather_dcp` (nope, rope; sharded over
+        `dcp_axis_name`). The KV write then rides a patch call that re-gathers
+        only the atoms naming a written row, in place of the full gather
+        (`sparse_ragged_paged_attention(group_pre_gathered=...)`). Same
+        results. `group_fault`: test-only (`native_sc_gather.GROUP_FAULTS`).
 
     TPU_MLA_KV_WRITE_IN_GATHER: on fused-prep decode buckets the step's KV
     write is not a kernel of its own; the SparseCore gather that feeds the
@@ -1360,7 +1463,11 @@ def sparse_mla_attention_dcp(
     ):
         # Trailing operands, in order: the q rope table (TPU_MLA_DECODE_PROLOGUE),
         # then this shard's DCP rank (TPU_DCP_RANK_OPERAND), then its lane
-        # (TPU_MLA_FUSED_SMALL_A2A).
+        # (TPU_MLA_FUSED_SMALL_A2A), then the group's pre-gathered rows
+        # (TPU_GROUP_BATCHED_GATHER).
+        pre_ = None
+        if group_pre_gathered is not None:
+            pre_, extra_ = tuple(extra_[-2:]), extra_[:-2]
         rope_table_ = extra_[0] if q_rope else None
         dcp_lane = extra_[-1][0] if fused_exchange else None
         # TPU_MLA_FUSED_SMALL_A2A_MIN_TOKENS: whether this bucket (static T)
@@ -1394,6 +1501,10 @@ def sparse_mla_attention_dcp(
                 nope_spec, rope_spec, kv_c_normed.shape[0], topk_idx.shape[-1]
             )
         )
+        if pre_ is not None and not kv_in_gather:
+            raise ValueError(
+                "group_pre_gathered needs the TPU_MLA_KV_WRITE_IN_GATHER decode path"
+            )
         kv_write = None
         if kv_in_gather:
             # The gather writes the rows; only their addresses and packed
@@ -1575,6 +1686,8 @@ def sparse_mla_attention_dcp(
             decode_body_levers=_decode_body_levers(envs.TPU_MLA_DECODE_BODY_LEVERS),
             out_pieces=merge_pieces,
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
+            group_pre_gathered=pre_,
+            group_fault=group_fault,
             **chunk_kwargs,
             **split_kwargs,
         )
@@ -1636,6 +1749,9 @@ def sparse_mla_attention_dcp(
     if fused_exchange:
         rank_args = rank_args + (dcp_lane_ids,)
         in_specs = in_specs + (P(dcp_axis_name),)
+    if group_pre_gathered is not None:
+        rank_args = rank_args + tuple(group_pre_gathered)
+        in_specs = in_specs + (P(dcp_axis_name), P(dcp_axis_name))
     return jax.jit(
         shard_map.shard_map(
             _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False

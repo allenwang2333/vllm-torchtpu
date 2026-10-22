@@ -1923,7 +1923,37 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            group_pre_gathered=kwargs.get("group_pre_gathered"),
         )
+
+
+# TPU_GROUP_BATCHED_GATHER: the MLA wrappers of each `<...>.layers` container by
+# layer index, so a group head (an indexed layer) finds the skip_topk layers
+# that follow it and reuse its top-k.
+_GROUP_LAYERS: dict[str, dict[int, Any]] = {}
+_LAYER_PREFIX_RE = re.compile(r"^(.*\.layers)\.(\d+)(\.|$)")
+
+
+def _register_group_layer(wrapper: Any, prefix: str) -> None:
+    """Record `wrapper` and, for a skip_topk layer, append it to its head's
+    `_group_skips` (the nearest earlier indexed layer of an unbroken run of
+    skip_topk layers). Layers are built in index order."""
+    m = _LAYER_PREFIX_RE.match(prefix)
+    if m is None:
+        return
+    container, idx = m.group(1), int(m.group(2))
+    layers = _GROUP_LAYERS.setdefault(container, {})
+    layers[idx] = wrapper
+    if not wrapper.skip_topk:
+        return
+    j = idx - 1
+    while j in layers and layers[j].skip_topk:
+        j -= 1
+    head = layers.get(j)
+    if head is not None and head.indexer is not None:
+        # Not `head._group_skips = ...`: a tuple of modules must not become
+        # registered submodules.
+        object.__setattr__(head, "_group_skips", (*head._group_skips, wrapper))
 
 
 # Backward compatibility alias right in case legacy external imports reference old name
@@ -2083,6 +2113,108 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 )
             hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
             hooks.append(self.indexer.permute_rope_to_half_split)
+
+        # TPU_GROUP_BATCHED_GATHER: a group head gathers its skip_topk layers'
+        # decode rows in one SparseCore call; each skip layer consumes its own.
+        self._group_pre = None
+        object.__setattr__(self, "_group_skips", ())
+        if envs.TPU_GROUP_BATCHED_GATHER and self.is_sparse:
+            _register_group_layer(self, prefix)
+            hooks = self.mla_attn.__dict__.setdefault("post_load_hooks", [])
+            hooks.append(self._build_group_gather_ops)
+
+    def _build_group_gather_ops(self) -> None:
+        """TPU_GROUP_BATCHED_GATHER, after the DCP ops are built: the head's
+        group gather op, or a skip layer's attention ops that take the
+        pre-gathered rows. Only for the served DCP decode configuration
+        (query replication, the decode prologue, the rank operand)."""
+        attn = self.mla_attn
+        for name in (
+            "sparse_mla_group_gather_op",
+            "sparse_mla_dcp_rope_pre_op",
+            "sparse_mla_dcp_send_pre_op",
+            "sparse_mla_dcp_fused_pre_op",
+        ):
+            setattr(attn, name, None)
+        impl = attn.impl
+        dcp_size = getattr(impl, "dcp_size", 1)
+        if not (
+            dcp_size > 1
+            and self.dcp_q_replicate
+            and envs.TPU_MLA_DECODE_PROLOGUE
+            and envs.TPU_DCP_RANK_OPERAND
+            and envs.TPU_MLA_KV_WRITE_IN_GATHER
+        ):
+            logger.warning_once(
+                "TPU_GROUP_BATCHED_GATHER needs DCP with query replication, "
+                "TPU_MLA_DECODE_PROLOGUE, TPU_DCP_RANK_OPERAND and "
+                "TPU_MLA_KV_WRITE_IN_GATHER; off for this model"
+            )
+            return
+        il = impl.dcp_interleave_size
+        if self.skip_topk:
+            attn.sparse_mla_dcp_rope_pre_op = impl._build_sparse_mla_dcp_op(
+                attn, dcp_size, il, q_rope=True, group_pre=True
+            )
+            if envs.TPU_DCP_MLA_SEND_LAYOUT:
+                attn.sparse_mla_dcp_send_pre_op = impl._build_sparse_mla_dcp_op(
+                    attn, dcp_size, il, q_rope=True, send_layout=True, group_pre=True
+                )
+                if envs.TPU_MLA_FUSED_SMALL_A2A:
+                    attn.sparse_mla_dcp_fused_pre_op = impl._build_sparse_mla_dcp_op(
+                        attn,
+                        dcp_size,
+                        il,
+                        q_rope=True,
+                        send_layout=True,
+                        fused_exchange=True,
+                        group_pre=True,
+                    )
+        elif self.indexer is not None and len(self._group_skips) == 3:
+            attn.sparse_mla_group_gather_op = impl._build_sparse_mla_group_gather_op(
+                attn, len(self._group_skips)
+            )
+
+    def _issue_group_gather(
+        self, hidden_states: torch.Tensor, topk_indices: torch.Tensor
+    ) -> None:
+        """TPU_GROUP_BATCHED_GATHER at a group head, after its own attention:
+        gather every skip layer's decode rows (one SparseCore call) and hand
+        each skip layer its pair. Buckets `group_gather_applies` refuses keep
+        the per-layer gathers."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            group_gather_applies,
+        )
+
+        attn = self.mla_attn
+        op = getattr(attn, "sparse_mla_group_gather_op", None)
+        skips = self._group_skips
+        if op is None or not skips:
+            return
+        if any(
+            getattr(s.mla_attn, "sparse_mla_dcp_rope_pre_op", None) is None
+            # Only the prologue op (raw q head + rope table) has the variant.
+            or not (s.decode_prologue and s._rope_neox_permuted)
+            for s in skips
+        ):
+            return
+        attn_metadata, _, kv_cache, _ = get_attention_context(attn.layer_name)
+        if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 2:
+            return  # the memory probe, before the caches are bound
+        nope_spec, rope_spec = attn.mla_kv_spec
+        if not group_gather_applies(
+            nope_spec, rope_spec, hidden_states.shape[0], topk_indices.shape[-1]
+        ):
+            return
+        skip_caches = []
+        for s in skips:
+            cache = get_attention_context(s.mla_attn.layer_name)[2]
+            if not isinstance(cache, (tuple, list)) or len(cache) != 2:
+                return
+            skip_caches.append(tuple(cache))
+        outs = op(skip_caches, kv_cache[0], topk_indices, attn_metadata)
+        for i, s in enumerate(skips):
+            object.__setattr__(s, "_group_pre", (outs[2 * i], outs[2 * i + 1]))
 
     def permute_rope_to_half_split(self) -> None:
         """Put the q and k_pe rope columns in half-split order (see
@@ -2284,6 +2416,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )._local_view
             q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        # TPU_GROUP_BATCHED_GATHER: a skip_topk layer's rows, pre-gathered by
+        # its group head earlier in this forward (consumed once).
+        group_kw = {}
+        group_pre = getattr(self, "_group_pre", None)
+        if group_pre is not None:
+            object.__setattr__(self, "_group_pre", None)
+            group_kw["group_pre_gathered"] = group_pre
+
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
@@ -2291,7 +2431,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            **group_kw,
         )
+        if self._group_skips and topk_indices is not None:
+            self._issue_group_gather(hidden_states, topk_indices)
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()

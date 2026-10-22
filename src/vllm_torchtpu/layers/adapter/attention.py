@@ -2442,6 +2442,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_rope: bool = False,
         send_layout: bool = False,
         fused_exchange: bool = False,
+        group_pre: bool = False,
     ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2465,6 +2466,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         the op takes this rank's lane operand and returns `(o_recv, l_recv)`,
         the received partials and lse (`cp_mla_attention.merge_fused_recv`).
         Buckets `cp_mla_attention.fused_small_a2a_applies` takes only.
+
+        `group_pre` (TPU_GROUP_BATCHED_GATHER; a skip_topk layer, needs
+        `q_rope` and TPU_DCP_RANK_OPERAND): the op takes two more trailing
+        operands, the rows its group head pre-gathered
+        (`sparse_mla_attention_dcp(group_pre_gathered=...)`). Same outputs.
         """
         from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
         from vllm_torchtpu.layers.core.attention_interface import (
@@ -2511,6 +2517,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             rope_table: jax.Array | None,
             rank_ids: jax.Array | None,
             lane_ids: jax.Array | None = None,
+            pre: tuple[jax.Array, jax.Array] | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
@@ -2538,6 +2545,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 fused_exchange=fused_exchange,
                 fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
+                group_pre_gathered=pre,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2697,6 +2705,82 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 lane_ids,
             )
 
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank_pre(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            pre_nope: jax.Array,  # the group head's gather of this layer
+            pre_rope: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+                None,
+                (pre_nope, pre_rope),
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank_lane_pre(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+            pre_nope: jax.Array,  # the group head's gather of this layer
+            pre_rope: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+                lane_ids,
+                (pre_nope, pre_rope),
+            )
+
+        if group_pre and not (q_rope and rank_tensor is not None):
+            raise ValueError(
+                "TPU_GROUP_BATCHED_GATHER needs TPU_MLA_DECODE_PROLOGUE and "
+                "TPU_DCP_RANK_OPERAND"
+            )
         core_fn = {
             (False, False): sparse_mla_attention_core_tpu_dcp,
             (True, False): sparse_mla_attention_core_tpu_dcp_qrope,
@@ -2705,6 +2789,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         }[(bool(q_rope), rank_tensor is not None)]
         if fused_exchange:
             core_fn = sparse_mla_attention_core_tpu_dcp_qrope_rank_lane
+        if group_pre:
+            core_fn = (
+                sparse_mla_attention_core_tpu_dcp_qrope_rank_lane_pre
+                if fused_exchange
+                else sparse_mla_attention_core_tpu_dcp_qrope_rank_pre
+            )
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
@@ -2719,6 +2809,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             op_name += "_xa2a"
         if fused_merge:
             op_name += "m"
+        if group_pre:
+            op_name += "_gpre"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
@@ -2726,6 +2818,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # rank ids, sharded
         if lane_tensor is not None:
             input_specs = input_specs + (P(DCP_AXIS_NAME),)  # lane ids, sharded
+        if group_pre:
+            # The group head's pre-gathered nope / rope rows, sharded.
+            input_specs = input_specs + (P(DCP_AXIS_NAME), P(DCP_AXIS_NAME))
         output_specs = _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS
         if fused_merge:
             # Caches, then this rank's merged [T, L, V]: three outputs. The op's
@@ -2752,10 +2847,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 **core_fn.__annotations__,
                 "return": tuple[jax.Array, jax.Array, jax.Array],
             }
+        donate = (0, 1)
+        if group_pre:
+            # The pre-gathered rows are patched in place (last two operands).
+            n = len(input_specs)
+            donate = (0, 1, n - 2, n - 1)
         sparse_mla_jax_op = pcp_streaming_jax_op(
             op_name,
             core_fn,
-            donate_argnums=(0, 1),
+            donate_argnums=donate,
             mesh=mesh,
             input_partition_specs=input_specs,
             output_partition_specs=output_specs,
@@ -2820,8 +2920,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             query_start_loc: torch.Tensor,
             request_distribution: torch.Tensor,
             *rope_table: torch.Tensor,
+            group_pre_gathered: tuple[torch.Tensor, torch.Tensor] | None = None,
         ) -> Any:
             assert len(rope_table) == int(q_rope), "rope table iff q_rope"
+            assert (group_pre_gathered is not None) == group_pre, (
+                "pre-gathered rows iff the group_pre op"
+            )
             nope_cache, rope_cache = kv_cache
             results = sparse_mla_jax_op(
                 nope_cache,
@@ -2838,6 +2942,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 *rope_table,
                 *(() if rank_tensor is None else (rank_tensor,)),
                 *(() if lane_tensor is None else (lane_tensor,)),
+                *(() if group_pre_gathered is None else group_pre_gathered),
             )
             new_nope, new_rope = results[:2]
             nope_cache.copy_(new_nope)
@@ -2852,6 +2957,70 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             return outputs, lse
 
         return sparse_mla_dcp_impl
+
+    def _build_sparse_mla_group_gather_op(self, layer: Any, num_skip: int):
+        """TPU_GROUP_BATCHED_GATHER: the group head's op that gathers its
+        `num_skip` skip_topk layers' decode rows in one SparseCore call
+        (`attention_interface.sparse_mla_group_gather_dcp`). Returns
+        `impl(skip_caches, head_nope_cache, local_topk_indices, attn_metadata)
+        -> (nope_0, rope_0, ...)`. GLM-5.2's groups have 3 skip layers."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_group_gather_dcp,
+        )
+
+        if num_skip != 3:
+            raise NotImplementedError(f"group gather op for {num_skip} skip layers")
+        mesh = self._dcp_mesh
+        assert mesh is not None
+        dcp_size = self.dcp_size
+
+        def sparse_mla_group_gather_core_tpu_dcp3(
+            s0_nope: jax.Array,
+            s0_rope: jax.Array,
+            s1_nope: jax.Array,
+            s1_rope: jax.Array,
+            s2_nope: jax.Array,
+            s2_rope: jax.Array,
+            after: jax.Array,  # the head's updated nope cache (ordering only)
+            local_topk_indices: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+            nope_spec, _ = layer.mla_kv_spec
+            return sparse_mla_group_gather_dcp(
+                ((s0_nope, s0_rope), (s1_nope, s1_rope), (s2_nope, s2_rope)),
+                after,
+                local_topk_indices,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                dcp_size=dcp_size,
+            )
+
+        op = pcp_streaming_jax_op(
+            "pallas::sparse_mla_group_gather_dcp_" + layer.layer_name.replace(".", "_"),
+            sparse_mla_group_gather_core_tpu_dcp3,
+            donate_argnums=(),
+            mesh=mesh,
+            input_partition_specs=(P(DCP_AXIS_NAME),) * 8 + (P(), P(), P()),
+            output_partition_specs=(P(DCP_AXIS_NAME),) * 6,
+        )
+
+        def group_gather_impl(skip_caches, head_nope_cache, local_topk_indices, md):
+            flat = [t for pair in skip_caches for t in pair]
+            return op(
+                *flat,
+                head_nope_cache,
+                local_topk_indices,
+                md.block_tables,
+                md.query_start_loc,
+                md.request_distribution,
+            )
+
+        return group_gather_impl
 
     def forward(
         self,
@@ -2888,6 +3057,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # TPU_GROUP_BATCHED_GATHER: this skip_topk layer's rows, pre-gathered
+        # by its group head (`VllmTPUMultiHeadLatentAttentionWrapper`).
+        group_pre = kwargs.get("group_pre_gathered")
+        group_kw = {} if group_pre is None else {"group_pre_gathered": group_pre}
         # TPU_DCP_MERGE_VSPACE: the DCP merge already applied W_UV.
         projected = False
         # Query replication hands us the whole DCP group's heads already, so
@@ -3003,6 +3176,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     )
                 ):
                     fused_op = getattr(layer, "sparse_mla_dcp_fused_op", None)
+                    if group_pre is not None:
+                        send_op = getattr(layer, "sparse_mla_dcp_send_pre_op", None)
+                        fused_op = getattr(layer, "sparse_mla_dcp_fused_pre_op", None)
+                        assert send_op is not None, (
+                            "TPU_GROUP_BATCHED_GATHER send op was never built"
+                        )
                     if fused_op is not None and _cp_mla_attention.fused_small_a2a_applies(
                         ql_nope_dcp.shape[0]
                     ):
@@ -3020,6 +3199,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             attn_metadata.query_start_loc,
                             attn_metadata.request_distribution,
                             *q_rope_table,
+                            **group_kw,
                         )
                         if envs.TPU_MLA_FUSED_SMALL_A2A_MERGE:
                             outputs = fused_out  # merged in the kernel
@@ -3043,6 +3223,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             attn_metadata.query_start_loc,
                             attn_metadata.request_distribution,
                             *q_rope_table,
+                            **group_kw,
                         )
                         outputs = _cp_mla_attention.merge_send_layout(
                             send, attn_metadata.query_start_loc, ql_nope_dcp.shape[0]
@@ -3054,6 +3235,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         dcp_op = layer.sparse_mla_dcp_rope_op
                         assert dcp_op is not None, (
                             "TPU_MLA_DECODE_PROLOGUE rope op was never built"
+                        )
+                    if group_pre is not None:
+                        dcp_op = layer.sparse_mla_dcp_rope_pre_op
+                        assert dcp_op is not None and q_rope_table, (
+                            "TPU_GROUP_BATCHED_GATHER rope op was never built"
                         )
                     partial, lse = dcp_op(
                         kv_cache,
@@ -3067,6 +3253,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         attn_metadata.query_start_loc,
                         attn_metadata.request_distribution,
                         *q_rope_table,
+                        **group_kw,
                     )
                     # The scatter undoes the head all-gather above.
                     #

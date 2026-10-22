@@ -14,6 +14,8 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+from collections.abc import Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -3164,6 +3166,122 @@ def _chunk_kernel_batch_size(
     return small_chunk, _largest_divisor(chunk_size, batch_cap)
 
 
+def _decode_gather_atoms(
+    num_tokens: int,
+    attention_kernel_batch_size: int,
+    small_chunk_tokens: int,
+    small_chunk_batch_size: int | None,
+    small_chunk_live_gather: bool,
+    small_chunk_gather_atoms: int,
+    sparsecore_atoms_per_batch: int,
+) -> int:
+    """Gather atoms per owner batch of a one-chunk decode bucket, exactly as
+    the fused prep and `sparse_attention_chunk` pick them."""
+    small, _ = _chunk_kernel_batch_size(
+        num_tokens,
+        attention_kernel_batch_size,
+        small_chunk_tokens,
+        small_chunk_batch_size,
+    )
+    if small and small_chunk_live_gather:
+        return small_chunk_gather_atoms
+    return sparsecore_atoms_per_batch
+
+
+def group_gather_supported(
+    num_tokens: int, topk: int, topk_cap: int | None, chunk_size: int
+) -> bool:
+    """Whether a bucket takes the fused-prep decode gather that
+    `group_gather_decode` replays (one chunk, capped, <= FUSED_PREP_MAX_TOKENS)."""
+    return bool(
+        topk_cap
+        and topk_cap < topk
+        and topk % topk_cap == 0
+        and topk_cap % GATHER_ATOM_ROWS == 0
+        and 0 < num_tokens <= FUSED_PREP_MAX_TOKENS
+        and num_tokens <= chunk_size
+    )
+
+
+def group_gather_decode(
+    caches: Sequence[tuple[jax.Array, jax.Array]],
+    topk_indices: jax.Array,  # i32[num_tokens, topk], the group's shared top-k
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    topk_cap: int,
+    gather_and_attention_chunk_size: int = DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE,
+    attention_kernel_batch_size: int = DEFAULT_ATTENTION_KERNEL_BATCH_SIZE,
+    small_chunk_tokens: int = 16,
+    small_chunk_batch_size: int | None = 1,
+    small_chunk_live_gather: bool = True,
+    small_chunk_gather_atoms: int = 1,
+    sparsecore_atoms_per_batch: int = 16,
+    sparsecore_gather_wait_mode: str = "overlap_rope",
+    sparsecore_gather_pipelined: bool = True,
+    after: Any = None,
+) -> list[tuple[jax.Array, jax.Array]]:
+    """TPU_GROUP_BATCHED_GATHER, at a group head: the decode gather of every
+    one of `caches` (the group's skip_topk layers) in one SparseCore call.
+
+    Replays `sparse_ragged_paged_attention`'s fused-prep decode path for
+    these arguments (same window prep, so XLA can CSE it with the head's own;
+    same live bound and atoms), then gathers all layers' rows from the shared
+    window indices (`dsa_gather_native_sc_group` multi mode). Each result is
+    what that layer's own gather would return before this step's KV write;
+    pass it to that layer's attention as `group_pre_gathered`.
+
+    `after` (optional pytree): the gather is ordered after it (an
+    optimization barrier on its window indices), e.g. the head's updated
+    cache, so the head's own gather is not queued behind this call.
+    """
+    num_tokens, topk = topk_indices.shape
+    if not group_gather_supported(
+        num_tokens, topk, topk_cap, gather_and_attention_chunk_size
+    ):
+        raise ValueError(
+            f"group gather unsupported: {num_tokens} tokens, topk {topk}, cap "
+            f"{topk_cap}, chunk {gather_and_attention_chunk_size}"
+        )
+    page_size = caches[0][0].shape[1]
+    prep_small, prep_batch = _chunk_kernel_batch_size(
+        num_tokens,
+        attention_kernel_batch_size,
+        small_chunk_tokens,
+        small_chunk_batch_size,
+    )
+    atoms = (
+        small_chunk_gather_atoms
+        if prep_small and small_chunk_live_gather
+        else sparsecore_atoms_per_batch
+    )
+    window_indices = prepare_capped_window_fused(
+        topk_indices,
+        page_indices,
+        cu_q_lens,
+        cu_q_lens[distribution[2]],
+        topk_cap=topk_cap,
+        page_size=page_size,
+        total_num_pages=caches[0][0].shape[0],
+        kernel_batch_size=prep_batch,
+        gather_atoms=atoms,
+    )
+    if after is not None:
+        window_indices, _ = lax.optimization_barrier((window_indices, after))
+    outs = native_sc_gather.dsa_gather_native_sc_group(
+        tuple((n, r) for n, r in caches),
+        window_indices,
+        out_size=num_tokens * topk,
+        live_vec_offset=num_tokens * topk,
+        atoms_per_batch=atoms,
+        wait_mode=sparsecore_gather_wait_mode,
+        serve_pipelined=sparsecore_gather_pipelined,
+        live_multiple=prep_batch * topk_cap,
+    )
+    return [(outs[2 * g], outs[2 * g + 1]) for g in range(len(caches))]
+
+
 def prepare_q_inputs(
     q: jax.Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim],
 ):
@@ -3295,6 +3413,8 @@ def sparse_ragged_paged_attention(
     send_exchange: tuple | None = None,
     send_peer: jax.Array | None = None,
     send_recv_in: jax.Array | None = None,
+    group_pre_gathered: tuple[jax.Array, jax.Array] | None = None,
+    group_fault: str | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -3463,6 +3583,14 @@ def sparse_ragged_paged_attention(
       out_pieces_gather_first: With `out_pieces` taken: issue every chunk's
         gather before any attention and tie the gathers of the chunks after
         piece 0 to piece 0's buffers with an optimization barrier. Same values.
+      group_pre_gathered: TPU_GROUP_BATCHED_GATHER, fused-prep decode path
+        with `kv_write` only: this layer's rows as `group_gather_decode`
+        gathered them at its group head, before this step's write (flat
+        u32[T * topk, 128] nope, u32[T * topk / 4, 128] rope). Instead of the
+        gather, one `native_sc_gather.dsa_gather_native_sc_group` patch call
+        writes `kv_write` and re-gathers only the atoms naming a written row.
+        Bit-identical outputs and caches. `group_fault`: test-only
+        (`native_sc_gather.GROUP_FAULTS`).
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -3652,6 +3780,8 @@ def sparse_ragged_paged_attention(
         raise ValueError("fused_window_prep requires lse_mask_empty")
     if kv_write is not None and not fused_prep:
         raise ValueError("kv_write needs the fused-prep decode path (one gather)")
+    if group_pre_gathered is not None and (kv_write is None or not fused_prep):
+        raise ValueError("group_pre_gathered needs kv_write on the fused-prep path")
     if fused_prep:
         assert topk_cap is not None
         # Only the attention kernel reads kv_lens here: the fused prep counts
@@ -3922,6 +4052,47 @@ def sparse_ragged_paged_attention(
             **extra,
         )
 
+    group_caches = None
+    if group_pre_gathered is not None:
+        # TPU_GROUP_BATCHED_GATHER: write + re-gather the stale atoms into the
+        # head's pre-gathered rows; the chunk then attends them as is.
+        assert window_indices_all is not None and topk_cap is not None
+        g_nope, g_rope, cache_kv_nope, cache_kv_rope = (
+            native_sc_gather.dsa_gather_native_sc_group(
+                ((cache_kv_nope, cache_kv_rope),),
+                window_indices_all,
+                out_size=q.shape[0] * topk,
+                live_vec_offset=q.shape[0] * topk,
+                atoms_per_batch=_decode_gather_atoms(
+                    q.shape[0],
+                    attention_kernel_batch_size,
+                    small_chunk_tokens,
+                    small_chunk_batch_size,
+                    small_chunk_live_gather,
+                    small_chunk_gather_atoms,
+                    sparsecore_atoms_per_batch,
+                ),
+                wait_mode=sparsecore_gather_wait_mode,
+                serve_pipelined=sparsecore_gather_pipelined,
+                live_multiple=prep_batch * topk_cap,
+                gathered=group_pre_gathered,
+                kv_write=kv_write
+                if isinstance(kv_write, jax.Array)
+                else native_sc_gather.pack_write_rows(*kv_write),
+                fault=group_fault,
+            )
+        )
+        windows = topk // topk_cap
+        group_caches = (cache_kv_nope, cache_kv_rope)
+        kv_write = None
+        pre_group = (
+            g_nope.reshape(windows * q.shape[0], topk_cap, 128),
+            g_rope.reshape(
+                windows * q.shape[0], topk_cap // native_sc_gather.ROPE_PACKING, 128
+            ),
+            None,
+        )
+
     # Merge pieces, gathers first (`out_pieces_gather_first`): every chunk's
     # SparseCore gather is issued up front, and the attention of the chunks
     # after piece 0 waits on all of them together with piece 0's buffers (one
@@ -3957,6 +4128,8 @@ def sparse_ragged_paged_attention(
         extra = {"out_piece": out_piece}
         if pre[i] is not None:
             extra["pre_gathered"] = pre[i]
+        if group_caches is not None:
+            extra["pre_gathered"] = pre_group
         if piece_rows and i:
             # Merge pieces leave the attention calls independent, and XLA is
             # then free to run them in any order (it reversed them). Keep the
@@ -3984,6 +4157,8 @@ def sparse_ragged_paged_attention(
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     caches = () if kv_write is None else (cache_kv_nope, cache_kv_rope)
+    if group_caches is not None:
+        caches = group_caches
     if return_lse:
         if send_world:
             # `lse` is the send buffer; `out` was not written.
