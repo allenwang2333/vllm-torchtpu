@@ -912,6 +912,11 @@ DECODE_SMALL_ROWS = 16
 #: DMA of the body waits behind.
 DECODE_ASYNC_GROUP_SIZES = True
 
+#: Whether the decode path pins its unpadded lhs operand to HBM. Left to XLA,
+#: it can be placed in VMEM, and each call then starts ~0.65 us after the
+#: op before it (measured in a 16-call profile).
+DECODE_LHS_IN_HBM = True
+
 
 def decode_slots(cfgs: GmmConfigs) -> int:
     """Whole-expert weight buffers of the decode path at `cfgs`."""
@@ -1897,6 +1902,8 @@ def gmm_v2(
     is_decode = use_decode_path(cfgs)
     if padded_size_m != size_m and not is_decode:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    if is_decode and DECODE_LHS_IN_HBM:
+        lhs = pltpu.with_memory_space_constraint(lhs, pltpu.HBM)
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
