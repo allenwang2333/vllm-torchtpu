@@ -57,6 +57,7 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.kv_cache_materializer import (
+    MaterializedKVCache,
     build_kernel_block_size_by_group_id,
     can_share_attention_cache,
     format_kv_cache_layout_summary,
@@ -360,6 +361,13 @@ class KVCacheManager:
                     page_size_padded=page_size_padded,
                 )
             elif isinstance(attn_module, DeepseekV32IndexerCache):
+                if self._glm5_unified_pool() and getattr(
+                    attn_module, "kv_dtype_is_fixed", False
+                ):
+                    # GLM-5.3 pool-key cache: folded into the MLA group on
+                    # the unified pool (see glm5_next/unified_pool.py), so it
+                    # declares no group of its own.
+                    continue
                 # DSA indexer K cache: the module declares its own spec
                 # (DeepSeek: uint8, head_dim fp8 bytes + 1 e8m0 scale byte per
                 # token; GLM-5.3-Flash: bf16 `[k | gate]` rows).
@@ -1186,6 +1194,13 @@ class KVCacheManager:
         if cw is not None and hasattr(cw, "spec") and hasattr(cw.spec, "prewarm_shape"):
             cw.spec.prewarm_shape(p)
 
+    def _glm5_unified_pool(self) -> bool:
+        from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+            glm5_unified_pool_enabled,
+        )
+
+        return glm5_unified_pool_enabled(self.runner.vllm_config)
+
     def _initialize_unified_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.runner.attn_groups = []
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -1212,6 +1227,25 @@ class KVCacheManager:
                     )
                 ]
             )
+
+        glm5_pool_keys: dict[str, str] = {}
+        if self._glm5_unified_pool():
+            from vllm_torchtpu.models.vllm.glm5_next.unified_pool import (
+                pool_key_pairs,
+            )
+
+            glm5_pool_keys = pool_key_pairs(
+                self.runner.vllm_config.compilation_config.static_forward_context
+            )
+            # The pool-key caches ride the MLA group's block table: listing
+            # them in its attention group gives them its metadata.
+            mla_groups = [
+                group_list[0]
+                for group_list in self.runner.attn_groups
+                if isinstance(group_list[0].kv_cache_spec, MLAAttentionSpec)
+            ]
+            assert len(mla_groups) == 1, [g.kv_cache_spec for g in mla_groups]
+            mla_groups[0].layer_names.extend(glm5_pool_keys)
 
         # The HND batched-RPA backend distinguishes its generic 128-token page
         # from the wider page sizes supported by PCP streaming via the active
@@ -1267,14 +1301,38 @@ class KVCacheManager:
         block_major = unified_block_major_enabled(self.runner.vllm_config)
         if block_major:
             self._check_block_major_pool_supported()
-        materialized = materialize_kv_cache_tensors(
-            kv_cache_config=kv_cache_config,
-            attn_groups=self.runner.attn_groups,
-            kernel_block_sizes=kernel_block_sizes,
-            device=self.runner.device,
-            cache_dtype=self.runner.kv_cache_dtype,
-            block_major=block_major,
-        )
+        if glm5_pool_keys:
+            from vllm_torchtpu.models.vllm.glm5_next import unified_pool
+
+            if block_major:
+                raise NotImplementedError(
+                    "GLM-5.3 unified pool does not support the block-major pool"
+                )
+            glm5_kv_caches, glm5_raw, glm5_layer_to_raw = unified_pool.materialize(
+                vllm_config=self.runner.vllm_config,
+                kv_cache_config=kv_cache_config,
+                attn_groups=self.runner.attn_groups,
+                pool_key_layers=glm5_pool_keys,
+                device=self.runner.device,
+                forward_context=(
+                    self.runner.vllm_config.compilation_config.static_forward_context
+                ),
+                runner=self.runner,
+            )
+            materialized = MaterializedKVCache(
+                kv_caches=glm5_kv_caches,
+                raw_tensors=glm5_raw,
+                layer_to_raw=glm5_layer_to_raw,
+            )
+        else:
+            materialized = materialize_kv_cache_tensors(
+                kv_cache_config=kv_cache_config,
+                attn_groups=self.runner.attn_groups,
+                kernel_block_sizes=kernel_block_sizes,
+                device=self.runner.device,
+                cache_dtype=self.runner.kv_cache_dtype,
+                block_major=block_major,
+            )
         kv_caches = materialized.kv_caches
         self.runner.kv_cache_raw_tensors = materialized.raw_tensors
         self.runner.bm_pool_layout = materialized.bm_pool_layout
@@ -1289,7 +1347,12 @@ class KVCacheManager:
             )
         if self.runner._unified_kv_layout:
             self.runner._build_mamba_copy_plan(
-                kv_cache_config, materialized.layer_to_raw, materialized.bm_pool_layout
+                kv_cache_config,
+                materialized.layer_to_raw,
+                materialized.bm_pool_layout,
+                # GLM-5.3's state tensors (nope) are one pool block per
+                # manager block, but hold only part of the manager page.
+                pool_block_split=1 if glm5_pool_keys else None,
             )
 
         for layer_name, target_layer_name in self.runner.shared_kv_cache_layers.items():

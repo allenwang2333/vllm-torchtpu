@@ -911,6 +911,94 @@ def _build_kpool_index_op(
     return op
 
 
+def gather_pooled_member(pool, state_indices, kpool: int):
+    """Member rows of each request's state block, as the kernel's rows.
+
+    On the unified pool (glm5_next/unified_pool.py) the member state is the
+    first ``kpool`` token rows of the request's state block in the sparse-MLA
+    nope cache ``(blocks, block_size, 4, 128)`` uint8, and ``state_indices``
+    are manager block ids. Read through `pool_adapters` (one DMA per request,
+    pool layout untouched), not an XLA gather: under the uint8 tiling an XLA
+    gather / scatter relayouts the whole multi-GB pool on every call. The
+    returned bf16 view is the kernel's own byte packing: reshape it to
+    ``[n, kpool, 2 * head_dim]`` to use it and back to write it with
+    `scatter_pooled_member`; nothing else reads these bytes.
+    """
+    from vllm_torchtpu.kernels import pool_adapters
+
+    return pool_adapters.gather_region(
+        pool, state_indices, tok0=0, ntok=kpool, out_dtype=jnp.bfloat16
+    )
+
+
+def scatter_pooled_member(pool, rows, state_indices, kpool: int):
+    """Inverse of `gather_pooled_member`; returns the updated pool."""
+    from vllm_torchtpu.kernels import pool_adapters
+
+    return pool_adapters.scatter_region(pool, rows, state_indices, tok0=0, ntok=kpool)
+
+
+def _with_pooled_member(fn, kpool: int):
+    """Let `fn` (member_state, key_cache, *rest) run on the unified pool:
+    gather the member rows into a dense buffer (`gather_pooled_member`), run
+    `fn` with identity slots, and scatter them back."""
+
+    def wrapped(
+        member_state,
+        key_cache,
+        k_new,
+        gate_new,
+        q,
+        weights,
+        ape,
+        seq_lens,
+        cu_q_lens,
+        distribution,
+        state_indices,
+        key_page_indices,
+    ):
+        if member_state.ndim != 4:
+            return fn(
+                member_state,
+                key_cache,
+                k_new,
+                gate_new,
+                q,
+                weights,
+                ape,
+                seq_lens,
+                cu_q_lens,
+                distribution,
+                state_indices,
+                key_page_indices,
+            )
+        pool = member_state
+        n = state_indices.shape[0]
+        rows = gather_pooled_member(pool, state_indices, kpool)
+        dense = rows.reshape(n, kpool, 2 * k_new.shape[-1])
+        identity = jnp.arange(n, dtype=state_indices.dtype)
+        dense, key_cache, topk = fn(
+            dense,
+            key_cache,
+            k_new,
+            gate_new,
+            q,
+            weights,
+            ape,
+            seq_lens,
+            cu_q_lens,
+            distribution,
+            identity,
+            key_page_indices,
+        )
+        pool = scatter_pooled_member(
+            pool, dense.reshape(rows.shape), state_indices, kpool
+        )
+        return pool, key_cache, topk
+
+    return wrapped
+
+
 @functools.cache
 def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
     """The v3 indexer for a sequence-parallel step (see `sp.py`).
@@ -980,6 +1068,8 @@ def _build_kpool_index_v3_sp_op(kpool: int, select_k: int, width: int):
             q_is_local=True,
         )
         return member_state, key_cache, topk
+
+    _local = _with_pooled_member(_local, kpool)
 
     def _bound(
         member_state: jax.Array,
@@ -1073,7 +1163,7 @@ def _build_kpool_index_v3_op(
         mesh = get_pallas_mesh(axis_names=(_TOKEN_SHARD_AXIS,))
         num_shards = dist.get_world_size()
 
-    def _call(*args):
+    def _dense_call(*args):
         return _kpool_index_v3_jax(
             *args,
             kpool=kpool,
@@ -1083,6 +1173,8 @@ def _build_kpool_index_v3_op(
             num_shards=num_shards,
             shard_min_tokens=shard_min_tokens,
         )
+
+    _call = _with_pooled_member(_dense_call, kpool)
 
     # `pallas.jax_op` reads the annotations to build the torch schema.
     def _bound(

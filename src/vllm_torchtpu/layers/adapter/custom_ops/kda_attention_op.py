@@ -541,6 +541,7 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
+    pool_tokens_per_row: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -585,7 +586,15 @@ def _pooled_kda_core(
     # consecutive pool blocks — so measure the regions against the manager
     # block and let gather_region/scatter_region remap the ids
     # (`state_indices * split + kb`) through their split branch.
-    tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    #
+    # `pool_tokens_per_row` states the packing explicitly. The inference
+    # below holds for the 4-D MLA pool (Kimi-Linear, Kimi-K3), but GLM-5.3's
+    # sparse-MLA nope cache `(blocks, block_size, 4, 128)` keeps one token
+    # per row while also having ndim > 3, so it passes 1.
+    if pool_tokens_per_row is None:
+        tokens_per_row = pool.shape[2] if pool.ndim > 3 else 1
+    else:
+        tokens_per_row = pool_tokens_per_row
     if pool_block_tokens % tokens_per_row != 0:
         raise ValueError(
             "Manager block size is not a whole number of pool "
@@ -728,6 +737,7 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
+    pool_tokens_per_row: int | None = None,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -745,6 +755,10 @@ def build_kimi_pooled_kda_op(
     adjusted value exists), so a value captured at build time is the
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
+
+    ``pool_tokens_per_row`` is the number of tokens one pool row holds (see
+    ``_pooled_kda_core``). Leave it unset for the MLA pool; GLM-5.3, whose
+    state lives in the sparse-MLA nope cache, passes 1.
     """
 
     conv_shard_heads = None
@@ -802,6 +816,7 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
+            pool_tokens_per_row=pool_tokens_per_row,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -816,6 +831,10 @@ def build_kimi_pooled_kda_op(
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.
         op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
+    if pool_tokens_per_row is not None:
+        # The row packing decides every region offset, so it is part of the
+        # compiled program too.
+        op_name += f"_rows{pool_tokens_per_row}"
     pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
 
     def _fake_pooled(

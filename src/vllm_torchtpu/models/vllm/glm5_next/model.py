@@ -100,8 +100,14 @@ class Glm5NextDecoderLayer(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
 
         if config.layer_types[self.layer_idx] == "linear_attention":
+            # On the unified pool the KDA state lives in the sparse-MLA nope
+            # cache, one token per row (glm5_next/unified_pool.py), which the
+            # Kimi op's MLA-pool packing inference would misread.
             self.self_attn = Glm5NextLinearAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn"
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
+                pool_tokens_per_row=1,
             )
         else:
             self.self_attn = Glm5NextMLA(
