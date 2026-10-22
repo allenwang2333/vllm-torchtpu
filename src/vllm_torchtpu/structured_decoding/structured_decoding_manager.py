@@ -354,7 +354,14 @@ class StructuredDecodingManager:
     def apply_grammar_bitmask(
         self, logits: torch.Tensor, grammar_bitmask: torch.Tensor, arange: torch.Tensor
     ) -> torch.Tensor:
-        assert logits.shape[0] == grammar_bitmask.shape[0]
+        # torch._assert, not assert or raise: it survives python -O, and under
+        # torch.compile(fullgraph=True) the caller still sees this message.
+        torch._assert(
+            logits.shape[0] == grammar_bitmask.shape[0],
+            "grammar_bitmask must have one row per logits row: "
+            f"logits.shape[0]={logits.shape[0]}, "
+            f"grammar_bitmask.shape[0]={grammar_bitmask.shape[0]}",
+        )
         target_dim = logits.shape[-1]
         if target_dim < self.vocab_size:
             raise ValueError(
