@@ -762,9 +762,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ascending device-id order, so the SparseCore gather gets its
     # N-dimensional algorithm without moving the program's DeviceAssignment.
     "MOE_FUSED_EP_SORTED_GATHER": env_bool("MOE_FUSED_EP_SORTED_GATHER"),
-    # A JSON file naming, per MoE layer, which global experts each EP rank
-    # holds and in what slot order (expert_placement.py). Empty: the
-    # checkpoint's contiguous blocks.
+    # A static expert placement for the fused EP MoE kernel: a JSON table
+    # naming, per MoE layer, which global experts each EP rank holds and in
+    # what slot order -- a permutation, experts / ranks to a rank
+    # (expert_placement.py). A local path, a gs:// URI, or the name of a table
+    # shipped in vllm_torchtpu/expert_placements/. Empty: the checkpoint's
+    # contiguous blocks.
     "TPU_EXPERT_PLACEMENT": env_str("TPU_EXPERT_PLACEMENT", ""),
     # Directory the per-layer routed-expert counts are written to
     # (layers/adapter/expert_count_tap.py), every MOE_EXPERT_COUNT_TAP_EVERY
@@ -773,7 +776,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_EXPERT_COUNT_TAP_EVERY": env_int("MOE_EXPERT_COUNT_TAP_EVERY", 1000),
     # Finish the shared expert before the fused EP kernel starts, so it runs
     # while the kernel's token all-gather is in flight instead of after the
-    # kernel; see VllmMoERunner._apply_quant_method.
+    # kernel; see VllmMoERunner._apply_quant_method. The shared output is then
+    # materialized before the shared + routed sum rather than fused into it,
+    # so that sum may round differently in its last bits.
     "MOE_FUSED_EP_SHARED_BEFORE_KERNEL": env_bool("MOE_FUSED_EP_SHARED_BEFORE_KERNEL"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its

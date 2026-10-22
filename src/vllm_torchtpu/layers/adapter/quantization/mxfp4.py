@@ -475,9 +475,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if expert_placement.apply_to_layer(layer):
-            # A placement with replicas gives this rank more slots.
-            num_experts = layer.local_num_experts
+        # Before the weights load: a placed layer's expert map names the
+        # experts this rank's slots hold, which is what the loader fetches.
+        if expert_placement.apply_to_layer(layer) and not envs.MOE_FUSED_EP_ENABLE_W4A8:
+            # Only the W4A8 fused EP path reads slot order (_prebuild_w4a8);
+            # refuse now rather than after the whole checkpoint has loaded.
+            raise RuntimeError(
+                f"TPU_EXPERT_PLACEMENT places {layer.layer_name}'s experts for "
+                "the fused EP kernel, which MOE_FUSED_EP_ENABLE_W4A8 does not "
+                "enable for DeepSeek-V4 MXFP4"
+            )
         Mxfp4MoEMethod.create_weights(
             self,
             layer,

@@ -14,11 +14,14 @@
 # limitations under the License.
 """Build a TPU_EXPERT_PLACEMENT table from MOE_EXPERT_COUNT_TAP_DIR snapshots.
 
-    moe_expert_placement.py --shards 16 --layers 3:60 [--replica-slots 20] \\
+    moe_expert_placement.py --shards 16 --layers 3:60 \\
         --out placement.json TAP_DIR [TAP_DIR ...]
 
 Each rank's load is its last snapshot minus its `--skip`-th (1-based; 0 keeps
 everything), which drops warmup and compile traffic; ranks are then summed.
+Only the latest run in a directory counts: a restarted server numbers its
+snapshots after the old ones and starts its `step` over, so the snapshots from
+the last drop in `step` on are one run's.
 
 A layer is as slow as its costliest rank, and a rank's cost is the sum of its
 slots' costs (VisitModel: weight stream floor, full and short tiles). Each
@@ -26,9 +29,8 @@ layer is placed to minimise the EXPECTED straggler over steps sampled from the
 measured per-expert means and variances: costliest-first onto the cheapest
 rank, then pairwise swaps off the rank that is most often the straggler. A
 layer whose expected straggler does not drop by --min-gain-us stays
-contiguous. `--replica-slots` extra slots per rank in total (each one more
-expert's weights per rank in HBM) go one at a time to the layer whose expected
-straggler drops most; a replica takes an even share of its expert's rows.
+contiguous. A placement only permutes a layer's experts over the ranks,
+experts / shards to a rank; it never replicates one.
 """
 
 import argparse
@@ -50,12 +52,17 @@ def load_counts(dirs, skip):
         pattern = os.path.join(d, "**", "counts_ep*_*.npz")
         for path in glob.glob(pattern, recursive=True):
             m = re.search(r"counts_ep(\d+)_(\d+)\.npz$", path)
-            by_rank[(d, int(m.group(1)))].append((int(m.group(2)), path))
+            if m:
+                by_rank[(d, int(m.group(1)))].append((int(m.group(2)), path))
     if not by_rank:
         raise SystemExit(f"no counts_ep*_*.npz under {dirs}")
     mean, var, names = None, None, None
     for key, snaps in sorted(by_rank.items()):
         snaps.sort()
+        # The latest run: everything from the last restart of `step` on.
+        steps = [int(np.load(path)["step"]) for _, path in snaps]
+        restarts = [i for i in range(1, len(steps)) if steps[i] <= steps[i - 1]]
+        snaps = snaps[restarts[-1] :] if restarts else snaps
         if len(snaps) <= skip:
             raise SystemExit(f"{key}: {len(snaps)} snapshots, need more than {skip}")
         last = np.load(snaps[-1][1])
@@ -107,7 +114,7 @@ def sample_rows(mu, var, steps, rng):
     return np.maximum(0, np.rint(mu[:, None] + sd[:, None] * noise))
 
 
-def place(mu, var, shards, spare, model, steps=64, sweeps=200, seed=0):
+def place(mu, var, shards, model, steps=64, sweeps=200, seed=0):
     """(per rank the experts it holds, expected straggler us).
 
     The objective is the mean over sampled steps of the costliest rank, so a
@@ -117,26 +124,14 @@ def place(mu, var, shards, spare, model, steps=64, sweeps=200, seed=0):
     """
     rng = np.random.default_rng(seed)
     experts = mu.size
-    width = experts // shards + spare
-    reps = np.ones(experts, int)
-    for _ in range(shards * spare):
-        e = max(
-            (e for e in range(experts) if reps[e] < shards),
-            key=lambda e: (float(model.cost(mu[e] / reps[e])), mu[e] / reps[e]),
-        )
-        reps[e] += 1
+    width = experts // shards
     rows = sample_rows(mu, var, steps, rng)
-    cost = {e: model.cost(rows[e] / reps[e]) for e in range(experts)}
-    # Replicated experts first: their copies need distinct ranks, which only
-    # stays possible while every rank still has free slots.
-    order = sorted(
-        (e for e in range(experts) for _ in range(reps[e])),
-        key=lambda e: (reps[e] == 1, -cost[e].mean()),
-    )
+    cost = {e: model.cost(rows[e]) for e in range(experts)}
+    order = sorted(range(experts), key=lambda e: -cost[e].mean())
     held = [[] for _ in range(shards)]
     total = np.zeros((shards, steps))
     for e in order:
-        free = [r for r in range(shards) if len(held[r]) < width and e not in held[r]]
+        free = [r for r in range(shards) if len(held[r]) < width]
         r = min(free, key=lambda r: total[r].mean())
         held[r].append(e)
         total[r] += cost[e]
@@ -146,15 +141,13 @@ def place(mu, var, shards, spare, model, steps=64, sweeps=200, seed=0):
         best = None
         for i, a in enumerate(held[hi]):
             for lo in range(shards):
-                if lo == hi or a in held[lo]:
+                if lo == hi:
                     continue
-                cand = [j for j, b in enumerate(held[lo]) if b not in held[hi]]
-                if not cand:
-                    continue
-                cb = np.stack([cost[held[lo][j]] for j in cand])
+                cand = list(range(len(held[lo])))
+                cb = np.stack([cost[b] for b in held[lo]])
                 new_hi = total[hi] - cost[a] + cb
                 new_lo = total[lo] + cost[a] - cb
-                rest = np.delete(total, [hi, lo], axis=0).max(0)
+                rest = np.delete(total, [hi, lo], axis=0).max(0, initial=0.0)
                 o = np.maximum(np.maximum(new_hi, new_lo), rest).mean(1)
                 k = int(np.argmin(o))
                 if o[k] < objective - 1e-9 and (best is None or o[k] < best[0]):
@@ -172,8 +165,7 @@ def place(mu, var, shards, spare, model, steps=64, sweeps=200, seed=0):
 def expected_straggler(held, mu, var, model, steps=256, seed=1):
     """Mean over sampled steps of the costliest rank of a given placement."""
     rows = sample_rows(mu, var, steps, np.random.default_rng(seed))
-    reps = np.bincount([e for h in held for e in h], minlength=mu.size)
-    total = np.stack([sum(model.cost(rows[e] / reps[e]) for e in h) for h in held])
+    total = np.stack([sum(model.cost(rows[e]) for e in h) for h in held])
     return total.max(0).mean()
 
 
@@ -188,12 +180,6 @@ def main():
         required=True,
         help="first:last decoder layers to place (a drafter's MoE layers are "
         "numbered after the target's)",
-    )
-    ap.add_argument(
-        "--replica-slots",
-        type=int,
-        default=0,
-        help="extra slots per rank, summed over layers, for replicas",
     )
     ap.add_argument("--min-gain-us", type=float, default=5.0)
     ap.add_argument("--floor-us", type=float, default=4.86)
@@ -226,18 +212,7 @@ def main():
         m = _LAYER_RE.search(name)
         if m and lo <= int(m.group(1)) <= hi:
             layers[int(m.group(1))] = (mu, var)
-    spare = dict.fromkeys(layers, 0)
-    built = {n: place(mu, var, a.shards, 0, model) for n, (mu, var) in layers.items()}
-    for _ in range(a.replica_slots):
-        trial = {
-            n: place(mu, var, a.shards, spare[n] + 1, model)
-            for n, (mu, var) in layers.items()
-        }
-        n = max(layers, key=lambda n: built[n][1] - trial[n][1])
-        if trial[n][1] >= built[n][1]:
-            break
-        spare[n] += 1
-        built[n] = trial[n]
+    built = {n: place(mu, var, a.shards, model) for n, (mu, var) in layers.items()}
     table, before, after = {}, [], []
     for n, (mu, var) in sorted(layers.items()):
         slots = mu.size // a.shards
@@ -248,8 +223,8 @@ def main():
         print(
             f"layer {n:3d} rows/step {mu.sum():8.1f} hottest expert "
             f"{mu.max() / mu.mean():5.1f}x mean | expected straggler us: "
-            f"contiguous {before[-1]:6.1f} placed {after[-1]:6.1f} "
-            f"replica slots {spare[n]}{'' if keep else ' -> not placed'}"
+            f"contiguous {before[-1]:6.1f} placed {after[-1]:6.1f}"
+            f"{'' if keep else ' -> not placed'}"
         )
         if keep:
             table[str(n)] = built[n][0]
@@ -260,8 +235,8 @@ def main():
     with open(a.out, "w") as f:
         json.dump(out, f)
     print(
-        f"wrote {a.out}: {len(table)} layers, {sum(spare.values())} replica slots "
-        f"per rank, expected straggler summed over layers "
+        f"wrote {a.out}: {len(table)} layers, expected straggler summed over "
+        f"layers "
         f"{sum(before) / 1e3:.2f} -> {sum(after) / 1e3:.2f} ms/step"
     )
 

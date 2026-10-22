@@ -3725,7 +3725,7 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-        expert_count_tap.maybe_dump(self.parallel_config.data_parallel_rank)
+        expert_count_tap.maybe_dump()
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:

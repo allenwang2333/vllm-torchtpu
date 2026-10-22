@@ -582,7 +582,7 @@ def _operand_fn(call, names):
     """`call` behind the signature (x, w1, w2, w1_scale, w2_scale, gating,
     rank, *names), every operand annotated jax.Array as torch_tpu requires.
 
-    The four fixed-arity functions in _build_op cover the unplaced layers and
+    The three fixed-arity functions in _build_op cover the unplaced layers and
     keep their programs as they were; every combination with a placement or
     an ordering operand goes through here instead of one more hand-written
     function per combination.
@@ -967,9 +967,9 @@ def prebuild_fused_moe_ep(
     # address the wrong shard for every id past the first uneven boundary,
     # silently. `local_experts * ep` is exactly the `e_total` the kernel will
     # derive from the global weight, so requiring the gate width to match it is
-    # the same check the kernel would make if it made one.
-    placed = expert_placement.expert_slot_table(layer)
-    if placed is None and layer.global_num_experts != local_experts * ep:
+    # the same check the kernel would make if it made one. An expert placement
+    # permutes the experts and keeps every block's size, so it passes too.
+    if layer.global_num_experts != local_experts * ep:
         logger.warning_once(
             "Fused EP MoE not engaged: the kernel needs one equal contiguous "
             "expert block per shard, but %d global experts over ep=%d does "
@@ -992,13 +992,34 @@ def prebuild_fused_moe_ep(
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
+    placed = expert_placement.expert_slot_table(layer)
+    if placed is None and expert_placement.placed_ranks(
+        getattr(layer, "layer_name", "")
+    ):
+        logger.warning_once(
+            "TPU_EXPERT_PLACEMENT lists %s, but its MoE method does not apply "
+            "placements; it keeps the checkpoint's contiguous expert blocks.",
+            layer.layer_name,
+        )
+    has_order_after = envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL
+    if sorted_gather is not None and (placed is not None or has_order_after):
+        # _build_split_ops passes at most one extra operand to route and
+        # compute; the slot table and the ordering operand are not wired
+        # through it. The single fused program takes both.
+        logger.warning_once(
+            "MOE_FUSED_EP_SORTED_GATHER does not cover TPU_EXPERT_PLACEMENT or "
+            "MOE_FUSED_EP_SHARED_BEFORE_KERNEL yet; %s runs as the single fused "
+            "program instead.",
+            "placed layers" if not has_order_after else "every layer",
+        )
+        sorted_gather = None
+
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
-    has_expert_slot = placed is not None
     op = _build_op(
         mesh,
         topk,
@@ -1014,8 +1035,8 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
-        has_expert_slot=has_expert_slot,
-        has_order_after=envs.MOE_FUSED_EP_SHARED_BEFORE_KERNEL,
+        has_expert_slot=placed is not None,
+        has_order_after=has_order_after,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

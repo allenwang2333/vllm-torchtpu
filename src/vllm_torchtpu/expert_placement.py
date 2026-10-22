@@ -18,25 +18,23 @@ what slot order:
 
     {"experts": 384, "shards": 16,
      "layers": {"3": [[17, 250, ...24 ids...], ...16 ranks...],
-                "7": [[94, 13, ...25 ids...], ...16 ranks...], ...}}
+                "7": [[94, 13, ...24 ids...], ...16 ranks...], ...}}
 
-Every rank of a layer lists the same number of slots, at least experts /
-shards; every expert of a listed layer is held at least once and at most once
-per rank. Slots beyond experts / shards hold REPLICAS of hot experts: each copy
-computes the share of that expert's tokens the kernel routes to it, at the
-cost of one more expert's weights in HBM per rank. Layers that are not listed
-keep the checkpoint's contiguous blocks.
+A listed layer is a PERMUTATION of its experts: every rank lists experts /
+shards of them, and every expert appears exactly once. Placement only moves
+experts between ranks; it never replicates one, so every rank keeps the
+checkpoint's expert count and memory. Layers that are not listed keep the
+checkpoint's contiguous blocks.
 
 What follows from it, all decided at load:
   * the layer's expert map puts expert `ranks[r][j]` in slot j of rank r, so
-    vLLM's weight loader and the fetch-time expert filter load exactly those
-    (and the layer holds that many slots, not experts / shards);
-  * `expert_slot_table` lists, per global expert, the SLOT ids holding it,
-    `r * slots + j`, the contiguous-block numbering the fused EP kernel
-    addresses. The kernel maps the selected ids after top-k, so selection,
-    tie-breaking, the router weights and the order of the k combine terms are
-    those of the unplaced model: every copy holds the same weights, so per
-    token the output is the same bits; only where the matmuls run moves.
+    vLLM's weight loader and the fetch-time expert filter load exactly those;
+  * `expert_slot_table` gives, per global expert, the SLOT holding it,
+    `r * (experts / shards) + j`, the contiguous-block numbering the fused EP
+    kernel addresses. The kernel relabels the selected ids after top-k, so
+    selection, tie-breaking, the router weights and the order of the k
+    combine terms are those of the unplaced model: per token the output is
+    the same bits; only where the matmuls run moves.
 
 Only the fused EP kernel reads slot ids, so a placed layer must be armed for
 it; `check_layer_served` refuses anything else.
@@ -65,10 +63,13 @@ _DRAFTER_TENSOR_RE = re.compile(r"^mtp\.(\d+)\.")
 # The layer attribute the slot table is registered under.
 EXPERT_SLOT_ATTR = "_tpu_expert_slot"
 
-# Layer indices whose expert map follows the placement in this process. The
-# fetch-time filter consults the placement only for these, so a model whose
-# MoE method never applied it keeps the default filter.
-_APPLIED_LAYERS: set[int] = set()
+# Layer index -> the EP rank whose slots this process's expert map holds, for
+# every layer whose expert map follows the placement. The fetch-time filter
+# consults the placement only for these, and at exactly that rank, so it keeps
+# what the expert map loads by construction (under hierarchical EP the rank is
+# the chip's, not the one the dp/pcp/tp formula gives), and a model whose MoE
+# method never applied the placement keeps the default filter.
+_APPLIED_LAYERS: dict[int, int] = {}
 
 
 @dataclass(frozen=True)
@@ -77,28 +78,23 @@ class Placement:
     shards: int
     layers: dict[int, tuple[tuple[int, ...], ...]]
 
-    def slots(self, layer: int) -> int:
-        """Slots per rank of a listed layer."""
-        return len(self.layers[layer][0])
-
     def ranks(self, layer: int) -> tuple[tuple[int, ...], ...] | None:
         """Per rank, the global experts it holds in slot order; None if unlisted."""
         return self.layers.get(layer)
 
-    def slot_table(self, layer: int) -> list[list[int]]:
-        """Row e: the slots r * slots + j holding expert e, padded with -1 to
-        the most replicas any expert of the layer has."""
-        held_at = [[] for _ in range(self.experts)]
-        slots = self.slots(layer)
+    def slot_table(self, layer: int) -> list[int]:
+        """Entry e: the slot r * (experts / shards) + j holding expert e."""
+        per_rank = self.experts // self.shards
+        slot = [0] * self.experts
         for r, held in enumerate(self.layers[layer]):
             for j, e in enumerate(held):
-                held_at[e].append(r * slots + j)
-        width = max(len(h) for h in held_at)
-        return [h + [-1] * (width - len(h)) for h in held_at]
+                slot[e] = r * per_rank + j
+        return slot
 
 
 def parse(table: dict, source: str = "<dict>") -> Placement:
-    """Validate a placement table: every expert held, no rank holds one twice."""
+    """Validate a placement table: each listed layer permutes its experts over
+    the ranks, experts / shards to a rank."""
     experts = int(table["experts"])
     shards = int(table["shards"])
     if experts % shards:
@@ -106,28 +102,19 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
             f"expert placement {source}: {experts} experts do not divide over "
             f"{shards} ranks"
         )
+    per_rank = experts // shards
     layers = {}
     for key, ranks in table["layers"].items():
-        slots = len(ranks[0]) if ranks else 0
-        if (
-            len(ranks) != shards
-            or slots < experts // shards
-            or any(len(held) != slots for held in ranks)
-        ):
+        if len(ranks) != shards or any(len(held) != per_rank for held in ranks):
             raise ValueError(
                 f"expert placement {source}: layer {key} must list {shards} "
-                f"ranks of one slot count, at least {experts // shards}"
+                f"ranks of {per_rank} experts each"
             )
         ranks = tuple(tuple(int(e) for e in held) for held in ranks)
-        if any(len(set(held)) != len(held) for held in ranks):
+        if sorted(e for held in ranks for e in held) != list(range(experts)):
             raise ValueError(
-                f"expert placement {source}: layer {key} holds an expert twice "
-                "on one rank"
-            )
-        if sorted({e for held in ranks for e in held}) != list(range(experts)):
-            raise ValueError(
-                f"expert placement {source}: layer {key} must hold every one "
-                f"of the {experts} experts"
+                f"expert placement {source}: layer {key} must hold each of the "
+                f"{experts} experts exactly once"
             )
         layers[int(key)] = ranks
     return Placement(experts=experts, shards=shards, layers=layers)
@@ -135,24 +122,51 @@ def parse(table: dict, source: str = "<dict>") -> Placement:
 
 def _read(uri: str) -> str:
     if uri.startswith("gs://"):
-        return subprocess.run(
-            ["gcloud", "storage", "cat", uri],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
+        try:
+            return subprocess.run(
+                ["gcloud", "storage", "cat", uri],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"TPU_EXPERT_PLACEMENT={uri} is read with the gcloud CLI, which "
+                "this image does not have; copy the table to a local path or "
+                "name a shipped placement"
+            ) from e
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"TPU_EXPERT_PLACEMENT={uri}: gcloud storage cat failed: "
+                f"{e.stderr.strip()}"
+            ) from e
     with open(uri) as f:
         return f.read()
 
 
 @functools.cache
+def _text(uri: str) -> str:
+    """The table's text, read once per process: the compile cache key and the
+    table the layers load come from the same read, so a file rewritten between
+    the two cannot key one placement and serve another."""
+    return _read(uri)
+
+
+@functools.cache
 def _digest(uri: str) -> str:
-    return hashlib.sha256(_read(uri).encode()).hexdigest()
+    return hashlib.sha256(_text(uri).encode()).hexdigest()
 
 
 @functools.cache
 def _load(path: str) -> Placement:
-    return parse(json.loads(_read(path)), path)
+    return parse(json.loads(_text(path)), path)
+
+
+def clear_cache() -> None:
+    """Forget every table read so far, for a caller that rewrites one."""
+    _text.cache_clear()
+    _digest.cache_clear()
+    _load.cache_clear()
 
 
 # Placements shipped with the package, by name (a file stem in this directory).
@@ -204,11 +218,13 @@ def has_applied_layers() -> bool:
     return bool(_APPLIED_LAYERS)
 
 
-def fetch_filter_ids(name: str, ep_rank: int) -> frozenset[int] | None:
+def fetch_filter_ids(name: str) -> frozenset[int] | None:
     """The experts the fetch-time filter keeps for this tensor's layer.
 
     None defers to the default contiguous filter: either there is no
-    placement for the layer, or no MoE method applied one to it.
+    placement for the layer, or no MoE method applied one to it. Otherwise
+    the experts of the EP rank `apply_to_layer` built the layer's expert map
+    for, so the fetch and the expert map cannot pick different ranks.
     """
     layer = layer_index(name)
     drafter = _DRAFTER_TENSOR_RE.match(name)
@@ -220,7 +236,7 @@ def fetch_filter_ids(name: str, ep_rank: int) -> frozenset[int] | None:
     ranks = placement.ranks(layer)
     if ranks is None:
         return None
-    return frozenset(ranks[ep_rank])
+    return frozenset(ranks[_APPLIED_LAYERS[layer]])
 
 
 def apply_to_layer(layer) -> bool:
@@ -237,6 +253,14 @@ def apply_to_layer(layer) -> bool:
     ranks = placed_ranks(layer.layer_name)
     if placement is None or layer_idx is None or ranks is None:
         return False
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        # check_layer_served would refuse this layer anyway, but only after
+        # the whole checkpoint has loaded; the flag is known now.
+        raise RuntimeError(
+            f"TPU_EXPERT_PLACEMENT={envs.TPU_EXPERT_PLACEMENT} places "
+            f"{layer.layer_name}'s experts for the fused EP MoE kernel, which "
+            "USE_MOE_FUSED_EP_KERNEL does not enable"
+        )
     manager = layer.expert_map_manager
     if manager.global_num_experts != placement.experts or manager.ep_size != (
         placement.shards
@@ -254,11 +278,17 @@ def apply_to_layer(layer) -> bool:
         )
     _target_layers()  # cached under the model config, for the loader's threads
     rank = manager.ep_rank
+    held = ranks[rank]
+    if len(held) != manager.local_num_experts:
+        # A permutation keeps every rank's expert count, so only the map moves.
+        raise ValueError(
+            f"expert placement: {layer.layer_name} holds "
+            f"{manager.local_num_experts} experts on rank {rank}, the placement "
+            f"{len(held)}"
+        )
     expert_map = torch.full((placement.experts,), -1, dtype=torch.int32)
-    slots = len(ranks[rank])
-    expert_map[list(ranks[rank])] = torch.arange(slots, dtype=torch.int32)
+    expert_map[list(held)] = torch.arange(len(held), dtype=torch.int32)
     manager._expert_map = expert_map.to(manager.expert_map.device)
-    manager._local_num_experts = slots
     layer.update_expert_map_info()
     layer.register_buffer(
         EXPERT_SLOT_ATTR,
@@ -269,7 +299,7 @@ def apply_to_layer(layer) -> bool:
         ),
         persistent=False,
     )
-    _APPLIED_LAYERS.add(layer_idx)
+    _APPLIED_LAYERS[layer_idx] = rank
     logger.info_once(
         "Expert placement %s applied: rank %d of %d, %d placed layers; "
         "first placed layer holds %s",
@@ -290,7 +320,7 @@ def _target_layers() -> int:
 
 
 def expert_slot_table(layer):
-    """The [experts, replicas] i32 slot table of a placed layer, or None."""
+    """The [experts] i32 slot table of a placed layer, or None."""
     return getattr(layer, EXPERT_SLOT_ATTR, None)
 
 
