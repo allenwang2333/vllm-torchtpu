@@ -220,11 +220,13 @@ class MQAOps:
         else:
             jax.lax.cond((record & 1) == 0, lambda: load(0), lambda: load(1))
 
-    def fetch(self, tile, metadata_slot, slot):
+    def fetch(self, tile, metadata_slot, slot, *, unroll=False):
         def body(i, _):
             self.load_page(tile, i, metadata_slot, slot)
 
-        jax.lax.fori_loop(0, self.plan.config.key_tile // PAGE_RECORDS, body, None)
+        jax.lax.fori_loop(
+            0, self.plan.config.key_tile // PAGE_RECORDS, body, None, unroll=unroll
+        )
 
     def wait_keys(self, tile):
         slot = self.key_slot(tile)

@@ -206,7 +206,9 @@ class Pipeline:
         if ops.skip_invalid_pages:
 
             def empty():
-                pl.when(pending)(lambda: ops.fetch(*self.prefetch_target(ops, tile)))
+                pl.when(pending)(
+                    lambda: ops.fetch(*self.prefetch_target(ops, tile), unroll=True)
+                )
                 ops.clear_output(tile)
 
             jax.lax.cond(

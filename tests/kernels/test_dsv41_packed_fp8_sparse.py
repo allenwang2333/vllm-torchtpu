@@ -39,7 +39,7 @@ def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
         skip_invalid_pages=True,
         key_slot=lambda tile: tile & 3,
         wait_keys=lambda tile: calls.append(("wait", tile)),
-        fetch=lambda *args: calls.append(("fetch", *map(int, args))),
+        fetch=lambda *args, **kwargs: calls.append(("fetch", *map(int, args), kwargs)),
         clear_output=lambda tile: calls.append(("clear", tile)),
         publish=lambda tile, **kwargs: calls.append(("publish", tile, kwargs)),
     )
@@ -47,7 +47,7 @@ def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
         pipeline.Pipeline(plan).step(ops, jnp.int32(0))
     expected = [("wait", 0)]
     if following:
-        expected.append(("fetch", 0, 1, 3))
+        expected.append(("fetch", 0, 1, 3, {"unroll": True}))
     expected.extend((("clear", 0), ("publish", 0, {})))
     assert calls == expected
 
