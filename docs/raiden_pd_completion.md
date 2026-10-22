@@ -4,8 +4,9 @@
 
 Raiden 的响应生命周期现通过 init patch 接入官方 `Scheduler` / `AsyncScheduler`。
 四个临时 Raiden scheduler 类已删除，不再配置它们的 `scheduler_cls`。
-P 侧显式设置 `additional_config.raiden_pd_send_completion=true`，保留发送完成后
-才结束响应的契约；D 侧 Raiden consumer 设置 `kv_load_failure_policy="fail"`，
+P 侧 Raiden Stage-3 producer 的 DELTA / CUMULATIVE 请求自动等待发送完成后才结束响应，
+无需配置 `additional_config.raiden_pd_send_completion`；D 侧 Raiden consumer 设置
+`kv_load_failure_policy="fail"`，
 保留按请求身份终止加载失败、输出 `model.KVTDecodeLoadFailure` 的契约。
 调度、异步 token 账目、跨 rank 屏障及 KV 回收仍由 vLLM 负责。
 
@@ -17,22 +18,29 @@ P 侧显式设置 `additional_config.raiden_pd_send_completion=true`，保留发
 config.pop("scheduler_cls", None)
 config["async_scheduling"] = True  # False 选择官方同步 Scheduler
 
-# P：仅需要发送完成终包的流式前端开启。
-config.setdefault("additional_config", {})["raiden_pd_send_completion"] = True
-
 # D：沿用显式加载失败策略。
 config["kv_transfer_config"]["kv_load_failure_policy"] = "fail"
 ```
 
-P 字段必须为布尔类型，默认关闭；已有 `additional_config` 时合并该字段。
-该开关要求 Raiden Stage-3、`kv_producer`、TP1/DP1/PP1 和恰好一个
-`TPURaidenConnector`，可位于 `TPUMultiConnector` 中；不支持多引擎 finished IDs
-记录。PCP 沿用原有跨 rank 汇聚。
+P 完成桥由 Raiden Stage-3、`KVTransferConfig.is_kv_producer` 和恰好一个
+`TPURaidenConnector` 自动启用，可位于 `TPUMultiConnector` 中。沿用 vLLM 的
+producer 能力属性，`kv_producer` 与 `kv_both` 均可启用，包含外层角色为 `kv_both`、
+Raiden 子 connector 为 producer 的默认组合；旧配置字段不再读取，可删除。
+不具备 producer 能力、其他 transport 或 connector 保持原路径。
+完成桥不再额外限制 TP/DP/PP 为 1；拓扑仍须通过
+平台与 connector 原有校验，不代表任意 PP×TP×DP 组合均受支持。
+每个 DP engine 独立处理请求，沿用 connector 的 `get_finished_count()` 和 vLLM
+`KVOutputAggregator` 汇聚该 engine 内的发送完成，不增加跨 DP engine 的屏障。
 
 P 前端必须在收到首个 token/KV handle 后启动 D，并继续读 P 的响应流。
 沿用当前 DashLLM 契约：`n=1`、`max_tokens=1`、DELTA 输出、无 stop strings，
 `DS_LLM_ENABLE_DISAGGREGATED_PREFILL_ABORT=0`。不能先等 P 整条响应结束再启动 D。
-普通非流式 P→D 调用保持开关关闭，否则双方会互相等待。
+完成桥延后 vLLM `RequestOutputKind.DELTA` / `CUMULATIVE` 请求，两者都能提前交付
+pending 输出和 KV handle。CUMULATIVE 的调用方应在中间输出到达时启动 D，
+不能等待 P 的最终输出；其最终 `RequestOutput` 保留累计 token，
+引擎完成通知本身不追加 token。`FINAL_ONLY` 保留原模型终态和 client finished ID，
+不生成 Pkg2。OpenAI 非流式请求使用
+`FINAL_ONLY`，因此示例代理和容量验收仍可先获取 P 的 KV handle，再启动 D。
 
 D 处理只对 Raiden Stage-3 consumer、`fail` 策略和一个 `TPURaidenConnector`
 启用，要求 `TPU_RAIDEN_INLINE_LOAD=0`。其他 connector、transport、role 或
@@ -48,11 +56,16 @@ KV consumer 的 `kv_load_failure_policy="fail"` 同时启用容量抢占终止�
 - P 首个成功输出保留 token、KV handle 和缓存统计，只清除终止标记。
   `RaidenSendResults` 跨 rank / step 按
   `SEND_FAILURE > UNCLAIMED_TIMEOUT > SUCCESS` 合并；仅在 `finished_sending`
-  屏障后发送一次空 token 终态。成功为 STOP + `kv_transfer_done=True`，
+  屏障后发送一次无新增 token 的引擎终态，累计输出由 vLLM OutputProcessor 保留。
+  成功为 STOP + `kv_transfer_done=True`，
   失败为 ERROR + `kv_transfer_error`。
+- DP 的 `EngineCoreOutputs.finished_requests` 对等待发送的 P 请求延后到发送终态，
+  保留 vLLM DP client 的 abort 路由与 inflight 记账；成功、失败及缺失发送结果均只归还一次。
+  worker 使用的 `SchedulerOutput.finished_req_ids` 保持原时序。
 - P 收到 abort 时清除等待响应的数据，并通知 worker 将对应注册的到期时间设为 `-1`，
   在下一次轮询复用过期回收。仅取消尚未 claim 的注册；已 claim 的 KV 仍等待 native
   terminal，跨 rank 回收屏障保持不变。
+  取消时暂存的 client finished ID 归还原 scheduler 队列；迟到结果不再生成 Pkg2。
 - D 先读取 `RaidenLoadFailures`，按 request ID 调用 `finish_requests(FINISHED_ERROR)`，
   再处理本步模型输出，避免迟到 token 泄漏。`WAITING_FOR_REMOTE_KVS` 的 buffer
   仍等 `finished_recving` 后才释放；重复失败、已取消请求不再输出终态。
@@ -62,7 +75,7 @@ KV consumer 的 `kv_load_failure_policy="fail"` 同时启用容量抢占终止�
 `core/raiden_pd.py` 只包装 `Scheduler.__init__`，按配置给实例绑定必要方法。
 官方 `_update_after_schedule()`、`_update_request_with_output()` 和调度算法保持原实现。
 worker 与 scheduler 使用同一个配置解析函数决定是否收集/消费 Raiden metadata，
-不再通过类名推断能力。未开启的实例不绑定响应适配器。
+不再通过类名推断能力。不符合上述角色与 connector 条件的实例不绑定响应适配器。
 
 registry 先安装 Raiden init patch，再安装 capacity init patch。D 输出顺序为：
 
@@ -102,12 +115,15 @@ capacity 包装器 → Raiden 失败预处理 → 官方 update
 
 ## 验证与复现
 
-长期测试保护响应生命周期、缓存统计、结构化错误、跨 rank / step 失败优先、取消后无迟到终态，以及未启用时的旧行为；不依赖 TPU。使用与服务一致的 vLLM / Raiden 依赖：
+长期测试保护响应生命周期、缓存统计、结构化错误、跨 rank / step 失败优先、
+DP 路由与终态记账、取消后无迟到终态，以及未启用时的旧行为；不依赖 TPU。
+使用与服务一致的 vLLM / Raiden 依赖；connector 环境变量测试单独启动进程，
+避免 scheduler 配置初始化后 vLLM 环境缓存干扰 monkeypatch：
 
 ```bash
 python -m pytest tests/test_raiden_pd_scheduler.py \
-  tests/test_raiden_pd_decode_scheduler.py tests/test_raiden_pd_async_scheduler.py \
-  tests/distributed/test_tpu_connector.py -q
+  tests/test_raiden_pd_decode_scheduler.py tests/test_raiden_pd_async_scheduler.py -q
+python -m pytest tests/distributed/test_tpu_connector.py -q
 ```
 
 2026-09-20 的本机环境为 vLLM `0.27.0+empty`，可直接复现：
