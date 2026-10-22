@@ -75,27 +75,14 @@ def write_fp8_records(
         axis=1,
     )
     base, columns, valid = _record_addresses(records, layout)
+    rows = base[:, None] + jnp.arange(PAGE_ROWS)[None, :]
     updated = []
     offset = 0
     for bank in banks:
-        local = base - offset
-        active = valid & (local >= 0) & (local + PAGE_ROWS <= bank.shape[0])
+        local = rows - offset
+        active = valid[:, None] & (local >= 0) & (local < bank.shape[0])
         local = jnp.where(active, local, bank.shape[0])
-        # A record is one 33-word column window; valid record slots are unique.
-        updated.append(
-            jax.lax.scatter(
-                bank,
-                jnp.stack((local, columns), axis=-1),
-                values,
-                jax.lax.ScatterDimensionNumbers(
-                    update_window_dims=(1,),
-                    inserted_window_dims=(1,),
-                    scatter_dims_to_operand_dims=(0, 1),
-                ),
-                unique_indices=True,
-                mode="drop",
-            )
-        )
+        updated.append(bank.at[local, columns[:, None]].set(values, mode="drop"))
         offset += bank.shape[0]
     return tuple(updated)
 

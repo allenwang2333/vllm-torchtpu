@@ -266,14 +266,26 @@ The scorer, math and pipeline sources are unchanged. Same-shape sim-pjrt LLO
 comparisons retain all 17,536 sparse and 17,545 dense bundles instruction-for-
 instruction after removing debug identities.
 
-### Scatter follow-up awaiting hardware measurements
+### Scatter follow-up measured and reverted
 
-Commit `18c83ac12` batches candidate membership construction by query and
-expresses each cache record as one nonoverlapping 33-word column scatter window.
-It passes the same 42 CPU tests. Same-shape sim-pjrt scorer LLO remains identical
-at 17536 sparse / 17545 dense bundles. The P-state-7 experiment is queued for TPU
-capacity; these changes have no measured performance claim yet. The timing table
-above still describes commit `a7225b918`.
+Commit `18c83ac12` tried batching candidate membership construction by query and
+expressing each cache record as one 33-word column scatter window. It passed
+42 CPU tests and retained identical scorer LLO (17536 sparse / 17545 dense
+bundles), but P-state-7 experiment `exp-x62w5dthec` showed a regression:
+
+| Case | Prior best (ms) | Window scatter (ms) | Regression |
+| --- | ---: | ---: | ---: |
+| full | 1.897 | 3.364 | +77.3% |
+| publish | 2.237 | 3.729 | +66.7% |
+| filter_clustered | 3.840 | 5.840 | +52.1% |
+| filter_scattered | 3.942 | 5.943 | +50.8% |
+
+Values are means of two seed medians, with 30 device samples per seed and case,
+from analysis `an-fywgpzhzek`. Candidate mask scatter remained about 1.880 ms;
+the cache update trace added loops and large copies. The two scatter helpers
+have been restored byte-for-byte to measured best commit `a7225b918`. The timing
+table above remains the retained implementation's result. The SparseCore mask
+prototype has only compiled under sim-pjrt and is not integrated.
 
 ## Reproduce
 

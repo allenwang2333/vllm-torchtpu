@@ -53,12 +53,12 @@ def candidate_pages(
 
     width = logical_pages * PAGE_RECORDS
     blocks = (width + block_size - 1) // block_size
-
-    def membership(ids):
-        indices = jnp.where((ids >= 0) & (ids < blocks), ids, blocks)
-        return jnp.zeros((blocks,), jnp.int32).at[indices].set(1, mode="drop")
-
-    block_mask = jax.vmap(membership)(candidates)
+    valid = (candidates >= 0) & (candidates < blocks)
+    block_mask = (
+        jnp.zeros((rows, blocks + 1), jnp.int32)
+        .at[positions[:, None], jnp.where(valid, candidates, blocks)]
+        .set(1)[:, :blocks]
+    )
     # Only expand to the common block/page boundary, not individual tokens.
     stride = math.gcd(PAGE_RECORDS, block_size)
     covered = jnp.repeat(block_mask, block_size // stride, axis=1)[:, : width // stride]
