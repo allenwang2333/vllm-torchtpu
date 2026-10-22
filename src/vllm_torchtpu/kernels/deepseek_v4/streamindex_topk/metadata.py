@@ -201,14 +201,6 @@ def compute_batched_seq_metadata(
 
     is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
 
-    def _empty_schedule():
-        return MetadataRef.create(
-            num_steps=jnp.zeros((num_chunks,), dtype=jnp.int32),
-            batch_tile_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bq_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((max_steps,), dtype=jnp.int32),
-        )
-
     # Static shape bucketing for JAX XLA tracing on TPU:
     # Compute max_seq_tiles and padded arrays over max_num_seqs to maintain static
     # tensor shapes across kernel invocations. This prevents XLA recompilation per
@@ -328,7 +320,11 @@ def compute_batched_seq_metadata(
             bkv_idx=bkv_idx,
         )
 
-    return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
+    # No lax.cond: XLA never CSEs one, and every indexer layer builds this same
+    # schedule from the step metadata. An empty pass is zeroed instead.
+    return jax.tree_util.tree_map(
+        lambda x: jnp.where(is_empty_pass, jnp.zeros_like(x), x), _compute_schedule()
+    )
 
 
 def compute_metadata(
