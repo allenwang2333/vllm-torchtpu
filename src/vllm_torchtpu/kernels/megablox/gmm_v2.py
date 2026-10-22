@@ -742,6 +742,62 @@ def fill_metadata(
     return num_gm
 
 
+def fill_metadata_single_tile(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
+    metadata_ref: MetadataRef,
+    *,
+    cfgs: GmmConfigs,
+) -> jax.Array:
+    """`fill_metadata` as straight-line code when every group fits in one gm tile.
+
+    With group_offset 0, every group in range and each group in at most one
+    tile, `fill_metadata` gives group i the slot `num_gm` = its count of earlier
+    non-empty groups, with `gm_id_to_m_offset[num_gm + 1]` its end row; its start
+    row is the previous group's end. So every group stores its id and end row at
+    its `num_gm` unconditionally: a later non-empty group overwrites what an
+    empty one stored, and only slots past those `fill_metadata` defines keep it.
+    Inputs outside those assumptions run `fill_metadata`, which rewrites every
+    slot it defines.
+    """
+
+    if cfgs.dims.size_lhs_group != cfgs.dims.size_group:
+        return fill_metadata(
+            lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+        )
+
+    # A group of this many rows fits one tile wherever its first row falls.
+    max_single_tile_size = cfgs.tiles.tile_m - cfgs.dims.size_lhs_sublane + 1
+    metadata_ref.gm_id_to_m_offset[0] = 0
+
+    num_gm = jnp.int32(0)
+    end_m_offset = jnp.int32(0)
+    # Unsigned, so a negative group size also fails the single-tile bound.
+    max_group_size = jnp.uint32(0)
+    for group_id in range(cfgs.dims.size_group):
+        group_size = lhs_group_sizes_ref[group_id]
+        unsigned_size = lax.bitcast_convert_type(group_size, jnp.uint32)
+        max_group_size = jnp.maximum(max_group_size, unsigned_size)
+        end_m_offset += group_size
+
+        metadata_ref.gm_id_to_group_id[num_gm] = jnp.int32(group_id)
+        metadata_ref.gm_id_to_m_offset[num_gm + 1] = end_m_offset
+        num_gm += lax.bitcast_convert_type(
+            jnp.minimum(unsigned_size, jnp.uint32(1)), jnp.int32
+        )
+
+    is_fast_path = jnp.logical_and(
+        group_offset_ref[0] == 0, max_group_size <= max_single_tile_size
+    )
+    return lax.cond(
+        is_fast_path,
+        lambda: num_gm,
+        lambda: fill_metadata(
+            lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+        ),
+    )
+
+
 def zero_out_start(
     out_ref: jax.Array,  # [size_m, size_n]
     zero_ref: jax.Array,  # [tile_zero_m, num_lanes]
@@ -871,7 +927,7 @@ def kernel_main(
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
     # Fill metadata buffer and return number of group & m interations.
-    num_gm = fill_metadata(
+    num_gm = fill_metadata_single_tile(
         lhs_group_sizes_ref,
         group_offset_ref,
         metadata_ref,
