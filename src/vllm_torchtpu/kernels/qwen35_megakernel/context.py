@@ -139,6 +139,11 @@ class MKBuildContext:
         N_MB = c_wide.n_mb
         BW = N_MB * c.B  # rows of the wide step, the tail microbatch padded
         WIDE_MB = c_wide.wide
+        # dp: the chip's rows run the mixer NV times per microbatch (once per virtual rank); the
+        # MoE phase works on the rows of all DPG chips (chip g's at rows g * BW ..)
+        DPG, NV = c.dp, c.NV
+        DP = DPG > 1
+        assert not DP or WIDE_MB, "dp runs as a wide step (mb_rows > 0)"
 
         self.c = c
         self.c_wide = c_wide
@@ -189,8 +194,8 @@ class MKBuildContext:
         MB_GDN = nt["lin_in"] + nt["lin_out"]
         MB_ATT = nt["att_in"] + nt["att_out"]
         if WIDE_MB:
-            t_gdn = N_MB * MB_GDN + (t_gdn - MB_GDN)
-            t_att = N_MB * MB_ATT + (t_att - MB_ATT)
+            t_gdn = N_MB * NV * MB_GDN + (t_gdn - MB_GDN)
+            t_att = N_MB * NV * MB_ATT + (t_att - MB_ATT)
             t_block = (AE - 1) * t_gdn + t_att
         T_TOTAL = (L // AE) * t_block
         lay, S = smalls_layout(c)
@@ -550,7 +555,7 @@ class MKBuildContext:
             # starts), so it goes to the other slot.
             scratch["rb"] = pltpu.VMEM((2, 128, E) if WIDE_MB else (2, M, E), F32)
             scratch["rb_sem"] = pltpu.SemaphoreType.DMA((2,))
-        BWP = rup(BW, 128)  # all-rows buffers in 128-row chunks (the routing chunk)
+        BWP = rup(DPG * BW, 128)  # all-rows buffers in 128-row chunks (the routing chunk)
         CAP = min(WIDE_CAP, MB)  # gathered rows per expert tile (the tile reuses xb's rows)
         if WIDE_MB:
             del scratch["part"], scratch["wn"]  # the MoE phase works on part_all / wnT_all
@@ -613,6 +618,26 @@ class MKBuildContext:
         else:
             scratch["dpool"] = pltpu.VMEM((NBD * BROWS, 128), U8)
             scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
+        if DP:
+            # the TP8 all-reduce buffers give way to the dp exchanges: the core pair's mixer
+            # exchange (2 slots), the chips' row all-gather (into xb_all) and the MoE combine
+            # (every rank's bf16 partial of this chip's rows, by sender)
+            for k in ("send", "recv", "ar_ssem", "ar_rsem", "ag_credit", "ag_send", "ag_recv",
+                      "s2_send", "s2_recv", "arp", "sm"):
+                scratch.pop(k, None)
+            scratch.update({
+                "smv": pltpu.VMEM((NV, 2, 1, S), F32),  # [virtual rank, slot]: smalls rows
+                "dsum": pltpu.VMEM((MB, H), F32),  # the virtual ranks' mixer partial sum
+                "pr_send": pltpu.VMEM((2, MR, H), BF16),
+                "pr_recv": pltpu.VMEM((2, 2, MR, H), BF16),  # [slot, core]
+                "pr_ssem": pltpu.SemaphoreType.DMA((2,)),
+                "pr_rsem": pltpu.SemaphoreType.DMA((2,)),
+                "ag_ssem": pltpu.SemaphoreType.DMA((DPG - 1,)),
+                "ag_rsem": pltpu.SemaphoreType.DMA((DPG - 1,)),
+                "crecv": pltpu.VMEM((R, BW, H), BF16),  # [sender rank]
+                "c_ssem": pltpu.SemaphoreType.DMA((R - 1,)),
+                "c_rsem": pltpu.SemaphoreType.DMA((R - 1,)),
+            })
         s_names = list(scratch)
         if FUSED:
             st_names = ("raw", "page_table", "ckpt_indices", "read_offsets") + (
@@ -698,6 +723,8 @@ class MKBuildContext:
             and 128 % self.ER == 0
         )
         self.WIDE_MB, self.N_MB, self.BW, self.BWP, self.CAP = WIDE_MB, N_MB, BW, BWP, CAP
+        self.DP, self.DPG, self.NV = DP, DPG, NV
+        self.vr: Any = jnp.int32(0)  # dp: the virtual rank whose mixer is being built
         self.MB_GDN, self.MB_ATT = MB_GDN, MB_ATT
         self.WIDE_DYN_ROW = WIDE_DYN_ROW
         self.WIDE_SCATTER_TN = WIDE_SCATTER_TN
@@ -714,6 +741,8 @@ class MKBuildContext:
         self.o_names = o_names
         self.n_w, self.n_s = n_w, n_s
         self.comm = R > 1 and "ar" not in skip
+        if DP:
+            assert not (SPLIT or AR0S or ARP or AR_DEFER or HIER), (SPLIT, AR0S, HIER)
 
         # Precompute Pallas BlockSpecs, output shapes, aliases, and info dictionary
         oshapes = kernel_out_shapes(c_wide)
@@ -904,3 +933,15 @@ class MKBuildContext:
         if "active_seqs" in st:
             st["active_seqs"] = self.ST_all["active_seqs"].at[pl.ds(s0, ns)]
         self.ST = st
+
+    def bind_virtual(self, m, v) -> None:
+        """dp: microbatch m's operands for virtual rank v (its GatedDeltaNet checkpoint block of
+        ckpt_indices and its smalls rows); the KV pages and positions are the chip's for every
+        virtual rank."""
+        self.bind_microbatch(m)
+        self.vr = v
+        ns = self.c.NS
+        s0 = pl.multiple_of(v * self.c_wide.NS + m * ns, ns)
+        ck = self.ST_all["ckpt_indices"]
+        self.ST["ckpt_indices"] = ck.at[:, pl.ds(s0, ns)] if self.ckpt_is_3d else ck.at[pl.ds(s0, ns)]
+        self.scr["sm"] = self.scr["smv"].at[v]

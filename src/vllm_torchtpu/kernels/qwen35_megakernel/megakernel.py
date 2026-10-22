@@ -76,6 +76,7 @@ from .config import (
     weight_shapes,
 )
 from .context import MKBuildContext
+from .dp_kernel import kernel_dp
 from .gdn_block import GDNBlock
 from .moe_block import MoEBlock
 from .pool_dma import GDNPoolDMA, GprRecIn, KVPoolDMA
@@ -112,6 +113,9 @@ def build(
     R = ctx.R
 
     def kernel(*refs):
+        if ctx.DP:
+            kernel_dp(ctx, refs)
+            return
         if ctx.WIDE_MB:
             kernel_wide(ctx, refs)
             return

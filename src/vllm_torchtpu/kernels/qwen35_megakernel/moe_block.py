@@ -699,7 +699,11 @@ class MoEBlock:
                         rb_copy(l, q + 1).start()
                     else:
                         pl.when(l + 1 < L)(lambda: rb_copy(l + 1, 0).start())
-                live = row_q < (BLIVE - r0)
+                if ctx.DP:  # chip g's live rows are g * BW .. g * BW + BLIVE - 1
+                    rg = row_q + r0
+                    live = jnp.logical_and(lax.rem(rg, ctx.BW) < BLIVE, rg < ctx.DPG * ctx.BW)
+                else:
+                    live = row_q < (BLIVE - r0)
                 kb = lax.bitcast_convert_type(jnp.maximum(choice, FLT_MIN), I32)
                 key = lax.bitcast_convert_type((kb & ~EM) | (EM - lane_e), F32)
                 _, sel = topk_rows_on_lanes(key, c.TOPK, EM, need_ids=False)

@@ -220,6 +220,18 @@ class MKConfig:
     # p // dcp (vLLM's DCP layout, the batched RPA kernel's and Raiden's tp{T}dcp{D}_decode rule);
     # the page table is the rank-local one. 1: the pool is replicated over the group.
     dcp: int = 1
+    # Data parallel groups (DP4TP2 attention, EP8 MoE: dp=4 at R=8). Each chip (rank pair 2k,
+    # 2k + 1) serves its own B rows: its two cores run the TP8 mixer of virtual ranks 4 * core ..
+    # 4 * core + 3 one after another on the chip's rows (per-core weights and states stack the
+    # four virtual ranks' TP8 slices), the virtual partials sum locally and over the core pair.
+    # The MoE phase gathers every chip's rows, runs EP over all of them, and returns each chip
+    # the sum of the eight ranks' partials of its rows. B, the page table and the operands are
+    # per chip. 1: TP = EP = R over shared rows.
+    dp: int = 1
+
+    @property
+    def NV(self):  # virtual mixer ranks per core
+        return self.dp
 
     @property
     def wide(self) -> bool:
@@ -370,6 +382,10 @@ class MKConfig:
             assert self.page_size == 128 and self.num_pages >= 1 and self.max_pages_per_seq >= 1
         assert self.dcp >= 1 and self.G % self.dcp == 0, (self.dcp, self.G)
         assert self.dcp == 1 or self.paged_kv, "dcp > 1 shards the paged pool"
+        assert self.dp in (1, 4), self.dp
+        if self.dp > 1:
+            assert self.R == 8 and self.R // self.dp == 2, (self.R, self.dp)
+            assert self.paged_kv and self.fused_pool_io and not self.moe_tp and self.dcp == 1
         for n in (self.H, self.QKV, self.Z, self.KD, self.VD, self.HD, self.IR, self.ISR):
             assert n % 128 == 0, n
 
@@ -549,6 +565,8 @@ def default_tiles(c: MKConfig) -> Tiles:
         # the microbatch's tiles; the dense ring keeps every tile of one input projection (the
         # attention and GatedDeltaNet blocks take them at once)
         t = default_tiles(c.microbatch())
+        if c.dp > 1:  # virtual ranks share a core: no group split, no TP8 all-reduce stages
+            t = dataclasses.replace(t, split=False, hier=0, rsag=False)
         # 1.67 EP experts (20 of 12-tile experts) in the expert ring: the wide expert loop has no
         # software pipeline, so a one-expert ring serializes each expert's DMA behind its compute;
         # 2 experts (24) overflows the scoped VMEM limit at 192+ rows
@@ -679,11 +697,12 @@ def weight_shapes(c: MKConfig, tiles: Tiles):
     else:
         e13 = tuple(Spec(*tiled("e13", (c.EW,))) for _ in range(c.L))
         e2 = tuple(Spec(*tiled("e2", (c.EW,))) for _ in range(c.L))
+    nv = c.NV  # dp: the mixer slices of the core's virtual ranks, layer-major
     return {
-        "lin_in": tiled("lin_in", (ngdn,)),
-        "lin_out": tiled("lin_out", (ngdn,)),
-        "att_in": tiled("att_in", (c.NATT,)),
-        "att_out": tiled("att_out", (c.NATT,)),
+        "lin_in": tiled("lin_in", (ngdn * nv,)),
+        "lin_out": tiled("lin_out", (ngdn * nv,)),
+        "att_in": tiled("att_in", (c.NATT * nv,)),
+        "att_out": tiled("att_out", (c.NATT * nv,)),
         "router": tiled("router", (c.L,)),
         "sh13": tiled("sh13", (c.L,)),
         "sh2": tiled("sh2", (c.L,)),
@@ -692,7 +711,7 @@ def weight_shapes(c: MKConfig, tiles: Tiles):
         # per-channel scales, gate|up then down. One [1, N] row per expert: a one-row slice of a
         # 3-D [L, EW, N] array DMAs wrong data on TPU (interpret mode cannot catch it).
         "es": ((c.L, c.EW, 1, 2 * c.IR + c.H), F32),
-        "smalls": ((c.L, 1, S), F32),
+        "smalls": ((c.L, 1, S) if nv == 1 else (c.L, nv, 1, S), F32),
         "final_norm": ((1, c.H), F32),
     }
 
@@ -706,7 +725,8 @@ def state_shapes(c: MKConfig):
     if c.paged_kv and c.fused_pool_io:
         G_PER_ATT = max(1, c.att_every - 1)
         K_ckpt = c.ckpt_k if c.ckpt_k > 0 else c.T
-        ckpt_shape = (c.NS, K_ckpt) if c.ckpt_2d else (G_PER_ATT, c.NS, K_ckpt)
+        # dp: one block of NS sequences per virtual rank (its GatedDeltaNet head slices)
+        ckpt_shape = (c.NS, K_ckpt) if c.ckpt_2d else (G_PER_ATT, c.NV * c.NS, K_ckpt)
         roff_shape = (c.NS,) if c.roff_1d else (G_PER_ATT, c.NS)
         st = {
             "raw": tuple(Spec((c.num_pages, 2, 64, 4, c.page_size), FP8) for _ in range(c.NATT)),

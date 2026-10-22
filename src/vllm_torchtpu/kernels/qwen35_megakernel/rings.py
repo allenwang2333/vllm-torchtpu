@@ -114,12 +114,12 @@ class DenseWeightRing:
 
     def fetch_wide(self, g):
         """Wide step: a layer's dense stream is N_MB copies of the mixer tiles (input then
-        output projection, one per microbatch) followed by the MoE dense tiles (router, sh13,
-        sh2) once."""
+        output projection, one per microbatch; dp: N_MB * NV, one per microbatch and virtual
+        rank) followed by the MoE dense tiles (router, sh13, sh2) once."""
         ctx = self.ctx
         T_TOTAL, skip = ctx.T_TOTAL, ctx.skip
         t_block, t_gdn, t_att, AE, NBD = ctx.t_block, ctx.t_gdn, ctx.t_att, ctx.AE, ctx.NBD
-        nt, N_MB, MB_GDN, MB_ATT = ctx.nt, ctx.N_MB, ctx.MB_GDN, ctx.MB_ATT
+        nt, N_MB, MB_GDN, MB_ATT, NV = ctx.nt, ctx.N_MB, ctx.MB_GDN, ctx.MB_ATT, ctx.NV
 
         @pl.when(jnp.logical_and(g < T_TOTAL, "dense" not in skip))
         def _():
@@ -131,7 +131,7 @@ class DenseWeightRing:
             bank = g % NBD
 
             def issue(lt_s, names, per_mb):
-                mb_tiles = N_MB * per_mb
+                mb_tiles = N_MB * NV * per_mb
                 ords = (
                     (blk if lt_s == AE - 1 else blk * (AE - 1) + lt_s),
                     layer,
@@ -141,8 +141,12 @@ class DenseWeightRing:
                 @pl.when(r < mb_tiles)
                 def _mixer():
                     rr = lax.rem(r, per_mb)
+                    m_ords = ords
+                    if NV > 1:  # dp: copy k is microbatch k // NV with virtual rank k % NV
+                        v = lax.rem(lax.div(r, per_mb), NV)
+                        m_ords = (ords[0] * NV + v, layer)
                     self.seg_issue(
-                        [(names[0], 0, a0, 0), (names[1], a0, per_mb, 0)], rr, ords, bank
+                        [(names[0], 0, a0, 0), (names[1], a0, per_mb, 0)], rr, m_ords, bank
                     )
 
                 @pl.when(r >= mb_tiles)
