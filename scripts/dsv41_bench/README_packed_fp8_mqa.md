@@ -59,7 +59,8 @@ invalid pages are masked to `-inf` before top-k or any cross-token operation.
 Their arbitrary values, including NaNs, cannot contribute to valid columns.
 Do not add a cross-token reduction before this mask. Sparse pages can select a
 different head-reduction path; bitwise agreement with dense scoring has not been
-established. Hardware performance of the logical-page route remains unmeasured.
+established. See the model integration measurements below for the logical-page
+route's hardware timing.
 
 To exercise the scorer, use a context exceeding `index_topk` compressed keys
 and a model maximum length beyond that threshold; the existing all-indices-fit
@@ -233,6 +234,37 @@ after debug normalization. Static totals include mutually exclusive paths and
 are not execution-cycle counts. Candidate metadata preparation, DMA stalls and
 model integration still require hardware timing; fewer compute bundles alone
 do not establish end-to-end speedup.
+
+## Model integration timing
+
+Measured on TPU v7x at P-state 7, using one core, 48 requests with six queries
+each, 98,304 context keys, H32/D128, two native cache banks, top-k 512, and 2,048
+candidate blocks of eight keys. Each cell is the mean of the two seed medians
+(2026/2027), with 30 XProf device-duration samples per seed and variant.
+
+The previous FP8 adapter is commit `c2c55f990`; the logical-page adapter is
+`a7225b918`. The BF16 column is the same-run control for the latter.
+
+| Indexer call | Previous FP8 (ms) | Logical-page FP8 (ms) | BF16 (ms) |
+| --- | ---: | ---: | ---: |
+| Full context | 1.901 | 1.897 | 1.047 |
+| Publish candidates | 2.242 | 2.237 | 1.104 |
+| Filter clustered candidates | 1304.173 | 3.840 | 6.714 |
+| Filter scattered candidates | 1306.597 | 3.942 | 6.764 |
+
+The sparse path is 1.75x/1.72x faster than the BF16 control. The previous
+per-token Boolean membership gather took about 1.296 seconds; it is absent
+from the logical-page route. MQA scoring remains about 321 microseconds.
+Candidate block-mask scatter still costs about 1.880 ms, and the two incremental
+cache-write scatters together cost about 0.79 ms. Full-context and publication
+calls remain slower than BF16; this change targets candidate filtering.
+
+Timing includes K writes, Q quantization, metadata, scoring and top-k. It excludes
+projections, RoPE, Torch dispatch and TP collectives. CPU token-reference tests
+and hardware ID constraints passed; this is not a model-quality evaluation.
+The scorer, math and pipeline sources are unchanged. Same-shape sim-pjrt LLO
+comparisons retain all 17,536 sparse and 17,545 dense bundles instruction-for-
+instruction after removing debug identities.
 
 ## Reproduce
 
