@@ -880,17 +880,26 @@ def zero_out_end(
     ).wait()
 
 
-#: Whole-expert weight buffers of the decode path; DECODE_SLOTS - 1 experts
-#: are fetched ahead of the one being multiplied.
-DECODE_SLOTS = 3
+#: Whole-expert weight buffers of the decode path, for a fused gate/up
+#: projection and an unfused one; slots - 1 experts are fetched ahead of the
+#: one being multiplied.
+DECODE_SLOTS_FUSED = 2
+DECODE_SLOTS_UNFUSED = 4
 
 #: Group sizes `start_first_decode_fetch` tests per scan step.
 FIRST_SCAN_CHUNK = 8
 
-#: Column panels per projection of a decode expert. Each is its own weight
-#: DMA, multiplied as soon as it lands, so only the last panel's work is
-#: exposed after the last expert's weights arrive.
-DECODE_COL_SPLIT = 2
+#: Column panels per projection of a decode expert (fused gate/up: per half),
+#: fused and unfused. Each is its own weight DMA, multiplied as soon as it
+#: lands, so only the last panel's work is exposed after the last expert's
+#: weights arrive.
+DECODE_COL_SPLIT_FUSED = 4
+DECODE_COL_SPLIT_UNFUSED = 2
+
+
+def decode_slots(cfgs: GmmConfigs) -> int:
+    """Whole-expert weight buffers of the decode path at `cfgs`."""
+    return DECODE_SLOTS_UNFUSED if cfgs.fuse_act is None else DECODE_SLOTS_FUSED
 
 
 @jax.tree_util.register_dataclass
@@ -901,11 +910,11 @@ class DecodeRefs:
     lhs: Any  # [size_m, size_k]
     lhs_q: Any  # [size_m, size_k] in the lhs quant dtype
     lhs_scale: Any  # [size_k // lhs quant block, size_m, 1]
-    weight: Any  # [DECODE_SLOTS, size_k, size_n]
-    scale: Any  # [DECODE_SLOTS, 1, 1, size_n]
+    weight: Any  # [decode_slots, size_k, size_n]
+    scale: Any  # [decode_slots, 1, 1, size_n]
     lhs_sem: Any  # DMA[1]
-    weight_sems: Any  # DMA[DECODE_SLOTS, panels]: one per weight column panel
-    scale_sems: Any  # DMA[DECODE_SLOTS]
+    weight_sems: Any  # DMA[decode_slots, panels]: one per weight column panel
+    scale_sems: Any  # DMA[decode_slots]
 
 
 def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
@@ -916,12 +925,13 @@ def decode_panels(cfgs: GmmConfigs) -> tuple[tuple[int, int], ...]:
     """
     halves = 1 if cfgs.fuse_act is None else 2
     half_n = cfgs.dims.size_n // halves
-    width = half_n // DECODE_COL_SPLIT
-    assert width * DECODE_COL_SPLIT == half_n
+    split = DECODE_COL_SPLIT_UNFUSED if cfgs.fuse_act is None else DECODE_COL_SPLIT_FUSED
+    width = half_n // split
+    assert width * split == half_n
     assert width % pltpu.get_tpu_info().mxu_column_size == 0, width
     return tuple(
         (h * half_n + s * width, width)
-        for s in range(DECODE_COL_SPLIT)
+        for s in range(split)
         for h in range(halves)
     )
 
@@ -1033,7 +1043,7 @@ def decode_kernel(
 
     lhs is fetched and quantized once for every expert. Each gm tile's expert
     arrives as one contiguous weight DMA plus one scale DMA through
-    DECODE_SLOTS rotating buffers (tile 0's started before the metadata is
+    `decode_slots` rotating buffers (tile 0's started before the metadata is
     filled), and is multiplied over every lhs row, of which the tile's rows
     are kept in the VMEM-resident output. Each output element sees the same
     ops in the same order as `inner_kernel`.
@@ -1041,7 +1051,8 @@ def decode_kernel(
     dims = cfgs.dims
     sublane = dims.size_lhs_sublane
     rows = dims.size_m
-    lookahead = DECODE_SLOTS - 1
+    slots = decode_slots(cfgs)
+    lookahead = slots - 1
 
     first_group = start_first_decode_fetch(
         lhs_group_sizes_ref, rhs_hbm_ref, dec, cfgs=cfgs
@@ -1056,7 +1067,7 @@ def decode_kernel(
     def copies(gm):
         group_id = metadata_ref.gm_id_to_group_id[gm]
         return decode_weight_copies(
-            rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS, panels
+            rhs_hbm_ref, dec, group_id, gm % slots, panels
         )
 
     def start_fetch(gm, panels=range(num_panels)):
@@ -1158,7 +1169,7 @@ def decode_kernel(
         return jnp.concatenate(acc_list, axis=1)
 
     def gm_body(gm, carry):
-        slot = gm % DECODE_SLOTS
+        slot = gm % slots
         weights, scale = copies(gm)
         # Fused gate and up are multiplied as separate contiguous column panels
         # and paired per output panel; each column sees the same ops as
@@ -1810,6 +1821,7 @@ def gmm_v2(
 
     if is_decode:
         num_q_blocks = dims.size_k // cfgs.lhs_cfgs.quant_block_size
+        slots = decode_slots(cfgs)
         scratch_shapes.append(
             DecodeRefs(
                 lhs=pltpu.VMEM((dims.size_m, dims.size_k), cfgs.lhs_cfgs.dtype),
@@ -1819,13 +1831,13 @@ def gmm_v2(
                 lhs_scale=pltpu.VMEM(
                     (num_q_blocks, dims.size_m, 1), cfgs.lhs_cfgs.dtype
                 ),
-                weight=pltpu.VMEM((DECODE_SLOTS, dims.size_k, dims.size_n), rhs.dtype),
-                scale=pltpu.VMEM((DECODE_SLOTS, 1, 1, dims.size_n), jnp.float32),
+                weight=pltpu.VMEM((slots, dims.size_k, dims.size_n), rhs.dtype),
+                scale=pltpu.VMEM((slots, 1, 1, dims.size_n), jnp.float32),
                 lhs_sem=pltpu.SemaphoreType.DMA((1,)),
                 weight_sems=pltpu.SemaphoreType.DMA(
-                    (DECODE_SLOTS, len(decode_panels(cfgs)))
+                    (slots, len(decode_panels(cfgs)))
                 ),
-                scale_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
+                scale_sems=pltpu.SemaphoreType.DMA((slots,)),
             )
         )
     else:
