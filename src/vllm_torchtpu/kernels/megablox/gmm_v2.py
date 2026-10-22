@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -878,6 +879,9 @@ def zero_out_end(
 #: are fetched ahead of the one being multiplied.
 DECODE_SLOTS = 3
 
+#: Group sizes `start_first_decode_fetch` tests per scan step.
+FIRST_SCAN_CHUNK = 8
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -892,6 +896,62 @@ class DecodeRefs:
     lhs_sem: Any  # DMA[1]
     weight_sems: Any  # DMA[DECODE_SLOTS]
     scale_sems: Any  # DMA[DECODE_SLOTS]
+
+
+def decode_weight_copy(rhs_hbm_ref: WeightsRef, dec: DecodeRefs, group_id, slot):
+    """Whole-expert weight and scale DMAs of `group_id` into decode slot `slot`."""
+    return (
+        pltpu.make_async_copy(
+            rhs_hbm_ref.weight.at[group_id],
+            dec.weight.at[slot],
+            dec.weight_sems.at[slot],
+        ),
+        pltpu.make_async_copy(
+            rhs_hbm_ref.scale.at[group_id], dec.scale.at[slot], dec.scale_sems.at[slot]
+        ),
+    )
+
+
+def start_first_decode_fetch(
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    rhs_hbm_ref: WeightsRef,
+    dec: DecodeRefs,
+    *,
+    cfgs: GmmConfigs,
+) -> jax.Array:
+    """Starts the first non-empty group's fetch into slot 0 before metadata exists.
+
+    With group_offset 0 that group is gm tile 0's, so its weights stream while
+    the metadata is filled. Returns its id, or size_group if every group is
+    empty and nothing was started. `decode_kernel` checks it against tile 0.
+    """
+    size_group = cfgs.dims.size_group
+    chunk = math.gcd(size_group, FIRST_SCAN_CHUNK)
+
+    # The scan stops after the chunk holding the first non-empty group, and its
+    # dynamically addressed loads are not shared with (and kept live for) the
+    # unrolled metadata fill.
+    def scan_chunk(carry):
+        start, _ = carry
+        found = jnp.int32(size_group)
+        for j in reversed(range(chunk)):
+            found = jnp.where(lhs_group_sizes_ref[start + j] > 0, start + j, found)
+        return start + chunk, found
+
+    def not_found(carry):
+        start, found = carry
+        return (found == size_group) & (start < size_group)
+
+    _, first_group = lax.while_loop(
+        not_found, scan_chunk, (jnp.int32(0), jnp.int32(size_group))
+    )
+
+    @pl.when(first_group < size_group)
+    def _():
+        for copy in decode_weight_copy(rhs_hbm_ref, dec, first_group, 0):
+            copy.start()
+
+    return first_group
 
 
 def use_decode_path(cfgs: GmmConfigs) -> bool:
@@ -925,7 +985,8 @@ def decode_kernel(
     metadata_ref: MetadataRef,
     dec: DecodeRefs,
     *,
-    num_gm: jax.Array,
+    lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
+    group_offset_ref: jax.Array,  # int32[1]
     lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
     cfgs: GmmConfigs,
@@ -937,32 +998,32 @@ def decode_kernel(
 
     lhs is fetched and quantized once for every expert. Each gm tile's expert
     arrives as one contiguous weight DMA plus one scale DMA through
-    DECODE_SLOTS rotating buffers, and is multiplied over every lhs row, of
-    which the tile's rows are kept in the VMEM-resident output. Each output
-    element sees the same ops in the same order as `inner_kernel`.
+    DECODE_SLOTS rotating buffers (tile 0's started before the metadata is
+    filled), and is multiplied over every lhs row, of which the tile's rows
+    are kept in the VMEM-resident output. Each output element sees the same
+    ops in the same order as `inner_kernel`.
     """
     dims = cfgs.dims
     sublane = dims.size_lhs_sublane
     rows = dims.size_m
     lookahead = DECODE_SLOTS - 1
 
-    def weight_copy(gm):
-        slot = gm % DECODE_SLOTS
+    first_group = start_first_decode_fetch(
+        lhs_group_sizes_ref, rhs_hbm_ref, dec, cfgs=cfgs
+    )
+    num_gm = fill_metadata_single_tile(
+        lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
+    )
+
+    def copies(gm):
         group_id = metadata_ref.gm_id_to_group_id[gm]
-        return pltpu.make_async_copy(
-            rhs_hbm_ref.weight.at[group_id],
-            dec.weight.at[slot],
-            dec.weight_sems.at[slot],
-        )
+        return decode_weight_copy(rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS)
+
+    def weight_copy(gm):
+        return copies(gm)[0]
 
     def scale_copy(gm):
-        slot = gm % DECODE_SLOTS
-        group_id = metadata_ref.gm_id_to_group_id[gm]
-        return pltpu.make_async_copy(
-            rhs_hbm_ref.scale.at[group_id],
-            dec.scale.at[slot],
-            dec.scale_sems.at[slot],
-        )
+        return copies(gm)[1]
 
     def start_fetch(gm):
         @pl.when(gm < num_gm)
@@ -974,7 +1035,26 @@ def decode_kernel(
         lhs_hbm_ref, dec.lhs.at[pl.ds(0, lhs_hbm_ref.shape[0])], dec.lhs_sem.at[0]
     )
     lhs_copy.start()
-    for gm in range(lookahead):
+
+    # Tile 0's fetch is in flight unless metadata put another group there
+    # (group_offset != 0); then it is drained and tile 0 fetched as usual.
+    first_started = first_group < dims.size_group
+    first_is_tile0 = (
+        first_started
+        & (num_gm > 0)
+        & (metadata_ref.gm_id_to_group_id[0] == first_group)
+    )
+
+    @pl.when(first_started & jnp.logical_not(first_is_tile0))
+    def _():
+        for copy in decode_weight_copy(rhs_hbm_ref, dec, first_group, 0):
+            copy.wait()
+
+    @pl.when(jnp.logical_not(first_is_tile0))
+    def _():
+        start_fetch(0)
+
+    for gm in range(1, lookahead):
         start_fetch(gm)
 
     tpu_info = pltpu.get_tpu_info()
@@ -1109,20 +1189,14 @@ def kernel_main(
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
 
-    # Fill metadata buffer and return number of group & m interations.
-    num_gm = fill_metadata_single_tile(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        metadata_ref,
-        cfgs=cfgs,
-    )
-
     if decode_refs is not None:
         # The output block spans every row and zeroes those no group owns, so
-        # zero initialization needs no DMAs of its own.
+        # zero initialization needs no DMAs of its own. The body fills the
+        # metadata itself, after starting its first expert's fetch.
         body = functools.partial(
             decode_kernel,
-            num_gm=num_gm,
+            lhs_group_sizes_ref=lhs_group_sizes_ref,
+            group_offset_ref=group_offset_ref,
             lhs_hbm_ref=lhs_ref,
             rhs_hbm_ref=rhs_ref,
             cfgs=cfgs,
@@ -1133,6 +1207,14 @@ def kernel_main(
         )
         pipeline_fn(out_ref, scratches=[metadata_ref, decode_refs])
         return
+
+    # Fill metadata buffer and return number of group & m interations.
+    num_gm = fill_metadata_single_tile(
+        lhs_group_sizes_ref,
+        group_offset_ref,
+        metadata_ref,
+        cfgs=cfgs,
+    )
 
     if cfgs.zero_init:
         zero_size = zero_out_start(
