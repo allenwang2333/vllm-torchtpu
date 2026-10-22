@@ -296,6 +296,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS_SITES: str = "q_b_proj,self_attn.o_proj,mlp.gate_up_proj"
     TPU_SAMPLER_VERIFY_TRIM: bool = False
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_LONG_PREFILL_THRESHOLD_POLICY: str = "always"
 
 
 def env_with_choices(
@@ -2032,6 +2033,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    # Scheduler (core/long_prefill_threshold.py): how --long-prefill-token-
+    # threshold applies. "always" (default) caps every request on every step
+    # (vLLM 0.29); "multi" only when more than one request is running or
+    # waiting (vLLM 0.32); "adaptive" as "multi", floored at
+    # max_num_batched_tokens / num_requests (vLLM 0.32's adaptive threshold).
+    "VLLM_TPU_LONG_PREFILL_THRESHOLD_POLICY": env_with_choices(
+        "VLLM_TPU_LONG_PREFILL_THRESHOLD_POLICY",
+        "always",
+        ["always", "multi", "adaptive"],
     ),
 }
 
