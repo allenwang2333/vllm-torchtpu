@@ -661,6 +661,36 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
+    def validate_environ(cls, hard_fail: bool) -> None:
+        """Reports set env vars that neither vLLM nor this package reads.
+
+        Replaces vLLM's check, which flags every VLLM_* name missing from
+        vLLM's registry, including this package's VLLM_TPU_* knobs.
+        EngineArgs calls it once, in the front-end process; hard_fail is
+        vLLM's --fail-on-environ-validation.
+        """
+        from vllm import envs as vllm_envs
+
+        from vllm_torchtpu.env_validation import find_unread_env_vars
+
+        torchtpu_names = (
+            set(envs.environment_variables)
+            | set(cls.additional_env_vars)
+            | {cls.device_control_env_var}
+        )
+        unread = find_unread_env_vars(
+            os.environ, torchtpu_names, vllm_envs.environment_variables
+        )
+        if not unread:
+            return
+        message = "Environment variables that nothing reads: " + ", ".join(
+            str(u) for u in unread
+        )
+        if hard_fail:
+            raise ValueError(message)
+        logger.warning(message)
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
