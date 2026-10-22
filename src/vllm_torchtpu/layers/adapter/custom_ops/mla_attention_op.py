@@ -2170,7 +2170,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         fused_exchange=True,
                         group_pre=True,
                     )
-        elif self.indexer is not None and len(self._group_skips) == 3:
+        elif self.indexer is not None and 1 <= len(self._group_skips) <= 3:
             attn.sparse_mla_group_gather_op = impl._build_sparse_mla_group_gather_op(
                 attn, len(self._group_skips)
             )

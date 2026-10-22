@@ -2960,19 +2960,72 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
     def _build_sparse_mla_group_gather_op(self, layer: Any, num_skip: int):
         """TPU_GROUP_BATCHED_GATHER: the group head's op that gathers its
-        `num_skip` skip_topk layers' decode rows in one SparseCore call
+        `num_skip` (1-3) skip_topk layers' decode rows in one SparseCore call
         (`attention_interface.sparse_mla_group_gather_dcp`). Returns
         `impl(skip_caches, head_nope_cache, local_topk_indices, attn_metadata)
-        -> (nope_0, rope_0, ...)`. GLM-5.2's groups have 3 skip layers."""
+        -> (nope_0, rope_0, ...)`. GLM-5.2's groups have 3 skip layers (its
+        one-layer-per-kind microbenchmark twin, 1)."""
         from vllm_torchtpu.layers.core.attention_interface import (
             sparse_mla_group_gather_dcp,
         )
 
-        if num_skip != 3:
-            raise NotImplementedError(f"group gather op for {num_skip} skip layers")
         mesh = self._dcp_mesh
         assert mesh is not None
         dcp_size = self.dcp_size
+
+        def run(caches, after, topk, block_tables, query_start_loc, distribution):
+            nope_spec, _ = layer.mla_kv_spec
+            return sparse_mla_group_gather_dcp(
+                caches,
+                after,
+                topk,
+                block_tables,
+                query_start_loc,
+                distribution,
+                mesh,
+                nope_spec,
+                dcp_size=dcp_size,
+            )
+
+        # The torch op schema is inferred from the signature (no varargs), so
+        # each group size states its cache operands explicitly.
+        def sparse_mla_group_gather_core_tpu_dcp1(
+            s0_nope: jax.Array,
+            s0_rope: jax.Array,
+            after: jax.Array,  # the head's updated nope cache (ordering only)
+            local_topk_indices: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return run(
+                ((s0_nope, s0_rope),),
+                after,
+                local_topk_indices,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+            )
+
+        def sparse_mla_group_gather_core_tpu_dcp2(
+            s0_nope: jax.Array,
+            s0_rope: jax.Array,
+            s1_nope: jax.Array,
+            s1_rope: jax.Array,
+            after: jax.Array,
+            local_topk_indices: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return run(
+                ((s0_nope, s0_rope), (s1_nope, s1_rope)),
+                after,
+                local_topk_indices,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+            )
 
         def sparse_mla_group_gather_core_tpu_dcp3(
             s0_nope: jax.Array,
@@ -2981,32 +3034,36 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             s1_rope: jax.Array,
             s2_nope: jax.Array,
             s2_rope: jax.Array,
-            after: jax.Array,  # the head's updated nope cache (ordering only)
+            after: jax.Array,
             local_topk_indices: jax.Array,
             block_tables: jax.Array,
             query_start_loc: jax.Array,
             request_distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-            nope_spec, _ = layer.mla_kv_spec
-            return sparse_mla_group_gather_dcp(
+            return run(
                 ((s0_nope, s0_rope), (s1_nope, s1_rope), (s2_nope, s2_rope)),
                 after,
                 local_topk_indices,
                 block_tables,
                 query_start_loc,
                 request_distribution,
-                mesh,
-                nope_spec,
-                dcp_size=dcp_size,
             )
 
+        core_fns = {
+            1: sparse_mla_group_gather_core_tpu_dcp1,
+            2: sparse_mla_group_gather_core_tpu_dcp2,
+            3: sparse_mla_group_gather_core_tpu_dcp3,
+        }
+        if num_skip not in core_fns:
+            raise NotImplementedError(f"group gather op for {num_skip} skip layers")
         op = pcp_streaming_jax_op(
             "pallas::sparse_mla_group_gather_dcp_" + layer.layer_name.replace(".", "_"),
-            sparse_mla_group_gather_core_tpu_dcp3,
+            core_fns[num_skip],
             donate_argnums=(),
             mesh=mesh,
-            input_partition_specs=(P(DCP_AXIS_NAME),) * 8 + (P(), P(), P()),
-            output_partition_specs=(P(DCP_AXIS_NAME),) * 6,
+            input_partition_specs=(P(DCP_AXIS_NAME),) * (2 * num_skip + 2)
+            + (P(), P(), P()),
+            output_partition_specs=(P(DCP_AXIS_NAME),) * (2 * num_skip),
         )
 
         def group_gather_impl(skip_caches, head_nope_cache, local_topk_indices, md):
