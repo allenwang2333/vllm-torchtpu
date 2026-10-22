@@ -76,15 +76,10 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
             pl.run_scoped(gather_row, pltpu.VMEM((width,), jnp.float32))
 
             def select_row(keys, ids, selected, selected_ids, hist):
-                @plsc.parallel_loop(0, count * block_size, lanes, carry=jnp.int32(0))
-                def populate(i, n):
-                    values = compact[pl.ds(i, lanes)]
-                    valid = values > -jnp.inf
-                    plsc.store_compressed(keys.at[pl.ds(n, lanes)], values, mask=valid)
-                    plsc.store_compressed(
-                        ids.at[pl.ds(n, lanes)], i + lane_ids, mask=valid
-                    )
-                    return n + plsc.all_reduce_population_count(valid)[0]
+                @plsc.parallel_loop(0, count * block_size, lanes)
+                def populate(i):
+                    keys[pl.ds(i, lanes)] = compact[pl.ds(i, lanes)]
+                    ids[pl.ds(i, lanes)] = i + lane_ids
 
                 digits = max(
                     1, pl.cdiv((count * block_size - 1).bit_length(), RADIX_BITS)
@@ -95,10 +90,19 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
                     selected,
                     selected_ids,
                     hist,
-                    populate,
+                    jnp.int32(count * block_size),
                     candidate_buffers=2,
                     id_digits=digits,
                 )
+
+                @plsc.parallel_loop(0, k, lanes)
+                def remove_invalid(i):
+                    ids[pl.ds(i, lanes)] = jnp.where(
+                        keys[pl.ds(i, lanes)] > -jnp.inf,
+                        ids[pl.ds(i, lanes)],
+                        -1,
+                    )
+
                 _sort_selected(ids, selected_ids, hist, id_digits=digits)
 
                 @plsc.parallel_loop(0, k, lanes)
@@ -133,3 +137,34 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
                 )
 
     return kernel(scores, candidates)
+
+
+def verify_fused_selection(*, unroll_selection):
+    """Exercise empty rows, ties, short rows and noncontiguous block IDs."""
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
+        candidate_topk,
+        compact_candidate_scores,
+    )
+
+    positions = jnp.arange(98304, dtype=jnp.int32)
+    scores = jnp.stack(
+        (
+            jnp.full((98304,), -jnp.inf),
+            jnp.zeros((98304,)),
+            jnp.where(positions < 17, 0.0, -jnp.inf),
+            (positions % 17).astype(jnp.float32),
+        )
+    )
+    candidates = jnp.broadcast_to(jnp.arange(2048), (4, 2048))
+    candidates = candidates.at[0].set(-1).at[3].multiply(3)
+
+    def reference(values, ids):
+        compact = compact_candidate_scores(values, ids, block_size=8)
+        return candidate_topk(compact, ids, k=512, block_size=8)
+
+    expected = jax.jit(reference)(scores, candidates)
+    actual = jax.jit(
+        functools.partial(fused_select, unroll_selection=unroll_selection)
+    )(scores, candidates)
+    assert bool(jnp.array_equal(actual, expected)), "Fused selection edge case changed"
+    print("Fused selection edge cases passed", flush=True)

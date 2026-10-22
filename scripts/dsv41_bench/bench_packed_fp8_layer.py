@@ -531,6 +531,10 @@ def main():
         )
     )
     with jax.default_device(jax.devices()[0]):
+        if args.fused_candidate_select:
+            from _fused_candidate_select import verify_fused_selection
+
+            verify_fused_selection(unroll_selection=args.unroll_candidate_selection)
         for seed in args.seeds:
             pools, common, candidates = fixture(
                 args.requests, args.queries, args.width, seed
