@@ -599,7 +599,9 @@ class TestWorkerSide:
     def test_init_worker(self, monkeypatch):
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "8")
-        args = argparse.Namespace(tp_size=8, seed=42, result_dir=pathlib.Path("/tmp"))
+        args = argparse.Namespace(
+            tp_size=8, dp_size=1, seed=42, result_dir=pathlib.Path("/tmp")
+        )
 
         with (
             patch("torch.distributed.init_process_group") as mock_init_pg,
@@ -619,7 +621,7 @@ class TestWorkerSide:
             mock_vllm_init.assert_called_once()
             mock_vllm_mp.assert_called_once_with(8, 1)
 
-        args_bad = argparse.Namespace(tp_size=5)
+        args_bad = argparse.Namespace(tp_size=5, dp_size=1)
         with pytest.raises(ValueError, match="not divisible by tp_size"):
             common.init_worker(args_bad)
 

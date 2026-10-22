@@ -489,6 +489,7 @@ def add_common_args(parser: argparse.ArgumentParser, subops: Sequence[str]) -> N
     parser.add_argument("--num-seqs", type=int, default=1)
     parser.add_argument("--kv-len", type=int, default=90112)
     parser.add_argument("--tp-size", type=int, default=WORLD_SIZE)
+    parser.add_argument("--dp-size", type=int, default=1)
     parser.add_argument("--subop", choices=list(subops), default=subops[0])
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -701,6 +702,7 @@ class WorkerContext:
     tp_size: int
     cpu_group: Any
     result_dir: pathlib.Path
+    dp_size: int = 1
 
 
 def _worker_entry(args: argparse.Namespace, worker_fn) -> None:
@@ -738,7 +740,7 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
     import torch
     import torch.distributed as dist
     import torch_tpu  # noqa: F401
-    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         ensure_model_parallel_initialized,
         init_distributed_environment,
@@ -746,12 +748,16 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size % args.tp_size:
+    if args.tp_size < 1 or args.dp_size < 1:
+        raise ValueError("--tp-size and --dp-size must be positive")
+    if world_size % (args.tp_size * args.dp_size):
         raise ValueError(
-            f"world_size={world_size} not divisible by tp_size={args.tp_size}"
+            f"world_size={world_size} not divisible by "
+            f"tp_size={args.tp_size} * dp_size={args.dp_size}"
         )
     dist.init_process_group(backend="tpu_dist")
     torch.empty((1,), device="tpu").cpu()
+    # torchrun already supplies global ranks; a DP config here offsets them again.
     init_distributed_environment(
         world_size=world_size,
         rank=rank,
@@ -759,7 +765,21 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
         distributed_init_method="env://",
         backend="tpu_dist",
     )
-    with set_current_vllm_config(VllmConfig()):
+    if args.dp_size > 1:
+        dp_rank = (rank // args.tp_size) % args.dp_size
+        config = VllmConfig(
+            parallel_config=ParallelConfig(
+                tensor_parallel_size=args.tp_size,
+                data_parallel_size=args.dp_size,
+                data_parallel_size_local=args.dp_size,
+                data_parallel_rank=dp_rank,
+                data_parallel_rank_local=dp_rank,
+                enable_expert_parallel=True,
+            )
+        )
+    else:
+        config = VllmConfig()
+    with set_current_vllm_config(config):
         ensure_model_parallel_initialized(args.tp_size, 1)
     cpu_group = dist.new_group(ranks=list(range(world_size)), backend="gloo")
     torch.manual_seed(args.seed)
@@ -769,6 +789,7 @@ def init_worker(args: argparse.Namespace) -> WorkerContext:
         tp_size=args.tp_size,
         cpu_group=cpu_group,
         result_dir=args.result_dir,
+        dp_size=args.dp_size,
     )
 
 
@@ -895,6 +916,8 @@ def profile_steps(
         for i in range(args.profile_steps):
             with torch.profiler.record_function(f"{label}_step{i}"):
                 synchronize(step())
+        # Keep every rank's profiler active until all EP work has finished.
+        dist.barrier(group=ctx.cpu_group)
     dist.barrier(group=ctx.cpu_group)
     profiler_trace.merge_rank_capture(
         capture_dir, profile_dir, canonical_ts, ctx.rank, world_size=ctx.world_size
