@@ -162,7 +162,14 @@ def make_tables(layout: TQLayout, centroids: np.ndarray) -> TQTables:
 
 
 def rotate(inputs: jax.Array, hadamard: jax.Array) -> jax.Array:
-    """`inputs @ H` in `f32` (`Precision.HIGHEST` avoids `bf16` midpoint drift)."""
+    """`inputs @ H` in `f32` (uses 1-pass `bf16` MXU with `f32` accum for `bf16` inputs)."""
+    if inputs.dtype == jnp.bfloat16:
+        return jnp.einsum(
+            "...d,de->...e",
+            inputs,
+            hadamard.astype(jnp.bfloat16),
+            preferred_element_type=jnp.float32,
+        )
     return jnp.einsum(
         "...d,de->...e",
         inputs.astype(jnp.float32),
@@ -224,27 +231,27 @@ def _bf16_u16_to_f32_vreg(lo_u32: jax.Array, hi_u32: jax.Array) -> jax.Array:
 def _lookup_centroids_vreg(
     idx: jax.Array, bits: int, centroids: np.ndarray
 ) -> jax.Array:
-    """VREG binary-tree select of `centroids[idx]` exploiting antisymmetry."""
-    c_arr = np.asarray(centroids, dtype=np.float32)
-    half = 1 << (bits - 1)
-    top_bit = (idx & half) != 0
-    fold_idx = jnp.where(top_bit, ~idx, idx)
-    vals = [jnp.full(idx.shape, float(val), dtype=jnp.float32) for val in c_arr[:half]]
+    """VREG binary-tree select of `centroids[idx]` using sign-magnitude encoding."""
+    c_pos = np.asarray(centroids, dtype=np.float32)[1 << (bits - 1) :]
+    vals = [jnp.full(idx.shape, float(val), dtype=jnp.float32) for val in c_pos]
     for bit_idx in range(bits - 1):
-        bit_set = (fold_idx & (1 << bit_idx)) != 0
+        bit_set = (idx & (1 << bit_idx)) != 0
         vals = [
             jnp.where(bit_set, vals[2 * pair_i + 1], vals[2 * pair_i])
             for pair_i in range(len(vals) // 2)
         ]
-    return jnp.where(top_bit, -vals[0], vals[0])
+    top_bit = (idx & (1 << (bits - 1))) != 0
+    return jnp.where(top_bit, vals[0], -vals[0])
 
 
 def _unpack_bits_vreg(plane: jax.Array, bits: int) -> jax.Array:
     """Unpacks `u8[P*bits//8, 128]` -> `u32[P, 128]` in TPU VREGs."""
-    packed = plane.astype(jnp.uint32)
     if bits == 4:
-        return jnp.concatenate([packed & 0xF, (packed >> 4) & 0xF], axis=0)
+        lo_u8 = plane & jnp.uint8(0xF)
+        hi_u8 = plane >> jnp.uint8(4)
+        return jnp.concatenate([lo_u8, hi_u8], axis=0).astype(jnp.uint32)
     assert bits == 3, bits
+    packed = plane.astype(jnp.uint32)
     grp = packed.shape[0] // 3
     word = (
         packed[:grp] | (packed[grp : 2 * grp] << 8) | (packed[2 * grp : 3 * grp] << 16)
@@ -259,18 +266,11 @@ def _unpack_bits_multi_vreg(planes: list[jax.Array], bits: int) -> jax.Array:
     if len(planes) == 1:
         return _unpack_bits_vreg(planes[0], bits)
     if bits == 4:
-        half = planes[0].shape[0]
-        packed = jnp.concatenate(planes, axis=0).astype(jnp.uint32)
-        lo_nib, hi_nib = packed & 0xF, (packed >> 4) & 0xF
         parts = []
-        for page_i in range(len(planes)):
-            parts.extend(
-                [
-                    lo_nib[page_i * half : (page_i + 1) * half],
-                    hi_nib[page_i * half : (page_i + 1) * half],
-                ]
-            )
-        return jnp.concatenate(parts, axis=0)
+        for plane in planes:
+            parts.append(plane & jnp.uint8(0xF))
+            parts.append(plane >> jnp.uint8(4))
+        return jnp.concatenate(parts, axis=0).astype(jnp.uint32)
     return jnp.concatenate([_unpack_bits_vreg(plane, bits) for plane in planes], axis=0)
 
 
@@ -364,40 +364,30 @@ def _dequant_tq_page_vreg(
 
     # Step 2: Extract k_norm (if meta_words > 1 and non-fp8) and dequantize K.
     if meta_words > 1 and not layout.is_key_fp8:
-        mts2 = [_bcast_col(m_tile[2:3]) for m_tile in m_tiles]
-        kn_lo = jnp.concatenate([mt[0:p_sz] for mt in mts2], axis=0).astype(jnp.uint32)
-        kn_hi = jnp.concatenate([mt[64 : 64 + p_sz] for mt in mts2], axis=0).astype(
+        m2_u32 = jnp.concatenate([m_tile[2:3] for m_tile in m_tiles], axis=0).astype(
             jnp.uint32
         )
+        mts2 = [_bcast_col(m2_u32[page_i : page_i + 1]) for page_i in range(num_pages)]
+        kn_lo = jnp.concatenate([mt[0:p_sz] for mt in mts2], axis=0)
+        kn_hi = jnp.concatenate([mt[64 : 64 + p_sz] for mt in mts2], axis=0)
         k_norm = _bf16_u16_to_f32_vreg(kn_lo, kn_hi)
 
-    k_folds = []
+    dk_folds = []
     for fold_i in range(folds):
         kp_list = [
             _load_slice(ph, fold_i * k_wpf, (fold_i + 1) * k_wpf) for ph in pages_list
         ]
         if layout.is_key_fp8:
             kp_all = jnp.concatenate(kp_list, axis=0)
-            k_folds.append(
+            dk_folds.append(
                 jax.lax.bitcast_convert_type(kp_all, jnp.float8_e4m3fn).astype(kv_dtype)
             )
         else:
             k_idx_f = _unpack_bits_multi_vreg(kp_list, layout.key_bits)
-            k_folds.append(
-                _lookup_centroids_vreg(k_idx_f, layout.key_bits, tables.centroids)
-            )
+            kf = _lookup_centroids_vreg(k_idx_f, layout.key_bits, tables.centroids)
+            dk_folds.append((kf * k_norm).astype(kv_dtype))
 
-    if layout.is_key_fp8:
-        dk = k_folds[0] if folds == 1 else jnp.concatenate(k_folds, axis=1)
-    else:
-        if layout.norm_correction:
-            sq_acc = sum((kf * kf for kf in k_folds[1:]), k_folds[0] * k_folds[0])
-            sq_sum = jnp.sum(sq_acc, axis=-1, keepdims=True)
-            k_scale = k_norm * jax.lax.rsqrt(sq_sum + _CENTROID_NORM_EPS)
-        else:
-            k_scale = k_norm
-        dk_folds = [(kf * k_scale).astype(kv_dtype) for kf in k_folds]
-        dk = dk_folds[0] if folds == 1 else jnp.concatenate(dk_folds, axis=1)
+    dk = dk_folds[0] if folds == 1 else jnp.concatenate(dk_folds, axis=1)
     return dk, dv
 
 
@@ -450,9 +440,15 @@ def _quantize_kv_components(
             rot_k = rotate(
                 key_f32 / (norm + _KEY_NORM_EPS), jnp.asarray(tables.hadamard)
             )
-        k_unpacked = jnp.sum(
+        k_idx = jnp.sum(
             rot_k[..., None] >= jnp.asarray(tables.midpoints), axis=-1
         ).astype(jnp.uint8)
+        if layout.norm_correction:
+            k_c = jnp.asarray(tables.centroids, dtype=jnp.float32)[k_idx]
+            c_sq = jnp.sum(k_c * k_c, axis=-1, keepdims=True)
+            norm = norm * jax.lax.rsqrt(c_sq + _CENTROID_NORM_EPS)
+        half = jnp.uint8(1 << (layout.key_bits - 1))
+        k_unpacked = jnp.where(k_idx < half, k_idx ^ (half - jnp.uint8(1)), k_idx)
         kn_lo, kn_hi = _f32_to_bf16_bytes(norm)
         meta_bytes = jnp.concatenate(
             [vs_lo, vs_hi, vz_lo, vz_hi, kn_lo, kn_hi], axis=-1
@@ -590,11 +586,11 @@ def _update_tq_page_vreg(
             axis=0,
         )
 
-    def _reduce_or_axis0(val: jax.Array, msk: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def _reduce_or_axis0(val: jax.Array) -> jax.Array:
         while val.shape[0] > 1:
             half = val.shape[0] // 2
-            val, msk = val[:half] | val[half:], msk[:half] | msk[half:]
-        return val, msk
+            val = val[:half] | val[half:]
+        return val
 
     k_planes, v_planes = [], []
     for fold_i in range(folds):
@@ -628,11 +624,11 @@ def _update_tq_page_vreg(
     else:
         row_iota = jax.lax.broadcasted_iota(jnp.int32, (p_sz, _WORD_SIZE), 0)
         match = valid_mask & (row_iota == col_slot) & in_bounds
+        msk = _reduce_or_axis0(jnp.where(match, jnp.uint8(0xFF), jnp.uint8(0)))
         meta_planes = []
         for mw in range(meta_words):
-            val, msk = _reduce_or_axis0(
-                jnp.where(match, tok_words[m_off + mw], jnp.uint8(0)),
-                jnp.where(match, jnp.uint8(0xFF), jnp.uint8(0)),
+            val = _reduce_or_axis0(
+                jnp.where(match, tok_words[m_off + mw], jnp.uint8(0))
             )
             meta_planes.append((old_meta[mw : mw + 1] & ~msk) | val)
 
@@ -702,7 +698,7 @@ def tq_ragged_paged_attention(
     else:
         hadamard = jnp.asarray(tables.hadamard)
         q_in = rotate(queries, hadamard).astype(compute_dtype)
-        k_rot = rotate(keys.astype(jnp.float32), hadamard)
+        k_rot = rotate(keys, hadamard)
         k_in = k_rot.astype(compute_dtype)
 
     dequant_fn = functools.partial(_dequant_tq_page_vreg, layout=layout, tables=tables)
