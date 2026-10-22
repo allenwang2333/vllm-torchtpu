@@ -39,6 +39,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 MAX_M = 16
 LANE = 128
+# `weight_vmem` only for a weight (the whole stack operand) up to this size: XLA's
+# memory-space assignment refuses to color 32 MiB (q_b at full heads, (2048, 16384))
+# into VMEM ("Too many buffers are colored in the alternate memory"); 16 MiB fits.
+VMEM_WEIGHT_MAX_BYTES = 24 << 20
 
 # Measured per site on tpu7x (GLM-5.2-FP8, TP16 q-replicate decode, cold weight)
 # in write-tpu-kernels fp8-gemm probes 03-04: fastest config, ties to the smaller ring.
@@ -319,6 +323,8 @@ def fp8_skinny_matmul_stacked(
     m, k = x.shape
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
+    if weight_vmem and w_stack.size * w_stack.dtype.itemsize > VMEM_WEIGHT_MAX_BYTES:
+        weight_vmem = False  # too big to color into VMEM: keep the ring (and pin)
     if weight_vmem:
         hbm_pin = False
     call = _build(

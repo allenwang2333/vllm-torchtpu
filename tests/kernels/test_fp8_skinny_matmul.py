@@ -418,7 +418,7 @@ def test_weight_vmem_positive_control():
 
 
 def test_weight_vmem_stacked_eager_bit_identical():
-    k, n = 2048, 8192
+    k, n = 1024, 6144
     x = _x(4, k, 4)
     ws_list = [_w(k, n, seed=s) for s in (5, 6)]
     stack = jnp.stack([w for w, _ in ws_list])
@@ -431,25 +431,66 @@ def test_weight_vmem_stacked_eager_bit_identical():
         )
 
 
-@pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 8192), (2048, 16384)])
+def _vmem_operands(hlo: str, call_marker: str) -> tuple[str, list[str]]:
+    """(call line, its operands XLA placed in VMEM (S(1)), followed through
+    bitcasts) for the one custom call whose line contains `call_marker`."""
+    defs = {}
+    for ln in hlo.splitlines():
+        m = re.match(r"\s*(?:ROOT )?%(\S+) = (.*)", ln)
+        if m:
+            defs[m.group(1)] = m.group(2)
+
+    def in_vmem(name):
+        rhs = defs.get(name, "")
+        if "S(1)" in rhs.split(" ", 1)[0]:
+            return True
+        b = re.search(r" bitcast\(%([\w.\-]+)", rhs)
+        return bool(b) and in_vmem(b.group(1))
+
+    calls = [
+        (n, r) for n, r in defs.items() if "custom-call(" in r and call_marker in n
+    ]
+    assert len(calls) == 1, [n for n, _ in calls]
+    name, rhs = calls[0]
+    args = re.findall(r"%([\w.\-]+)", rhs.split("custom-call(", 1)[1].split(")", 1)[0])
+    return name + " = " + rhs[:400], [a for a in args if in_vmem(a)], args
+
+
+@pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 8192), (6144, 2688)])
 def test_weight_vmem_lowers_to_vmem_color_and_staged_operand(k, n):
     """The custom call carries `input_memory_space_colors`, and in the compiled
-    module its weight operand sits in VMEM (S(1)), i.e. XLA staged it."""
+    module its weight operand (the last) sits in VMEM (S(1)): XLA staged it. The
+    ring variant's weight does not (pinned)."""
     x = _x(16, k, 4)
     wq, ws = _w(k, n)
-    lowered = jax.jit(
+
+    def compiled(**kw):
+        lowered = jax.jit(
+            lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, **kw)
+        ).lower(x, wq, ws)
+        return lowered.as_text(), lowered.compile().as_text()
+
+    low, hlo = compiled(weight_vmem=True)
+    assert "input_memory_space_colors" in low
+    line, vmem_args, args = _vmem_operands(hlo, "_wv_")
+    print(line)
+    assert args[-1] in vmem_args, (args, vmem_args)
+    _, hlo_pin = compiled(hbm_pin=True)
+    _, vmem_pin, args_pin = _vmem_operands(hlo_pin, "fp8_skinny")
+    assert args_pin[-1] not in vmem_pin
+
+
+def test_weight_vmem_falls_back_to_the_ring_above_the_vmem_cap():
+    """A weight above VMEM_WEIGHT_MAX_BYTES (q_b at full heads, 32 MiB) keeps the HBM
+    ring: XLA cannot color it into VMEM ("Too many buffers are colored")."""
+    k, n = 2048, 16384
+    assert k * n > fp8_skinny.VMEM_WEIGHT_MAX_BYTES
+    x = _x(16, k, 16)
+    wq, ws = _w(k, n)
+    run = jax.jit(
         lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, weight_vmem=True)
-    ).lower(x, wq, ws)
-    assert "input_memory_space_colors" in lowered.as_text()
-    hlo = lowered.compile().as_text()
-    call = [
-        ln
-        for ln in hlo.splitlines()
-        if "custom-call(" in ln and "fp8_skinny" in ln and "_wv_" in ln
-    ]
-    assert len(call) == 1, call
-    print(call[0][:600])
-    weight_arg = call[0].split("custom-call(", 1)[1].split("),")[0].split(", ")[-2:]
-    assert any(
-        a.startswith(f"f8e4m3fn[1,{k},{n}]") and "S(1)" in a for a in weight_arg
-    ), weight_arg
+    )
+    ref = jax.jit(lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c))
+    np.testing.assert_array_equal(
+        np.asarray(run(x, wq, ws), np.float32), np.asarray(ref(x, wq, ws), np.float32)
+    )
