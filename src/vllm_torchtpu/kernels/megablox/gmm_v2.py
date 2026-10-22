@@ -920,17 +920,20 @@ def use_decode_path(cfgs: GmmConfigs) -> bool:
 
 def decode_kernel(
     # Out
-    out_ref: jax.Array,  # [size_m, aligned out_size_n], VMEM
+    out_ref: jax.Array,  # [<= size_m, aligned out_size_n], VMEM
     # Scratch
     metadata_ref: MetadataRef,
     dec: DecodeRefs,
     *,
     num_gm: jax.Array,
-    lhs_hbm_ref: jax.Array,  # [size_m, size_k]
+    lhs_hbm_ref: jax.Array,  # [<= size_m, size_k]
     rhs_hbm_ref: WeightsRef,  # [size_group, size_k, size_n]
     cfgs: GmmConfigs,
 ):
     """Whole-call body of a one-step pipeline that only writes the output back.
+
+    lhs_hbm_ref and out_ref may hold fewer rows than size_m: the rows past
+    them are computed on stale VMEM and never stored.
 
     lhs is fetched and quantized once for every expert. Each gm tile's expert
     arrives as one contiguous weight DMA plus one scale DMA through
@@ -967,7 +970,9 @@ def decode_kernel(
             weight_copy(gm).start()
             scale_copy(gm).start()
 
-    lhs_copy = pltpu.make_async_copy(lhs_hbm_ref, dec.lhs, dec.lhs_sem.at[0])
+    lhs_copy = pltpu.make_async_copy(
+        lhs_hbm_ref, dec.lhs.at[pl.ds(0, lhs_hbm_ref.shape[0])], dec.lhs_sem.at[0]
+    )
     lhs_copy.start()
     for gm in range(lookahead):
         start_fetch(gm)
@@ -1035,7 +1040,7 @@ def decode_kernel(
                 acc_n += block_acc
             acc_list.append(acc_n)
         acc = apply_act_fn(jnp.concatenate(acc_list, axis=1), cfgs.fuse_act)
-        acc = acc.astype(out_ref.dtype)
+        acc = acc[: out_ref.shape[0]].astype(out_ref.dtype)
 
         m_start = metadata_ref.gm_id_to_m_offset[gm]
         m_end = metadata_ref.gm_id_to_m_offset[gm + 1]
@@ -1571,14 +1576,13 @@ def gmm_v2(
 
     del precision
 
-    # The kernel reshapes lhs by its sublane block, so pad the rows up to it.
-    # The extra rows sit past every group, so they add no work, and they are
-    # sliced back off the output below.
+    # The kernel reshapes lhs by its sublane block, so it is configured for
+    # the rows padded up to it. The extra rows sit past every group, so they
+    # add no work, and they are sliced back off the output below.
     size_m = lhs.shape[0]
     size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
     padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
-        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+    padded_lhs = jax.ShapeDtypeStruct((padded_size_m, lhs.shape[1]), lhs.dtype)
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1590,7 +1594,7 @@ def gmm_v2(
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
 
     cfgs = make_gmm_configs(
-        lhs,
+        padded_lhs,
         rhs,
         rhs_scale,
         rhs_bias,
@@ -1607,6 +1611,12 @@ def gmm_v2(
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
+
+    # The decode path fetches lhs rows itself and writes exactly size_m output
+    # rows, so it needs neither the padded copy of lhs nor the output slice.
+    is_decode = use_decode_path(cfgs)
+    if padded_size_m != size_m and not is_decode:
+        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
@@ -1658,7 +1668,7 @@ def gmm_v2(
     else:
         scratch_shapes += [None, None]
 
-    if use_decode_path(cfgs):
+    if is_decode:
         num_q_blocks = dims.size_k // cfgs.lhs_cfgs.quant_block_size
         scratch_shapes.append(
             DecodeRefs(
@@ -1680,7 +1690,8 @@ def gmm_v2(
         scratch_shapes.append(None)
 
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
-    out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
+    out_rows = size_m if is_decode else dims.size_m
+    out_init = jax.ShapeDtypeStruct((out_rows, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
 
     return pl.pallas_call(
