@@ -41,7 +41,7 @@ def test_sparse_tasks_match_token_level_candidate_reference(block_size):
         block_size=block_size,
         cache_pages=cache_pages,
     )
-    physical, offsets, task_lengths, block_mask = map(np.asarray, tasks)
+    physical, offsets, task_lengths, block_mask = map(np.asarray, tasks[:4])
     allowed = np.zeros((rows, width), bool)
     for row in range(rows):
         for candidate in candidates[row]:

@@ -12,6 +12,7 @@ import argparse
 import functools
 import gzip
 import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -62,6 +63,27 @@ def load_model():
     )
 
     return attention_kernels, packed_fp8_indexer
+
+
+def load_sparse_baseline(source: Path):
+    """Load the two historical source files supplied for an exact FP8 A/B."""
+    modules = []
+    for suffix in (
+        "kernels.deepseek_v41.index_selection.packed_fp8_sparse",
+        "models.vllm.deepseek_v41.v2.packed_fp8_indexer",
+    ):
+        name = "vllm_torchtpu." + suffix
+        path = source / "src" / (name.replace(".", "/") + ".py")
+        spec = importlib.util.spec_from_file_location(name + "_baseline", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        modules.append(module)
+    sparse, indexer = modules
+    indexer.candidate_pages = sparse.candidate_pages
+    indexer.mask_candidate_scores = sparse.mask_candidate_scores
+    return indexer
 
 
 def round_fp8(values):
@@ -157,6 +179,8 @@ def fixture(requests, queries, width, seed):
 
 def compile_arm(modules, variant, mode, requests, queries, width, out):
     baseline, candidate = modules
+    if variant == "packed_fp8_full_scores":
+        candidate = baseline
     write, filtering = mode == "publish", mode == "filter"
 
     def run(
@@ -314,9 +338,10 @@ def validate_outputs(outputs, lengths, candidates, filtering):
             )
     reference, candidate = sets.values()
     overlap = [len(a & b) / 512 for a, b in zip(reference, candidate)]
-    if "packed_fp8_scatter" in outputs:
-        for before, after in zip(outputs["packed_fp8_scatter"], outputs["packed_fp8"]):
-            assert bool(jnp.array_equal(before, after)), "Cache writer changed output"
+    for baseline in ("packed_fp8_scatter", "packed_fp8_full_scores"):
+        if baseline in outputs:
+            for before, after in zip(outputs[baseline], outputs["packed_fp8"]):
+                assert bool(jnp.array_equal(before, after)), "FP8 output changed"
     return dict(
         topk_overlap_mean=float(np.mean(overlap)), topk_overlap_min=min(overlap)
     )
@@ -414,12 +439,19 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compare-cache-writers", action="store_true")
+    parser.add_argument("--sparse-baseline", type=Path)
     args = parser.parse_args()
     modules = load_model()
+    if args.sparse_baseline is not None:
+        modules = (load_sparse_baseline(args.sparse_baseline), modules[1])
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (
-        "packed_fp8_scatter" if args.compare_cache_writers else "bf16",
+        "packed_fp8_full_scores"
+        if args.sparse_baseline is not None
+        else "packed_fp8_scatter"
+        if args.compare_cache_writers
+        else "bf16",
         "packed_fp8",
     )
     compiled = {
@@ -435,7 +467,11 @@ def main():
             )
             for variant in variants
         }
-        for mode in ("full", "publish", "filter")
+        for mode in (
+            ("filter",)
+            if args.sparse_baseline is not None
+            else ("full", "publish", "filter")
+        )
     }
     dependencies = sorted(
         str(Path(m.__file__).relative_to(ROOT))
@@ -466,17 +502,17 @@ def main():
             pools, common, candidates = fixture(
                 args.requests, args.queries, args.width, seed
             )
-            if args.compare_cache_writers:
+            if args.compare_cache_writers or args.sparse_baseline is not None:
                 del pools["bf16"]
-                pools["packed_fp8_scatter"] = tuple(
-                    x.copy() for x in pools["packed_fp8"]
-                )
+                pools[variants[0]] = tuple(x.copy() for x in pools["packed_fp8"])
             for mode, distribution in (
                 ("full", "scattered"),
                 ("publish", "scattered"),
                 ("filter", "clustered"),
                 ("filter", "scattered"),
             ):
+                if mode not in compiled:
+                    continue
                 case = f"{mode}_{distribution}" if mode == "filter" else mode
                 measure(
                     compiled[mode],

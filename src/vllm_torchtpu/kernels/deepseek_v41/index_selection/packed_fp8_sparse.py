@@ -8,6 +8,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from ._packed_fp8_compact import candidate_membership
 from .packed_fp8_cache import PAGE_RECORDS
 from .tuned_block_sizes import PACKED_FP8_MQA_CONFIG
 
@@ -17,6 +18,7 @@ class CandidatePages(NamedTuple):
     query_offsets: jax.Array
     lengths: jax.Array
     block_mask: jax.Array
+    candidates: jax.Array
 
 
 def candidate_pages(
@@ -53,12 +55,7 @@ def candidate_pages(
 
     width = logical_pages * PAGE_RECORDS
     blocks = (width + block_size - 1) // block_size
-    valid = (candidates >= 0) & (candidates < blocks)
-    block_mask = (
-        jnp.zeros((rows, blocks + 1), jnp.int32)
-        .at[positions[:, None], jnp.where(valid, candidates, blocks)]
-        .set(1)[:, :blocks]
-    )
+    block_mask, canonical = candidate_membership(candidates, blocks)
     # Only expand to the common block/page boundary, not individual tokens.
     stride = math.gcd(PAGE_RECORDS, block_size)
     covered = jnp.repeat(block_mask, block_size // stride, axis=1)[:, : width // stride]
@@ -77,7 +74,7 @@ def candidate_pages(
         physical, ((0, 0), (0, padded - logical_pages)), constant_values=-1
     )
     lengths = jnp.where(query_pages.any(axis=1), lengths, 0)
-    return CandidatePages(physical, offsets, lengths, block_mask)
+    return CandidatePages(physical, offsets, lengths, block_mask, canonical)
 
 
 def mask_candidate_scores(

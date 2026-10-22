@@ -14,6 +14,9 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.index_quantization import quantize_index_rows
+from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
+    compact_candidate_scores,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
     PAGE_RECORDS,
     PackedFP8Layout,
@@ -25,7 +28,6 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_mqa import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import (
     candidate_pages,
-    mask_candidate_scores,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     PACKED_FP8_MQA_CONFIG,
@@ -249,6 +251,8 @@ def _score_and_select(
             )
 
         def sparse():
+            if row_candidates.shape[1] == 0:
+                return jnp.full((rows, min(topk, width)), -1, jnp.int32), row_candidates
             tasks = candidate_pages(
                 row_candidates,
                 row_lengths,
@@ -268,23 +272,32 @@ def _score_and_select(
                 cache_layout=layout,
                 skip_invalid_pages=True,
             )
-            scores = mask_candidate_scores(
+            scores = compact_candidate_scores(
                 scores,
-                tasks.block_mask,
-                row_lengths,
+                tasks.candidates,
                 block_size=block_size,
-                width=width,
             )
             selected, _ = attention_kernels.select_indices_jax(
                 scores,
-                tasks.lengths,
-                row_candidates,
+                jnp.full_like(row_lengths, scores.shape[1]),
+                tasks.candidates,
                 min(topk, width),
                 block_size,
                 False,
                 False,
                 unordered,
                 batch_max,
+            )
+            selected = jnp.pad(
+                selected,
+                ((0, 0), (0, min(topk, width) - selected.shape[1])),
+                constant_values=-1,
+            )
+            blocks = jnp.take_along_axis(
+                tasks.candidates, jnp.maximum(selected, 0) // block_size, axis=1
+            )
+            selected = jnp.where(
+                selected >= 0, blocks * block_size + selected % block_size, -1
             )
             return selected, row_candidates
 
