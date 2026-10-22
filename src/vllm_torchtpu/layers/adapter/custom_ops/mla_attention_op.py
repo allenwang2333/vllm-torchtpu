@@ -95,6 +95,10 @@ from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op, synchronize_ten
 
 logger = init_logger(__name__)
 
+# TPU_SEGMENT_MEGAKERNEL: set on a fused_qkv_a_proj the segment arming gave a
+# lane-padded copy of its weight; the value is the logical output width.
+SEGMENT_QKV_LOGICAL_ATTR = "_segment_megakernel_n_logical"
+
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
 # The guard is batch-wide, so this fires during warmup and on short-context
@@ -1923,6 +1927,8 @@ class VllmTPUMLAAttention(MLAAttention):
             output=output,
             topk_indices=kwargs.get("topk_indices"),
             q_dcp_replicated=kwargs.get("q_dcp_replicated"),
+            segment_recv=kwargs.get("segment_recv", False),
+            kv_rows=kwargs.get("kv_rows"),
         )
 
 
@@ -2139,13 +2145,31 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
         prefill_group=None,
+        segment_tail: bool = False,
+        segment_head: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """`segment_tail` / `segment_head` (TPU_SEGMENT_MEGAKERNEL, see
+        layers/adapter/segment_megakernel.py): as a tail, return the DCP
+        merge's output in latent space and leave W_UV, o_proj and its
+        all-reduce to the megakernel; as a head, take the megakernel's
+        `(q_c, kv_rows)` in place of this layer's fused_qkv_a / q_a_layernorm /
+        kv_a_layernorm / k_pe rope / KV pack (`hidden_states` is then only a
+        token-count template)."""
         q_c = None
         kv_lora = None
         output_gate = None
         early_topk = None
+        kv_rows = None
 
-        if self.kimi_preprocess is not None:
+        if segment_head is not None:
+            q_c, kv_rows = segment_head
+            assert self.q_b_proj is not None and self.kimi_preprocess is None
+            assert not self.gate_is_fused and self.g_proj is None
+            assert self.is_sparse and (self.indexer is None or self.skip_topk)
+            q = self.q_b_proj(q_c)[0]
+            kv_c_normed = None
+            k_pe = None
+        elif self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
             assert self.q_a_layernorm is not None
             assert self.q_b_proj is not None
@@ -2221,8 +2245,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q = q.view(-1, self.num_heads * self.dcp_group_size, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
+        if segment_head is None:
+            # Add head dim of 1 to k_pe
+            k_pe = k_pe.unsqueeze(1)
 
         q_rope_table = None
         fold_q_rope = (
@@ -2230,7 +2255,12 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             and getattr(self, "_rope_neox_permuted", False)
             and llama_4_scaling is None
         )
-        if fold_q_rope:
+        if segment_head is not None:
+            # k_pe was roped and packed by the megakernel; q_pe is roped in the
+            # attention kernel (TPU_MLA_DECODE_PROLOGUE).
+            assert fold_q_rope, "segment_head needs the MLA decode prologue"
+            q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
+        elif fold_q_rope:
             # k_pe exactly as below (the unused q half is dead code to XLA);
             # q_pe is roped in the attention kernel from the raw q head.
             k_pe_dtype = k_pe.dtype
@@ -2284,6 +2314,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             )._local_view
             q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
+        segment_kwargs = {}
+        if segment_tail:
+            segment_kwargs["segment_recv"] = True
+        if kv_rows is not None:
+            segment_kwargs["kv_rows"] = kv_rows
         attn_out = self.mla_attn(
             (q_nope, q_pe),
             kv_c_normed,
@@ -2291,7 +2326,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             output_shape=(q.shape[0], self.num_heads * self.v_head_dim),
             topk_indices=topk_indices,
             q_dcp_replicated=q_dcp_replicated,
+            **segment_kwargs,
         )
+        if segment_tail:
+            # The merged latent: W_UV, o_proj and its all-reduce run in the
+            # segment megakernel.
+            assert output_gate is None and self.g_proj is None
+            assert prefill_group is None
+            return attn_out
 
         if output_gate is not None:
             attn_out *= output_gate.sigmoid()

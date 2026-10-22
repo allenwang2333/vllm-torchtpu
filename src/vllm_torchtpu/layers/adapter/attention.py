@@ -2442,6 +2442,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_rope: bool = False,
         send_layout: bool = False,
         fused_exchange: bool = False,
+        kv_rows: bool = False,
     ):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.
 
@@ -2465,6 +2466,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         the op takes this rank's lane operand and returns `(o_recv, l_recv)`,
         the received partials and lse (`cp_mla_attention.merge_fused_recv`).
         Buckets `cp_mla_attention.fused_small_a2a_applies` takes only.
+
+        `kv_rows` (TPU_SEGMENT_MEGAKERNEL; with `send_layout`, `q_rope` and
+        TPU_DCP_RANK_OPERAND): the variant whose step KV write arrives packed
+        per rank (`sparse_mla_attention_dcp`'s `kv_rows`, written by the
+        segment megakernel) in place of `kv_c_normed` / `k_pe`.
         """
         from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
         from vllm_torchtpu.layers.core.attention_interface import (
@@ -2473,6 +2479,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         assert q_rope or not send_layout, "send_layout rides the prologue op"
         assert send_layout or not fused_exchange, "fused_exchange rides send_layout"
+        assert send_layout or not kv_rows, "kv_rows rides send_layout"
 
         mesh = self._dcp_mesh
         # Set in __init__ when dcp_size > 1, the only case that builds this op.
@@ -2511,6 +2518,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             rope_table: jax.Array | None,
             rank_ids: jax.Array | None,
             lane_ids: jax.Array | None = None,
+            kv_rows_: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             nope_spec, rope_spec = layer.mla_kv_spec
             return sparse_mla_attention_dcp(
@@ -2538,6 +2546,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 fused_exchange=fused_exchange,
                 fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
+                kv_rows=kv_rows_,
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -2697,6 +2706,73 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 lane_ids,
             )
 
+        # TPU_SEGMENT_MEGAKERNEL: the same two decode variants with this
+        # rank's packed KV write rows in place of (kv_c_normed, k_pe).
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank_kvrows(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_rows: jax.Array,  # i32 [3 * Tp, 128] per rank, sharded
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                None,
+                None,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+                None,
+                kv_rows,
+            )
+
+        def sparse_mla_attention_core_tpu_dcp_qrope_rank_lane_kvrows(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_rows: jax.Array,  # i32 [3 * Tp, 128] per rank, sharded
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            rope_table: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+            lane_ids: jax.Array,  # i32[dcp], sharded: each shard its lane
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return _sparse_mla_attention_dcp_run(
+                kv_cache_nope,
+                kv_cache_rope,
+                ql_nope,
+                q_pe,
+                None,
+                None,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_ids,
+                lane_ids,
+                kv_rows,
+            )
+
         core_fn = {
             (False, False): sparse_mla_attention_core_tpu_dcp,
             (True, False): sparse_mla_attention_core_tpu_dcp_qrope,
@@ -2705,6 +2781,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         }[(bool(q_rope), rank_tensor is not None)]
         if fused_exchange:
             core_fn = sparse_mla_attention_core_tpu_dcp_qrope_rank_lane
+        if kv_rows:
+            if not q_rope or rank_tensor is None:
+                raise ValueError(
+                    "the kv_rows DCP op needs q_rope and TPU_DCP_RANK_OPERAND"
+                )
+            core_fn = (
+                sparse_mla_attention_core_tpu_dcp_qrope_rank_lane_kvrows
+                if fused_exchange
+                else sparse_mla_attention_core_tpu_dcp_qrope_rank_kvrows
+            )
 
         op_name = (
             f"pallas::sparse_mla_attention_dcp_{layer.layer_name.replace('.', '_')}"
@@ -2720,6 +2806,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         if fused_merge:
             op_name += "m"
         input_specs = _SPARSE_MLA_DCP_INPUT_PARTITION_SPECS
+        if kv_rows:
+            op_name += "_kvrows"
+            # (kv_c_normed, k_pe) -> this rank's packed write rows.
+            input_specs = input_specs[:4] + (P(DCP_AXIS_NAME),) + input_specs[6:]
         if q_rope:
             input_specs = input_specs + (P(),)  # rope table, replicated
         if rank_tensor is not None:
@@ -2851,7 +2941,48 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             outputs, lse = results[2:]
             return outputs, lse
 
-        return sparse_mla_dcp_impl
+        if not kv_rows:
+            return sparse_mla_dcp_impl
+        assert rank_tensor is not None  # checked above
+
+        def sparse_mla_dcp_kvrows_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            ql_nope: torch.Tensor,
+            q_pe: torch.Tensor,
+            rows: torch.Tensor,
+            local_topk_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+            rope_table: torch.Tensor,
+        ) -> Any:
+            nope_cache, rope_cache = kv_cache
+            results = sparse_mla_jax_op(
+                nope_cache,
+                rope_cache,
+                ql_nope,
+                q_pe,
+                rows,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                rope_table,
+                rank_tensor,
+                *(() if lane_tensor is None else (lane_tensor,)),
+            )
+            new_nope, new_rope = results[:2]
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            if fused_merge:
+                return results[2]  # merged [T, L, V]
+            if fused_exchange:
+                return results[2], results[3]  # received partials, lse
+            return results[2]  # the send buffer
+
+        return sparse_mla_dcp_kvrows_impl
 
     def forward(
         self,
@@ -2888,6 +3019,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         topk_indices = kwargs.get("topk_indices")
         q_dcp_replicated = kwargs.get("q_dcp_replicated")
+        # TPU_SEGMENT_MEGAKERNEL: `segment_recv` returns layer N's merged DCP
+        # output in latent space (before W_UV; the megakernel applies it);
+        # `kv_rows` is layer N+1's KV write, packed by the megakernel.
+        segment_recv = bool(kwargs.get("segment_recv", False))
+        kv_rows = kwargs.get("kv_rows")
         # TPU_DCP_MERGE_VSPACE: the DCP merge already applied W_UV.
         projected = False
         # Query replication hands us the whole DCP group's heads already, so
@@ -2943,19 +3079,31 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
-        if layer.kv_cache_quantized_dtype is not None:
-            assert k_scale is not None
-            kv_c_normed, _ = quantize_kv(
-                layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
-            )
-            k_pe, _ = quantize_kv(
-                layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
-            )
-
         ql_nope_flat = ql_nope.view(-1, attn_heads, layer.kv_lora_rank)
         q_pe_flat = q_pe.reshape(-1, attn_heads, pe_dim)
-        kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
-        k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
+        kv_c_normed_flat = k_pe_flat = None
+        if kv_rows is None:
+            if layer.kv_cache_quantized_dtype is not None:
+                assert k_scale is not None
+                kv_c_normed, _ = quantize_kv(
+                    layer.kv_cache_quantized_dtype,
+                    kv_c_normed,
+                    value=None,
+                    k_scale=k_scale,
+                )
+                k_pe, _ = quantize_kv(
+                    layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
+                )
+            kv_c_normed_flat = kv_c_normed.view(-1, layer.kv_lora_rank)
+            k_pe_flat = k_pe.view(-1, layer.qk_rope_head_dim)
+        elif not (
+            topk_indices is not None and self.dcp_size > 1 and use_qrep and q_rope_table
+        ):
+            raise RuntimeError(
+                "kv_rows needs the sparse DCP query-replicated decode prologue path"
+            )
+        if segment_recv and not (topk_indices is not None and self.dcp_size > 1):
+            raise RuntimeError("segment_recv needs the sparse DCP attention path")
 
         if topk_indices is not None:
             assert isinstance(kv_cache, (tuple, list)) and len(kv_cache) == 2, (
@@ -2991,7 +3139,15 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # own local cache indices, `-1` where it owns nothing.
                 is_backbone = vllm_compilation_backends.model_tag == "backbone"
                 send_op = getattr(layer, "sparse_mla_dcp_send_op", None)
-                if (
+                if kv_rows is not None:
+                    # TPU_SEGMENT_MEGAKERNEL: the send / fused ops' kv_rows
+                    # variants (built by the segment arming).
+                    send_op = getattr(layer, "sparse_mla_dcp_send_kvrows_op", None)
+                    assert send_op is not None, (
+                        "kv_rows was passed but the segment arming never built "
+                        "this layer's kv_rows DCP op"
+                    )
+                send_path = bool(
                     q_rope_table
                     and send_op is not None
                     and _cp_mla_attention.send_layout_applies(
@@ -3001,8 +3157,24 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         ql_nope_dcp.dtype,
                         is_backbone,
                     )
-                ):
+                )
+                if (kv_rows is not None or segment_recv) and not send_path:
+                    raise RuntimeError(
+                        "the segment megakernel's hand-offs need the send-layout "
+                        "DCP decode path (TPU_DCP_MLA_SEND_LAYOUT)"
+                    )
+                if send_path:
+                    # The step's KV write: the latents, or the megakernel's rows.
+                    kv_args = (
+                        (kv_c_normed_flat, k_pe_flat) if kv_rows is None else (kv_rows,)
+                    )
                     fused_op = getattr(layer, "sparse_mla_dcp_fused_op", None)
+                    if kv_rows is not None and fused_op is not None:
+                        fused_op = getattr(layer, "sparse_mla_dcp_fused_kvrows_op", None)
+                        assert fused_op is not None, (
+                            "kv_rows was passed but the segment arming never "
+                            "built this layer's fused kv_rows DCP op"
+                        )
                     if fused_op is not None and _cp_mla_attention.fused_small_a2a_applies(
                         ql_nope_dcp.shape[0]
                     ):
@@ -3012,8 +3184,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             kv_cache,
                             ql_nope_dcp,
                             q_pe_dcp,
-                            kv_c_normed_flat,
-                            k_pe_flat,
+                            *kv_args,
                             topk_indices,
                             attn_metadata.seq_lens,
                             attn_metadata.block_tables,
@@ -3035,8 +3206,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             kv_cache,
                             ql_nope_dcp,
                             q_pe_dcp,
-                            kv_c_normed_flat,
-                            k_pe_flat,
+                            *kv_args,
                             topk_indices,
                             attn_metadata.seq_lens,
                             attn_metadata.block_tables,
@@ -3047,6 +3217,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         outputs = _cp_mla_attention.merge_send_layout(
                             send, attn_metadata.query_start_loc, ql_nope_dcp.shape[0]
                         )
+                    if segment_recv:
+                        # bf16 [T, heads, kv_lora]: the merged latent. W_UV,
+                        # o_proj and its all-reduce run in the megakernel.
+                        return outputs
                 else:
                     dcp_op = layer.sparse_mla_dcp_op
                     if q_rope_table:

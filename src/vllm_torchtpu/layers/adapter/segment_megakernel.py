@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Torch bridge for kernels/experimental/segment_megakernel (TPU_SEGMENT_MEGAKERNEL).
 
-A DeepSeek-V3.2-style decoder (GLM-5.2) runs, between MoE layer N's sparse
-MLA attention and the next layer's attention core, a chain of ~50 small XLA
-ops and 3 kernels: the DCP LSE merge, o_proj and its TP all-reduce, the fused
-add + RMSNorm, the router, the MoE (moe_tp_decode, with its own all-reduce),
+A DeepSeek-V3.2-style decoder (GLM-5.2) runs, between MoE layer N's merged
+sparse MLA attention output and the next layer's attention core, a chain of
+small XLA ops and kernels: W_UV, o_proj and its TP all-reduce (one fused
+kernel at <= 16 rows), the fused add + RMSNorm, the router, the MoE
+(moe_tp_decode, with its own all-reduce),
 the next layer's fused add + RMSNorm, fused q_a/kv_a, the q_a / kv_a norms,
 the k_pe rope and the packing of the KV write rows for the SparseCore gather.
 When layer N+1 is a skip layer (no indexer: it reuses the shared top-k), and
@@ -17,8 +18,9 @@ write rows (`native_sc_gather.pack_write_rows` layout, the gather's operand).
 Dispatch (`run_layer`, called per layer from the patched DeepseekV2Model
 forward in models/vllm/deepseek_v2_segment_patch.py): an armed layer N at a
 backbone token bucket <= 32, with its KV cache bound, calls its attention with
-`segment_tail=True` (the MLA wrapper returns the merge's packed all-to-all
-receive buffer instead of merging it and running o_proj), runs the megakernel,
+`segment_tail=True` (the MLA wrapper returns the send-layout / fused small
+all-to-all merge's output in latent space instead of applying W_UV and running
+o_proj), runs the megakernel,
 and hands `(residual, q_c, kv_rows)` to layer N+1, whose input_layernorm is
 skipped and whose attention takes `segment_head=(q_c, kv_rows)`. Every other
 case runs the layer as upstream does. The token-count test leaves a shape
@@ -39,9 +41,10 @@ dynamic token dimension).
 
 Admission is narrow on purpose: the kernel reproduces the incumbent ops'
 numerics only for the setup it was verified on -- TP16 x DCP8 with
-VLLM_DCP_Q_REPLICATE, TPU_DCP_MLA_UV_BEFORE_MERGE, the packed real-rows LSE
-merge all-to-all, TPU_SMALL_ALL_REDUCE (valid rows) for o_proj's all-reduce,
-o_proj on the fp8_skinny site and q_a/kv_a on xla_quantized_matmul,
+VLLM_DCP_Q_REPLICATE, the send-layout DCP decode path (TPU_DCP_MLA_SEND_LAYOUT,
+optionally TPU_MLA_FUSED_SMALL_A2A) with W_UV after the merge in bf16,
+TPU_SMALL_ALL_REDUCE (valid rows) or TPU_FUSED_OPROJ_AR for o_proj's
+all-reduce, o_proj on the fp8_skinny site and q_a/kv_a on xla_quantized_matmul,
 moe_tp_decode on N, the KV write in the gather, the MLA decode prologue, an
 fp8 KV cache with k_scale 1, bf16 NeoX rope. Anything else keeps the usual
 path, with the reason logged.
@@ -145,7 +148,8 @@ STACK_MIN_ROWS = 32
 # The op
 # ---------------------------------------------------------------------------
 _PER_RANK = (
-    "a2a",
+    "lat",
+    "wuv",
     "dcp_rank",
     "rank",
     "slot",
@@ -159,7 +163,7 @@ _PER_RANK = (
     "sw2s",
 )
 _ARGS = (
-    "a2a",  # int16 [dcp, 1 + 4T, v_head]: N's packed merge receive buffer
+    "lat",  # bf16 [T, heads, kv_lora]: N's merged attention output (latent)
     "res",  # bf16 [T, H] residual stream
     "cos",  # bf16 [T, rope / 2] (N+1's rotary table rows)
     "sin",
@@ -170,6 +174,7 @@ _ARGS = (
     "dcp_rank",  # int32 [1]
     "rank",  # int32 [1, 1]: mesh index (moe_tp_decode's)
     "slot",  # int32 [1, 1]: the boundary's row of the constant stacks
+    "wuv",  # bf16 [heads, kv_lora, v_head]: N's W_UV
     "oproj_w",  # fp8 [o_in, H]
     "gate",  # bf16 [E, H]
     "w13",
@@ -200,7 +205,7 @@ def _kv_geometry() -> tuple[int, int]:
 
 def _op_body(st: _Statics):
     def body(
-        a2a,
+        lat,
         res,
         cos,
         sin,
@@ -211,6 +216,7 @@ def _op_body(st: _Statics):
         dcp_rank,
         rank,
         slot,
+        wuv,
         oproj_w,
         gate,
         w13,
@@ -243,8 +249,9 @@ def _op_body(st: _Statics):
         dst = mla_kv_utils._dst_rows(page, row_slot, page_size)
         ops = dict(
             meta=kernel.pack_meta(n_valid, rank, slot, dst),
-            a2a=a2a,
+            lat=lat.reshape(T, -1),
             act=kernel.pack_act(res, cfull, sfull),
+            wuv=wuv,
             oproj_w=oproj_w,
             gate=gate,
             w13=w13,
@@ -290,7 +297,7 @@ def _get_op(mesh, st: _Statics):
 
     # torch_tpu reads the operand types from these annotations.
     def fn(
-        a2a: jax.Array,
+        lat: jax.Array,
         res: jax.Array,
         cos: jax.Array,
         sin: jax.Array,
@@ -301,6 +308,7 @@ def _get_op(mesh, st: _Statics):
         dcp_rank: jax.Array,
         rank: jax.Array,
         slot: jax.Array,
+        wuv: jax.Array,
         oproj_w: jax.Array,
         gate: jax.Array,
         w13: jax.Array,
@@ -313,7 +321,7 @@ def _get_op(mesh, st: _Statics):
         sw2s: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         args = (
-            a2a,
+            lat,
             res,
             cos,
             sin,
@@ -324,6 +332,7 @@ def _get_op(mesh, st: _Statics):
             dcp_rank,
             rank,
             slot,
+            wuv,
             oproj_w,
             gate,
             w13,
@@ -350,7 +359,7 @@ def _get_op(mesh, st: _Statics):
         output_partition_specs=out_specs,
     )
     q_lora = st.q_lora
-    op.register_fake(lambda a2a, res, *a, **k: _fake(res, q_lora))
+    op.register_fake(lambda lat, res, *a, **k: _fake(res, q_lora))
     _OPS[key] = op
     return op
 
@@ -364,17 +373,16 @@ def _env_reason() -> str | None:
         "TPU_MOE_SKIP_PADDED_TOKENS": envs.TPU_MOE_SKIP_PADDED_TOKENS,
         "TPU_SMALL_ALL_REDUCE": envs.TPU_SMALL_ALL_REDUCE,
         "TPU_SMALL_ALL_REDUCE_VALID_ROWS": envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS,
-        "TPU_DCP_MLA_UV_BEFORE_MERGE": envs.TPU_DCP_MLA_UV_BEFORE_MERGE,
         "TPU_DCP_LSE_MERGE_A2A": envs.TPU_DCP_LSE_MERGE_A2A,
         "TPU_DCP_LSE_MERGE_A2A_PACK": envs.TPU_DCP_LSE_MERGE_A2A_PACK,
         "TPU_DCP_LSE_MERGE_A2A_REAL_ROWS": envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS,
-        "TPU_DCP_RS_OUT_PRECISION": envs.TPU_DCP_RS_OUT_PRECISION,
+        "TPU_DCP_MLA_SEND_LAYOUT": envs.TPU_DCP_MLA_SEND_LAYOUT,
+        "TPU_DCP_MLA_SPLIT_Q_LSE": envs.TPU_DCP_MLA_SPLIT_Q_LSE,
         "TPU_MLA_KV_WRITE_IN_GATHER": envs.TPU_MLA_KV_WRITE_IN_GATHER,
         "TPU_DCP_MLA_MASK_IN_KERNEL": envs.TPU_DCP_MLA_MASK_IN_KERNEL,
         "TPU_DCP_MLA_FUSED_PREP": envs.TPU_DCP_MLA_FUSED_PREP,
         "TPU_DCP_RANK_OPERAND": envs.TPU_DCP_RANK_OPERAND,
         "TPU_MLA_DECODE_PROLOGUE": envs.TPU_MLA_DECODE_PROLOGUE,
-        "TPU_MLA_SPARSE_SPLIT_Q": envs.TPU_MLA_SPARSE_SPLIT_Q,
         "TPU_FP8_LINEAR_PALLAS": envs.TPU_FP8_LINEAR_PALLAS,
     }
     off = [k for k, v in need.items() if not v]
@@ -382,6 +390,11 @@ def _env_reason() -> str | None:
         return f"needs {', '.join(off)}=1"
     if envs.FUSED_MOE_DECODE_KERNEL:
         return "FUSED_MOE_DECODE_KERNEL is set"
+    if envs.TPU_MOE_ROUTER_HBM_PIN:
+        # Its router logits are ~1e-4 one bf16 ulp off the XLA dot's.
+        return "TPU_MOE_ROUTER_HBM_PIN is set (the kernel reproduces XLA's router)"
+    if envs.TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS > min(kernel.TOKEN_BUCKETS):
+        return "TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS leaves kernel buckets off it"
     if envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS < kernel.MAX_TOKENS:
         return f"TPU_SMALL_ALL_REDUCE_MAX_ROWS < {kernel.MAX_TOKENS}"
     if envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS < kernel.MAX_TOKENS:
@@ -487,8 +500,14 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
     if wrap.gate_is_fused or wrap.kimi_preprocess is not None:
         return "layer N's attention has an output gate"
     attn = wrap.mla_attn
-    if getattr(attn, "W_UV_dcp_qrep", None) is None:
-        return "layer N's W_UV does not run before the merge"
+    if getattr(attn, "sparse_mla_dcp_send_op", None) is None:
+        return "layer N has no send-layout DCP op (TPU_DCP_MLA_SEND_LAYOUT)"
+    w_uv = getattr(attn, "W_UV", None)
+    want_uv = (int(wrap.num_heads), int(wrap.kv_lora_rank), int(wrap.v_head_dim))
+    if w_uv is None or tuple(w_uv.shape) != want_uv or w_uv.dtype != torch.bfloat16:
+        return f"layer N's W_UV is not bf16 {list(want_uv)} (QUANTIZE_ON_LOAD?)"
+    if getattr(attn, "W_UV_scale", None) is not None:
+        return "layer N's W_UV carries a scale"
     o_proj = wrap.o_proj
     reason = _fp8_linear(o_proj, int(wrap.num_heads * wrap.v_head_dim), hidden)
     if reason is not None:
@@ -521,6 +540,8 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
     if rope.rotary_dim != nwrap.qk_rope_head_dim or nwrap.qk_rope_head_dim != 64:
         return "layer N+1's rope does not cover the 64-wide rope head"
     nattn = nwrap.mla_attn
+    if getattr(nattn, "sparse_mla_dcp_send_op", None) is None:
+        return "layer N+1 has no send-layout DCP op (TPU_DCP_MLA_SEND_LAYOUT)"
     if nattn.kv_cache_quantized_dtype != torch.float8_e4m3fn:
         return "layer N+1's KV cache is not fp8"
     impl = nattn.impl
@@ -628,8 +649,21 @@ def _one_side_tensors(model: Any, i: int) -> list[torch.Tensor]:
     moe = layer.mlp.experts.routed_experts
     nwrap = nxt.self_attn.mla_attn
     qkv = nwrap.fused_qkv_a_proj
+    attn = layer.self_attn.mla_attn.mla_attn
+    # The usual path reads W_UV after the merge and (TPU_DCP_MERGE_VSPACE)
+    # retains the gathered copy beside it; the kernel side reads only W_UV.
+    uv = [
+        t
+        for t in (
+            attn.W_UV,
+            getattr(attn, "W_UV_dcp_vspace", None),
+            getattr(attn, "W_UV_dcp_vspace_scale", None),
+        )
+        if t is not None
+    ]
     out = [
         getattr(layer, TAIL_ATTR).slot,
+        *uv,
         layer.self_attn.mla_attn.o_proj.weight_scale,
         layer.post_attention_layernorm.weight,
         moe.w13_weight_scale_inv,
@@ -826,13 +860,28 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
         width = nwrap.q_lora_rank + nwrap.kv_lora_rank + nwrap.qk_rope_head_dim
         _pad_qkv(nwrap.fused_qkv_a_proj, st.qkv_pad, width)
         nattn = nwrap.mla_attn
-        nattn.sparse_mla_dcp_kvrows_op = nattn.impl._build_sparse_mla_dcp_op(
+        # The head's send-layout op and (TPU_MLA_FUSED_SMALL_A2A) its fused
+        # exchange op, taking the megakernel's KV write rows.
+        nattn.sparse_mla_dcp_send_kvrows_op = nattn.impl._build_sparse_mla_dcp_op(
             nattn,
             st.dcp,
             st.interleave,
             q_rope=True,
+            send_layout=True,
             kv_rows=True,
         )
+        if getattr(nattn, "sparse_mla_dcp_fused_op", None) is not None:
+            nattn.sparse_mla_dcp_fused_kvrows_op = (
+                nattn.impl._build_sparse_mla_dcp_op(
+                    nattn,
+                    st.dcp,
+                    st.interleave,
+                    q_rope=True,
+                    send_layout=True,
+                    fused_exchange=True,
+                    kv_rows=True,
+                )
+            )
         _HEAD_ATTNS.append(nattn)
         setattr(
             layer,
@@ -917,7 +966,7 @@ def segment_forward(
     moe = runner.routed_experts
     rank = getattr(moe, moe_tp_decode._BUFFERS[5])
     res_out, q_c, kv_rows = tail.op(
-        recv,
+        recv,  # the merged latent [T, heads, kv_lora]
         residual,
         cos,
         sin,
@@ -928,6 +977,7 @@ def segment_forward(
         tail.dcp_rank,
         rank,
         tail.slot,
+        wrap.mla_attn.W_UV,
         wrap.o_proj.weight,
         runner.gate.weight,
         moe.w13_weight,
