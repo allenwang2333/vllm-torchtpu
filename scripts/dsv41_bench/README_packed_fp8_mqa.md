@@ -287,13 +287,62 @@ bundles), but P-state-7 experiment `exp-x62w5dthec` showed a regression:
 Values are means of two seed medians, with 30 device samples per seed and case,
 from analysis `an-fywgpzhzek`. Candidate mask scatter remained about 1.880 ms;
 the cache update trace added loops and large copies. The two scatter helpers
-have been restored byte-for-byte to measured best commit `a7225b918`. The timing
-table above remains the retained implementation's result. The SparseCore mask
-prototype has only compiled under sim-pjrt and is not integrated.
+were restored byte-for-byte to measured best commit `a7225b918` before the
+page-DMA follow-up below. The SparseCore mask prototype has only compiled under
+sim-pjrt and is not integrated.
 
-The subsequent page-DMA writer replaces the TPU cache scatter with explicit
-Pallas reads and writes. Local interpreted byte-preservation tests and the
-complete filter-path sim-pjrt compilation pass. Hardware results are pending.
+### Page-DMA cache writer retained
+
+Commit `626631300` replaces the TPU cache scatter with explicit Pallas page reads
+and writes, grouping updates to the same page before merging them in VMEM.
+P-state-7 experiment `exp-eh1vxy4a2j`, analyzed by `an-u9mla6c1nh`, compares the
+previous scatter writer with this writer in the same run:
+
+| Indexer call | Scatter writer (ms) | Page-DMA writer (ms) | Reduction |
+| --- | ---: | ---: | ---: |
+| Full context | 1.899 | 1.161 | 38.8% |
+| Publish candidates | 2.238 | 1.501 | 32.9% |
+| Filter clustered candidates | 3.840 | 3.106 | 19.1% |
+| Filter scattered candidates | 3.944 | 3.209 | 18.6% |
+
+These are means of seed-2026/2027 medians, with 30 XProf device-duration samples
+per seed and variant at the shape above. In the full-context trace, the two cache
+write operators together fall from 791.8 to 34.5 microseconds. This operator-only
+number excludes grouping and preparation; the complete call saves about
+735 microseconds. Candidate mask scatter remains about 1.880 ms in the filter
+path, and MQA scoring remains about 321 microseconds. The scorer sources and
+same-shape compiled LLO instructions are unchanged.
+
+For clustered candidates, analysis `an-3lhtrw91or` exposes the complete recorded
+operation table. Averaging per-operation medians across the two seeds gives:
+
+| Component | Time (ms) |
+| --- | ---: |
+| Candidate block-mask scatter | 1.880 |
+| MQA scoring | 0.321 |
+| Two SparseCore top-k calls | 0.368 |
+| SparseCore data-format call | 0.093 |
+| `bitcast-convert_bitcast_fusion.1` and `copy.44` | 0.156 |
+| `sort.14` | 0.036 |
+| Two page-DMA cache writers | 0.035 |
+| Other recorded operations | 0.184 |
+| Module latency minus the sum of operation medians | 0.033 |
+| Complete Indexer call | 3.106 |
+
+The `cond.5.clone.1` event encloses child operations and is excluded from the sum.
+This is an approximate accounting of operation medians, not an exclusive timeline
+attribution; the 33-microsecond residual is not established to be wait time.
+The sparse scorer skips unused KV pages but retains full logical-position logits,
+so candidate masking and top-k still process full-width arrays.
+
+Validation passed 42 CPU tests and eight applicable TPU cache tests. Four local
+allocator tests require the unavailable upstream vLLM interface. Two exhaustive
+CPU FP8 bit-pattern tests were excluded from the TPU retry after the first run
+showed negative-NaN canonicalization on TPU; the tests and packing implementation
+are unchanged. Both cache banks, selected IDs and published candidates match
+exactly between writers in all eight case/seed pairs. Local interpreted
+byte-preservation tests and complete filter-path sim-pjrt compilation also pass.
+
 Use `bench_packed_fp8_layer.py --compare-cache-writers --profile --out <dir>`
 to compare both FP8 writers in the same run. The benchmark checks exact equality
 of both cache banks, selected IDs and published candidates before measuring.
