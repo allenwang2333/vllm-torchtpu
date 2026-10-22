@@ -701,10 +701,11 @@ def merge_send_layout(
     rows = num_tokens * local
     # Padded with the real count, so the last entry is that count.
     real = query_start_loc[-1:].to(torch.int32)
-    if send_small_a2a_applies(num_tokens):
+    if send_small_a2a_applies(num_tokens) or inkernel_a2a_applies(num_tokens):
         # One Pallas round of remote DMAs + the unpack, one JAX op; partial
         # rows past the real ones zeroed as the ragged exchange leaves them.
         # The merge below is the incumbent's, on the same bits.
+        # (TPU_DCP_A2A_INKERNEL: also the buckets above the small cap.)
         from vllm_torchtpu.distributed.dcp import dcp_lane_operand
 
         prebuild_send_small(world)
@@ -1111,6 +1112,30 @@ def send_small_a2a_applies(num_tokens: int) -> bool:
         and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
         and envs.TPU_DCP_RANK_OPERAND
         and num_tokens <= envs.TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS
+    )
+
+
+def small_a2a_preconditions() -> bool:
+    """The Pallas small all-to-all's preconditions: the lane operand the
+    indexer's small all-gather lifts on every bucket, and the rank operand."""
+    return bool(
+        envs.TPU_DCP_INDEXER_SMALL_AG
+        and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+        and envs.TPU_DCP_RANK_OPERAND
+    )
+
+
+def inkernel_a2a_applies(num_tokens: int) -> bool:
+    """Whether `merge_send_layout` exchanges this bucket with the Pallas
+    small all-to-all because of `TPU_DCP_A2A_INKERNEL`: the backbone
+    send-layout buckets above `TPU_DCP_MLA_SEND_SMALL_A2A`'s cap, up to
+    `TPU_DCP_A2A_INKERNEL_MAX_TOKENS`. Kept apart from
+    `send_small_a2a_applies` so `fused_small_a2a_applies` (which gates on it)
+    takes exactly the buckets it took before. Static per bucket."""
+    return bool(
+        envs.TPU_DCP_A2A_INKERNEL
+        and small_a2a_preconditions()
+        and num_tokens <= envs.TPU_DCP_A2A_INKERNEL_MAX_TOKENS
     )
 
 
@@ -1604,7 +1629,12 @@ def prebuild_sized_merge(world: int) -> None:
         tokens, heads, vdim = output.shape
         return output.new_empty((tokens, heads // world, vdim))
 
-    if not (envs.TPU_MTP_DCP_MERGE_SMALL_A2A and envs.TPU_DCP_RANK_OPERAND):
+    # TPU_DCP_A2A_INKERNEL: every all-to-all bucket up to its cap takes the
+    # small all-to-all, with or without TPU_MTP_DCP_MERGE_SMALL_A2A.
+    inkernel = bool(envs.TPU_DCP_A2A_INKERNEL and small_a2a_preconditions())
+    if not (
+        (envs.TPU_MTP_DCP_MERGE_SMALL_A2A or inkernel) and envs.TPU_DCP_RANK_OPERAND
+    ):
 
         def body(o, lse):
             return sized_merge_local(
@@ -1631,7 +1661,13 @@ def prebuild_sized_merge(world: int) -> None:
     # buckets above the small cap ignore them.
     from vllm_torchtpu.distributed.dcp import dcp_lane_operand, dcp_rank_operand
 
-    small_cap = int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+    small_cap = (
+        int(envs.TPU_MTP_DCP_MERGE_SMALL_A2A_MAX_TOKENS)
+        if envs.TPU_MTP_DCP_MERGE_SMALL_A2A
+        else 0
+    )
+    if inkernel:
+        small_cap = max(small_cap, int(envs.TPU_DCP_A2A_INKERNEL_MAX_TOKENS))
     lane_axes = tuple(a for a in mesh.axis_names if a != DCP_AXIS_NAME)
     assert len(lane_axes) <= 1, mesh.axis_names
     lane_axis = lane_axes[0] if lane_axes else None
@@ -1658,7 +1694,8 @@ def prebuild_sized_merge(world: int) -> None:
         )(output, lse, rank, lane)
 
     op = sharded_jax_op(
-        f"pallas::mtp_dcp_merge_sized_small_{world}",
+        f"pallas::mtp_dcp_merge_sized_small_{world}"
+        + (f"_ik{small_cap}" if inkernel else ""),
         fn_small,
         mesh=mesh,
         input_partition_specs=(spec, spec, spec, spec),

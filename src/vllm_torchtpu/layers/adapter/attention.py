@@ -2168,7 +2168,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                         _cp_mla_attention.prebuild_send_group(
                             self.dcp_size, envs.TPU_DCP_MLA_SEND_GROUP_ROWS
                         )
-                    if envs.TPU_DCP_MLA_SEND_SMALL_A2A:
+                    if (
+                        envs.TPU_DCP_MLA_SEND_SMALL_A2A
+                        or _cp_mla_attention.inkernel_a2a_applies(1)
+                    ):
                         _cp_mla_attention.prebuild_send_small(self.dcp_size)
 
     def _get_kv_scales(
