@@ -3342,6 +3342,7 @@ def prepare_outputs(
         "lse_in_kernel",
         "prologue_fault",
         "kv_write_fault",
+        "group_fault",
         "mixed_fused_prep",
         "mixed_union_gather",
         "mixed_union_gather_rope",

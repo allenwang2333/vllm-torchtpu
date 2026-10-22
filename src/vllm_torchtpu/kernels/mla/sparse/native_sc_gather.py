@@ -1705,7 +1705,11 @@ def _group_kernel(
                 if wait_mode == "before_rope":
                     for copy in nope_copies:
                         copy.wait()
-                for row in range(QUADS_PER_ATOM):
+                if patch:
+                    # No Mosaic-SC layout passes in patch mode (the dirty
+                    # test's lane reduction needs them off): (16,) vectors.
+                    _rope_group(rope_inputs, rope_output)
+                for row in range(0 if patch else QUADS_PER_ATOM):
                     data = []
                     for token_slot in range(ROPE_PACKING):
                         logical_rank = row * ROPE_PACKING + token_slot
@@ -1948,7 +1952,7 @@ def dsa_gather_native_sc_group(
         out_type=out_type,
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
+            needs_layout_passes=not patch,  # patch: lane reduction (see body)
             disable_bounds_checks=True,
         ),
         scratch_types=scratch_types,
