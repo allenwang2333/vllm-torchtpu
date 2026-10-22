@@ -291,13 +291,15 @@ def test_flag_defaults_off():
 
 def test_group_registry_links_skip_layers_to_their_head():
     """GLM-5.2's pattern: 0-2 indexed (2 heads a group of 3, 0/1 none),
-    3-5 skip, 6 indexed, 7-9 skip; another container is separate."""
+    3-5 skip, 6 indexed, 7-9 skip; the MTP layer (10: skip_topk toggled, but
+    with an indexer) joins no group; a layer in another container, a 4th skip
+    and a skip after the head froze its op are refused too."""
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as m
 
     class Wrapper:
-        def __init__(self, skip):
+        def __init__(self, skip, indexer=None):
             self.skip_topk = skip
-            self.indexer = None if skip else object()
+            self.indexer = indexer if indexer is not None or skip else object()
             self._group_skips = ()
 
     skip = [i not in (0, 1, 2, 6) for i in range(10)]
@@ -305,9 +307,18 @@ def test_group_registry_links_skip_layers_to_their_head():
         ws = [Wrapper(s) for s in skip]
         for i, w in enumerate(ws):
             m._register_group_layer(w, f"model.layers.{i}.self_attn")
+        mtp = Wrapper(True, indexer=object())
+        m._register_group_layer(mtp, "model.layers.10.self_attn")
         other = Wrapper(True)
         m._register_group_layer(other, "mtp.layers.3.self_attn")
+        fourth = Wrapper(True)
+        m._register_group_layer(fourth, "model.layers.10.self_attn")
+        heads = [Wrapper(False), Wrapper(True)]
+        m._register_group_layer(heads[0], "x.layers.0.self_attn")
+        object.__setattr__(heads[0], "_group_frozen", True)
+        m._register_group_layer(heads[1], "x.layers.1.self_attn")
     assert ws[0]._group_skips == () and ws[1]._group_skips == ()
     assert ws[2]._group_skips == (ws[3], ws[4], ws[5])
     assert ws[6]._group_skips == (ws[7], ws[8], ws[9])
     assert all(w._group_skips == () for w in ws if w.skip_topk)
+    assert heads[0]._group_skips == ()

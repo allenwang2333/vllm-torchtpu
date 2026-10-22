@@ -1931,6 +1931,7 @@ class VllmTPUMLAAttention(MLAAttention):
 # layer index, so a group head (an indexed layer) finds the skip_topk layers
 # that follow it and reuse its top-k.
 _GROUP_LAYERS: dict[str, dict[int, Any]] = {}
+_GROUP_MAX_SKIPS = 3  # the group head's op variants (1-3 skip layers)
 _LAYER_PREFIX_RE = re.compile(r"^(.*\.layers)\.(\d+)(\.|$)")
 
 
@@ -1944,13 +1945,22 @@ def _register_group_layer(wrapper: Any, prefix: str) -> None:
     container, idx = m.group(1), int(m.group(2))
     layers = _GROUP_LAYERS.setdefault(container, {})
     layers[idx] = wrapper
-    if not wrapper.skip_topk:
+    # A skip layer has no indexer of its own. The MTP layer always builds one
+    # (and toggles skip_topk at runtime): it is never a group member, even
+    # though its index follows the backbone's last group.
+    if not wrapper.skip_topk or wrapper.indexer is not None:
         return
     j = idx - 1
-    while j in layers and layers[j].skip_topk:
+    while j in layers and layers[j].skip_topk and layers[j].indexer is None:
         j -= 1
     head = layers.get(j)
-    if head is not None and head.indexer is not None:
+    if (
+        head is not None
+        and head.indexer is not None
+        and not head.skip_topk
+        and len(head._group_skips) < _GROUP_MAX_SKIPS
+        and not getattr(head, "_group_frozen", False)
+    ):
         # Not `head._group_skips = ...`: a tuple of modules must not become
         # registered submodules.
         object.__setattr__(head, "_group_skips", (*head._group_skips, wrapper))
@@ -2171,6 +2181,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         group_pre=True,
                     )
         elif self.indexer is not None and 1 <= len(self._group_skips) <= 3:
+            # The op's operand count is fixed now: no later layer may join.
+            object.__setattr__(self, "_group_frozen", True)
             attn.sparse_mla_group_gather_op = impl._build_sparse_mla_group_gather_op(
                 attn, len(self._group_skips)
             )
@@ -2189,7 +2201,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         attn = self.mla_attn
         op = getattr(attn, "sparse_mla_group_gather_op", None)
         skips = self._group_skips
-        if op is None or not skips:
+        if op is None or not skips or not getattr(self, "_group_frozen", False):
             return
         if any(
             getattr(s.mla_attn, "sparse_mla_dcp_rope_pre_op", None) is None
