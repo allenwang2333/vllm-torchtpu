@@ -99,22 +99,25 @@ class StructuredDecodingManager:
         """Builds the device inputs for `structured_decode` for one chunk.
 
         Bitmask rows follow the order of `structured_output_request_ids`
-        (the scheduler order). Each chunk covers requests
-        [cur_start_idx, cur_end_idx) of the input batch, so global batch
-        indices are shifted to chunk-local rows and requests outside the
-        chunk are skipped.
+        (the scheduler order), with `mask_stride = 1 + max_num_spec_tokens`
+        rows allocated per request when speculative decoding is enabled.
+        Each chunk covers requests [cur_start_idx, cur_end_idx) of the input
+        batch, so global batch indices are shifted to chunk-local rows and
+        requests outside the chunk are skipped.
         """
         padded_num_reqs = logits.shape[0]
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
         bitmask = grammar_output.grammar_bitmask
+        req_ids = grammar_output.structured_output_request_ids
+        mask_stride = bitmask.shape[0] // len(req_ids) if req_ids else 1
         local_indices = []
         mask_rows = []
-        for mask_row, req_id in enumerate(grammar_output.structured_output_request_ids):
+        for grammar_idx, req_id in enumerate(req_ids):
             batch_index = req_id_to_index.get(req_id)
             if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
                 local_indices.append(batch_index - cur_start_idx)
-                mask_rows.append(mask_row)
+                mask_rows.append(grammar_idx * mask_stride)
 
         # Fast path 1: No structured requests in this chunk.
         # Bypass both requirement and bitmask host transfers completely by
@@ -167,9 +170,10 @@ class StructuredDecodingManager:
     ]:
         """Builds the `structured_decode` inputs for one spec decoding chunk.
 
-        On spec decoding path, the scheduler emits `1 + s_r` consecutive
-        bitmask rows for one structured request, where `s_r` is the number of drafts
-        scheduled for this step.
+        On spec decoding path, the scheduler allocates a fixed block of
+        `mask_stride = 1 + max_num_spec_tokens` rows per structured request,
+        where the first `s_r` rows cover the `s_r` drafts scheduled for this
+        step and row `s_r` covers the bonus token.
 
         Returns `(require_target, target_bitmask, require_bonus,
         bonus_bitmask, arange)`; the first two are None when `target_logits`
@@ -192,12 +196,13 @@ class StructuredDecodingManager:
 
         req_id_to_index = self.runner.input_batch.req_id_to_index
         bitmask = grammar_output.grammar_bitmask
-        mask_row = 0
-        for req_id in grammar_output.structured_output_request_ids:
+        req_ids = grammar_output.structured_output_request_ids
+        mask_stride = bitmask.shape[0] // len(req_ids) if req_ids else 1
+        for grammar_idx, req_id in enumerate(req_ids):
+            mask_row = grammar_idx * mask_stride
             num_drafts = len(scheduled_spec_decode_tokens.get(req_id, ()))
             batch_index = req_id_to_index.get(req_id)
             if batch_index is None or not cur_start_idx <= batch_index < cur_end_idx:
-                mask_row += 1 + num_drafts
                 continue
             local_index = batch_index - cur_start_idx
             if num_drafts:
@@ -221,7 +226,6 @@ class StructuredDecodingManager:
                 bitmask[mask_row + num_drafts]
             )
             self.require_structured_out_cpu[local_index] = True
-            mask_row += 1 + num_drafts
 
         if target_logits is not None:
             require_target = self.require_structured_out_target_cpu[

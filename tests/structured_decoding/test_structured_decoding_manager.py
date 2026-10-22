@@ -266,6 +266,30 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[2].tolist() == row(20)  # reqB sits at batch row 6.
         assert bitmask[3].tolist() == row(40)  # reqD sits at batch row 7.
 
+    def test_spec_config_prefill_strides_over_unused_draft_rows(self):
+        # When speculative decoding is configured, StructuredOutputManager
+        # allocates 1 + num_spec_tokens rows per request even on prefill steps
+        # where 0 draft tokens are scheduled and `prepare_structured_decoding_input`
+        # is called. Each request's bonus mask sits at `grammar_idx * mask_stride`.
+        manager = make_manager(
+            num_spec_tokens=2,
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2},
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req2"],
+            [row(10), row(99), row(99), row(20), row(99), row(99)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=0, cur_end_idx=3
+        )
+
+        assert require[:, 0].tolist() == [True, False, True, False]
+        assert bitmask[0].tolist() == row(10)
+        assert bitmask[1].tolist() == [0, 0]
+        assert bitmask[2].tolist() == row(20)
+
 
 class TestStructuredDecode:
     @pytest.mark.parametrize("vocab_size", [64, 50])
@@ -392,8 +416,8 @@ def row(value: int) -> list[int]:
 
 
 class TestPrepareSpecStructuredDecodingInput:
-    """Each structured request owns 1 + s_r consecutive
-    bitmask rows (draft + bonus)"""
+    """Each structured request owns a fixed block of 1 + num_spec_tokens
+    bitmask rows (s_r draft rows + 1 bonus row + unused tail rows)."""
 
     def test_spec_buffers_only_allocated_with_spec_config(self):
         manager = make_manager()
@@ -414,14 +438,15 @@ class TestPrepareSpecStructuredDecodingInput:
 
     def test_variable_draft_counts_single_chunk(self):
         # req0 structured, 2 drafts; req1 unstructured, 1 draft;
-        # req2 structured, 0 drafts.
+        # req2 structured, 0 drafts (plus 2 unused tail rows in its 3-row block).
         manager = make_manager(
             num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1, "req2": 2}
         )
         grammar_output = make_grammar_output(
             ["req0", "req2"],
-            # req0: draft rows 10, 11, bonus 12; req2: bonus row 20.
-            [row(10), row(11), row(12), row(20)],
+            # req0: draft rows 10, 11, bonus 12;
+            # req2: bonus row 20 + 2 unused tail rows.
+            [row(10), row(11), row(12), row(20), row(99), row(99)],
         )
         scheduled = {"req0": [7, 8], "req1": [9]}
         draft_lengths = np.array([2, 1, 0], dtype=np.int32)
@@ -474,8 +499,9 @@ class TestPrepareSpecStructuredDecodingInput:
         )
         grammar_output = make_grammar_output(
             ["req0", "req3"],
-            # req0: draft row 10, bonus 11; req3: draft rows 30, 31, bonus 32.
-            [row(10), row(11), row(30), row(31), row(32)],
+            # req0: draft row 10, bonus 11, 1 unused tail row;
+            # req3: draft rows 30, 31, bonus 32.
+            [row(10), row(11), row(99), row(30), row(31), row(32)],
         )
         scheduled = {"req0": [1], "req2": [2], "req3": [3, 4]}
         # Chunk-local draft lengths for [req2, req3].
@@ -515,8 +541,9 @@ class TestPrepareSpecStructuredDecodingInput:
         )
         grammar_output = make_grammar_output(
             ["req0", "req1"],
-            # req0 (other chunk): drafts 10, 11, bonus 12; req1: bonus 20.
-            [row(10), row(11), row(12), row(20)],
+            # req0 (other chunk): drafts 10, 11, bonus 12;
+            # req1: bonus 20 + 2 unused tail rows.
+            [row(10), row(11), row(12), row(20), row(99), row(99)],
         )
         scheduled = {"req0": [5, 6]}
         logits = torch.zeros(2, VOCAB_SIZE)
@@ -534,14 +561,14 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == row(20)
 
     def test_finished_request_keeps_row_alignment(self):
-        # A request already removed from the batch still owns its 1 + s_r
-        # rows; later requests must not shift up.
+        # A request already removed from the batch still owns its
+        # 1 + num_spec_tokens rows; later requests must not shift up.
         manager = make_manager(num_spec_tokens=2, req_id_to_index={"req1": 0})
         grammar_output = make_grammar_output(
             ["req0", "req1"],
             # req0 (gone, had 2 drafts): rows 10, 11, 12; req1: draft 20,
-            # bonus 21.
-            [row(10), row(11), row(12), row(20), row(21)],
+            # bonus 21, 1 unused tail row.
+            [row(10), row(11), row(12), row(20), row(21), row(99)],
         )
         scheduled = {"req0": [1, 2], "req1": [3]}
         draft_lengths = np.array([1], dtype=np.int32)

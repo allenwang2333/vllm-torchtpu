@@ -984,7 +984,11 @@ class VllmTPUMLAAttention(MLAAttention):
         finally:
             if flipped:
                 assert kv_b_weight is not None
-                self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
+                self.kv_b_proj.weight = (
+                    kv_b_weight
+                    if isinstance(kv_b_weight, Parameter)
+                    else Parameter(kv_b_weight, requires_grad=False)
+                )
 
         device = torch.device("tpu")
 
