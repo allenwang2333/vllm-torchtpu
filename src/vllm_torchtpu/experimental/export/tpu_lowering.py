@@ -25,6 +25,7 @@ import torch
 import torch.fx as fx
 
 from vllm_torchtpu.experimental.export import api
+from vllm_torchtpu.experimental.export.trace import trace
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,6 +194,7 @@ def lower_torch_callable_to_mlir(
         or execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
     )
     with (
+        trace(f"export.lower.{module_name or getattr(fn, '__name__', 'fn')}"),
         execution_mode.set_eager_mode(eager_mode),
         mock.patch.object(torch.compiler, "is_compiling", return_value=True),
         torch.no_grad(),

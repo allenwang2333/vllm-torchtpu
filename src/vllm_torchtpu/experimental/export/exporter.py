@@ -29,6 +29,7 @@ from vllm_torchtpu.experimental.export import (
     validator,
     weight_mapper,
 )
+from vllm_torchtpu.experimental.export.trace import trace
 
 # User inputs of forward_bucket{B}.mlir, in @main order; also the keyword names
 # of `ExportableTextOnlyLLM.forward`.
@@ -231,6 +232,7 @@ def _main_args_read(mlir_text: str) -> set[int]:
     return {k for k in range(num_args) if re.search(rf"%arg{k}\b", body)}
 
 
+@trace("export.params_read_by_forward")
 def _params_read_by_forward(
     model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -469,6 +471,7 @@ def _export_text_only_llm_functions(
     }
 
 
+@trace("export.weight_json")
 def _emit_declarative_weight_json(
     model: api.ExportableTextOnlyLLM,
     params_map: Mapping[str, Any],
@@ -622,6 +625,7 @@ def _emit_model_companion_files(
     return serving_config
 
 
+@trace("export.export")
 def export(
     model: api.ExportableTextOnlyLLM,
     output_dir: str,
