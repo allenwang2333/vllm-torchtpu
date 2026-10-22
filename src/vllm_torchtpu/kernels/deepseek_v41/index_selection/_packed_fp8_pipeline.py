@@ -148,13 +148,7 @@ class Pipeline:
     def emit_tile(
         self, ops: "MQAOps", tile, *, prefetch: bool, full_tile: bool
     ) -> None:
-        following = tile + self.plan.config.key_buffers - 1
-        following_tile = jnp.where(
-            following < ops.live_tiles, following, following - ops.live_tiles
-        )
-        metadata = jnp.where(
-            following < ops.live_tiles, ops.metadata_slot, (ops.metadata_slot + 1) & 3
-        )
+        following_tile, metadata, following_slot = self.prefetch_target(ops, tile)
         if not full_tile:
             ops.prepare_output_mask(tile)
         # Trace every producer and consumer, including startup and drain.
@@ -164,18 +158,24 @@ class Pipeline:
         for stage in range(self.plan.fragments + lag):
             if stage < self.plan.fragments:
                 if prefetch:
-                    ops.load_page(
-                        following_tile, stage * 2, metadata, ops.key_slot(following)
-                    )
+                    ops.load_page(following_tile, stage * 2, metadata, following_slot)
                 pending_logits[stage] = ops.qk(tile, stage)
             if stage >= lag:
                 fragment = stage - lag
                 value = ops.reduce(fragment, pending_logits.pop(fragment))
                 ops.store(tile, fragment, value, full_tile=full_tile)
             if stage < self.plan.fragments and prefetch:
-                ops.load_page(
-                    following_tile, stage * 2 + 1, metadata, ops.key_slot(following)
-                )
+                ops.load_page(following_tile, stage * 2 + 1, metadata, following_slot)
+
+    def prefetch_target(self, ops: "MQAOps", tile) -> tuple:
+        following = tile + self.plan.config.key_buffers - 1
+        following_tile = jnp.where(
+            following < ops.live_tiles, following, following - ops.live_tiles
+        )
+        metadata = jnp.where(
+            following < ops.live_tiles, ops.metadata_slot, (ops.metadata_slot + 1) & 3
+        )
+        return following_tile, metadata, ops.key_slot(following)
 
     def step(self, ops: "MQAOps", tile) -> None:
         ops.wait_keys(tile)
@@ -195,12 +195,25 @@ class Pipeline:
                 lambda: self.emit_tile(ops, tile, prefetch=False, full_tile=full_tile),
             )
 
-        jax.lax.cond(
-            ((tile + 1) * self.plan.config.key_tile <= ops.minimum_length)
-            & ops.full_page_tile(tile),
-            lambda: emit(True),
-            lambda: emit(False),
-        )
+        def compute():
+            jax.lax.cond(
+                ((tile + 1) * self.plan.config.key_tile <= ops.minimum_length)
+                & ops.full_page_tile(tile),
+                lambda: emit(True),
+                lambda: emit(False),
+            )
+
+        if ops.skip_invalid_pages:
+
+            def empty():
+                pl.when(pending)(lambda: ops.fetch(*self.prefetch_target(ops, tile)))
+                ops.clear_output(tile)
+
+            jax.lax.cond(
+                ops.tile_flags[ops.state.query.key_group, tile] > 0, compute, empty
+            )
+        else:
+            compute()
 
         ops.publish(tile)
 

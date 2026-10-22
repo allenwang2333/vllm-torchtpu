@@ -17,6 +17,41 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize("following", [False, True])
+def test_empty_tile_keeps_prefetch_and_output_lifetimes(following):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+        _packed_fp8_pipeline as pipeline,
+    )
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
+        PACKED_FP8_MQA_CONFIG,
+    )
+
+    calls = []
+    plan = pipeline.BufferPlan(
+        PACKED_FP8_MQA_CONFIG, 32, 768, 256, jnp.dtype(jnp.float8_e4m3fn)
+    )
+    ops = SimpleNamespace(
+        state=pipeline.QueryState(pipeline.QueryTile(0, 6, 0), 0, 0),
+        live_tiles=3,
+        next_tiles=3 if following else 0,
+        tile_flags=jnp.zeros((1, 3), jnp.int32),
+        metadata_slot=0,
+        skip_invalid_pages=True,
+        key_slot=lambda tile: tile & 3,
+        wait_keys=lambda tile: calls.append(("wait", tile)),
+        fetch=lambda *args: calls.append(("fetch", *map(int, args))),
+        clear_output=lambda tile: calls.append(("clear", tile)),
+        publish=lambda tile, **kwargs: calls.append(("publish", tile, kwargs)),
+    )
+    with jax.disable_jit():
+        pipeline.Pipeline(plan).step(ops, jnp.int32(0))
+    expected = [("wait", 0)]
+    if following:
+        expected.append(("fetch", 0, 1, 3))
+    expected.extend((("clear", 0), ("publish", 0, {})))
+    assert calls == expected
+
+
 @pytest.mark.parametrize("block_size", [8, 64, 96, 128, 192, 256])
 def test_sparse_tasks_match_token_level_candidate_reference(block_size):
     rng = np.random.default_rng(911)

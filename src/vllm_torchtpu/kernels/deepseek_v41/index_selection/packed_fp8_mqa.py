@@ -243,6 +243,11 @@ class MQAOps:
     def output_slot(self, tile):
         return 2 * (self.state.step & 1) + (tile & 1)
 
+    def clear_output(self, tile) -> None:
+        self.scores[self.output_slot(tile)] = jnp.full(
+            self.scores.shape[1:], -jnp.inf, jnp.float32
+        )
+
     def release_output_pair(self, pair):
         # Only the recorded rows own outstanding completions. A tile with
         # zero live queries must not wait on an unissued output transfer.
@@ -482,8 +487,8 @@ def packed_fp8_mqa_logits(
         cache_layout: This layer's page placement in shared owners. None means
             tightly packed pages, including a page-aligned bank boundary.
         skip_invalid_pages: Sparse task tables skip invalid page DMAs and wait
-            for only the issued bytes. Padded fragments are still computed;
-            their arbitrary values are discarded by the per-token output mask.
+            for only the issued bytes. Empty tiles skip arithmetic. Padded
+            fragments inside nonempty tiles are computed and masked at output.
 
     QK accumulates in FP32 then rounds to BF16. ReLU, folded Q weights and
     weighted products use BF16. Head sums accumulate in FP32, round to BF16,

@@ -66,9 +66,11 @@ def load_model():
 
 
 def load_sparse_baseline(source: Path):
-    """Load the two historical source files supplied for an exact FP8 A/B."""
+    """Load historical scorer sources supplied for an exact FP8 A/B."""
     modules = []
     for suffix in (
+        "kernels.deepseek_v41.index_selection._packed_fp8_pipeline",
+        "kernels.deepseek_v41.index_selection.packed_fp8_mqa",
         "kernels.deepseek_v41.index_selection.packed_fp8_sparse",
         "models.vllm.deepseek_v41.v2.packed_fp8_indexer",
     ):
@@ -80,7 +82,12 @@ def load_sparse_baseline(source: Path):
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
         modules.append(module)
-    sparse, indexer = modules
+    pipeline, scorer, sparse, indexer = modules
+    scorer.BufferPlan = pipeline.BufferPlan
+    scorer.Pipeline = pipeline.Pipeline
+    scorer.QueryState = pipeline.QueryState
+    scorer.QueryTile = pipeline.QueryTile
+    indexer.packed_fp8_mqa_logits = scorer.packed_fp8_mqa_logits
     indexer.candidate_pages = sparse.candidate_pages
     indexer.mask_candidate_scores = sparse.mask_candidate_scores
     return indexer
