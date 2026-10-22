@@ -21,6 +21,7 @@ steps:
         agents:
           queue: cpu_64_core
         commands:
+          - bash .buildkite/scripts/setup_git_lfs.sh
           - bash .buildkite/scripts/setup_docker_env.sh dev
         # The torch-tpu virtual registry sometimes 404s a wheel it serves
         # moments later; a build that fails that way passes on the next try.

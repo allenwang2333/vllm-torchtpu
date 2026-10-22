@@ -74,6 +74,7 @@ ENV UV_TORCH_BACKEND=cpu
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=wheels,target=/wheels \
+    --mount=type=bind,source=wheels,target=/workspace/vllm-torchtpu/wheels \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm
@@ -127,6 +128,7 @@ FROM ci AS dev
 # the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,from=wheels,target=/wheels \
+    --mount=type=bind,source=wheels,target=/workspace/vllm-torchtpu/wheels \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
