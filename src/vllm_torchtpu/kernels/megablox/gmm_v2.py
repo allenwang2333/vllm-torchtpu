@@ -104,6 +104,11 @@ def apply_act_fn(acc: jax.Array, fuse_act: str | None):
         return acc
 
     acc_gate, acc_up = deinterleave_lane(acc)
+    return apply_gated_act(acc_gate, acc_up, fuse_act)
+
+
+def apply_gated_act(acc_gate: jax.Array, acc_up: jax.Array, fuse_act: str):
+    """Applies `fuse_act` (see `apply_act_fn`) to separate gate and up values."""
     match fuse_act:
         case "silu":
             return jax.nn.silu(acc_gate) * acc_up
@@ -1068,7 +1073,6 @@ def decode_kernel(
         dtype_max = float(jnp.iinfo(lhs_q_dtype).max)
         preferred_element_type = jnp.int32
     acc_dtype = cfgs.acc_dtype
-    rhs_n = dims.size_n
 
     out_ref[...] = jnp.zeros_like(out_ref)
 
@@ -1083,26 +1087,23 @@ def decode_kernel(
         ).astype(lhs_q_dtype)
         dec.lhs_scale[b_id] = block_scale
 
-    def gm_body(gm, carry):
-        start_fetch(gm + lookahead)
-        weight_copy(gm).wait()
-        scale_copy(gm).wait()
+    panel_n = cfgs.out_size_n
+    num_panels = dims.size_n // panel_n
 
-        slot = gm % DECODE_SLOTS
+    def matmul_panel(slot, panel):
+        """acc_dtype[rows, panel_n] of weight columns [panel * panel_n, +panel_n)."""
+        cols = pl.ds(panel * panel_n, panel_n)
         rhs_ref = WeightsRef(
-            weight=dec.weight.at[slot], scale=dec.scale.at[slot], bias=None
+            weight=dec.weight.at[slot, :, cols],
+            scale=dec.scale.at[slot, :, :, cols],
+            bias=None,
         )
-        if cfgs.fuse_act is not None:
-            rhs_ref = FusedWeightsRef(
-                gate=jax.tree.map(lambda x: x.at[..., : cfgs.out_size_n], rhs_ref),
-                up=jax.tree.map(lambda x: x.at[..., cfgs.out_size_n :], rhs_ref),
-            )
         rhs = rhs_ref.get_weight()
         rhs_scale_replicated = rhs_ref.get_scale(replicate_size=rows)
 
         acc_list = []
-        for start_n in range(0, rhs_n, mxu_size):
-            end_n = min(rhs_n, start_n + mxu_size)
+        for start_n in range(0, panel_n, mxu_size):
+            end_n = min(panel_n, start_n + mxu_size)
             acc_n = jnp.zeros((rows, end_n - start_n), dtype=acc_dtype)
             for b_id, start_k in enumerate(range(0, dims.size_k, q_block_size)):
                 block_rhs = rhs[start_k : start_k + q_block_size, start_n:end_n]
@@ -1119,7 +1120,21 @@ def decode_kernel(
                 )
                 acc_n += block_acc
             acc_list.append(acc_n)
-        acc = apply_act_fn(jnp.concatenate(acc_list, axis=1), cfgs.fuse_act)
+        return jnp.concatenate(acc_list, axis=1)
+
+    def gm_body(gm, carry):
+        start_fetch(gm + lookahead)
+        weight_copy(gm).wait()
+        scale_copy(gm).wait()
+
+        slot = gm % DECODE_SLOTS
+        # Fused gate and up are multiplied as separate contiguous column panels
+        # and paired at the end; each column sees the same ops as interleaved.
+        panels = [matmul_panel(slot, p) for p in range(num_panels)]
+        if cfgs.fuse_act is None:
+            (acc,) = panels
+        else:
+            acc = apply_gated_act(*panels, cfgs.fuse_act)
         acc = acc[: out_ref.shape[0]].astype(out_ref.dtype)
 
         m_start = metadata_ref.gm_id_to_m_offset[gm]
