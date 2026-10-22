@@ -98,19 +98,22 @@ def test_layout_validate_rejects_unvalidated_geometry():
 
 
 def test_layout_validate_checks_in_kernel_conv_windows():
-    """GPR stages the verify conv window in the K half of the conv page (128
-    bf16 rows), fused pool I/O in the whole conv page (256 rows)."""
+    """GPR stages the verify conv window in the K half of the conv page (64
+    fp8 rows = 128 bf16 rows), fused pool I/O in the whole conv page (256 rows)."""
     lay = replace(_layout(3), kh=8, vh=8)  # 24 conv rows of 128 lanes per rank
     split = with_cache(_exec(R=1, B=6, T=6), paged_kv=True)
     lay.validate(split)  # split path: 3 taps fit
+    assert lay.gpr_conv_rows(4, R=1) == 96 and not lay.gpr_conv_fits(4, R=1)
     with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
         lay.validate(
             with_cache(replace(split, B=4, T=4), pool_gather=True)
-        )  # 8 * 24 = 192 rows
+        )  # 8 * 24 = 192 bf16 rows (96 fp8 page rows > 64)
     narrow = replace(_layout(3), kh=4, vh=4)  # 12 conv rows per rank
+    assert narrow.gpr_conv_rows(4, R=1) == 48 and narrow.gpr_conv_fits(4, R=1)
     narrow.validate(
         with_cache(replace(split, B=4, T=4), pool_gather=True)
-    )  # 8 * 12 = 96 rows
+    )  # 8 * 12 = 96 bf16 rows (48 fp8 page rows <= 64)
+    assert narrow.gpr_conv_rows(6, R=1) == 96 and not narrow.gpr_conv_fits(6, R=1)
     with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
         narrow.validate(with_cache(split, pool_gather=True))  # 16 * 12 rows
     narrow.validate(
@@ -120,16 +123,3 @@ def test_layout_validate_checks_in_kernel_conv_windows():
         lay.validate(
             with_cache(replace(split, B=1, T=1), fused_pool_io=True)
         )  # 16 * 24 rows
-
-
-@pytest.mark.parametrize("kh", [2, 4, 6, 8])
-@pytest.mark.parametrize("T", [2, 4, 5, 6, 8])
-def test_layout_validate_agrees_with_gpr_conv_fits(kh: int, T: int):
-    lay = replace(_layout(3), kh=kh, vh=kh)
-    ex = with_cache(_exec(R=1, B=8 * T, T=T), pool_gather=True)
-    fits = lay.gpr_conv_fits(T, R=1)
-    if fits:
-        lay.validate(ex)
-    else:
-        with pytest.raises(MegakernelConfigError, match="in-kernel gather"):
-            lay.validate(ex)

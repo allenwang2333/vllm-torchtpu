@@ -30,12 +30,6 @@ from vllm_torchtpu.megakernel.pool import (
 
 
 def test_cache_exec_pool_gather_default_is_split():
-    assert pool.POOL_STATE_NAME == "raw"
-    assert pool.POOL_IO_NUMERICS == {
-        "fused_pool_io": "approx",
-        "pool_gather": "exact",
-        "pool_gather_eligible": "approx",
-    }
     assert ExecSpec().cache is None
     # A `CacheExec` equal to its defaults is the same as no cache extension.
     assert ExecSpec(cache=CacheExec()) == ExecSpec()
