@@ -242,6 +242,8 @@ VARIANTS = {
     "no_attn_gdn_kv": (frozenset({"attn", "gdn", "kv"}), 0, {"vmem_mib": 63}, {}),
     "no_attn_gdn_ar": (frozenset({"attn", "gdn", "ar"}), 0, {"vmem_mib": 63}, {}),
     "no_dense_v63": (frozenset({"dense"}), 0, {"vmem_mib": 63}, {}),
+    # dp: each virtual rank runs the TP8 attention block (its own KV pass) instead of one shared
+    "v1att": (frozenset(), 0, {}, {("context", "DP_VATT"): False}),
 }
 
 
@@ -1025,11 +1027,12 @@ def _dp_inputs(world, case):
     c = _dp_cfg(b_all, world.e_slots)
     bg, nsg = c.B, c.NS
     bw = c.n_mb * c.mb_rows
+    nsw = bw // T  # the chip's padded sequence grid (sequences nsg .. nsw - 1 inactive)
     nv = c.NV
-    pos = np.zeros((R, bg), np.int32)
-    pt = np.zeros((R, nsg, MAXP), np.int32)
-    ck = np.zeros((R, 3, nv * nsg, T), np.int32)
-    ro = np.zeros((R, 3, nsg), np.int32)
+    pos = np.zeros((R, bw), np.int32)
+    pt = np.zeros((R, nsw, MAXP), np.int32)
+    ck = np.zeros((R, 3, nv * nsw, T), np.int32)
+    ro = np.zeros((R, 3, nsw), np.int32)
     hid = np.zeros((R, c.M, c.H), np.float32)
     m_rb = -(-(DPG * bw) // 128) * 128
     rb = np.full((L, m_rb, c.E), 1e-3, np.float32)
@@ -1049,7 +1052,7 @@ def _dp_inputs(world, case):
                 for sub in range(3):
                     for v in range(nv):
                         # per chip: the TP8 checkpoint region holds 3 x NV x NSEQ_MAX / 4 slots
-                        ck[r, sub, v * nsg + j] = (
+                        ck[r, sub, v * nsw + j] = (
                             CKPT0 + (((sub * nv + v) * (NSEQ_MAX // DPG) + j) * T) + np.arange(T))
         picks = picks_all[:, g * bg:(g + 1) * bg]
         for k in range(picks.shape[-1]):

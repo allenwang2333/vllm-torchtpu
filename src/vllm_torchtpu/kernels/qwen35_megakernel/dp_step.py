@@ -83,10 +83,13 @@ def make_dp_step(
     scopes=False,
 ):
     """`hid, raw = step(pos, hidden, weights, raw_pools, page_table, ckpt_indices, read_offsets,
-    [rbias])`, all per rank on a leading rank axis: pos [R, B], hidden [R * M, H], weights as
-    make_pooled_step (leading R), raw_pools NATT x [R * num_pages, ...], page_table [R, NS, P],
-    ckpt_indices [R, 3, NV * NS, K], read_offsets [R, 3, NS], rbias [R * L, M_rb, E] (rows of
-    every chip, M_rb >= the 128-row padded all-chips rows)."""
+    [rbias])`, all per rank on a leading rank axis. The per-row / per-sequence operands cover the
+    chip's microbatch grid, BW = n_mb * mb_rows rows (NSW = BW / T sequences; those past the
+    chip's B rows are inactive: checkpoint index 0, position 0): pos [R, BW], hidden [R * M, H],
+    page_table [R, NSW, P], ckpt_indices [R, 3, NV * NSW, K] (virtual rank v's sequences at
+    v * NSW ..), read_offsets [R, 3, NSW]; weights as make_pooled_step (leading R), raw_pools
+    NATT x [R * num_pages, ...], rbias [R * L, M_rb, E]: chip g's rows at g * BW .., M_rb the
+    all-chips rows rounded up to 128."""
     assert c.dp > 1 and c.wide, (c.dp, c.mb_rows)
     c = dataclasses.replace(c, paged_kv=True, fused_pool_io=True, act_mode="from_ckpt",
                             ckpt_2d=False, roff_1d=False, ckpt_k=c.ckpt_k or c.T)

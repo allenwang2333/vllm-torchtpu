@@ -103,6 +103,10 @@ WIDE_AR_XLAYER = True
 # expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
 WIDE_NGI = 2
 WIDE_TILE_REUSE = True
+# dp: the attention layer's virtual ranks share one KV pass (dp_attention.DPAttention: all their
+# query heads per KV block). False: each virtual rank runs the TP8 attention block (its own KV
+# pass and KV write).
+DP_VATT = True
 # Bisect switch: False runs the expert loop but drops its output (part_all keeps the shared
 # expert only), so a parity against the no-experts kernel shows whether the loop itself disturbs
 # later phases.
@@ -247,7 +251,9 @@ class MKBuildContext:
         DCP = c.dcp
         assert DCP == 1 or SPLIT, "dcp > 1 needs the sequence-split attention (its merge)"
         TS = (G // DCP) if SPLIT else 1
-        QR = rup(G * nh, 8) if SPLIT else 8  # query rows per sequence row in the KV loop
+        VATT = bool(DP and DP_VATT and c.paged_kv and c.T > 1)
+        # query rows per sequence row in the KV loop (VATT: every virtual rank's heads)
+        QR = rup(G * nh, 8) if SPLIT else (rup(NV * nh, 8) if VATT else 8)
         # verify (T > 1): the KV rows are the NS sequences; each KV block is scored for the T * QR
         # query rows of its sequence (token t's heads in rows t * QR ..). T = 1: NS = B, TQ = QR.
         T, NS = c.T, c.NS
@@ -598,6 +604,11 @@ class MKBuildContext:
         if QV:  # row-vector layout: [g, lane chunk j, row b * SR + head, 128 lanes]
             scratch["qg"] = pltpu.VMEM((G if SPLIT and not GQ else 1, NHH, QVR, 128), F32)
             scratch["ost"] = pltpu.VMEM((NHH, QVR, 128), F32)  # att_new: rnd(out) of row b, head h
+        if VATT:  # per virtual rank [v, ...]
+            assert QV and not SPLIT and SR == 8, (QV, SPLIT, SR)
+            scratch["qg"] = pltpu.VMEM((NV, NHH, QVR, 128), F32)
+            scratch["ost"] = pltpu.VMEM((NV, NHH, QVR, 128), F32)
+            scratch["gate"] = pltpu.VMEM((NV, MR, nh * HD), F32)
         if GQ:
             del scratch["pso"]
             scratch.update({
@@ -723,7 +734,7 @@ class MKBuildContext:
             and 128 % self.ER == 0
         )
         self.WIDE_MB, self.N_MB, self.BW, self.BWP, self.CAP = WIDE_MB, N_MB, BW, BWP, CAP
-        self.DP, self.DPG, self.NV = DP, DPG, NV
+        self.DP, self.DPG, self.NV, self.VATT = DP, DPG, NV, VATT
         self.vr: Any = jnp.int32(0)  # dp: the virtual rank whose mixer is being built
         self.MB_GDN, self.MB_ATT = MB_GDN, MB_ATT
         self.WIDE_DYN_ROW = WIDE_DYN_ROW
@@ -941,7 +952,7 @@ class MKBuildContext:
         self.bind_microbatch(m)
         self.vr = v
         ns = self.c.NS
-        s0 = pl.multiple_of(v * self.c_wide.NS + m * ns, ns)
+        s0 = pl.multiple_of(v * (self.BW // self.T) + m * ns, ns)  # blocks of the padded grid
         ck = self.ST_all["ckpt_indices"]
         self.ST["ckpt_indices"] = ck.at[:, pl.ds(s0, ns)] if self.ckpt_is_3d else ck.at[pl.ds(s0, ns)]
         self.scr["sm"] = self.scr["smv"].at[v]

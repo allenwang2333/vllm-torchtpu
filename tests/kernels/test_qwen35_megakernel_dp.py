@@ -155,36 +155,44 @@ def _rep(mesh, x):
     return jax.device_put(x, NamedSharding(mesh, P()))
 
 
-def test_dp_step_matches_tp8_wide():
+@pytest.mark.parametrize("live", [NSG, NSG - 1])
+def test_dp_step_matches_tp8_wide(live):
+    """live: sequences per chip; below NSG the chip's last grid sequences are inactive padding
+    (checkpoint 0, position 0), as when a chip's rows do not fill the microbatch grid."""
     devs = jax.devices("cpu")
     if len(devs) < R:
         pytest.skip("needs 8 CPU devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)")
     mesh = Mesh(np.array(devs[:R]), ("tp",))
+    S_ = DPG * live  # sequences served
+    Bg = live * T  # live rows per chip
+    BWg = NSG * T  # the chip's row grid (one microbatch)
+    c8 = _cfg(B=S_ * T, mb_rows=MB)
+    cd = _cfg(B=Bg, mb_rows=MB, dp=DPG)
     rng = np.random.default_rng(7)
     w_tp8 = _model(rng)
-    w_dp = dp_weights_from_tp8(C_DP, {k: (tuple(np.asarray(x) for x in v) if isinstance(v, tuple)
-                                          else np.asarray(v)) for k, v in w_tp8.items()})
+    w_dp = dp_weights_from_tp8(cd, {k: (tuple(np.asarray(x) for x in v) if isinstance(v, tuple)
+                                        else np.asarray(v)) for k, v in w_tp8.items()})
     shard_w = lambda w: {k: (tuple(_shard(mesh, jnp.asarray(x)) for x in v) if isinstance(v, tuple)
                              else _shard(mesh, jnp.asarray(v))) for k, v in w.items()}
 
-    # ---- sequences, pages ----
-    ctx_len = rng.integers(130, 240, S)
-    pos = np.concatenate([ctx_len[s] + np.arange(T) for s in range(S)]).astype(np.int32)
-    pt = np.zeros((S, MAXP), np.int32)
-    for s in range(S):
+    # ---- sequences, pages (sequence s = g * live + j is chip g's j-th) ----
+    ctx_len = rng.integers(130, 240, S_)
+    pos = np.concatenate([ctx_len[s] + np.arange(T) for s in range(S_)]).astype(np.int32)
+    pt = np.zeros((S_, MAXP), np.int32)
+    for s in range(S_):
         pt[s] = KV0 + s * MAXP + np.arange(MAXP)
-    n_pages = C_TP8.num_pages
+    n_pages = c8.num_pages
     assert KV0 + S * MAXP <= n_pages
-    ck_tp8 = np.array([[[_slot_tp8(sub, s, t) for t in range(T)] for s in range(S)]
+    ck_tp8 = np.array([[[_slot_tp8(sub, s, t) for t in range(T)] for s in range(S_)]
                        for sub in range(3)], np.int32)
-    roff = np.zeros((3, S), np.int32)
+    roff = np.zeros((3, S_), np.int32)
     pools_tp8 = rng.integers(0, 40, (R, n_pages, 2, 64, 4, PS), dtype=np.uint8)
-    G = R // C_TP8.NKV
+    G = R // c8.NKV
     for r in range(R):  # the KV pages of a head are the same on every rank of its group
         g0 = (r // G) * G
         pools_tp8[r, KV0:] = pools_tp8[g0, KV0:]
-    gp = C_TP8.gdn_pages
-    stride = C_TP8.gdn_stride
+    gp = c8.gdn_pages
+    stride = c8.gdn_stride
     pools_dp = np.zeros_like(pools_tp8)
     ck_dp = np.zeros((R, 3, NV * NSG, T), np.int32)
     for r in range(R):
@@ -192,91 +200,96 @@ def test_dp_step_matches_tp8_wide():
         pools_dp[r, KV0:] = pools_tp8[core * G, KV0:]
         for v, q in enumerate(virtual_ranks(r, NV)):
             for sub in range(3):
-                for j in range(NSG):
-                    s = g * NSG + j
+                for j in range(live):
+                    s = g * live + j
                     for t in range(T):
                         a, b = _slot_tp8(sub, s, t) * stride, _slot_dp(sub, v, j, t) * stride
                         pools_dp[r, b:b + gp] = pools_tp8[q, a:a + gp]
                         ck_dp[r, sub, v * NSG + j, t] = _slot_dp(sub, v, j, t)
 
-    hid_rows = (rng.standard_normal((S * T, C_TP8.H)) * 0.1).astype(np.float32)
-    # forced routing: every row's TOPK picks (the same rows in both layouts)
+    hid_rows = (rng.standard_normal((S_ * T, c8.H)) * 0.1).astype(np.float32)
+    # forced routing: every row's TOPK picks; dp: chip g's rows at g * BWg
     m_rb = 128
-    rb = np.full((C_TP8.L, m_rb, C_TP8.E), 1e-3, np.float32)
-    rb += np.arange(C_TP8.E, dtype=np.float32)[None, None, :] * 1e-6
-    for l in range(C_TP8.L):
-        for b in range(S * T):
-            picks = rng.choice(C_TP8.E, C_TP8.TOPK, replace=False)
-            rb[l, b, picks] = 2.0 - 0.01 * np.arange(C_TP8.TOPK)
-    rb_all = _shard(mesh, jnp.asarray(np.tile(rb, (R, 1, 1))))
+    rb = np.full((c8.L, m_rb, c8.E), 1e-3, np.float32)
+    rb += np.arange(c8.E, dtype=np.float32)[None, None, :] * 1e-6
+    rb_dp = rb.copy()
+    for l in range(c8.L):
+        for b in range(S_ * T):
+            picks = rng.choice(c8.E, c8.TOPK, replace=False)
+            rb[l, b, picks] = 2.0 - 0.01 * np.arange(c8.TOPK)
+            g, i = divmod(b, Bg)
+            rb_dp[l, g * BWg + i, picks] = 2.0 - 0.01 * np.arange(c8.TOPK)
     to_raw = lambda p: (_shard(mesh, jax.lax.bitcast_convert_type(
         jnp.asarray(p.reshape(R * n_pages, 2, 64, 4, PS)), K.FP8)),)
 
     # ---- TP8 wide reference ----
-    step8, _ = pool_io.make_pooled_step(mesh, C_TP8, _tiles(C_TP8), interpret=True,
+    step8, _ = pool_io.make_pooled_step(mesh, c8, _tiles(c8), interpret=True,
                                         forced_routing=True, fused_pool_io=True)
-    hid8 = np.zeros((C_TP8.M, C_TP8.H), np.float32)
-    hid8[:S * T] = hid_rows
+    hid8 = np.zeros((c8.M, c8.H), np.float32)
+    hid8[:S_ * T] = hid_rows
     out8, raw8 = step8(
         _rep(mesh, jnp.asarray(pos)), _shard(mesh, jnp.asarray(np.tile(hid8, (R, 1)), K.BF16)),
         shard_w(w_tp8), to_raw(pools_tp8), _rep(mesh, jnp.asarray(pt)),
-        _rep(mesh, jnp.asarray(ck_tp8)), _rep(mesh, jnp.asarray(roff)), rb_all,
+        _rep(mesh, jnp.asarray(ck_tp8)), _rep(mesh, jnp.asarray(roff)),
+        _shard(mesh, jnp.asarray(np.tile(rb, (R, 1, 1)))),
     )
-    h8 = np.asarray(out8.astype(jnp.float32)).reshape(R, C_TP8.M, C_TP8.H)
+    h8 = np.asarray(out8.astype(jnp.float32)).reshape(R, c8.M, c8.H)
     p8 = np.asarray(jax.lax.bitcast_convert_type(raw8[0], jnp.uint8)).reshape(pools_tp8.shape)
 
-    # ---- dp ----
-    stepd, _ = make_dp_step(mesh, C_DP, _tiles(C_DP), interpret=True, forced_routing=True)
-    Bg = NSG * T
-    hidd = np.zeros((R, C_DP.M, C_DP.H), np.float32)
-    posd = np.zeros((R, Bg), np.int32)
+    # ---- dp (operands on the chip's grid of NSG sequences) ----
+    stepd, _ = make_dp_step(mesh, cd, _tiles(cd), interpret=True, forced_routing=True)
+    hidd = np.zeros((R, cd.M, cd.H), np.float32)
+    posd = np.zeros((R, BWg), np.int32)
     ptd = np.zeros((R, NSG, MAXP), np.int32)
     rod = np.zeros((R, 3, NSG), np.int32)
     for r in range(R):
         g = r // 2
         hidd[r, :Bg] = hid_rows[g * Bg:(g + 1) * Bg]
-        posd[r] = pos[g * Bg:(g + 1) * Bg]
-        ptd[r] = pt[g * NSG:(g + 1) * NSG]
+        posd[r, :Bg] = pos[g * Bg:(g + 1) * Bg]
+        ptd[r, :live] = pt[g * live:(g + 1) * live]
     outd, rawd = stepd(
         _shard(mesh, jnp.asarray(posd)),
-        _shard(mesh, jnp.asarray(hidd.reshape(R * C_DP.M, C_DP.H), K.BF16)),
+        _shard(mesh, jnp.asarray(hidd.reshape(R * cd.M, cd.H), K.BF16)),
         shard_w(w_dp), to_raw(pools_dp), _shard(mesh, jnp.asarray(ptd)),
-        _shard(mesh, jnp.asarray(ck_dp)), _shard(mesh, jnp.asarray(rod)), rb_all,
+        _shard(mesh, jnp.asarray(ck_dp)), _shard(mesh, jnp.asarray(rod)),
+        _shard(mesh, jnp.asarray(np.tile(rb_dp, (R, 1, 1)))),
     )
-    hd = np.asarray(outd.astype(jnp.float32)).reshape(R, C_DP.M, C_DP.H)
+    hd = np.asarray(outd.astype(jnp.float32)).reshape(R, cd.M, cd.H)
     pd = np.asarray(jax.lax.bitcast_convert_type(rawd[0], jnp.uint8)).reshape(pools_dp.shape)
 
     # ---- compare ----
-    assert np.isfinite(h8).all() and np.isfinite(hd).all()
+    assert np.isfinite(h8).all() and np.isfinite(hd[:, :Bg]).all()
     for r in range(1, R):
-        assert np.array_equal(h8[r, :S * T], h8[0, :S * T])
+        assert np.array_equal(h8[r, :S_ * T], h8[0, :S_ * T])
     for g in range(DPG):
         assert np.array_equal(hd[2 * g, :Bg], hd[2 * g + 1, :Bg]), f"chip {g}: cores differ"
     ref = np.concatenate([h8[0, g * Bg:(g + 1) * Bg] for g in range(DPG)])
     got = np.concatenate([hd[2 * g, :Bg] for g in range(DPG)])
     close = np.isclose(got, ref, atol=2e-2, rtol=2e-2)
-    print("hidden close frac", float(close.mean()), "max abs diff", float(np.abs(got - ref).max()),
-          "ref max", float(np.abs(ref).max()))
+    print("live", live, "hidden close frac", float(close.mean()), "max abs diff",
+          float(np.abs(got - ref).max()), "ref max", float(np.abs(ref).max()))
     assert close.mean() > 0.999 and np.abs(got - ref).max() < 0.1
+    # the inactive grid sequences wrote nothing: page 0 (the null page) is untouched
+    assert np.array_equal(pd[:, 0], pools_dp[:, 0])
 
     kvf = lambda a: a.view(jnp.dtype(K.FP8)).astype(np.float32)
     for r in range(R):
         g, core = r // 2, r % 2
-        pages = pt[g * NSG:(g + 1) * NSG].reshape(-1)
+        pages = pt[g * live:(g + 1) * live].reshape(-1)
         np.testing.assert_allclose(kvf(pd[r, pages]), kvf(p8[core * G, pages]), atol=0.25, rtol=0.13)
         for v, q in enumerate(virtual_ranks(r, NV)):
             for sub in range(3):
-                for j in range(NSG):
-                    s = g * NSG + j
+                for j in range(live):
+                    s = g * live + j
                     for t in range(T):
                         a, b = _slot_tp8(sub, s, t) * stride, _slot_dp(sub, v, j, t) * stride
                         msg = f"rank {r} vr {v} sub {sub} seq {s} token {t}"
-                        rp = C_TP8.rec_pages
+                        rp = c8.rec_pages
                         np.testing.assert_allclose(
-                            _unpack_rec(pd[r, b:b + rp], C_TP8.vh),
-                            _unpack_rec(p8[q, a:a + rp], C_TP8.vh), atol=2e-2, rtol=2e-2,
+                            _unpack_rec(pd[r, b:b + rp], c8.vh),
+                            _unpack_rec(p8[q, a:a + rp], c8.vh), atol=2e-2, rtol=2e-2,
                             err_msg="rec " + msg)
                         np.testing.assert_allclose(
-                            _unpack_conv(pd[r, b + rp], C_TP8.QKV),
-                            _unpack_conv(p8[q, a + rp], C_TP8.QKV), atol=2e-2, rtol=2e-2,
+                            _unpack_conv(pd[r, b + rp], c8.QKV),
+                            _unpack_conv(p8[q, a + rp], c8.QKV), atol=2e-2, rtol=2e-2,
                             err_msg="conv " + msg)

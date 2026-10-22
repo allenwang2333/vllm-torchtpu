@@ -140,6 +140,22 @@ class DenseWeightRing:
 
                 @pl.when(r < mb_tiles)
                 def _mixer():
+                    if NV > 1 and ctx.VATT and names[0] == "att_in":
+                        # dp attention: a microbatch's att_in of virtual ranks 0 .. NV-1, then
+                        # their att_out
+                        a1 = per_mb - a0
+                        rm = lax.rem(r, NV * per_mb)
+                        is_in = rm < NV * a0
+                        ri = jnp.where(is_in, rm, rm - NV * a0)
+                        wd = jnp.where(is_in, a0, a1)
+                        v = lax.div(ri, wd)
+                        row = ri - v * wd
+                        o0 = ords[0] * NV + v
+                        pl.when(is_in)(lambda: self.dcopy(
+                            names[0], ctx.W[names[0]].at[o0, row], bank).start())
+                        pl.when(jnp.logical_not(is_in))(lambda: self.dcopy(
+                            names[1], ctx.W[names[1]].at[o0, row], bank).start())
+                        return
                     rr = lax.rem(r, per_mb)
                     m_ords = ords
                     if NV > 1:  # dp: copy k is microbatch k // NV with virtual rank k % NV

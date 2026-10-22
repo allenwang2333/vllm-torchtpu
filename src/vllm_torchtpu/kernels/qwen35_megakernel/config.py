@@ -725,12 +725,15 @@ def state_shapes(c: MKConfig):
     if c.paged_kv and c.fused_pool_io:
         G_PER_ATT = max(1, c.att_every - 1)
         K_ckpt = c.ckpt_k if c.ckpt_k > 0 else c.T
-        # dp: one block of NS sequences per virtual rank (its GatedDeltaNet head slices)
-        ckpt_shape = (c.NS, K_ckpt) if c.ckpt_2d else (G_PER_ATT, c.NV * c.NS, K_ckpt)
-        roff_shape = (c.NS,) if c.roff_1d else (G_PER_ATT, c.NS)
+        # dp: the per-sequence operands cover the chip's microbatch grid (n_mb * mb_rows rows;
+        # sequences past NS inactive: checkpoint 0, position 0), and ckpt_indices holds one
+        # block of them per virtual rank (its GatedDeltaNet head slices)
+        ns = c.n_mb * c.mb_rows // c.T if (c.dp > 1 and c.wide) else c.NS
+        ckpt_shape = (ns, K_ckpt) if c.ckpt_2d else (G_PER_ATT, c.NV * ns, K_ckpt)
+        roff_shape = (ns,) if c.roff_1d else (G_PER_ATT, ns)
         st = {
             "raw": tuple(Spec((c.num_pages, 2, 64, 4, c.page_size), FP8) for _ in range(c.NATT)),
-            "page_table": Spec((c.NS, c.max_pages_per_seq), I32),
+            "page_table": Spec((ns, c.max_pages_per_seq), I32),
             "ckpt_indices": Spec(ckpt_shape, I32),
             "read_offsets": Spec(roff_shape, I32),
         }

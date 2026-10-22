@@ -42,6 +42,7 @@ from jax.experimental.pallas import tpu as pltpu
 from .attention_block import PagedAttentionBlock
 from .config import BF16, F32, FP8, I32, rnd
 from .context import MKBuildContext
+from .dp_attention import DPAttention
 from .gdn_block import GDNBlock
 from .moe_block import MoEBlock
 from .pool_dma import GDNPoolDMA, KVPoolDMA
@@ -169,6 +170,7 @@ def kernel_dp(ctx: MKBuildContext, refs):
     att_blk = PagedAttentionBlock(ctx, rings, kv_dma)
     moe_blk = MoEBlock(ctx, rings)
     xch = DPExchange(ctx)
+    vatt = DPAttention(ctx, rings, kv_dma, att_blk) if ctx.VATT else None
 
     c, scr, R = ctx.c, ctx.scr, ctx.R
     W, hid_hbm, out_hbm = ctx.W, ctx.hid_ref, ctx.out_ref
@@ -239,13 +241,29 @@ def kernel_dp(ctx: MKBuildContext, refs):
                         def gdn_branch():
                             scr["dsum"][...] += gdn_blk.gdn(l, slot, g0)
 
-                        if AE == 1:
+                        if ctx.VATT:  # only GatedDeltaNet layers run per virtual rank
+                            gdn_branch()
+                        elif AE == 1:
                             att_branch()
                         else:
                             lax.cond(is_att, att_branch, gdn_branch)
                     return carry_v
 
-                lax.fori_loop(0, NV, virtual, 0)
+                def virtual_all():
+                    lax.fori_loop(0, NV, virtual, 0)
+
+                if ctx.VATT:  # attention: one KV pass for the core's virtual ranks
+                    def att_mb():
+                        att_blk.init_worklist()
+                        att_blk.init_rope()
+                        vatt.attention(l, slot, m, base_l + m * NV * per_mb)
+
+                    if AE == 1:
+                        att_mb()
+                    else:
+                        lax.cond(is_att, att_mb, virtual_all)
+                else:
+                    virtual_all()
                 ctx.bind_microbatch(m)
                 ctx.scr["sm"] = smv.at[0]
                 tot = xch.pair_sum(scr["dsum"][...], l * N_MB + m)
