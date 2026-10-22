@@ -18,8 +18,9 @@ slots (no copies in use) and forced routing. One TP8 model serves 16 sequences (
 in the TP8 wide step; the same model in the dp layout (`dp_weights_from_tp8`) serves them as 4
 chips x 4 sequences. Compared: every chip's hidden rows (on both of its cores), the KV pages
 the step writes and the GatedDeltaNet checkpoints of every virtual rank. The all-reduce orders
-differ (TP8: 8 bf16 partials; dp: 4 virtual partials summed in f32, then 2 bf16 core sums;
-MoE: 8 bf16 partials in rank order either way), hence the tolerance.
+differ (TP8: 8 bf16 partials; dp mixer: 4 virtual partials in f32, then the core pair's f32
+sums; dp MoE: 4 bf16 chip partials per core index, then the core pair's f32 sums), hence the
+tolerance.
 
 Imports only the kernel modules (no vllm), so it runs with the mkshim sitecustomize.
 """

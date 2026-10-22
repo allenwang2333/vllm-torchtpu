@@ -18,13 +18,14 @@ Chip g (ranks 2g, 2g + 1) serves its own rows. Per layer:
   * mixer, per microbatch of the chip's rows: core c runs the TP8 mixer block of virtual rank
     4c + v for v = 0 .. 3 (that rank's weight slices from the dense stream, its smalls row, its
     GatedDeltaNet checkpoint block; every virtual rank of core c holds KV head c), sums the four
-    partials, then exchanges the bf16 sum with core c ^ 1. Both cores add the two bf16 sums, so
-    they hold the same residual rows.
+    partials, then exchanges the f32 sum with core c ^ 1 (on-chip). Both cores add the two sums,
+    so they hold the same residual rows.
   * MoE: each core sends the chip's post-norm rows to the same core of the other three chips
     (an all-gather into xb_all, chip g's rows at g * BW ..), runs the wide MoE phase (router,
     shared-expert slice and its EP experts) over all rows, and sends its bf16 partial of chip
-    g's rows to both cores of chip g. Every core sums the eight partials of its chip's rows in
-    rank order, so the cores of a chip again agree.
+    g's rows to the same core of chip g (a reduce-scatter). Each core sums the four partials of
+    its core index in chip order, then the core pair exchanges and adds the two f32 sums, so
+    the cores of a chip again agree.
 
 The exchanges need no credits: a payload is only overwritten after its receiver has passed a
 later exchange with the sender (pair: two slots, each core waits for the other's previous
@@ -69,8 +70,8 @@ class DPExchange:
         )
 
     def pair_sum(self, x, seq):
-        """x [>= MR, H] f32 core partial -> the chip's sum (f32 of two bf16 sums, the same on both
-        cores). seq: the step's exchange index (traced), selecting the slot."""
+        """x [>= MR, H] f32 core partial -> the chip's sum (the two cores' f32 sums added, the
+        same on both cores). seq: the step's exchange index (traced), selecting the slot."""
         ctx = self.ctx
         MR, scr, sc = ctx.MR, ctx.scr, ctx.sc
         slot = lax.rem(seq, 2)
@@ -79,13 +80,13 @@ class DPExchange:
         with sc("dp_pair"):
             if ctx.comm:
                 pl.when(seq >= 2)(cp.wait_send)
-            scr["pr_send"][slot] = x[:MR].astype(BF16)
+            scr["pr_send"][slot] = x[:MR]
             scr["pr_recv"][slot, c_idx] = scr["pr_send"][slot]
             if not ctx.comm:
-                return scr["pr_recv"][slot, c_idx].astype(F32) * 2.0
+                return scr["pr_recv"][slot, c_idx] * 2.0
             cp.start()
             cp.wait_recv()
-            return scr["pr_recv"][slot, 0].astype(F32) + scr["pr_recv"][slot, 1].astype(F32)
+            return scr["pr_recv"][slot, 0] + scr["pr_recv"][slot, 1]
 
     def pair_drain(self, n_seq: int):
         if not self.ctx.comm:
@@ -122,13 +123,14 @@ class DPExchange:
             for d in cps:
                 d.wait_send()
 
-    # ---- MoE combine: every rank's partial of this chip's rows ----
+    # ---- MoE combine: reduce-scatter over the same core of every chip ----
     def combine(self):
-        """part_all (this rank's MoE partial of every row) -> crecv[r] = rank r's bf16 partial
-        of this chip's rows, for every r. xb_all (read by the experts, idle now) stages the bf16
-        partials of all rows."""
+        """part_all (this rank's MoE partial of every row) -> crecv[g] = the bf16 partial of this
+        chip's rows from rank 2g + core (core: this rank's), for every chip g. xb_all (read by
+        the experts, idle now) stages the bf16 partials of all rows. The core pair then sums its
+        two chip sums (pair_sum), so the cross-chip bytes are one partial per chip."""
         ctx = self.ctx
-        scr, me, BW, R, sc = ctx.scr, ctx.me, ctx.BW, ctx.R, ctx.sc
+        scr, me, BW, sc = ctx.scr, ctx.me, ctx.BW, ctx.sc
         xb_all, part_all, crecv = scr["xb_all"], scr["part_all"], scr["crecv"]
         n_all = ctx.DPG * BW
         with sc("dp_stage"):
@@ -136,19 +138,19 @@ class DPExchange:
                 n = min(64, n_all - r0)
                 xb_all[r0:r0 + n, :] = part_all[r0:r0 + n, :].astype(BF16)
             mine = pl.ds(pl.multiple_of((me // 2) * BW, 8), BW)
-            crecv[me] = xb_all[mine, :]
+            crecv[me // 2] = xb_all[mine, :]
         if not ctx.comm:
             return
         cps = [
             pltpu.make_async_remote_copy(
                 src_ref=xb_all.at[pl.ds(pl.multiple_of(((me ^ off) // 2) * BW, 8), BW)],
-                dst_ref=crecv.at[me],
-                send_sem=scr["c_ssem"].at[off - 1],
-                recv_sem=scr["c_rsem"].at[off - 1],
+                dst_ref=crecv.at[me // 2],
+                send_sem=scr["c_ssem"].at[i],
+                recv_sem=scr["c_rsem"].at[i],
                 device_id=(me ^ off,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
-            for off in range(1, R)
+            for i, off in enumerate((2, 4, 6))
         ]
         with sc("dp_combine"):
             for d in cps:
@@ -266,7 +268,7 @@ def kernel_dp(ctx: MKBuildContext, refs):
                     virtual_all()
                 ctx.bind_microbatch(m)
                 ctx.scr["sm"] = smv.at[0]
-                tot = xch.pair_sum(scr["dsum"][...], l * N_MB + m)
+                tot = xch.pair_sum(scr["dsum"][...], l * (2 * N_MB) + m)
                 with sc("ar_res"):
                     res_m = rnd(scr["res"][...] + tot[0:B])
                 with sc("moe_router"):
@@ -284,14 +286,16 @@ def kernel_dp(ctx: MKBuildContext, refs):
         def moe_res(m, carry_m):
             with sc("ar_res"):
                 r0 = pl.multiple_of(m * B, B)
-                tot = jnp.zeros((B, H), F32)
                 crecv = scr["crecv"]
-                if ctx.comm:
-                    for r in range(R):
-                        tot = tot + crecv[r, pl.ds(r0, B), :].astype(F32)
+                if ctx.comm:  # the chips' partials of this core index, in chip order
+                    part = crecv[0, pl.ds(r0, B), :].astype(F32)
+                    for g in range(1, ctx.DPG):
+                        part = part + crecv[g, pl.ds(r0, B), :].astype(F32)
                 else:
-                    tot = crecv[me, pl.ds(r0, B), :].astype(F32) * float(R)
-                res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot).astype(BF16)
+                    part = crecv[me // 2, pl.ds(r0, B), :].astype(F32) * float(ctx.DPG)
+            tot = xch.pair_sum(part, l * (2 * N_MB) + N_MB + m)
+            with sc("ar_res"):
+                res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
             return carry_m
 
         lax.fori_loop(0, N_MB, moe_res, 0)
@@ -345,7 +349,7 @@ def kernel_dp(ctx: MKBuildContext, refs):
         zero_seen.wait()
     lax.fori_loop(0, L, layer_scoped, 0)
     with sc("step_tail"):
-        xch.pair_drain(L * N_MB)
+        xch.pair_drain(L * 2 * N_MB)
         if c.NGDN > 0:
             for slot_o in range(NGO):
                 gdn_dma.wait_gdn_out(slot_o)

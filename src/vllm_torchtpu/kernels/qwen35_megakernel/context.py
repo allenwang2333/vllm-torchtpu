@@ -633,22 +633,22 @@ class MKBuildContext:
         if DP:
             # the TP8 all-reduce buffers give way to the dp exchanges: the core pair's mixer
             # exchange (2 slots), the chips' row all-gather (into xb_all) and the MoE combine
-            # (every rank's bf16 partial of this chip's rows, by sender)
+            # (the same core index's bf16 partials of this chip's rows, by sender chip)
             for k in ("send", "recv", "ar_ssem", "ar_rsem", "ag_credit", "ag_send", "ag_recv",
                       "s2_send", "s2_recv", "arp", "sm"):
                 scratch.pop(k, None)
             scratch.update({
                 "smv": pltpu.VMEM((NV, 2, 1, S), F32),  # [virtual rank, slot]: smalls rows
                 "dsum": pltpu.VMEM((MB, H), F32),  # the virtual ranks' mixer partial sum
-                "pr_send": pltpu.VMEM((2, MR, H), BF16),
-                "pr_recv": pltpu.VMEM((2, 2, MR, H), BF16),  # [slot, core]
+                "pr_send": pltpu.VMEM((2, MR, H), F32),  # on-chip: f32 sums, no extra rounding
+                "pr_recv": pltpu.VMEM((2, 2, MR, H), F32),  # [slot, core]
                 "pr_ssem": pltpu.SemaphoreType.DMA((2,)),
                 "pr_rsem": pltpu.SemaphoreType.DMA((2,)),
                 "ag_ssem": pltpu.SemaphoreType.DMA((DPG - 1,)),
                 "ag_rsem": pltpu.SemaphoreType.DMA((DPG - 1,)),
-                "crecv": pltpu.VMEM((R, BW, H), BF16),  # [sender rank]
-                "c_ssem": pltpu.SemaphoreType.DMA((R - 1,)),
-                "c_rsem": pltpu.SemaphoreType.DMA((R - 1,)),
+                "crecv": pltpu.VMEM((DPG, BW, H), BF16),  # [sender chip] (same core index)
+                "c_ssem": pltpu.SemaphoreType.DMA((DPG - 1,)),
+                "c_rsem": pltpu.SemaphoreType.DMA((DPG - 1,)),
             })
         s_names = list(scratch)
         if FUSED:
