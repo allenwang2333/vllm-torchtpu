@@ -44,9 +44,12 @@ K pool: it reads the original FP8 cache directly. Candidate IDs remain necessary
 Candidate consumers mark pages needed by each group of at most six queries from
 the same request. Page slots retain their original logical positions; unused
 pages are marked `-1`. Only valid pages issue HBM DMAs, and the receive wait counts
-only the bytes actually requested. Query-specific block masks broadcast over
-scores before top-k. There is no page-union compaction, per-token membership
-gather or top-k ID remapping.
+only the bytes actually requested. SparseCore builds unique, ascending candidate
+block IDs and gathers their scores before top-k. The public sparse entry point,
+`packed_fp8_sparse_mqa_logits`, returns `[queries, candidate_blocks * block_size]`
+FP32 scores and their canonical block IDs. For 2048 eight-token blocks this is
+16384 columns. Top-k maps compact column indices back to logical token IDs;
+duplicate candidate IDs do not duplicate tokens in the result.
 Candidate publishers still score the full visible context. The whole-batch
 short-context bypass and the existing all-blocks-fit identity are preserved.
 
@@ -55,8 +58,12 @@ can bring other tokens on that page into the computation. Candidates that touch
 every page still read every page. The arithmetic pipeline retains its unrolled
 32768-key tiles, including page holes and padding in a partial tile. Preserving
 logical page positions can compute more tiles than compacting selected pages;
-the change removes metadata overhead without changing the scorer. Sparse calls
-leave skipped K pages unwritten and allocate no zero buffer.
+the change removes metadata overhead while retaining the compute pipeline.
+Entirely empty tiles skip arithmetic; partial tiles retain their unrolled
+compute. TensorCore still writes a full-context temporary score array, which
+SparseCore reads to produce the compact result. The public output shape does
+not imply that this temporary or all extra arithmetic has been eliminated.
+Sparse calls leave skipped K pages unwritten and allocate no zero buffer.
 QK and both head-reduction paths operate independently on each token column;
 invalid pages are masked to `-inf` before top-k or any cross-token operation.
 Their arbitrary values, including NaNs, cannot contribute to valid columns.
@@ -87,8 +94,9 @@ infinite scales and random bits, including holes and fully invalid fragments.
 They compare zero-filled and poisoned inputs through the production QK,
 VPU/MXU reduction and store methods; valid outputs are identical and invalid
 outputs are `-inf`. These CPU tests emulate the unsupported TPU pack/unpack/roll
-primitives and are not hardware validation. No model or hardware execution has
-been performed for this integration. The local check
+primitives and are not hardware validation. Hardware validation of the JAX
+Indexer stages is reported below; a complete model forward remains untested.
+The local check
 environment lacks vLLM/torch-tpu, so real custom-op registration and a model
 forward still need the full runtime; the existing startup test now includes
 the packed ops. Independent kernel-reference differences remain as documented
@@ -346,6 +354,46 @@ byte-preservation tests and complete filter-path sim-pjrt compilation also pass.
 Use `bench_packed_fp8_layer.py --compare-cache-writers --profile --out <dir>`
 to compare both FP8 writers in the same run. The benchmark checks exact equality
 of both cache banks, selected IDs and published candidates before measuring.
+
+### Compact candidate scores
+
+P-state-7 experiments `exp-vhy0bbtozb` and `exp-j4e5uvig2m` compare against the
+page-DMA writer baseline at commit `c590a5009`. They retain the same 288 queries,
+96K context, 16K candidate tokens, two cache banks, and two random seeds.
+`filter_clustered` uses one contiguous 16K candidate range per request;
+`filter_scattered` independently distributes each query's 16K candidates over
+the 96K context. These are synthetic coverage cases, not measured model
+candidate distributions. Both have a 16K-column compact score output.
+
+| Variant | Clustered (microseconds) | Scattered (microseconds) |
+| --- | ---: | ---: |
+| Full-width baseline, second run | 3107.511 | 3211.651 |
+| Compact scores, first run | 880.809 | 880.567 |
+| Compact scores and empty-tile bypass, second run | 872.366 | 881.827 |
+
+Numbers are means of the two seed medians, each with 30 XProf device samples.
+Declared operator analyses are `an-07cf7q2xvw` and `an-9e885t80wd`; stage-sample
+analyses are `an-86ea8dsk2b` and `an-6fyttey0kp`. All four outputs (two cache
+banks, selected IDs and candidate IDs) match the historical implementation
+exactly for every case and seed. The first compact version's normalized scorer
+LLO instructions match the baseline byte-for-byte. The four compute regions
+contain 4081/3968/4110/4051 bundles; with empty-tile bypass the region boundaries
+contain 4081/3968/4110/3995 bundles. These are static region counts, not complete
+runtime cycles or a prediction of latency.
+
+The second run's clustered seed-2026 trace has 315.1 microseconds of MQA scoring,
+61.3 of candidate membership, 83.6 of score compaction and 88.2 of top-k. Two
+remaining metadata scatters account for 64.5 microseconds, sorting for 35.7 and
+logical-ID remapping for 13.5. A third experiment, `exp-sksivkv699`, tests their
+removal/fusion and unrolled empty-tile prefetch; its timing is pending. The
+500-microsecond target has **not** been demonstrated. These timings cover JAX
+cache writes, Q quantization, metadata, scoring and selection; they exclude
+projections, RoPE, Torch dispatch and TP collectives.
+
+Use `bench_packed_fp8_layer.py --sparse-baseline <baseline-checkout> --profile
+--out <dir>` for the same-run comparison. The baseline checkout must contain
+the historical full-width scorer, pipeline, candidate metadata and model entry
+point. The current benchmark loads all four together to avoid mixing variants.
 
 ## Reproduce
 
