@@ -159,12 +159,6 @@ echo "ports: server=${PORT} registry=${REGISTRY_PORT}\
  offload controller=${OFFLOAD_CONTROLLER_PORT}\
  node controller=${NODE_CONTROLLER_PORT}"
 
-# ---------------------------------------------------------------------------
-# Control-plane preflight: the installed tpu-sync-torch wheel must bundle the
-# global DRAM pool's binaries. Its version is logged, not compared with the
-# pyproject.toml pin, so the canary's tpu-sync leg, which layers a newer wheel
-# over the pinned one, runs the test too.
-# ---------------------------------------------------------------------------
 RAIDEN_VERSION="$(python3 -c \
   'import importlib.metadata as m; print(m.version("tpu-sync-torch"))')" \
   || fail "tpu-sync-torch is not installed"
