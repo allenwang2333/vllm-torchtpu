@@ -507,6 +507,59 @@ class TestConstructionGuards(unittest.TestCase):
             self.assertIsNotNone(spec)
             self.assertEqual(spec.key_namespace, b"test_ns")
 
+    def test_cp_scale_check_matches_offloaded_groups_by_id(self):
+        # Regression: `config.groups` holds only the prefix-cacheable groups.
+        # A non-cacheable attention group (a per-request circular buffer
+        # with a 4-token block) ahead of the offloaded one must not be paired
+        # with it positionally, or the CP check compares 512 against 4.
+        from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
+
+        from vllm_torchtpu.offload.raiden_store import TPURaidenStoreOffloadingSpec
+
+        ring = MagicMock(spec=CircularBufferSpec)
+        ring.block_size = 4
+        main = MagicMock(spec=FullAttentionSpec)
+        main.block_size = 512
+        vllm_config = MagicMock()
+        vllm_config.model_config.is_hybrid = False
+        vllm_config.parallel_config.data_parallel_rank = 0
+        vllm_config.parallel_config.data_parallel_rank_local = 0
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=ring),
+                SimpleNamespace(kv_cache_spec=main),
+            ],
+            kv_cache_tensors=[object()],
+        )
+        config = MagicMock()
+        config.cache.blocks_per_chunk = 1
+        config.parallel.dcp_size = 1
+        config.parallel.pcp_size = 1
+        config.parallel.world_size = 1
+        config.parallel.pp_size = 1
+        config.extra_config = {"cpu_bytes_to_use": 1024 * 1024}
+        config.worker_kv_bytes_per_block = 1024
+        config.groups = [SimpleNamespace(group_id=1, tokens_per_block=512)]
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_kernel_geometry",
+                return_value=(512, (1, 1), None, 512),
+            ),
+            patch(
+                "vllm_torchtpu.offload.raiden_store.resolve_block_major_contract",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.offload.raiden_store.derive_offload_namespace",
+                return_value=b"test_ns",
+            ),
+        ):
+            TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+            # A genuine mismatch on the offloaded group still fails.
+            main.block_size = 256
+            with self.assertRaises(AssertionError):
+                TPURaidenStoreOffloadingSpec(config, vllm_config, kv_cache_config)
+
     def test_registry_requires_pythonhashseed(self):
         # Require PYTHONHASHSEED to prevent hash mismatch across distributed replicas.
         env = {k: v for k, v in os.environ.items() if k != "PYTHONHASHSEED"}
@@ -2616,7 +2669,7 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     config = SimpleNamespace(
         extra_config={"cpu_bytes_to_use": 1 << 20, **extra_config},
         enable_kv_cache_events=False,
-        groups=[SimpleNamespace(tokens_per_block=64)],
+        groups=[SimpleNamespace(group_id=0, tokens_per_block=64)],
         cache=SimpleNamespace(tokens_per_hash=64, blocks_per_chunk=1),
         parallel=SimpleNamespace(
             tp_size=tp_size,
