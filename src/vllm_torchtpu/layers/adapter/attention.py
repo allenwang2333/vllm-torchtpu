@@ -2491,6 +2491,9 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 fused_exchange=fused_exchange,
                 fused_merge=fused_merge,
                 dcp_lane_ids=lane_ids,
+                # GLM5_MKD_STACK_C: read at trace time; the runner binds it
+                # with the stacked caches, after this op is built.
+                kv_stack=getattr(layer, "kv_stack", None),
             )
 
         # The torch op schema is inferred from the signature: no varargs or
@@ -3074,6 +3077,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                             query_start_loc=attn_metadata.query_start_loc,
                         )
             else:
+                assert getattr(layer, "kv_stack", None) is None, (
+                    "GLM5_MKD_STACK_C stacked caches are only wired into the "
+                    "DCP sparse MLA op"
+                )
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
 
