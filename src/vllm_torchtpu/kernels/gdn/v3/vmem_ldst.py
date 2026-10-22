@@ -264,6 +264,60 @@ def zero_state_padding(slot_ref: jax.Ref, region: config.StateRegion) -> None:
         )
 
 
+def conv_tap_shape(
+    slot_ref: jax.Ref, region: config.StateRegion, cfg: config.GDNConfig
+) -> tuple[int, int]:
+    """Dense [rows, lanes] shape of one conv tap, the region's typed row width."""
+    assert region.rows_perm is None and region.nblocks == 1
+    assert jnp.dtype(region.view_dtype) == jnp.bfloat16
+    _, lanes = _region_rows_per_block(slot_ref, region)
+    assert cfg.dim_size % lanes == 0
+    return cfg.dim_size // lanes, lanes
+
+
+def load_conv_state_taps(
+    slot_ref: jax.Ref,
+    region: config.StateRegion,
+    cfg: config.GDNConfig,
+    has_initial_state: jax.Array,
+) -> list[jax.Array]:
+    """One slot's conv state as prev_kernel_size dense conv_tap_shape f32 taps.
+
+    The region's bf16 rows hold the taps back to back in flat order, so tap
+    t is a contiguous row range of the typed view: whole vregs, no relayout.
+    """
+    rows, _ = conv_tap_shape(slot_ref, region, cfg)
+    taps = []
+    for t in range(cfg.prev_kernel_size):
+        tap = typed_ldst.load_typed_rows(
+            slot_ref.at[0],
+            t * rows,
+            rows,
+            view_dtype=jnp.bfloat16,
+            lane_split=region.lane_split,
+        )
+        taps.append(jnp.where(has_initial_state, tap, 0).astype(jnp.float32))
+    return taps
+
+
+def store_conv_state_taps(
+    slot_ref: jax.Ref,
+    region: config.StateRegion,
+    cfg: config.GDNConfig,
+    taps: list[jax.Array],
+) -> None:
+    """Inverse of load_conv_state_taps; leaves the tile as store_state_region would."""
+    rows, _ = conv_tap_shape(slot_ref, region, cfg)
+    for t, tap in enumerate(taps):
+        typed_ldst.store_typed_rows(
+            slot_ref.at[0],
+            t * rows,
+            tap.astype(jnp.bfloat16),
+            lane_split=region.lane_split,
+        )
+    zero_state_padding(slot_ref, region)
+
+
 def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.Array:
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
@@ -411,15 +465,19 @@ def has_initial_states(
 
 
 def load_activation_as_compact(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
     cfgs: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Load activations from VMEM as a compact layout."""
+    """Load activations from VMEM as a compact layout.
 
-    qkv_vmem_ref[...] = qkv_vreg
+    qkv_vreg is stored to qkv_vmem_ref first; None when the ref already holds it.
+    """
+
+    if qkv_vreg is not None:
+        qkv_vmem_ref[...] = qkv_vreg
 
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset

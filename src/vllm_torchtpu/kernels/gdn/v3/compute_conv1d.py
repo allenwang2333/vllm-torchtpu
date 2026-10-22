@@ -75,3 +75,17 @@ def causal_conv1d(
         state_list.append(new_conv_state)
 
     return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
+
+
+def causal_conv1d_decode(
+    taps: list[jax.Array],  # kernel_size x [...]: oldest input first
+    conv_weight: jax.Array,  # [kernel_size, ...]
+    conv_bias: jax.Array | None,  # [...]
+) -> jax.Array:
+    """One-token causal Conv1D on any layout; causal_conv1d's summation order."""
+    out = jnp.zeros(taps[0].shape, jnp.float32)
+    for k, tap in enumerate(taps):
+        out += tap * conv_weight[k]
+    if conv_bias is not None:
+        out += conv_bias
+    return out

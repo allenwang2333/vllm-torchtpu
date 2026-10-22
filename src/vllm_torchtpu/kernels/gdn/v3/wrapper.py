@@ -72,6 +72,91 @@ def _decode_state_head_ldst(
     return load, store
 
 
+def _decode_conv1d_dense(
+    qkv_slot_ref: jax.Ref,
+    conv_state_slot_ref: jax.Ref,
+    weights_ref: memory_ref.WeightRefs,
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """One-token Conv1D + SiLU of a BATCHED pool tile, in place in qkv_slot_ref.
+
+    A single token needs no sliding window, so the taps are dense tiles in the
+    conv region's row shape (8 rows per vreg instead of compact's one) and the
+    conv state moves between the pool rows and the taps without relayout.
+    Arithmetic and stored bytes are those of the compact path.
+    """
+    region = cfg.state_plan.conv
+    shape = vmem_ldst.conv_tap_shape(conv_state_slot_ref.at[0, 0], region, cfg)
+    conv_weight = weights_ref.conv.weight.reshape(cfg.kernel_size, *shape)
+    conv_weight = conv_weight[...].astype(jnp.float32)
+    conv_bias = None
+    if weights_ref.conv.bias is not None:
+        conv_bias = weights_ref.conv.bias.reshape(shape)[...].astype(jnp.float32)
+    has_initial_state = vmem_ldst.has_initial_states(metadata_ref, p_id, cfg)
+    for idx in range(cfg.seq_tile_size):
+        state_ref = conv_state_slot_ref.at[idx, 0]
+        taps = vmem_ldst.load_conv_state_taps(
+            state_ref, region, cfg, has_initial_state[idx]
+        )
+        qkv_ref = qkv_slot_ref.at[idx].reshape(shape)
+        taps.append(qkv_ref[...].astype(jnp.float32))
+        vmem_ldst.store_conv_state_taps(state_ref, region, cfg, taps[1:])
+        qkv_ref[...] = jax.nn.silu(
+            compute_conv1d.causal_conv1d_decode(taps, conv_weight, conv_bias)
+        )
+
+
+def _gdn_decode_fused(
+    qkv_vreg: jax.Array | None,
+    qkv_slot_ref: jax.Ref,
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    recurrent_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    real_sizes: jax.Array,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    p_id: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Single-token GDN of a BATCHED tile (compute_gdn.recurrent_gdn_decode_fused).
+
+    qkv_vreg is the post-SiLU activation, or None when qkv_slot_ref holds it.
+    """
+    padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
+    a_log = jnp.pad(a_log, ((0, padding_size)))
+    dt_bias = jnp.pad(dt_bias, ((0, padding_size)))
+    q_compact, k_compact, v_compact, b_compact, a_compact = (
+        vmem_ldst.load_activation_as_compact(
+            qkv_vreg=qkv_vreg,
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
+            cfgs=cfg,
+        )
+    )
+    load_state, store_state = _decode_state_head_ldst(
+        recurrent_slot_ref, metadata_ref, p_id, cfg
+    )
+    out = compute_gdn.recurrent_gdn_decode_fused(
+        real_sizes=real_sizes,
+        q_compact=q_compact,
+        k_compact=k_compact,
+        v_compact=v_compact,
+        b_compact=b_compact,
+        a_compact=a_compact,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        load_state=load_state,
+        store_state=store_state,
+        cfg=cfg,
+    )
+    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
@@ -129,6 +214,29 @@ def inner_kernel(
         and not cfg.is_kda
         and carry_recurrent_scratch_ref is None
     )
+
+    if fused_decode and cfg.state_plan is not None:
+        real_sizes = jnp.stack(
+            [metadata_ref.p_id_to_r_size[p_id, idx] for idx in range(cfg.seq_tile_size)]
+        )
+        _decode_conv1d_dense(
+            qkv_slot_ref, conv_state_slot_ref, weights_ref, metadata_ref, p_id, cfg
+        )
+        _gdn_decode_fused(
+            None,
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            recurrent_slot_ref,
+            out_slot_ref,
+            metadata_ref,
+            real_sizes,
+            weights_ref.gdn.a_log[...],
+            weights_ref.gdn.dt_bias[...],
+            p_id,
+            cfg,
+        )
+        return
 
     # Prepare states.
     real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -216,32 +324,20 @@ def inner_kernel(
     # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
     # Passing refs into gdn.py breaks strict separation of concerns.
     if fused_decode:
-        q_compact, k_compact, v_compact, b_compact, a_compact = (
-            vmem_ldst.load_activation_as_compact(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
-                b_vmem_ref=b_slot_ref,
-                a_vmem_ref=a_slot_ref,
-                cfgs=cfg,
-            )
+        _gdn_decode_fused(
+            qkv_out_compact,
+            qkv_slot_ref,
+            b_slot_ref,
+            a_slot_ref,
+            recurrent_slot_ref,
+            out_slot_ref,
+            metadata_ref,
+            real_sizes,
+            weights_ref.gdn.a_log[...],
+            weights_ref.gdn.dt_bias[...],
+            p_id,
+            cfg,
         )
-        load_state, store_state = _decode_state_head_ldst(
-            recurrent_slot_ref, metadata_ref, p_id, cfg
-        )
-        out = compute_gdn.recurrent_gdn_decode_fused(
-            real_sizes=real_sizes,
-            q_compact=q_compact,
-            k_compact=k_compact,
-            v_compact=v_compact,
-            b_compact=b_compact,
-            a_compact=a_compact,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            load_state=load_state,
-            store_state=store_state,
-            cfg=cfg,
-        )
-        out_slot_ref[...] = out.astype(out_slot_ref.dtype)
         return
 
     if cfg.use_recurrent:
