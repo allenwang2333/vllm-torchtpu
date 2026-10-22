@@ -62,8 +62,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import kernel_1763
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce, kernel_1763
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias

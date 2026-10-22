@@ -2649,14 +2649,19 @@ def _attention_kernel(
     def load_bkv_levers(bkv_sem_idx, batch_idx, rows, levers):
         """`load_bkv` for the live body with `body_levers` (see above)."""
         rows = bkv_sz if rows is None else rows
+        nope_atoms, nope_ref = [], None
         if am:
             # Atom-major rings: token batch_idx's rows are atoms 0 .. n_at-1.
+            assert live_nope_hbm_ref is not None
             n_at = rows // live_nope_hbm_ref.shape[2]
             nope_atoms = [
                 bkv_nope_x2_ref.at[bkv_sem_idx, a, batch_idx] for a in range(n_at)
             ]
             rope_words = jnp.concatenate(
-                [bkv_rope_x2_ref.at[bkv_sem_idx, a, batch_idx][...] for a in range(n_at)],
+                [
+                    bkv_rope_x2_ref.at[bkv_sem_idx, a, batch_idx][...]
+                    for a in range(n_at)
+                ],
                 axis=0,
             )
         else:
@@ -2683,6 +2688,7 @@ def _attention_kernel(
                     for j in range(4)
                 ]
             else:
+                assert nope_ref is not None
                 xs = [nope_ref[pl.ds(j, quarter, stride=4), :] for j in range(4)]
             if zu:
                 key4 = lax.broadcasted_iota(jnp.int32, xs[0].shape, 0) * 4
@@ -2690,6 +2696,7 @@ def _attention_kernel(
                     jnp.where(key4 < kv_len - j, x, jnp.uint32(0))
                     for j, x in enumerate(xs)
                 ]
+        cols = []
         if xs is not None and "pk" in levers:
             # Word s of column b = byte b of keys 4s, 4s+1, 4s+2, 4s+3 (byte
             # j <- key 4s + j): unpack byte b of each key's word, pack four.
@@ -2724,6 +2731,7 @@ def _attention_kernel(
                 [pltpu.bitcast(c, jnp.float8_e4m3fn) for c in cols], axis=-1
             )
         else:
+            assert nope_ref is not None
             words = nope_ref[pl.ds(0, rows)]
             if zu:
                 key = lax.broadcasted_iota(jnp.int32, words.shape, 0)
@@ -2870,6 +2878,7 @@ def _attention_kernel(
                 if am:
                     # Window 0 of an overflowing token: its group is whole
                     # (A = every atom), staged atom-major.
+                    assert bkv_nope_x2_ref is not None
                     n_at = bkv_nope_x2_ref.shape[1]
                     kv0 = unpack_bkv_words(
                         jnp.concatenate(

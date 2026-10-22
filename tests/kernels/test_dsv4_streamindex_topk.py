@@ -14,7 +14,6 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
-import re
 from typing import NamedTuple
 
 import jax

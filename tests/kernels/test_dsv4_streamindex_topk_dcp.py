@@ -987,9 +987,7 @@ def test_dcp_mixed_short_split(dcp_size, chunk_tokens):
     assert "StreamIdxTC-m-bq_4-" in hlo_on, "short pass not built"
     assert "StreamIdxTC-m-bq_4-" not in hlo_off
 
-    off = np.asarray(streamindex_topk_dcp(*dargs, **kwargs)).reshape(
-        dcp_size, Q_LEN, K
-    )
+    off = np.asarray(streamindex_topk_dcp(*dargs, **kwargs)).reshape(dcp_size, Q_LEN, K)
     on = np.asarray(streamindex_topk_dcp(*dargs, **kwargs, **split)).reshape(
         dcp_size, Q_LEN, K
     )
