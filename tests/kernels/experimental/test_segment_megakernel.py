@@ -246,7 +246,7 @@ def _kernel_device(
     ops_only=False,
 ):
     """pf (speculative expert prefetch): dict(cfg=<prefetch SegCfg>, pref=int32
-    [8, 128], predict=0/1, g_post_nx, bias_nx, gate_nx); returns pred_out too."""
+    [8, 128] when cfg.pf_src == "input")."""
     cfg = d.cfg(T) if pf is None else pf["cfg"]
     g_post, g_in = sh["g_post"], sh["g_in"]
     oproj_s = pr["oproj_s"]
@@ -276,14 +276,10 @@ def _kernel_device(
     )
     # Two boundaries in the stacks, this one in row 1 (row 0 a decoy: wrong
     # row indexing shows up as garbage constants).
-    if pf is not None:
-        consts.update(g_post_nx=pf["g_post_nx"], bias_nx=pf["bias_nx"])
     row = seg.fstack_row(cfg, consts)
     decoy = jnp.flip(row) + 1.0
     ops = dict(
-        meta=seg.pack_meta(
-            n_valid, rank[0], 1, dst_rows, 0 if pf is None else pf["predict"]
-        ),
+        meta=seg.pack_meta(n_valid, rank[0], 1, dst_rows),
         lat=pr["lat"].reshape(T, -1),
         act=seg.pack_act(sh["res"], cfull, sfull),
         wuv=wuv,
@@ -299,16 +295,13 @@ def _kernel_device(
         sw2s=jnp.stack([jnp.flip(pr["sw2"], 0), pr["sw2"]]),
     )
     if pf is not None:
-        ops.update(
-            qkv_w=seg.block_qkv(qkv_w, cfg.qkv_blk),
-            pref=pf["pref"],
-            gate_nx=pf["gate_nx"],
-        )
+        if cfg.qkv_blocked:
+            ops["qkv_w"] = seg.block_qkv(qkv_w, cfg.qkv_blk)
+        if cfg.pf_src == "input":
+            ops["pref"] = pf["pref"]
     if ops_only:
         return cfg, ops, (cfull, sfull)
     out = seg.segment_call(cfg, ops, interpret=interpret)
-    if pf is not None:
-        return out["res_out"], out["qc_out"], out["kvp_out"], out["pred_out"]
     return out["res_out"], out["qc_out"], out["kvp_out"]
 
 
@@ -805,42 +798,62 @@ def _prefs(d: Dims, planted, n_valid, P, seed):
     return out, hits, len(picked)
 
 
-def _nx_inputs(d: Dims, seed):
-    """Layer N+1's router (the predictor's), host-side."""
-    rng = np.random.default_rng(seed + 2000)
-    gate = rng.standard_normal((d.experts, d.hidden)).astype(np.float32)
-    gate /= np.linalg.norm(gate, axis=1, keepdims=True)
-    return dict(
-        gate_nx=_host(gate, BF16),
-        g_post_nx=_host(1 + 0.3 * rng.standard_normal(d.hidden), BF16),
-        bias_nx=_host(rng.standard_normal(d.experts) * 0.01, F32),
-    )
+def predictor_vs_reference(d: Dims, *, interpret, calls=8):
+    """The in-kernel predictor (`_predict_ids`' arithmetic: rms_add,
+    router_scores, predict_mass, rank_experts in Mosaic) against the same
+    rule in XLA (production GateLinear + sigmoid), on real-bias-like router
+    inputs at every bucket: the kernel's ids must be a top-P set of the
+    reference mass up to near-ties (_pred_ok)."""
+    from jax.experimental import pallas as pl
 
-
-def _pred_reference(d, cfg, res_out, nx, n_valid):
-    """P15 rule (b) in XLA on the kernel's residual exit: production router
-    (GateLinear bf16 logits, sigmoid) on post_attention_layernorm_{N+1}, the
-    production routing rule, ranked by routed mass. -> (ids [P], mass [E])."""
     from vllm_torchtpu.kernels.experimental.segment_megakernel import kernel as sk
 
-    m = cfg.m
-    x = jnp.pad(jnp.asarray(res_out, BF16), ((0, m - res_out.shape[0]), (0, 0)))
-    hp, _ = sk.rms_add(
-        x.astype(F32), None, jnp.asarray(nx["g_post_nx"])[None], jnp.float32(d.eps)
-    )
-    scores = _production_scores(hp, jnp.asarray(nx["gate_nx"]))
-    mass = sk.predict_mass(
-        scores, jnp.asarray(nx["bias_nx"])[None], n_valid, topk=d.topk
-    )
-    return np.asarray(sk.rank_experts(mass, cfg.e_pre))[0, : cfg.e_pre], np.asarray(
-        mass
-    )[0]
+    out = {}
+    for T in seg.TOKEN_BUCKETS:
+        m = 16 if T <= 16 else 32
+        n_ids = 12
+        ok, n = True, 0
+        for layer in range(len(ROUTE_LAYERS)):
+            for call in range(calls):
+                h, gate, bias = _routing_inputs(d, layer, call)
+                x = jnp.pad(jnp.asarray(h[:T]).astype(F32), ((0, m - T), (0, 0)))
+                g = jnp.asarray(
+                    1 + 0.3 * np.random.default_rng(call).standard_normal(d.hidden),
+                    F32,
+                ).astype(BF16)[None]
+
+                def body(x_ref, g_ref, w_ref, b_ref, o_ref, T=T):
+                    hp, _ = sk.rms_add(x_ref[...], None, g_ref[...], jnp.float32(d.eps))
+                    sc = sk.router_scores(hp, w_ref[...])
+                    o_ref[...] = sk.rank_experts(
+                        sk.predict_mass(sc, b_ref[...], T, topk=d.topk), n_ids
+                    )
+
+                got = np.asarray(
+                    pl.pallas_call(
+                        body,
+                        out_shape=jax.ShapeDtypeStruct((8, 128), I32),
+                        compiler_params=pltpu.CompilerParams(
+                            vmem_limit_bytes=64 * 2**20
+                        ),
+                        interpret=interpret,
+                    )(x, g, jnp.asarray(gate), jnp.asarray(bias))
+                )
+                hp, _ = sk.rms_add(x, None, g, jnp.float32(d.eps))
+                scores = _production_scores(hp, jnp.asarray(gate))
+                mass = np.asarray(
+                    sk.predict_mass(scores, jnp.asarray(bias), T, topk=d.topk)
+                )[0]
+                ok = ok and _pred_ok(got[0, :n_ids], None, mass) and (got[1:] == -1).all()
+                n += 1
+        out[f"T{T}"] = dict(ok=bool(ok), calls=n)
+    return out
 
 
 PRED_TIE_TOL = 2e-3  # mass units: a routed weight is O(1/topk)
 
 
-def _pred_ok(got, ref_ids, mass, tol=PRED_TIE_TOL):
+def _pred_ok(got, _ref_ids, mass, tol=PRED_TIE_TOL):
     """The kernel's ids are a top-P set of the reference mass up to near-ties
     (the two sum the bf16 routing weights in different orders): distinct,
     valid, every chosen expert's mass >= every unchosen one's - tol, and the
@@ -858,16 +871,19 @@ def _pred_ok(got, ref_ids, mass, tol=PRED_TIE_TOL):
     return bool(np.all(np.diff(chosen) <= tol))
 
 
-def _pf_cfg(d: Dims, T: int, e_pre: int, **kw):
-    cfg = seg.prefetch_fit(d.cfg(T), e_pre)
+def _pf_cfg(d: Dims, T: int, e_pre: int, qkv_early: int = 0, **kw):
+    cfg = seg.prefetch_fit(d.cfg(T), e_pre, qkv_early)
     assert cfg is not None, (T, e_pre)
     return dataclasses.replace(cfg, **kw)
 
 
-def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timing=()):
-    """Bit-identity of the prefetch kernel with the prefetch-off kernel on
-    every device, for every pool id list kind, the removal arm and the
-    faults; the predictor against its XLA reference. timing: M values for a
+def _run_prefetch_case(
+    mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timing=(), sweep=()
+):
+    """Bit-identity with the prefetch-off kernel on every device: the
+    production form (pool ids predicted in the call, "self") with its
+    removal arms, and controlled pools ("input": hit / mixed / wrong /
+    garbage / none) with the positive controls. timing: M values for a
     chained per-call clock of the arms (TPU only)."""
     rank_ids = jax.device_put(
         np.arange(N_RANKS, dtype=np.int32).reshape(N_RANKS, 1),
@@ -879,10 +895,10 @@ def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timi
     dst_all = shared["dst"][np.arange(N_RANKS) % DCP]
     dst_sh = jax.device_put(dst_all, NamedSharding(mesh, P(AXIS)))
     sh_specs = {k: P() for k in sh}
-    nx = _nx_inputs(d, seed)
-    nx_dev = {k: jax.device_put(v, NamedSharding(mesh, P())) for k, v in nx.items()}
-    base_cfg = _pf_cfg(d, T, e_pre)
-    Pn = base_cfg.e_pre
+    e_pre, qkv_early = e_pre if isinstance(e_pre, tuple) else (e_pre, 0)
+    self_cfg = _pf_cfg(d, T, e_pre, qkv_early)
+    in_cfg = dataclasses.replace(self_cfg, pf_src="input")
+    Pn = self_cfg.e_pre
     prefs, hits, n_routed = _prefs(d, shared["planted"], n_valid, Pn, seed)
     local = [
         i
@@ -890,28 +906,21 @@ def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timi
         if dv.process_index == jax.process_index()
     ]
 
-    def build(arm):
-        """arm: (cfg | None, predict). Returns a jitted fn(rank, dst, sh, nx,
-        pref) -> outputs (each [16, ...])."""
-        cfg, predict = arm
-
-        def body(rank, dst, sh_, nx_, pref):
+    def build(cfg):
+        def body(rank, dst, sh_, pref):
             pr = _per_rank_inputs(d, T, n_valid, seed, rank[0])
-            pf = None
-            if cfg is not None:
-                pf = dict(cfg=cfg, pref=pref[0], predict=predict, **nx_)
+            pf = None if cfg is None else dict(cfg=cfg, pref=pref[0])
             outs = _kernel_device(
                 d, T, n_valid, sh_, pr, rank[0], dst[0], interpret=interpret, pf=pf
             )
             return tuple(x[None] for x in outs)
 
-        n_out = 3 if cfg is None else 4
         return jax.jit(
             jax.shard_map(
                 body,
                 mesh=mesh,
-                in_specs=(P(AXIS), P(AXIS), sh_specs, {k: P() for k in nx}, P(AXIS)),
-                out_specs=tuple(P(AXIS) for _ in range(n_out)),
+                in_specs=(P(AXIS), P(AXIS), sh_specs, P(AXIS)),
+                out_specs=tuple(P(AXIS) for _ in range(3)),
                 check_vma=False,
             )
         )
@@ -926,11 +935,9 @@ def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timi
             res.append(
                 tuple(
                     np.asarray(
-                        [
-                            s
-                            for s in x.addressable_shards
-                            if s.device == mesh.devices[i]
-                        ][0].data[0]
+                        [s for s in x.addressable_shards if s.device == mesh.devices[i]][
+                            0
+                        ].data[0]
                     )
                     for x in out
                 )
@@ -938,95 +945,100 @@ def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timi
         return res
 
     def same(a, b):  # bit identity of res / q_c / kv rows on every local device
-        return all(
+        return bool(
             all(
-                np.array_equal(
-                    np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8)
+                all(
+                    np.array_equal(
+                        np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8)
+                    )
+                    for x, y in zip(da, db)
                 )
-                for x, y in zip(da[:3], db[:3])
+                for da, db in zip(a, b)
             )
-            for da, db in zip(a, b)
         )
 
-    base = shards(build((None, 0))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("none")))
+    def run(cfg, kind="none"):
+        return shards(build(cfg)(rank_ids, dst_sh, sh_dev, pref_dev(kind)))
+
+    base = run(None)
     out = dict(
         e_pre=Pn,
-        nb=base_cfg.nb,
-        vmem_limit_mib=round(seg.kernel.vmem_need_bytes(base_cfg)["limit"] / 2**20, 2),
+        qkv_early=self_cfg.qkv_early,
+        nb=self_cfg.nb,
+        vmem_limit_mib=round(seg.kernel.vmem_need_bytes(self_cfg)["limit"] / 2**20, 2),
         routed_experts=n_routed,
         planned_hits=hits,
         exact={},
         caught={},
     )
-    fn_pf = build((base_cfg, 1))
-    pred_ok, pred_detail = True, {}
+    out["exact"]["self"] = same(run(self_cfg), base)
+    out["exact"]["self_issue_only"] = same(
+        run(dataclasses.replace(self_cfg, pf_use=False)), base
+    )
+    out["exact"]["self_no_issue"] = same(
+        run(dataclasses.replace(self_cfg, pf_issue=False)), base
+    )
     for kind in PF_KINDS:
-        o = shards(fn_pf(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev(kind)))
-        out["exact"][kind] = same(o, base)
-        if kind == "hit":  # predictor vs its XLA reference, per device
-            for j, dev_out in enumerate(o):
-                ref_ids, mass = _pred_reference(d, base_cfg, dev_out[0], nx, n_valid)
-                got = dev_out[3][0, :Pn]
-                ok = _pred_ok(got, ref_ids, mass) and (dev_out[3][1:] == -1).all()
-                if not ok:
-                    pred_detail[str(local[j])] = dict(
-                        got=got.tolist(), ref=ref_ids.tolist()
-                    )
-                pred_ok = pred_ok and ok
-            out["pred_n_positive"] = int((mass > 0).sum())
-            out["pred_ids_dev0"] = o[0][3][0, :Pn].tolist()
-            # identical on every rank (the residual exit is identical)
-            out["pred_same_all_ranks"] = all(np.array_equal(x[3], o[0][3]) for x in o)
-    out["pred_matches_reference"] = pred_ok
-    out["pred_mismatch"] = pred_detail
-    o = shards(build((base_cfg, 0))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
-    out["exact"]["predict_off"] = same(o, base)
-    out["predict_off_all_minus1"] = all((x[3] == -1).all() for x in o)
-    io_cfg = dataclasses.replace(base_cfg, pf_use=False)
-    o = shards(build((io_cfg, 1))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
-    out["exact"]["issue_only"] = same(o, base)
+        out["exact"][f"input_{kind}"] = same(run(in_cfg, kind), base)
+    out["exact"]["input_issue_only"] = same(
+        run(dataclasses.replace(in_cfg, pf_use=False), "hit"), base
+    )
     for f in PF_FAULTS:
-        fn = build((dataclasses.replace(base_cfg, pf_fault=f), 1))
-        # VMEM holds another call's experts first (what "no_dma" leaves).
-        fn_pf(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("wrong"))
-        o = shards(fn(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
-        out["caught"][f] = not same(o, base)
+        fcfg = dataclasses.replace(in_cfg, pf_fault=f)
+        run(in_cfg, "wrong")  # VMEM holds other experts first ("no_dma")
+        out["caught"][f] = not same(run(fcfg, "hit"), base)
+
+    def pref_for(c, kind):
+        a = _prefs(d, shared["planted"], n_valid, c.e_pre, seed)[0][kind]
+        return jax.device_put(
+            np.ascontiguousarray(np.broadcast_to(a[None], (N_RANKS, 8, 128))),
+            NamedSharding(mesh, P(AXIS)),
+        )
+
+    sweep_cfgs = {}
+    for P_, K_ in sweep:
+        c = _pf_cfg(d, T, P_, K_)
+        name = f"P{c.e_pre}K{c.qkv_early}"
+        sweep_cfgs[name] = c
+        ci = dataclasses.replace(c, pf_src="input")
+        out["exact"][f"{name}_self"] = same(run(c), base)
+        out["exact"][f"{name}_input_hit"] = same(
+            shards(build(ci)(rank_ids, dst_sh, sh_dev, pref_for(c, "hit"))), base
+        )
     if timing:
         if jax.process_index() == 0:
-            print(
-                f"[segmk-pf] T={T} nv={n_valid} correctness {json.dumps(out)}",
-                flush=True,
-            )
+            print(f"[segmk-pf] T={T} nv={n_valid} correctness {json.dumps(out)}", flush=True)
         out["timing_us"] = _pf_timing(
             mesh,
             d,
             T,
             n_valid,
             seed,
-            base_cfg,
-            io_cfg,
+            sweep_cfgs or {"main": self_cfg},
             timing,
-            (rank_ids, dst_sh, sh_dev, nx_dev),
-            pref_dev,
+            (rank_ids, dst_sh, sh_dev),
+            pref_for,
             sh_specs,
-            nx,
         )
     return out
 
 
-def _pf_timing(
-    mesh, d, T, n_valid, seed, pf_cfg, io_cfg, Ms, args, pref_dev, sh_specs, nx
-):
+def _pf_timing(mesh, d, T, n_valid, seed, cfgs, Ms, args, pref_for, sh_specs):
     """Per-call device time of each arm: M chained calls in one program (each
     call's residual input depends on the previous call's output through an
-    optimization barrier), slope of the median wall time over M (M2)."""
-    arms = {
-        "A0_off": (None, "none"),
-        "A1_pf_hit": (pf_cfg, "hit"),
-        "R1_issue_only": (io_cfg, "hit"),
-        "R2_pf_empty": (pf_cfg, "none"),
-        "W_pf_wrong": (pf_cfg, "wrong"),
-    }
+    optimization barrier), every operand built outside the loop, slope of
+    the median wall time over M (M2). Arms: A0 the prefetch-off kernel; per
+    (pool, early q_a/kv_a blocks) config: L the layout alone (empty pool, no
+    predictor), S the production form (self-predicted pool), S_io its
+    removal arm (pool DMAs issued, never used), I_hit a planted pool."""
+    first = next(iter(cfgs.values()))
+    arms = {"A0_off": (None, first, "none")}
+    for name, c in cfgs.items():
+        ci = dataclasses.replace(c, pf_src="input")
+        arms[f"{name}_L_layout"] = (ci, c, "none")
+        arms[f"{name}_S_self"] = (c, c, "none")
+        arms[f"{name}_S_io"] = (dataclasses.replace(c, pf_use=False), c, "none")
+        arms[f"{name}_I_hit"] = (ci, c, "hit")
     # The per-rank weights once, outside the timed programs.
     pr_keys = tuple(
         jax.eval_shape(
@@ -1045,16 +1057,13 @@ def _pf_timing(
             check_vma=False,
         )
     )(args[0])
-    res = {}
-    for name, (cfg, kind) in arms.items():
-        times = {}
+    fns = {}
+    for name, (cfg, pcfg, kind) in arms.items():
         for M in Ms:
 
-            def body(rank, dst, sh_, nx_, pref, prs, cfg=cfg, M=M):
+            def body(rank, dst, sh_, pref, prs, cfg=cfg, M=M):
                 pr = {k: v[0] for k, v in prs.items()}
-                pf = None
-                if cfg is not None:
-                    pf = dict(cfg=cfg, pref=pref[0], predict=1, **nx_)
+                pf = None if cfg is None else dict(cfg=cfg, pref=pref[0])
                 # Every operand built once, outside the loop (block_qkv is an
                 # fp8 relayout; nothing but the kernel may sit in the loop).
                 kcfg, ops, (cfull, sfull) = _kernel_device(
@@ -1079,7 +1088,6 @@ def _pf_timing(
                         P(AXIS),
                         P(AXIS),
                         sh_specs,
-                        {k: P() for k in nx},
                         P(AXIS),
                         {k: P(AXIS) for k in pr_keys},
                     ),
@@ -1087,23 +1095,32 @@ def _pf_timing(
                     check_vma=False,
                 )
             )
-            a = (*args, pref_dev(kind), pr_all)
-            n_cc = fn.lower(*a).as_text().count("tpu_custom_call")
+            a = (*args, pref_for(pcfg, kind), pr_all)
             jax.block_until_ready(fn(*a))  # compile + warm
-            ts = []
-            for _ in range(7):
+            fns[(name, M)] = (fn, a)
+    rounds = int(os.environ.get("SEGMK_PF_ROUNDS", "3"))
+    samples = {k: [] for k in fns}
+    for _ in range(rounds):  # arms interleaved, round after round
+        for key, (fn, a) in fns.items():
+            for _ in range(5):
                 t0 = time.perf_counter()
                 jax.block_until_ready(fn(*a))
-                ts.append(time.perf_counter() - t0)
-            times[M] = (float(np.median(ts[1:])), n_cc)
-        xs = np.asarray(list(times), np.float64)
-        ys = np.asarray([times[M][0] for M in times]) * 1e6
+                samples[key].append(time.perf_counter() - t0)
+    res = {}
+    for name in arms:
+        xs = np.asarray(Ms, np.float64)
+        ys = np.asarray([np.median(samples[(name, M)]) for M in Ms]) * 1e6
         slope, icpt = np.polyfit(xs, ys, 1)
+        # per-round slopes: the spread of the estimate
+        per = []
+        for rd in range(rounds):
+            yr = [np.median(samples[(name, M)][rd * 5 : rd * 5 + 5]) * 1e6 for M in Ms]
+            per.append(float(np.polyfit(xs, yr, 1)[0]))
         res[name] = dict(
             per_call_us=round(float(slope), 2),
+            round_slopes=[round(x, 2) for x in per],
             intercept_us=round(float(icpt), 1),
-            med_us={str(M): round(times[M][0] * 1e6, 1) for M in times},
-            custom_calls={str(M): times[M][1] for M in times},
+            med_us={str(M): round(float(y), 1) for M, y in zip(Ms, ys)},
         )
     return res
 
@@ -1323,6 +1340,12 @@ def _tpu_prefetch_main():
     assert len(devices) == N_RANKS, f"need {N_RANKS} devices, have {len(devices)}"
     mesh = _mesh(devices)
     e_pre = int(os.environ.get("SEGMK_PF_EPRE", "12"))
+    qkv_early = int(os.environ.get("SEGMK_PF_QKV_EARLY", "0"))
+    sweep = tuple(
+        tuple(int(v) for v in x.split(":"))
+        for x in os.environ.get("SEGMK_PF_SWEEP", "").split(",")
+        if x
+    )
     timing_T = {
         int(t) for t in os.environ.get("SEGMK_PF_TIMING_T", "4,16,32").split(",") if t
     }
@@ -1350,20 +1373,18 @@ def _tpu_prefetch_main():
             T,
             nv,
             seed=T * 100 + nv,
-            e_pre=e_pre,
+            e_pre=(e_pre, qkv_early),
+            sweep=sweep if (T in timing_T and nv == T) else (),
             timing=Ms if (T in timing_T and nv == T) else (),
         )
         mine = np.asarray(
             [r["exact"][k] for k in sorted(r["exact"])]
             + [r["caught"][k] for k in sorted(r["caught"])]
-            + [r["pred_matches_reference"], r["predict_off_all_minus1"]]
         )
         allv = multihost_utils_allgather(mine)
-        names = (
-            [f"exact.{k}" for k in sorted(r["exact"])]
-            + [f"caught.{k}" for k in sorted(r["caught"])]
-            + ["pred_matches_reference", "predict_off_all_minus1"]
-        )
+        names = [f"exact.{k}" for k in sorted(r["exact"])] + [
+            f"caught.{k}" for k in sorted(r["caught"])
+        ]
         agg = dict(zip(names, np.all(allv, axis=0).tolist()))
         r["all_hosts"] = agg
         case_ok = all(v for k, v in agg.items() if not k.startswith("caught.no_dma"))
@@ -1375,11 +1396,24 @@ def _tpu_prefetch_main():
             print(
                 f"[segmk-pf] T={T} nv={nv} pass={case_ok} {json.dumps(r)}", flush=True
             )
+            _pf_dump(summary)
     if jax.process_index() == 0:
-        print(
-            "SEGMK_PF_RESULT " + json.dumps({"pass": ok, "cases": summary}), flush=True
-        )
+        pv = predictor_vs_reference(GLM52, interpret=False)
+        summary["predictor_vs_xla"] = pv
+        ok = ok and all(v["ok"] for v in pv.values())
+        print(f"[segmk-pf] predictor vs XLA {pv}", flush=True)
+        print("SEGMK_PF_RESULT " + json.dumps({"pass": ok, "cases": summary}), flush=True)
+        _pf_dump({"pass": ok, "cases": summary})
     return 0 if ok else 1
+
+
+def _pf_dump(summary):
+    """Results also to $CDK_OUTPUT_DIR (the log transport can drop stdout)."""
+    d = os.environ.get("CDK_OUTPUT_DIR")
+    if d:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "segmk_pf_result.json"), "w") as f:
+            json.dump(summary, f)
 
 
 def multihost_utils_allgather(x):

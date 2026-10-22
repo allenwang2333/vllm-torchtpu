@@ -99,13 +99,14 @@ class _Statics:
     routed_scale: float
     rms_eps: float
     interleave: int
-    e_pre: int = 0  # TPU_SEGMK_EXPERT_PREFETCH (requested pool slots)
+    e_pre: int = 0  # TPU_SEGMK_EXPERT_PREFETCH: requested expert pool slots
+    qkv_early: int = 99  # TPU_SEGMK_PF_QKV_EARLY (clamped to the block count)
 
     def cfg(self, tokens: int) -> kernel.SegCfg:
         base = self.base_cfg(tokens)
         if self.e_pre <= 0:
             return base
-        fit = kernel.prefetch_fit(base, self.e_pre)
+        fit = kernel.prefetch_fit(base, self.e_pre, self.qkv_early)
         if fit is None:
             raise ValueError(f"segment megakernel: no prefetch pool fits T={tokens}")
         return fit
@@ -140,17 +141,11 @@ class _Tail:
 
     op: Any
     dcp_rank: torch.Tensor  # the DCP attention ops' rank operand (one buffer)
-    # int32 [1, 1]: this boundary's row of the stacks; with prefetch [1, 2]:
-    # + 1 when layer N+1 is itself an armed tail (its MoE runs in the next
-    # call, so this call's prediction is consumed)
-    slot: torch.Tensor
-    prefetch: bool = False
-    predicts: bool = False  # prefetch and layer N+1 is an armed tail
+    slot: torch.Tensor  # int32 [1, 1]: this boundary's row of the stacks
 
 
-# The megakernel's outputs for layer N+1: (residual, q_c, kv_rows, prediction
-# of N+1's routed experts or None).
-SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]
+# The megakernel's outputs for layer N+1: (residual, q_c, kv_rows).
+SegmentOut = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 # All armed boundaries' small constants, one row / slice per boundary
 # (`fstack`, `sw13s`, `sw2s`; kernel.SegCfg.fields()). One stack per tensor is
@@ -179,7 +174,6 @@ _PER_RANK = (
     "s13s",
     "sw13s",
     "sw2s",
-    "pref",
 )
 _ARGS = (
     "lat",  # bf16 [T, heads, kv_lora]: N's merged attention output (latent)
@@ -205,13 +199,6 @@ _ARGS = (
     "sw13s",  # fp8 [boundaries, H, 2 Fs]
     "sw2s",  # fp8 [boundaries, Fs, H]
 )
-# Prefetch only: the pool's expert ids (the previous call's prediction, int32
-# [8, 128] per rank) and layer N+1's router gate (the predictor's).
-_PF_ARGS = ("pref", "gate_nx")
-
-
-def _args(st: "_Statics") -> tuple[str, ...]:
-    return _ARGS + (_PF_ARGS if st.e_pre > 0 else ())
 
 
 def _kv_geometry() -> tuple[int, int]:
@@ -230,78 +217,82 @@ def _kv_geometry() -> tuple[int, int]:
 
 
 def _op_body(st: _Statics):
-    pf = st.e_pre > 0
-
-    def body(*args):
-        a = dict(zip(_args(st), args, strict=True))
-        res = a["res"]
+    def body(
+        lat,
+        res,
+        cos,
+        sin,
+        pad_mask,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        dcp_rank,
+        rank,
+        slot,
+        wuv,
+        oproj_w,
+        gate,
+        w13,
+        w2,
+        s2,
+        qkv_w,
+        fstack,
+        s13s,
+        sw13s,
+        sw2s,
+    ):
         T = res.shape[0]  # static: one export per token bucket
         cfg = st.cfg(T)
         page_size, num_pages = _kv_geometry()
-        n_valid = T - jnp.sum(a["pad_mask"][:T].astype(jnp.int32))
-        cfull, sfull = kernel.rope_lane_tables(a["cos"], a["sin"], cfg.m)
+        n_valid = T - jnp.sum(pad_mask[:T].astype(jnp.int32))
+        cfull, sfull = kernel.rope_lane_tables(cos, sin, cfg.m)
         # The step's KV destination rows on this DCP rank, exactly as
         # sparse_mla_attention_dcp builds them for the gather's KV write.
         spec = types.SimpleNamespace(page_size=page_size, num_pages=num_pages)
         page, row_slot = mla_kv_utils._get_dcp_page_and_slot(
             T,
-            a["seq_lens"],
-            a["block_tables"],
-            a["query_start_loc"],
-            a["dcp_rank"][0],
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank[0],
             nope_spec=spec,
             dcp_size=st.dcp,
             interleave_size=st.interleave,
         )
         dst = mla_kv_utils._dst_rows(page, row_slot, page_size)
-        slot = a["slot"].reshape(-1)
         ops = dict(
-            meta=kernel.pack_meta(
-                n_valid, a["rank"], slot[0], dst, slot[1] if pf else 0
-            ),
-            lat=a["lat"].reshape(T, -1),
+            meta=kernel.pack_meta(n_valid, rank, slot, dst),
+            lat=lat.reshape(T, -1),
             act=kernel.pack_act(res, cfull, sfull),
-            **{
-                n: a[n]
-                for n in (
-                    "wuv",
-                    "oproj_w",
-                    "gate",
-                    "w13",
-                    "w2",
-                    "s2",
-                    "qkv_w",
-                    "fstack",
-                    "s13s",
-                    "sw13s",
-                    "sw2s",
-                )
-            },
+            wuv=wuv,
+            oproj_w=oproj_w,
+            gate=gate,
+            w13=w13,
+            w2=w2,
+            s2=s2,
+            qkv_w=qkv_w,
+            fstack=fstack,
+            s13s=s13s,
+            sw13s=sw13s,
+            sw2s=sw2s,
         )
-        if pf:
-            ops.update(pref=a["pref"], gate_nx=a["gate_nx"])
         out = kernel.segment_call(cfg, ops)
         # int32 across the torch boundary (torch has no general uint32).
         kv_rows = lax.bitcast_convert_type(out["kvp_out"], jnp.int32)
-        if pf:
-            return out["res_out"], out["qc_out"], kv_rows, out["pred_out"]
         return out["res_out"], out["qc_out"], kv_rows
 
     return body
 
 
-def _fake(res: torch.Tensor, q_lora: int, pf: bool = False):
+def _fake(res: torch.Tensor, q_lora: int):
     T = res.shape[0]
     rnd = kernel.KV_TOKEN_ROUND
     rows = 3 * ((T + rnd - 1) // rnd) * rnd
-    out = (
+    return (
         torch.empty_like(res),
         res.new_empty((T, q_lora)),
         res.new_empty((rows, 128), dtype=torch.int32),
     )
-    if pf:
-        out += (res.new_empty((8, 128), dtype=torch.int32),)
-    return out
 
 
 def _get_op(mesh, st: _Statics):
@@ -311,27 +302,64 @@ def _get_op(mesh, st: _Statics):
     if op is not None:
         return op
     axis = mesh.axis_names[0]
-    names = _args(st)
-    pf = st.e_pre > 0
-    specs = tuple(P(axis) if name in _PER_RANK else P() for name in names)
-    out_specs = (P(axis),) * (4 if pf else 3)
+    specs = tuple(P(axis) if name in _PER_RANK else P() for name in _ARGS)
+    out_specs = (P(axis), P(axis), P(axis))
     sharded = jax.shard_map(
         _op_body(st), mesh=mesh, in_specs=specs, out_specs=out_specs, check_vma=False
     )
 
-    def call(*args):
+    # torch_tpu reads the operand types from these annotations.
+    def fn(
+        lat: jax.Array,
+        res: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        pad_mask: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        dcp_rank: jax.Array,
+        rank: jax.Array,
+        slot: jax.Array,
+        wuv: jax.Array,
+        oproj_w: jax.Array,
+        gate: jax.Array,
+        w13: jax.Array,
+        w2: jax.Array,
+        s2: jax.Array,
+        qkv_w: jax.Array,
+        fstack: jax.Array,
+        s13s: jax.Array,
+        sw13s: jax.Array,
+        sw2s: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        args = (
+            lat,
+            res,
+            cos,
+            sin,
+            pad_mask,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            dcp_rank,
+            rank,
+            slot,
+            wuv,
+            oproj_w,
+            gate,
+            w13,
+            w2,
+            s2,
+            qkv_w,
+            fstack,
+            s13s,
+            sw13s,
+            sw2s,
+        )
         return sharded(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
         )
-
-    # torch_tpu reads the operand types from the annotations: a fixed-arity
-    # signature per variant.
-    params = ", ".join(f"{n}: jax.Array" for n in names)
-    ret = ", ".join(["jax.Array"] * len(out_specs))
-    src = f"def fn({params}) -> tuple[{ret}]:\n    return call({', '.join(names)})\n"
-    ns: dict[str, Any] = {"jax": jax, "call": call}
-    exec(src, ns)
-    fn = ns["fn"]
 
     name = "pallas::segment_megakernel" + (f"_{len(_OPS)}" if _OPS else "")
     # PartitionSpecs at runtime, as moe_tp_decode._get_op passes them.
@@ -344,7 +372,7 @@ def _get_op(mesh, st: _Statics):
         output_partition_specs=out_specs,
     )
     q_lora = st.q_lora
-    op.register_fake(lambda lat, res, *a, **k: _fake(res, q_lora, pf))
+    op.register_fake(lambda lat, res, *a, **k: _fake(res, q_lora))
     _OPS[key] = op
     return op
 
@@ -581,6 +609,7 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
         rms_eps=eps.pop(),
         interleave=int(impl.dcp_interleave_size),
         e_pre=max(0, int(envs.TPU_SEGMK_EXPERT_PREFETCH)),
+        qkv_early=int(envs.TPU_SEGMK_PF_QKV_EARLY),
     )
     if st.tp != 16 or st.dcp != 8:
         return f"verified at TP16 x DCP8 only (TP {st.tp}, DCP {st.dcp})"
@@ -592,7 +621,10 @@ def _admit_pair(layer: Any, nxt: Any, topo_mesh: Any) -> _Statics | str:
     ):
         return "the shared expert's buffers are not [H, 2Fs] / [2Fs]"
     for t in kernel.TOKEN_BUCKETS:
-        if st.e_pre > 0 and kernel.prefetch_fit(st.base_cfg(t), st.e_pre) is None:
+        if (
+            st.e_pre > 0
+            and kernel.prefetch_fit(st.base_cfg(t), st.e_pre, st.qkv_early) is None
+        ):
             return f"T={t}: no expert prefetch pool fits VMEM"
         reason = kernel.supported(st.cfg(t))
         if reason is not None:
@@ -605,7 +637,8 @@ QKV_W_BUF = "_segment_megakernel_qkv_w"
 
 def _pad_qkv(qkv: Any, n_pad: int, n_logical: int, blk: int = 0) -> None:
     """Register on fused_qkv_a_proj row-major copies of its weight / scale
-    zero-padded to `n_pad` columns (the kernel's layout). The parameters stay
+    zero-padded to `n_pad` columns (the kernel's layout; with expert prefetch,
+    `blk` > 0: [n_pad / blk, H, blk] column blocks, kernel.block_qkv). The parameters stay
     as they are: the usual path's GEMM reads the weight in the layout its
     loader left (j-7694e3a5: on a row-major padded weight the 4096-token
     q_a/kv_a GEMM ran 155 us instead of 80). Costs n_pad x hidden fp8 of HBM
@@ -616,7 +649,7 @@ def _pad_qkv(qkv: Any, n_pad: int, n_logical: int, blk: int = 0) -> None:
     from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
     w = qkv.weight.data
-    if blk:  # prefetch: column blocks of an expert slot's shape (block_qkv)
+    if blk:
         n_pad = -(-n_pad // blk) * blk
     pad = n_pad - w.shape[1]
     # fresh_buffer: a dtype view handed to an op is re-materialized by a
@@ -756,16 +789,6 @@ def _consts_row(st: _Statics, layer: Any, nxt: Any) -> torch.Tensor:
         ss2=ss2,
         qkv_s=nwrap.fused_qkv_a_proj.weight_scale,
     )
-    if st.e_pre > 0:  # the predictor's: layer N+1's norm and routing bias
-        nrun = _moe_runner(nxt)
-        consts["g_post_nx"] = nxt.post_attention_layernorm.weight
-        consts["bias_nx"] = (
-            getattr(nrun.routed_experts, moe_tp_decode._BUFFERS[4])
-            if nrun is not None
-            and getattr(nrun.routed_experts, moe_tp_decode._BUFFERS[4], None)
-            is not None
-            else torch.zeros_like(bias)
-        )
     parts = []
     for name, _, w in st.cfg(kernel.TOKEN_BUCKETS[0]).fields():
         v = consts[name].detach().reshape(-1).to(torch.float32)
@@ -880,19 +903,14 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     )
     if plan:
         _build_stacks(layers, plan)
-    tails = {i for i, _ in plan}
     for k, (i, st) in enumerate(plan):
         assert not isinstance(topo, str)
         layer, nxt = layers[i], layers[i + 1]
         nwrap = nxt.self_attn.mla_attn
         width = nwrap.q_lora_rank + nwrap.kv_lora_rank + nwrap.qk_rope_head_dim
-        pf = st.e_pre > 0
-        _pad_qkv(
-            nwrap.fused_qkv_a_proj,
-            st.qkv_pad,
-            width,
-            st.cfg(kernel.TOKEN_BUCKETS[0]).qkv_blk if pf else 0,
-        )
+        c0 = st.cfg(kernel.TOKEN_BUCKETS[0])
+        blk = c0.qkv_blk if c0.qkv_blocked else 0
+        _pad_qkv(nwrap.fused_qkv_a_proj, st.qkv_pad, width, blk)
         nattn = nwrap.mla_attn
         # The head's send-layout op and (TPU_MLA_FUSED_SMALL_A2A) its fused
         # exchange op, taking the megakernel's KV write rows.
@@ -923,13 +941,7 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
             _Tail(
                 op=_get_op(topo.mesh, st),
                 dcp_rank=dcp_rank_operand(),
-                slot=torch.tensor(
-                    [[k, int((i + 1) in tails)]] if pf else [[k]],
-                    dtype=torch.int32,
-                    device=layer_device(layer),
-                ),
-                prefetch=pf,
-                predicts=pf and (i + 1) in tails,
+                slot=torch.tensor([[k]], dtype=torch.int32, device=layer_device(layer)),
             ),
         )
         setattr(nxt, HEAD_ATTR, True)
@@ -951,12 +963,14 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
     if plan and plan[0][1].e_pre > 0:
         st0 = plan[0][1]
         logger.info(
-            "segment_megakernel: expert prefetch requested %d; pool / ring per bucket "
-            "%s; predicting boundaries %d of %d",
+            "segment_megakernel: expert prefetch requested %d; (pool, ring, early "
+            "q_a/kv_a blocks) per bucket %s; ids predicted in each call from its "
+            "input residual",
             st0.e_pre,
-            {t: (st0.cfg(t).e_pre, st0.cfg(t).nb) for t in kernel.TOKEN_BUCKETS},
-            sum(1 for i, _ in plan if (i + 1) in tails),
-            len(plan),
+            {
+                t: (st0.cfg(t).e_pre, st0.cfg(t).nb, st0.cfg(t).qkv_early)
+                for t in kernel.TOKEN_BUCKETS
+            },
         )
     return len(plan)
 
@@ -994,7 +1008,6 @@ def segment_forward(
     recv: torch.Tensor,
     residual: torch.Tensor,
     positions: torch.Tensor,
-    pref: torch.Tensor | None = None,
 ) -> SegmentOut:
     """The megakernel for the boundary (prev = armed layer N, layer = N+1)
     from N's merge receive buffer. Called from N+1's step, and every tensor is
@@ -1016,16 +1029,7 @@ def segment_forward(
     runner = prev.mlp.experts
     moe = runner.routed_experts
     rank = getattr(moe, moe_tp_decode._BUFFERS[5])
-    extra: tuple[torch.Tensor, ...] = ()
-    if tail.prefetch:
-        if pref is None:  # no prediction for this layer: an empty pool
-            pref = torch.full((8, 128), -1, dtype=torch.int32, device=residual.device)
-        # Layer N+1's gate through the path its own boundary reads it by
-        # (Dynamo names a lifted tensor after its first access path); a
-        # boundary whose prediction nobody consumes passes N's gate (unread).
-        gate_nx = layer.mlp.experts.gate.weight if tail.predicts else runner.gate.weight
-        extra = (pref, gate_nx)
-    outs = tail.op(
+    res_out, q_c, kv_rows = tail.op(
         recv,  # the merged latent [T, heads, kv_lora]
         residual,
         cos,
@@ -1048,15 +1052,12 @@ def segment_forward(
         _STACKS["s13s"],
         _STACKS["sw13s"],
         _STACKS["sw2s"],
-        *extra,
     )
-    pred = outs[3] if tail.prefetch else None
-    return outs[0], outs[1], outs[2], pred
+    return res_out, q_c, kv_rows
 
 
-# Layer N's hand-off: (layer N, its merge receive buffer, the residual, the
-# prediction of N's routed experts made by the previous call or None).
-Pending = tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor | None]
+# Layer N's hand-off: (layer N, its merge receive buffer, the residual).
+Pending = tuple[Any, torch.Tensor, torch.Tensor]
 
 
 def run_layer(
@@ -1077,11 +1078,10 @@ def run_layer(
         return hs, res, None
     assert not layer.use_sequence_parallel_moe and not layer.use_mha
     attn_kwargs: dict[str, Any] = {}
-    pred = None
     if pending is not None:
-        prev, recv, prev_residual, pref = pending
-        residual, q_c, kv_rows, pred = segment_forward(
-            prev, layer, recv, prev_residual, positions, pref
+        prev, recv, prev_residual = pending
+        residual, q_c, kv_rows = segment_forward(
+            prev, layer, recv, prev_residual, positions
         )
         hidden_states = residual  # token-count template only
         attn_kwargs["segment_head"] = (q_c, kv_rows)
@@ -1096,7 +1096,7 @@ def run_layer(
         positions, hidden_states, llama_4_scaling, **attn_kwargs
     )
     if tail:
-        return None, None, (layer, out, residual, pred)
+        return None, None, (layer, out, residual)
     hidden_states, residual = layer.post_attention_layernorm(out, residual)
     hidden_states = layer.mlp(hidden_states)
     return hidden_states, residual, None

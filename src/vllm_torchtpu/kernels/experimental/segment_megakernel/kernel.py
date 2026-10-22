@@ -106,9 +106,20 @@ class SegCfg:
     # slots beside the `nb` ring slots of one expert buffer. 0 = the kernel
     # without it (every code path below gated on `prefetch`).
     e_pre: int = 0
+    # Where the pool's expert ids come from: "self" = probe P15 rule (b) run in
+    # this call on its own input residual (router_N(post_attention_layernorm_N
+    # (r_in_N)): its own gate / norm / bias), while AR1's reduce-scatter is in
+    # flight; "input" = the `pref` operand (tests: controlled pools).
+    pf_src: str = "self"
     # False: the removal arm -- the pool DMAs are issued and waited, every
     # routed expert still streams through the ring (timing only; exact).
     pf_use: bool = True
+    # False: no pool DMA at all (the layout + predictor cost alone; timing).
+    pf_issue: bool = True
+    # q_a/kv_a column blocks streamed early, into their own buffer, right
+    # behind the pool DMAs (the rest go into free expert slots after the
+    # routed experts, under AR2): trades pool slots for hidden q_a/kv_a bytes.
+    qkv_early: int = 0
     # Test-only positive control: "stale_slot" fills pool slot p with the
     # expert predicted for slot p + 1 (the map still says p).
     pf_fault: str = ""
@@ -132,6 +143,13 @@ class SegCfg:
     @property
     def qkv_nblk(self) -> int:
         return -(-self.qkv_pad // self.qkv_blk)
+
+    @property
+    def qkv_blocked(self) -> bool:
+        """q_a/kv_a held as column blocks (some streamed after the routed
+        experts into free expert slots); with every block early the
+        incumbent's buffer, layout and matmul are kept as they are."""
+        return self.prefetch and self.qkv_early < self.qkv_nblk
 
     @property
     def e_pad(self) -> int:
@@ -163,8 +181,6 @@ class SegCfg:
             ("ss2", self.hidden),
             ("qkv_s", self.qkv_pad),
         )
-        if self.prefetch:  # the predictor's: layer N+1's norm and bias
-            widths += (("g_post_nx", self.hidden), ("bias_nx", self.e_pad))
         out, off = [], 0
         for name, w in widths:
             out.append((name, off, w))
@@ -212,26 +228,36 @@ def supported(cfg: SegCfg) -> str | None:
             return f"prefetch pool above {PRED_LANES} slots"
         if cfg.nb < 2:
             return "prefetch needs at least 2 ring slots"
-        if cfg.slots < cfg.qkv_nblk:
-            return "q_a/kv_a blocks do not fit the expert buffer's slots"
+        if not 0 <= cfg.qkv_early <= cfg.qkv_nblk:
+            return "qkv_early outside [0, q_a/kv_a blocks]"
+        if cfg.qkv_blocked and cfg.slots < cfg.qkv_nblk - cfg.qkv_early:
+            return "late q_a/kv_a blocks do not fit the expert buffer's slots"
         if cfg.pf_fault not in ("", "stale_slot", "no_dma"):
             return f"unknown prefetch fault {cfg.pf_fault}"
+        if cfg.pf_src not in ("self", "input"):
+            return f"unknown prefetch source {cfg.pf_src}"
     if vmem_need_bytes(cfg)["limit"] > VMEM_CAP:
         return f"VMEM plan above {VMEM_CAP // MIB} MiB (prefetch pool overflow?)"
     return None
 
 
-VMEM_CAP = 64 * MIB
+# XLA's largest valid scoped-VMEM request on tpu7x is 64 MiB - 64 KiB
+# (67043328 B, "max valid bytes"); keep a margin under it.
+VMEM_CAP = 63 * MIB
 PRED_LANES = 16  # lanes of the prediction row that carry expert ids
 
 
-def prefetch_fit(cfg: SegCfg, e_pre: int, min_nb: int = 4) -> SegCfg | None:
-    """`cfg` with the largest pool <= e_pre slots that fits VMEM, the ring
+def prefetch_fit(
+    cfg: SegCfg, e_pre: int, qkv_early: int = 0, min_nb: int = 6
+) -> SegCfg | None:
+    """`cfg` with the largest pool <= e_pre slots that fits VMEM beside
+    `qkv_early` early q_a/kv_a blocks (clamped to the block count), the ring
     kept at nb (shrunk to min_nb only when that buys pool slots); None when
     not even one slot fits."""
+    k = min(max(qkv_early, 0), cfg.qkv_nblk)
     for p in range(min(e_pre, PRED_LANES), 0, -1):
         for nb in range(cfg.nb, min_nb - 1, -1):
-            c = dataclasses.replace(cfg, e_pre=p, nb=nb)
+            c = dataclasses.replace(cfg, e_pre=p, nb=nb, qkv_early=k)
             if supported(c) is None:
                 return c
     return None
@@ -241,7 +267,7 @@ def prefetch_fit(cfg: SegCfg, e_pre: int, min_nb: int = 4) -> SegCfg | None:
 # all-reduce epilogue: moe_tp_decode/all_reduce.py epilogue pieces with the barrier
 # wait optional (AR2 runs after AR1's exchange proved every peer is inside the call)
 # =====================================================================================
-def _exchange(spec, me, buf, rows, cols, s):
+def _exchange(spec, me, buf, rows, cols, s, mid=None):
     cw = cols // spec.n
 
     def slot(q):
@@ -254,6 +280,8 @@ def _exchange(spec, me, buf, rows, cols, s):
     own = pltpu.make_async_copy(chunk(me), slot(me), s["loc"].at[0])
     own.start()
     rs = MAR._send_all(spec, me, chunk, slot, s["rs_send"], s["rs_recv"])
+    if mid is not None:  # independent work while the reduce-scatter is in flight
+        mid()
     own.wait()
     MAR._recv_all(spec, me, slot, s["rs_recv"])
 
@@ -270,7 +298,7 @@ def _exchange(spec, me, buf, rows, cols, s):
         copy.wait_send()
 
 
-def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
+def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier, mid=None):
     m, h, tr = spec.m, spec.h, spec.tile_rows
     if kind == "fold":
         q = MAR._fold(spec, MAR._masked(partial, nv, tr, F32))
@@ -282,12 +310,15 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         buf = out_ref if rows == m else out_ref.at[pl.ds(0, rows)]
     if barrier is not None:
         pl.semaphore_wait(barrier, spec.n)
-    _exchange(spec, me, buf, rows, cols, s)
+    _exchange(spec, me, buf, rows, cols, s, mid)
     if kind == "fold":
         MAR._unfold(spec, s["q"][...].astype(F32), nv, out_ref)
 
 
-def _ar_epilogue(spec, rank, n_valid, partial, out_ref, scr, *, wait_barrier):
+def _ar_epilogue(spec, rank, n_valid, partial, out_ref, scr, *, wait_barrier, mid=None):
+    """`mid`: traced once per exclusive path, run once per call (between the
+    reduce-scatter sends and their waits; on the no-valid-rows path after
+    the barrier)."""
     s = dict(zip(MAR._scratch_names(spec), scr, strict=True))
     barrier = pltpu.get_barrier_semaphore() if wait_barrier else None
     m, tr = spec.m, spec.tile_rows
@@ -298,26 +329,28 @@ def _ar_epilogue(spec, rank, n_valid, partial, out_ref, scr, *, wait_barrier):
         out_ref[...] = jnp.zeros(out_ref.shape, out_ref.dtype)
         if barrier is not None:
             pl.semaphore_wait(barrier, spec.n)
+        if mid is not None:
+            mid()
 
     lo = 0
     if spec.fold:
 
         @pl.when((nv > 0) & (nv <= spec.fold_rows))
         def _fold_path():
-            _run_path(spec, "fold", rank, nv, partial, out_ref, s, barrier)
+            _run_path(spec, "fold", rank, nv, partial, out_ref, s, barrier, mid)
 
         lo = spec.fold_rows
     if tr < m:
 
         @pl.when((nv > lo) & (nv <= tr))
         def _trim_path():
-            _run_path(spec, "trim", rank, nv, partial, out_ref, s, barrier)
+            _run_path(spec, "trim", rank, nv, partial, out_ref, s, barrier, mid)
 
         lo = tr
 
     @pl.when(nv > lo)
     def _full_path():
-        _run_path(spec, "full", rank, nv, partial, out_ref, s, barrier)
+        _run_path(spec, "full", rank, nv, partial, out_ref, s, barrier, mid)
 
 
 # =====================================================================================
@@ -488,7 +521,7 @@ def _pool_started(cfg, r, p):
     """Whether pool slot p's DMAs were issued (pref[p] a valid expert id;
     never under the positive control "no_dma", which leaves the slot holding
     whatever an earlier call left there while the map still says hit)."""
-    if cfg.pf_fault == "no_dma":
+    if cfg.pf_fault == "no_dma" or not cfg.pf_issue:
         return jnp.bool_(False)
     return _pref_valid(cfg, r["pref_s"][0, p])
 
@@ -511,8 +544,28 @@ def _pool_copies(cfg, r, p, slot_k, e=None):
     ]
 
 
-def _gate_nx_copy(r):
-    return pltpu.make_async_copy(r["gate_nx"], r["gate_v"], r["pf_sem"].at[1])
+def _qkv_block_copy(cfg, r, j):
+    """q_a/kv_a column block j: early blocks into their own buffer, the rest
+    into expert slot j - qkv_early (free after the routed experts)."""
+    if j < cfg.qkv_early:
+        dst = r["qkv_e"].at[j]
+    else:
+        dst = r["w1_r"].at[j - cfg.qkv_early]
+    return pltpu.make_async_copy(r["qkv_w"].at[j], dst, r["qkvb_sem"].at[j])
+
+
+def _issue_pool(cfg, r, slot_k):
+    """Start every pool slot's DMAs (slots whose id is not an expert stay
+    empty), then the early q_a/kv_a blocks behind them."""
+    for p in range(cfg.e_pre):
+
+        @pl.when(_pool_started(cfg, r, p))
+        def _(p=p):
+            for c in _pool_copies(cfg, r, p, slot_k):
+                c.start()
+
+    for j in range(cfg.qkv_early if cfg.qkv_blocked else 0):
+        _qkv_block_copy(cfg, r, j).start()
 
 
 def _compact_pool(cfg, r):
@@ -520,7 +573,7 @@ def _compact_pool(cfg, r):
     (row 0), and per step j its buffer slot (row 1: nb + p for an expert the
     pool holds in slot p, else ring slot (miss ordinal % nb)), pool flag (row
     2), miss ordinal (row 3); row 4 the misses' ids in ascending order (the
-    ring's stream); row 5 lane p: whether a step uses pool slot p. Every
+    ring's stream). Every
     operand of the 0/1 matmuls is an integer <= 256: exact in bf16 with f32
     accumulation. Returns (hit count, miss count)."""
     E, nb, P = cfg.e_pad, cfg.nb, cfg.e_pre
@@ -529,7 +582,7 @@ def _compact_pool(cfg, r):
     # pool map: pm[e] = the pool slot holding expert e (last slot wins on a
     # duplicate id), -1 if none; the removal arm (pf_use False) maps nothing.
     pm = jnp.full((1, E), -1, I32)
-    if cfg.pf_use:
+    if cfg.pf_use and cfg.pf_issue:
         for p in range(P):
             e = r["pref_s"][0, p]
             pm = jnp.where((lane == e) & _pref_valid(cfg, e), p, pm)
@@ -554,13 +607,8 @@ def _compact_pool(cfg, r):
     steps = lax.dot_general(lhs2, P_hit, _NT, preferred_element_type=F32)  # [8, E]
     erow = jnp.where(row8 == 0, lane, 0).astype(F32).astype(BF16)
     mids = lax.dot_general(erow, P_miss, _NT, preferred_element_type=F32)  # row 0
-    used = jnp.zeros((1, E), I32)
-    for p in range(P):
-        u = jnp.max(jnp.where(in_pool & (pm == p), 1, 0), axis=1, keepdims=True)
-        used = jnp.where(lane == p, u, used)
     out = jnp.where(row8 < 4, steps.astype(I32), 0)
     out = jnp.where(row8 == 4, jnp.broadcast_to(mids[0:1].astype(I32), (8, E)), out)
-    out = jnp.where(row8 == 5, jnp.broadcast_to(used, (8, E)), out)
     r["ids_v"][...] = out
     n_hit = jnp.sum(jnp.where(hit, 1, 0), axis=1, keepdims=True)  # [1, 1]
     n_miss = jnp.sum(jnp.where(miss, 1, 0), axis=1, keepdims=True)
@@ -601,14 +649,14 @@ def rank_experts(mass, n):
     return out
 
 
-def _predict(cfg, r, n_valid, eps):
-    """Rule (b) of probe P15 on the residual this call exits with (layer
-    N+1's input): post_attention_layernorm_{N+1} -> GateLinear_{N+1} (bf16
-    logits, f32 sigmoid) -> + e_score_correction_bias_{N+1}, top-k per row
-    -> experts ranked by routed mass over the valid rows."""
-    hp, _ = rms_add(r["res_m"][...].astype(F32), None, r["g_post_nx_v"][...], eps)
+def _predict_ids(cfg, r, n_valid, eps):
+    """Probe P15 rule (b) on this call's input residual r_in (res_pad rows,
+    bf16 values): post_attention_layernorm -> GateLinear (bf16 logits, f32
+    sigmoid) -> + e_score_correction_bias, top-k per valid row -> experts
+    ranked by routed mass. The real routing input is norm(r_in + attention)."""
+    hp, _ = rms_add(r["res_pad"][...], None, r["g_post_v"][...], eps)
     scores = router_scores(hp, r["gate_v"][...])
-    mass = predict_mass(scores, r["bias_nx_v"][...], n_valid, topk=cfg.topk)
+    mass = predict_mass(scores, r["bias_v"][...], n_valid, topk=cfg.topk)
     return rank_experts(mass, cfg.e_pre)
 
 
@@ -661,27 +709,22 @@ VEC_FIELDS = (
     "qkv_s",
 )
 OUTS = ("res_out", "qc_out", "kvp_out")
-# The prefetch variant's extra operands: `pref` int32 [8, 128], row 0 lanes
-# 0..e_pre-1 = the expert ids to stage into the pool (-1 / out of range = none;
-# the previous boundary's `pred_out`), and layer N+1's router gate (the
-# predictor's). Its extra output `pred_out` is this call's prediction for
-# layer N+1's routed experts, in the same layout.
-PF_HBM_IN = ("pref", "gate_nx")
-PF_VEC_FIELDS = ("g_post_nx", "bias_nx")
-PF_OUTS = ("pred_out",)
-META_PREDICT = 3  # meta[3] = 1: run the predictor (layer N+1's MoE is armed)
+# The prefetch variant's extra operand (pf_src "input" only): `pref` int32
+# [8, 128], row 0 lanes 0..e_pre-1 = the expert ids to stage into the pool
+# (-1 / out of range = none).
+PF_HBM_IN = ("pref",)
 
 
 def hbm_in(cfg: SegCfg) -> tuple[str, ...]:
-    return HBM_IN + (PF_HBM_IN if cfg.prefetch else ())
+    return HBM_IN + (PF_HBM_IN if cfg.prefetch and cfg.pf_src == "input" else ())
 
 
 def vec_fields(cfg: SegCfg) -> tuple[str, ...]:
-    return VEC_FIELDS + (PF_VEC_FIELDS if cfg.prefetch else ())
+    return VEC_FIELDS
 
 
 def outs(cfg: SegCfg) -> tuple[str, ...]:
-    return OUTS + (PF_OUTS if cfg.prefetch else ())
+    return OUTS
 
 
 def scratch_table(cfg: SegCfg):
@@ -691,7 +734,7 @@ def scratch_table(cfg: SegCfg):
     spec = MAR.make_spec(cfg.tp, m, H)
     # Prefetch: no q_a/kv_a buffer -- its column blocks stream into the
     # expert slots after the routed experts are done.
-    qkv = [] if cfg.prefetch else [("qkv_v", pltpu.VMEM((H, cfg.qkv_pad), F8))]
+    qkv = [] if cfg.qkv_blocked else [("qkv_v", pltpu.VMEM((H, cfg.qkv_pad), F8))]
     sc = [
         ("wuv_v", pltpu.VMEM((cfg.heads_rank, cfg.kv_lora, cfg.v_head), BF16)),
         ("o_tiles", pltpu.VMEM((cfg.o_slots, cfg.o_in, cfg.o_tile), F8)),
@@ -739,8 +782,17 @@ def scratch_table(cfg: SegCfg):
             ("pref_s", pltpu.SMEM((8, LANES), I32)),
             ("pred_v", pltpu.VMEM((8, LANES), I32)),
             ("pool_sem", pltpu.SemaphoreType.DMA((cfg.e_pre, 4))),
-            ("qkvb_sem", pltpu.SemaphoreType.DMA((cfg.qkv_nblk,))),
-            ("pf_sem", pltpu.SemaphoreType.DMA((2,))),  # pref, gate_nx
+            *(
+                [
+                    ("qkvb_sem", pltpu.SemaphoreType.DMA((cfg.qkv_nblk,))),
+                    ("qkv_e", pltpu.VMEM((cfg.qkv_early, H, cfg.qkv_blk), F8)),
+                ]
+                if cfg.qkv_blocked and cfg.qkv_early
+                else [("qkvb_sem", pltpu.SemaphoreType.DMA((cfg.qkv_nblk,)))]
+                if cfg.qkv_blocked
+                else []
+            ),
+            ("pf_sem", pltpu.SemaphoreType.DMA((1,))),  # pool ids -> SMEM
         ]
     shapes = operand_shapes(cfg)
     sc += [(n, pltpu.VMEM(*shapes[n])) for n in STAGED_IN]
@@ -805,7 +857,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         r["wuv"], r["wuv_v"], r["in_sem"].at[len(STAGED_IN)]
     )
     wuv_copy.start()
-    if pf:  # the pool's expert ids, needed when the pool DMAs are issued
+    pf_in = pf and cfg.pf_src == "input"
+    pf_self = pf and cfg.pf_src == "self"
+    if pf_in:  # the pool's expert ids, needed when the pool DMAs are issued
         pref_copy = pltpu.make_async_copy(r["pref"], r["pref_s"], r["pf_sem"].at[0])
         pref_copy.start()
 
@@ -840,24 +894,28 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
             c.start()
             shared.append(c)
         qkv = []
-        if pf:  # the pool instead; q_a/kv_a streams into the slots later
-            pref_copy.wait()
-            for p_ in range(cfg.e_pre):
-
-                @pl.when(_pool_started(cfg, r, p_))
-                def _(p_=p_):
-                    for c in _pool_copies(cfg, r, p_, slot_k):
-                        c.start()
-
-        for c in range(0 if pf else cfg.qkv_chunks):
-            cp = pltpu.make_async_copy(
-                r["qkv_w"].at[pl.ds(c * qc_rows, qc_rows)],
-                r["qkv_v"].at[pl.ds(c * qc_rows, qc_rows)],
-                w_sem.at[1 + c],
+        for c in range(0 if cfg.qkv_blocked else cfg.qkv_chunks):
+            qkv.append(
+                pltpu.make_async_copy(
+                    r["qkv_w"].at[pl.ds(c * qc_rows, qc_rows)],
+                    r["qkv_v"].at[pl.ds(c * qc_rows, qc_rows)],
+                    w_sem.at[1 + c],
+                )
             )
-            cp.start()
-            qkv.append(cp)
         pre.update(gate=gate, shared=shared, qkv=qkv)
+        if pf_in:  # the pool first; q_a/kv_a behind it
+            pref_copy.wait()
+            issue_pool()
+        elif not pf:
+            for cp in qkv:
+                cp.start()
+
+    def issue_pool():
+        """The pool's DMAs, then the q_a/kv_a bytes due early behind them."""
+        _issue_pool(cfg, r, slot_k)
+        if not cfg.qkv_blocked:
+            for cp in pre["qkv"]:
+                cp.start()
 
     # ---- 3. entry: W_UV of the merged latent -> attn [T, o_in] bf16
     staged = {}
@@ -889,16 +947,39 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     if not pre:
         issue_prefetch()
 
+    def fill_residual():
+        r["res_pad"][...] = jnp.zeros((m, H), F32)
+        staged["act"].wait()
+        vec["g_post"].wait()
+        r["res_pad"][pl.ds(0, T), :] = r["act"][pl.ds(0, T), :].astype(F32)
+
+    def self_predict():
+        """P15 rule (b) on this call's input residual with its own router,
+        then the pool DMAs -- while AR1's reduce-scatter is in flight."""
+        fill_residual()
+        pre["gate"].wait()
+        vec["bias"].wait()
+        r["pred_v"][...] = _predict_ids(cfg, r, n_valid, eps)
+        cp = pltpu.make_async_copy(r["pred_v"], r["pref_s"], r["pf_sem"].at[0])
+        cp.start()
+        cp.wait()
+        issue_pool()
+
     # ---- 5. AR1 (attention TP all-reduce), barrier waited here
     _ar_epilogue(
-        spec, rank, n_valid, r["y_pad"][...], r["ar1_out"], ar1, wait_barrier=True
+        spec,
+        rank,
+        n_valid,
+        r["y_pad"][...],
+        r["ar1_out"],
+        ar1,
+        wait_barrier=True,
+        **({"mid": self_predict} if pf_self else {}),
     )
 
     # ---- 6. post_attention_layernorm(attn_sum, residual)
-    r["res_pad"][...] = jnp.zeros((m, H), F32)
-    staged["act"].wait()
-    vec["g_post"].wait()
-    r["res_pad"][pl.ds(0, T), :] = r["act"][pl.ds(0, T), :].astype(F32)
+    if not pf_self:
+        fill_residual()
     h, s1 = rms_add(
         r["ar1_out"][...].astype(F32), r["res_pad"][...], r["g_post_v"][...], eps
     )
@@ -906,11 +987,13 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     r["h_v"][...] = h
 
     # ---- 7. router: GateLinear's bf16 logits, f32 sigmoid
-    pre["gate"].wait()
+    if not pf_self:
+        pre["gate"].wait()
     scores = router_scores(r["h_v"][...], r["gate_v"][...])
 
     # ---- 8a. routing
-    vec["bias"].wait()
+    if not pf_self:
+        vec["bias"].wait()
     r["wtab"][...] = _route_argmax(scores, r["bias_v"][...], n_valid, topk=cfg.topk)
     hit = jnp.any(r["wtab"][...] != 0, axis=0, keepdims=True)
     r["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
@@ -1035,13 +1118,16 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         # The same steps in the same (ascending id) order as above -- so the
         # same arithmetic in the same order: only where a step's weights
         # come from differs (pool slot nb + p, or ring slot ordinal % nb).
-        def wait_step(step):
-            @pl.when((ids[2, step] != 0) & _pool_started(cfg, r, ids[1, step] - nb))
-            def _():
-                p_ = ids[1, step] - nb
-                for c in _pool_copies(cfg, r, p_, slot_k, e=ids[0, step]):
+        # Every issued pool slot is waited here, once, after the ring is
+        # primed (issued under AR1, they have normally landed by now).
+        for p_ in range(cfg.e_pre):
+
+            @pl.when(_pool_started(cfg, r, p_))
+            def _(p_=p_):
+                for c in _pool_copies(cfg, r, p_, slot_k):
                     c.wait()
 
+        def wait_step(step):
             @pl.when(ids[2, step] == 0)
             def _():
                 for c in transfers(ids[3, step]):
@@ -1072,24 +1158,10 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
             lax.fori_loop(0, items, expert_body, gate_up(ids[1, 0]))
 
-        # Pool slots no step used (mispredicted, duplicate, removal arm).
-        for p_ in range(cfg.e_pre):
-
-            @pl.when(_pool_started(cfg, r, p_) & (ids[5, p_] == 0))
-            def _(p_=p_):
-                for c in _pool_copies(cfg, r, p_, slot_k):
-                    c.wait()
-
         # Every slot is free: q_a/kv_a's column blocks stream into slots
         # 0..qkv_nblk-1 under AR2; the predictor's gate into gate_v.
-        for j in range(cfg.qkv_nblk):
-            pltpu.make_async_copy(
-                r["qkv_w"].at[j], r["w1_r"].at[j], r["qkvb_sem"].at[j]
-            ).start()
-
-        @pl.when(meta[META_PREDICT] != 0)
-        def _():
-            _gate_nx_copy(r).start()
+        for j in range(cfg.qkv_early, cfg.qkv_nblk if cfg.qkv_blocked else 0):
+            _qkv_block_copy(cfg, r, j).start()
 
     combined = MK._combine(r["owner"][...], r["shared"][...], cfg.routed_scale)
 
@@ -1110,7 +1182,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     # ---- 11. fused q_a/kv_a (xla_quantized_matmul numerics), K-chunked
     xq2, xs2 = quant_rows_block(h2)
     vec["qkv_s"].wait()
-    if not pf:
+    if not cfg.qkv_blocked:
         acc = None
         for c in range(cfg.qkv_chunks):
             pre["qkv"][c].wait()
@@ -1125,14 +1197,15 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         # Per column block, the same K chunks summed in the same order.
         blocks = []
         for j in range(cfg.qkv_nblk):
-            pltpu.make_async_copy(
-                r["qkv_w"].at[j], r["w1_r"].at[j], r["qkvb_sem"].at[j]
-            ).wait()
+            _qkv_block_copy(cfg, r, j).wait()
+            src, jj = (
+                (r["qkv_e"], j) if j < cfg.qkv_early else (r["w1_r"], j - cfg.qkv_early)
+            )
             acc_j = None
             for c in range(cfg.qkv_chunks):
                 part = lax.dot_general(
                     xq2[:, c * qc_rows : (c + 1) * qc_rows],
-                    r["w1_r"][j, pl.ds(c * qc_rows, qc_rows), :],
+                    src[jj, pl.ds(c * qc_rows, qc_rows), :],
                     _NN,
                     preferred_element_type=F32,
                 )
@@ -1159,25 +1232,6 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     kvp_copy = pltpu.make_async_copy(r["kvp_x"], r["kvp_out"], out_sem.at[2])
     kvp_copy.start()
     copies = [res_copy, qc_copy, kvp_copy]
-    if pf:
-        # ---- 13. predictor for layer N+1's routed experts (P15 rule (b)):
-        #          router_{N+1}(post_attention_layernorm_{N+1}(residual exit))
-        @pl.when(meta[META_PREDICT] != 0)
-        def _():
-            _gate_nx_copy(r).wait()
-            vec["g_post_nx"].wait()
-            vec["bias_nx"].wait()
-            r["pred_v"][...] = _predict(cfg, r, n_valid, eps)
-
-        @pl.when(meta[META_PREDICT] == 0)
-        def _():
-            vec["g_post_nx"].wait()
-            vec["bias_nx"].wait()
-            r["pred_v"][...] = jnp.full((8, LANES), -1, I32)
-
-        pred_copy = pltpu.make_async_copy(r["pred_v"], r["pred_out"], out_sem.at[3])
-        pred_copy.start()
-        copies.append(pred_copy)
     for c in copies:
         c.wait()
 
@@ -1241,7 +1295,9 @@ def _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps):
 def kernel_name(cfg: SegCfg) -> str:
     name = f"segment_megakernel_skip-T_{cfg.T}-m_{cfg.m}-nb_{cfg.nb}-e_{cfg.experts}"
     if cfg.prefetch:
-        name += f"-pf_{cfg.e_pre}" + ("" if cfg.pf_use else "-issueonly")
+        name += f"-pf_{cfg.e_pre}_{cfg.pf_src}_qe{cfg.qkv_early}"
+        name += "" if cfg.pf_use else "-issueonly"
+        name += "" if cfg.pf_issue else "-noissue"
     return name
 
 
@@ -1260,7 +1316,7 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         jax.ShapeDtypeStruct((T, H), BF16),
         jax.ShapeDtypeStruct((T, cfg.q_lora), BF16),
         jax.ShapeDtypeStruct((3 * cfg.tok_rows, LANES), U32),
-    ) + ((jax.ShapeDtypeStruct((8, LANES), I32),) if cfg.prefetch else ())
+    )
     limit = vmem_need_bytes(cfg)["limit"]
     call = pl.pallas_call(
         functools.partial(_segment_kernel, cfg=cfg, spec=spec),
@@ -1304,10 +1360,13 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
             {
                 # column blocks of the padded q_a/kv_a weight (block_qkv)
                 "qkv_w": ((cfg.qkv_nblk, H, cfg.qkv_blk), F8),
-                "pref": ((8, LANES), I32),
-                "gate_nx": ((cfg.e_pad, H), BF16),
             }
-            if cfg.prefetch
+            if cfg.qkv_blocked
+            else {}
+        ),
+        **(
+            {"pref": ((8, LANES), I32)}
+            if cfg.prefetch and cfg.pf_src == "input"
             else {}
         ),
     }
@@ -1330,13 +1389,11 @@ def pack_act(res, cfull, sfull):
     return jnp.concatenate([res, pad(cfull), pad(sfull)], axis=0)
 
 
-def pack_meta(n_valid, rank, slot, dst_rows, predict=0):
-    """The SMEM `meta` operand (`predict`: meta[META_PREDICT], prefetch only)."""
-    head = jnp.stack(
-        [jnp.asarray(x, I32).reshape(()) for x in (n_valid, rank, slot, predict)]
-    )
+def pack_meta(n_valid, rank, slot, dst_rows):
+    """The SMEM `meta` operand."""
+    head = jnp.stack([jnp.asarray(x, I32).reshape(()) for x in (n_valid, rank, slot)])
     return jnp.concatenate(
-        [head, jnp.zeros((META_DST - 4,), I32), dst_rows.astype(I32)]
+        [head, jnp.zeros((META_DST - 3,), I32), dst_rows.astype(I32)]
     )
 
 

@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_SEGMENT_MEGAKERNEL: bool = False
     TPU_SEGMK_EXPERT_PREFETCH: int = 0
+    TPU_SEGMK_PF_QKV_EARLY: int = 99
     TPU_MOE_TP_DECODE_FAST: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
     TPU_MOE_TP_DECODE_SHARED_META: bool = False
@@ -1218,6 +1219,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # next call stages them into the pool while its attention tail runs; the
     # result is bit-identical (only data movement changes). 0 = off.
     "TPU_SEGMK_EXPERT_PREFETCH": env_int("TPU_SEGMK_EXPERT_PREFETCH", 0),
+    # With TPU_SEGMK_EXPERT_PREFETCH: how many of the 11 q_a/kv_a column blocks
+    # stream early (behind the pool DMAs, own VMEM buffer); the rest stream into
+    # free expert slots after the routed experts. >= 11 (default) keeps the
+    # incumbent q_a/kv_a buffer and leaves the pool the remaining VMEM.
+    "TPU_SEGMK_PF_QKV_EARLY": env_int("TPU_SEGMK_PF_QKV_EARLY", 99),
     # With USE_MOE_TP_DECODE_KERNEL: the kernel's fast schedule (same arithmetic,
     # bit-identical output): top-k without the per-pick index reduction (exact
     # fallback on ties), the expert compaction on the vector units, ring primes
