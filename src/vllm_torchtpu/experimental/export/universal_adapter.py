@@ -32,6 +32,7 @@ from vllm_torchtpu.experimental.export import (
     tpu_lowering,
     weight_mapper,
 )
+from vllm_torchtpu.experimental.export.trace import trace
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 
@@ -135,6 +136,7 @@ def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
     return os.path.dirname(config_path)
 
 
+@trace("export.build_export_config")
 def build_export_config_from_vllm(
     vllm_config: Any,
     *,
@@ -332,6 +334,7 @@ def init_export_distributed_environment(vllm_config: Any) -> None:
     )
 
 
+@trace("export.load_model")
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     """Loads a vLLM model with `load_format='dummy'` on TPU (zero disk weight IO)."""
     import torch.distributed as dist
@@ -473,6 +476,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
     def export_config(self) -> api.TextOnlyLLMExportConfig:
         return self._export_config
 
+    @trace("export.fit_num_blocks")
     def fit_num_blocks_to_hbm(
         self,
         gpu_memory_utilization: float,

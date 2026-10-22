@@ -31,6 +31,7 @@ from vllm_torchtpu.experimental.export import (
     exporter,
     universal_adapter,
 )
+from vllm_torchtpu.experimental.export.trace import trace
 
 
 def _parse_int_list(raw: str | Sequence[int] | None) -> tuple[int, ...] | None:
@@ -185,6 +186,7 @@ def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
     return engine_args.create_engine_config()
 
 
+@trace("export.run")
 def run_export_from_args(
     args: argparse.Namespace,
     *,
@@ -264,6 +266,7 @@ def _worker_env(tp_size: int) -> dict[str, str]:
         os.environ.update(saved)
 
 
+@trace("export.launch_workers")
 def _launch_workers(argv: Sequence[str], tp_size: int, output_dir: str) -> None:
     """Runs one export worker per tensor-parallel rank and keeps rank 0's output.
 
