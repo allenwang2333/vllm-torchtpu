@@ -380,6 +380,7 @@ quantities.
 | Metadata and empty-tile prefetch fixes, third run | 618.784 | 735.342 |
 | Fused compaction and selection, fourth run | 596.299 | 715.920 |
 | Fused selection with vector copy and loop unrolling, fifth run | 552.375 | 672.085 |
+| Fused selection and grouped query scheduling, retained | 474.881 | 591.834 |
 
 Numbers are means of the two seed medians, each with 30 XProf device samples.
 Declared operator analyses are `an-07cf7q2xvw` and `an-9e885t80wd`; stage-sample
@@ -421,9 +422,34 @@ model's unordered path directly, removing the benchmark's temporary wiring.
 Forty CPU tests and the relevant pre-commit hooks pass. The same-shape TensorCore
 scorer LLO and SparseCore dispatch LLO match the measured source after stripping
 comments. A full model forward still requires the real vLLM/torch-tpu runtime.
-The 500-microsecond target has **not** been demonstrated. These timings cover JAX
-cache writes, Q quantization, metadata, scoring and selection; they exclude
-projections, RoPE, Torch dispatch and TP collectives.
+These timings cover JAX cache writes, Q quantization, metadata, scoring and
+selection; they exclude projections, RoPE, Torch dispatch and TP collectives.
+
+Commit `842880870` adds three independent 96-query chunks for the measured
+288-query shape. Already grouped requests skip query sorting and output
+reordering. Interleaved requests, incomplete six-query groups, short contexts,
+ordered selection and other shapes keep the original path. Keeping complete
+six-query groups preserves the scorer's BF16 head-reduction order.
+
+Experiment `exp-72krmrf9v9` compares this production entry point against
+`d4b5c6c19` at P-state 7. Analyses `an-s9jrn1igc6` and `an-ixtd50obct` expose
+the final metrics and stage samples. Clustered seed medians fall from
+541.8/560.6 to **464.9/484.8 microseconds**; scattered medians fall from
+667.9/672.4 to **590.8/592.8 microseconds**. All four outputs match exactly for
+both seeds and both distributions. Forty-three CPU tests pass in the main
+workspace, five TPU selector tests pass, and the relevant pre-commit hooks pass.
+
+For clustered seed 2026, cumulative scorer time across the three calls is 214.5
+microseconds versus 194.7 before, while the exposed selection wait
+falls from 158.6 to 57.3. The selection wait is not the total SparseCore runtime;
+asynchronous work overlaps later scoring calls. The four sparse scorer regions
+remain 4080/3967/4109/3994 bundles when excluding their leading dispatch branch,
+equivalent to the earlier 4081/3968/4110/3995 convention above.
+
+The two clustered fixture seed medians meet 500 microseconds. **Scattered
+candidates still exceed the target**, and TensorCore still writes full-context
+scratch before SparseCore selects candidate scores. These measurements do not
+establish a whole-model latency bound or a bound for every candidate distribution.
 
 Use `bench_packed_fp8_layer.py --sparse-baseline <baseline-checkout> --profile
 --out <dir>` for the same-run comparison. The baseline checkout must contain
