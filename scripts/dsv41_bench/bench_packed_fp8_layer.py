@@ -455,6 +455,7 @@ def main():
     parser.add_argument("--compare-cache-writers", action="store_true")
     parser.add_argument("--sparse-baseline", type=Path)
     parser.add_argument("--fused-candidate-select", action="store_true")
+    parser.add_argument("--unroll-candidate-selection", action="store_true")
     args = parser.parse_args()
     modules = load_model()
     if args.sparse_baseline is not None:
@@ -471,7 +472,9 @@ def main():
         packed_fp8_sparse.compact_candidate_scores = (
             lambda scores, candidates, *, block_size: scores
         )
-        modules[1].candidate_topk = fused_select
+        modules[1].candidate_topk = functools.partial(
+            fused_select, unroll_selection=args.unroll_candidate_selection
+        )
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (

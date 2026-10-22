@@ -370,6 +370,7 @@ candidate distributions. Both have a 16K-column compact score output.
 | Full-width baseline, second run | 3107.511 | 3211.651 |
 | Compact scores, first run | 880.809 | 880.567 |
 | Compact scores and empty-tile bypass, second run | 872.366 | 881.827 |
+| Metadata and empty-tile prefetch fixes, third run | 618.784 | 735.342 |
 
 Numbers are means of the two seed medians, each with 30 XProf device samples.
 Declared operator analyses are `an-07cf7q2xvw` and `an-9e885t80wd`; stage-sample
@@ -384,9 +385,21 @@ runtime cycles or a prediction of latency.
 The second run's clustered seed-2026 trace has 315.1 microseconds of MQA scoring,
 61.3 of candidate membership, 83.6 of score compaction and 88.2 of top-k. Two
 remaining metadata scatters account for 64.5 microseconds, sorting for 35.7 and
-logical-ID remapping for 13.5. A third experiment, `exp-sksivkv699`, tests their
-removal/fusion and unrolled empty-tile prefetch; its timing is pending. The
-500-microsecond target has **not** been demonstrated. These timings cover JAX
+logical-ID remapping for 13.5. The third experiment, `exp-sksivkv699`, removes
+the metadata scatters, fuses sorting/remapping into TopK, unrolls SC loops and
+empty-tile prefetch, and skips metadata walks for empty future tiles. Analyses
+`an-m2mdkt2fjt` and `an-9anszs9xns` confirm its results. All four outputs match
+the baseline exactly for both candidate distributions and both seeds. The
+clustered seed-2026 trace has 194.9 microseconds of scoring, 28.6 of membership,
+73.5 of compaction and 145.6 of fused TopK/sort/remapping. The two clustered
+seed medians are 607.5 and 630.1 microseconds, so report both rather than only
+the faster seed. The compute-region bundle counts remain unchanged from the
+second run. Commit `0ebac7883` adds the public sparse API wrapper to measured
+commit `f004121e5`; its normalized scorer LLO is identical.
+
+Experiment `exp-5whv0q7crg` separately tests a benchmark-only fusion of score
+compaction and TopK against the third version. It is not enabled in the model.
+The 500-microsecond target has **not** been demonstrated. These timings cover JAX
 cache writes, Q quantization, metadata, scoring and selection; they exclude
 projections, RoPE, Torch dispatch and TP collectives.
 

@@ -6,6 +6,9 @@ Two VMEM scopes reuse the full-row staging allocation after gathering. This
 prototype is benchmark-only until its full-path correctness and timing pass.
 """
 
+import functools
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -20,7 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
 )
 
 
-def fused_select(scores, candidates, *, k=512, block_size=8):
+def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=False):
     rows, width = scores.shape
     count = candidates.shape[1]
     info = plsc.get_sparse_core_info()
@@ -113,13 +116,20 @@ def fused_select(scores, candidates, *, k=512, block_size=8):
 
                 pltpu.async_copy(ids.at[:k], out.at[r], sem.at[0]).wait()
 
-            pl.run_scoped(
-                select_row,
-                pltpu.VMEM((2 * capacity,), jnp.float32),
-                pltpu.VMEM((2 * capacity,), jnp.int32),
-                pltpu.VMEM((k,), jnp.float32),
-                pltpu.VMEM((k,), jnp.int32),
-                pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
+            # Compile-time ablation of the existing selection helpers only.
+            # Restore the module before tracing any other kernel.
+            loop = functools.partial(
+                plsc.parallel_loop,
+                unroll=alignment // lanes if unroll_selection else 1,
             )
+            with mock.patch.object(plsc, "parallel_loop", loop):
+                pl.run_scoped(
+                    select_row,
+                    pltpu.VMEM((2 * capacity,), jnp.float32),
+                    pltpu.VMEM((2 * capacity,), jnp.int32),
+                    pltpu.VMEM((k,), jnp.float32),
+                    pltpu.VMEM((k,), jnp.int32),
+                    pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
+                )
 
     return kernel(scores, candidates)
