@@ -404,6 +404,32 @@ class _ToyLoopProgram:
         return self.world.forward(input_ids, positions, hidden_states, spec_step_idx)
 
 
+class _ToyFusedLoop:
+    """The fused IndexShare program: draft steps 1..K-1 of one chunk in one
+    call, indexer off (it reads the rows restored before it), bumping the
+    loop metadata's seq_lens in place between steps."""
+
+    def __init__(self, world, proposer, num_steps):
+        self.world = world
+        self.proposer = proposer
+        self.num_steps = num_steps
+        self.calls = 0
+
+    def __call__(self, input_ids, positions, hidden_states, seq_lens):
+        assert self.world.skip_topk
+        self.calls += 1
+        tokens = []
+        for step in range(1, self.num_steps + 1):
+            last_hidden, hidden_states = self.world.forward(
+                input_ids, positions, hidden_states, spec_step_idx=step
+            )
+            input_ids = self.proposer._draft_propose_token(last_hidden)
+            tokens.append(input_ids)
+            positions = positions + 1
+            seq_lens.add_(1)
+        return tuple(tokens)
+
+
 class _ToyKvOnly:
     def __init__(self, world):
         self.world = world
@@ -563,8 +589,18 @@ def _eager_body(method):
     return getattr(compiled, "_torchdynamo_orig_callable", compiled)
 
 
-def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
+def _run(
+    monkeypatch,
+    *,
+    two_pass: bool,
+    mode: str,
+    num_chunks: int = 1,
+    topk_inplace: bool = True,
+    fused: bool = False,
+):
     import torch._dynamo
+
+    from vllm_torchtpu.kernels import partial_kv_update
 
     torch._dynamo.reset()
     # propose() runs its small helpers in @torch.compile(backend="tpu")
@@ -574,6 +610,14 @@ def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
         monkeypatch.setattr(
             e3.Eagle3Proposer, name, _eager_body(getattr(e3.Eagle3Proposer, name))
         )
+    # TPU_MTP_TOPK_INPLACE: snapshot by gather, restore in place. The Pallas
+    # scatter is TPU-only; index_copy_ writes the same rows.
+    monkeypatch.setattr(envs, "TPU_MTP_TOPK_INPLACE", topk_inplace)
+    monkeypatch.setattr(
+        partial_kv_update,
+        "pallas_index_copy_",
+        lambda buf, ids, rows: buf.index_copy_(0, ids.long(), rows),
+    )
     chunks, requests, kwargs, prefix_lens, specs = _scenario(mode, num_chunks)
     world = _ToyWorld(len(specs), 24, prefix_lens)
     K = 3
@@ -597,6 +641,8 @@ def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
         _dp_num_tokens_across_dp=lambda n: n,
         _has_mamba_state=False,
         _unified_kv_layout=False,
+        # TPU_H2D_REUSE_STEADY's upload (no reuse here: a plain copy).
+        _upload_unless_unchanged=lambda slot, host, device=None: host.to("cpu"),
     )
     proposer._draft_attn_layer_names = {DRAFT_LAYER}
     proposer.draft_model = _ToyDraft(world)
@@ -606,6 +652,14 @@ def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
     proposer._mtp_topk_buffers = [world.topk_buf]
     proposer._mtp_loop_model = _ToyLoopProgram(world)
     proposer._mtp_loop_model_warm = True
+    fused_loop = _ToyFusedLoop(world, proposer, K - 1)
+    if fused:
+        # VLLM_TPU_MTP_FUSED_INDEXSHARE: steps 1..K-1 in one program, fed each
+        # chunk's saved step-0 rows.
+        proposer._mtp_fused_loop = fused_loop
+        proposer._mtp_fused_indexshare = True
+        proposer._mtp_fused_loop_sizes = None
+        proposer._mtp_fused_loop_warm = False
 
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", GATE)
     kv_only = _ToyKvOnly(world)
@@ -624,14 +678,32 @@ def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
     drafts = proposer.propose(**kwargs)
     if isinstance(drafts, torch.Tensor):
         drafts = drafts.tolist()
-    return SimpleNamespace(drafts=drafts, world=world, kv_only_calls=kv_only.calls)
+    return SimpleNamespace(
+        drafts=drafts,
+        world=world,
+        kv_only_calls=kv_only.calls,
+        fused_calls=fused_loop.calls,
+    )
 
 
+@pytest.mark.parametrize("fused", [False, True], ids=["separate", "fused_indexshare"])
+@pytest.mark.parametrize("topk_inplace", [True, False], ids=["inplace", "copy"])
 @pytest.mark.parametrize("num_chunks", [1, 2])
 @pytest.mark.parametrize("mode", ["sync", "async"])
-def test_two_pass_step0_matches_the_single_pass(monkeypatch, mode, num_chunks):
-    ref = _run(monkeypatch, two_pass=False, mode=mode, num_chunks=num_chunks)
-    new = _run(monkeypatch, two_pass=True, mode=mode, num_chunks=num_chunks)
+def test_two_pass_step0_matches_the_single_pass(
+    monkeypatch, mode, num_chunks, topk_inplace, fused
+):
+    opts = dict(mode=mode, num_chunks=num_chunks, topk_inplace=topk_inplace)
+    ref = _run(monkeypatch, two_pass=False, fused=fused, **opts)
+    new = _run(monkeypatch, two_pass=True, fused=fused, **opts)
+    if fused:
+        # Steps 1..K-1 ran in the program for every chunk (the first call
+        # runs it twice: trace, then compiled).
+        assert ref.fused_calls == new.fused_calls == num_chunks + 1
+        # And match the separate per-step loop.
+        sep = _run(monkeypatch, two_pass=False, fused=False, **opts)
+        assert new.drafts == sep.drafts
+        assert torch.equal(new.world.kv, sep.world.kv)
 
     # The paths actually differ: one full step 0 on all 16 rows vs a KV-only
     # pass over the 15 real rows and a full pass on p = 4 rows. A second

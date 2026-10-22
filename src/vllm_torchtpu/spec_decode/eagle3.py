@@ -971,11 +971,15 @@ class Eagle3Proposer:
         return self._target_draft_attn_metadata(chunk) is not None
 
     def _chunk_loop_inputs(
-        self, chunk: DraftChunkInputs, num_rejected: np.ndarray | torch.Tensor
+        self,
+        chunk: DraftChunkInputs,
+        num_rejected: np.ndarray | torch.Tensor,
+        chunk_index: int | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
         """`(rejected_dev, query_start_loc, request_distribution)` of a chunk's
         one-query-per-request steps, built exactly as `propose` builds them for
-        the loop steps, which then reuse these for a two-pass chunk."""
+        the loop steps, which then reuse these for a two-pass chunk.
+        `chunk_index` keys the TPU_H2D_REUSE_STEADY uploads as `propose` does."""
         runner = self.runner
         knr = (
             runner.num_reqs_max_model_len
@@ -991,6 +995,19 @@ class Eagle3Proposer:
             padded_nr[: chunk.num_reqs] = num_rejected.astype(np.int32, copy=False)
             rejected_dev = torch.from_numpy(padded_nr).to(runner.device)
         qsl_np = np.minimum(np.arange(knr + 1, dtype=np.int32), chunk.num_reqs)
+        if (
+            chunk_index is not None
+            and envs.TPU_H2D_REUSE_STEADY
+            and getattr(runner, "_h2d_reuse_on", True)
+        ):
+            query_start_loc = runner._upload_unless_unchanged(
+                f"draft_loop_qsl_{chunk_index}", torch.from_numpy(qsl_np)
+            )
+            request_distribution = runner._upload_unless_unchanged(
+                f"draft_loop_reqdist_{chunk_index}",
+                torch.tensor([chunk.num_reqs] * 3, dtype=torch.int32),
+            )
+            return rejected_dev, query_start_loc, request_distribution
         query_start_loc = torch.from_numpy(qsl_np).to(runner.device)
         request_distribution = torch.tensor(
             [chunk.num_reqs] * 3, dtype=torch.int32, device=runner.device
@@ -1070,6 +1087,7 @@ class Eagle3Proposer:
         target_hidden_states: torch.Tensor,
         gather_indices: torch.Tensor,
         num_rejected: np.ndarray | torch.Tensor,
+        chunk_index: int | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1113,7 +1131,7 @@ class Eagle3Proposer:
         rows_ids, rows_positions, rows_hidden = self._draft_gather_rows(
             input_ids, positions, target_hidden_states, gather_indices
         )
-        loop_inputs = self._chunk_loop_inputs(chunk, num_rejected)
+        loop_inputs = self._chunk_loop_inputs(chunk, num_rejected, chunk_index)
         last_hidden, hidden = self._forward_draft(
             chunk=chunk,
             input_ids=rows_ids,
@@ -1735,6 +1753,7 @@ class Eagle3Proposer:
                     target_hidden_states=target_hidden_states,
                     gather_indices=safe_gather_indices,
                     num_rejected=num_rejected,
+                    chunk_index=ci,
                 )
                 if self._share_mtp_indices:
                     # Pass 2 wrote one top-k row per request, in order.

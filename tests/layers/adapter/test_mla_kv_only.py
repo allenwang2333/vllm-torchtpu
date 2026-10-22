@@ -341,14 +341,28 @@ def _packed_by_the_indexer_op(hidden, q_fp8, k, weights):
     return exc.value.args_[3]
 
 
+def _fake_qprep_op(q, c, s):
+    """Stands in for the TPU_INDEXER_QPREP_FUSED Pallas op, which only makes
+    q: the k rows under test take that branch's own k rope either way."""
+    del c, s
+    t, hd = q.shape
+    return (
+        torch.zeros(t, IDX_N_HEAD, hd // IDX_N_HEAD, dtype=torch.float8_e4m3fn),
+        torch.ones(t, IDX_N_HEAD, dtype=torch.float32),
+    )
+
+
+@pytest.mark.parametrize("qprep", [False, True], ids=["qprep_off", "qprep_fused"])
 @pytest.mark.parametrize("permuted", [False, True])
 @pytest.mark.parametrize("num_tokens", [16, 96])
 @pytest.mark.parametrize("scaling", [False, True], ids=["rope", "deepseek_scaling"])
-def test_indexer_k_packed_matches_the_indexer(permuted, num_tokens, scaling):
+def test_indexer_k_packed_matches_the_indexer(permuted, num_tokens, scaling, qprep):
     ind = _indexer()
     rope = _rope(scaling=scaling)
     if permuted:
         ind.permute_rope_to_half_split()
+    # TPU_INDEXER_QPREP_FUSED takes its own forward branch (permuted only).
+    ind._qprep_op = _fake_qprep_op if qprep else None
     hidden, positions = _inputs(num_tokens)
     gen = torch.Generator().manual_seed(5)
     qr = torch.randn(num_tokens, Q_LORA, generator=gen).bfloat16()
@@ -692,6 +706,40 @@ def test_write_caches_dcp_matches_the_writers(monkeypatch, rank_operand):
         kv_cache_mode="xla",
     )
     _assert_caches_equal(got, _golden(inp, dcp=True))
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_write_caches_dcp_forwards_the_k_write_compact_knob(monkeypatch, compact):
+    """TPU_INDEXER_K_WRITE_COMPACT reaches the indexer K writer as the indexer
+    op passes it (`compact=`)."""
+    from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
+    from vllm_torchtpu.kernels.mla import kv_cache_utils
+
+    monkeypatch.setattr(
+        kv_cache_utils,
+        "update_sparse_mla_kv_cache_dcp",
+        kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax,
+    )
+    seen = []
+
+    def scatter(cache_kv, *args, **kwargs):
+        seen.append(kwargs)
+        return cache_kv
+
+    monkeypatch.setattr(mla_op, "_cp_scatter_indexer_k", scatter)
+    inp = _write_inputs()
+    mtp_kv_only.write_caches_dcp(
+        *_ordered(inp),
+        None,
+        mla_kv_spec=_mla_specs(),
+        mesh=get_or_create_dcp_mesh(),
+        dcp_size=1,
+        interleave_size=8,
+        kv_cache_mode="xla",
+        k_write_compact=compact,
+    )
+    (kwargs,) = seen
+    assert kwargs["compact"] is compact
 
 
 def test_write_caches_matches_the_writers(monkeypatch):

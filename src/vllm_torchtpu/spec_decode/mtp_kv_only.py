@@ -282,6 +282,7 @@ def write_caches_dcp(
     dcp_size: int,
     interleave_size: int,
     kv_cache_mode: str | None,
+    k_write_compact: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Write one step's MLA latents and indexer-K rows into DCP position-
     sharded caches (global arrays: caches sharded over the DCP axis, rows and
@@ -290,7 +291,8 @@ def write_caches_dcp(
     The MLA half is the shard_map `sparse_mla_attention_dcp` runs around
     `update_sparse_mla_kv_cache_dcp`; the indexer half is the
     `_cp_scatter_indexer_k` call of `_streamidx_topk_dcp_impl`, with the same
-    writer / layout resolution. `rank_ids` is the TPU_DCP_RANK_OPERAND operand.
+    writer / layout resolution and `compact` (TPU_INDEXER_K_WRITE_COMPACT).
+    `rank_ids` is the TPU_DCP_RANK_OPERAND operand.
     """
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
         DCP_AXIS_NAME,
@@ -357,6 +359,7 @@ def write_caches_dcp(
         writer=writer,
         kv_layout=kv_layout,
         rank_ids=rank_ids,
+        compact=k_write_compact,
     )
     return nope, rope, idx_cache
 
@@ -463,6 +466,8 @@ class _KvOnlyWriteOp:
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
         )
+        # The indexer op's own K-writer knob (read at its build, as here).
+        k_write_compact = envs.TPU_INDEXER_K_WRITE_COMPACT
         name = mla_layer.layer_name.replace(".", "_")
 
         def _fake(nope, rope, idx_cache, *rest):
@@ -488,6 +493,7 @@ class _KvOnlyWriteOp:
                     dcp_size=dcp_size,
                     interleave_size=interleave,
                     kv_cache_mode=kv_cache_mode,
+                    k_write_compact=k_write_compact,
                 )
 
             # Fixed arity: torch custom-op schemas take no varargs.
