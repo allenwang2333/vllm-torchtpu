@@ -984,3 +984,145 @@ def test_parity_wide(world, wide, split, variant):
     assert close.mean() >= 0.999 and min(by_mb) >= 0.995 and np.abs(h_w - h_s).max() < 1.0, (
         float(close.mean()), by_mb, float(np.abs(h_w - h_s).max()))
     assert np.mean(np.isclose(kvf(kv_w), kvf(kv_s), atol=0.25, rtol=0.13)) > 0.999
+
+
+# ---------------------------------------------------------------------------------------------
+# dp step (MKConfig.dp = 4: DP4TP2 attention, EP8 MoE). d<n> serves the rows of w<n> (the same
+# sequences and forced routing rows) as 4 chips of n / 4 sequences each. The world's routed
+# experts, router, shared expert and pools are reused (the dp EP layout is the TP8 one; pool
+# pages are random bytes either way); only the per-core mixer weights (the four virtual ranks'
+# TP8 slices) and smalls rows are the dp's own.
+DP_CASES = {"d24": 96, "d32": 128, "d48": 192, "d64": 256}
+DPG = 4
+
+
+def _dp_cfg(b_all: int, e_slots: int = E_SLOTS) -> C.MKConfig:
+    bg = b_all // DPG
+    mb = min(WIDE_MB, -(-bg // 16) * 16)
+    return dataclasses.replace(_cfg(bg, e_slots, wide=True), mb_rows=mb, dp=DPG, dcp=1)
+
+
+def _dp_weights(world):
+    if getattr(world, "dp_w", None) is None:
+        c = _dp_cfg(128, world.e_slots)
+        shapes = C.weight_shapes(c, C.default_tiles(c))
+        w = dict(world.weights)
+        for i, k in enumerate(("lin_in", "lin_out", "att_in", "att_out")):
+            shape, dt = shapes[k]
+            w[k] = _filler(world.mesh, (R, *shape), dt, "bytes")(_key(17, i))
+        lay, s_width, shape, dt = world._smalls_spec
+        sm = world._smalls(lay, s_width, shape, dt)  # [R, L, 1, S]
+        w["smalls"] = _global(world.mesh, np.ascontiguousarray(
+            np.broadcast_to(sm[:, :, None], (R, L, DPG, 1, s_width))))
+        world.dp_w = w
+    return world.dp_w
+
+
+def _dp_inputs(world, case):
+    """Per-rank operands of dp case `case`: chip g serves sequences g * NSg .. (the rows of the
+    TP8 case w<n>, chip-major), its routing-bias rows at g * BW (BW: the chip's padded rows)."""
+    b_all = DP_CASES[case]
+    c = _dp_cfg(b_all, world.e_slots)
+    bg, nsg = c.B, c.NS
+    bw = c.n_mb * c.mb_rows
+    nv = c.NV
+    pos = np.zeros((R, bg), np.int32)
+    pt = np.zeros((R, nsg, MAXP), np.int32)
+    ck = np.zeros((R, 3, nv * nsg, T), np.int32)
+    ro = np.zeros((R, 3, nsg), np.int32)
+    hid = np.zeros((R, c.M, c.H), np.float32)
+    m_rb = -(-(DPG * bw) // 128) * 128
+    rb = np.full((L, m_rb, c.E), 1e-3, np.float32)
+    rb += np.arange(c.E, dtype=np.float32)[None, None, :] * 1e-6
+    rkey = CASE_RKEY.get("w" + case[1:]) or b_all
+    picks_all = world.routing[f"b{rkey}"][:L, :b_all]
+    for g in range(DPG):
+        for r in (2 * g, 2 * g + 1):
+            hid[r, :bg] = world.hidden_rows[g * bg:(g + 1) * bg]
+        for j in range(nsg):
+            s = g * nsg + j
+            n_ctx = int(world.ctx[s])
+            for r in (2 * g, 2 * g + 1):
+                pos[r, j * T:(j + 1) * T] = n_ctx + np.arange(T)
+                npg = -(-(n_ctx + T) // 128)
+                pt[r, j, :npg] = KV0 + (s % NSEQ_KV) * PSEQ + np.arange(npg)
+                for sub in range(3):
+                    for v in range(nv):
+                        # per chip: the TP8 checkpoint region holds 3 x NV x NSEQ_MAX / 4 slots
+                        ck[r, sub, v * nsg + j] = (
+                            CKPT0 + (((sub * nv + v) * (NSEQ_MAX // DPG) + j) * T) + np.arange(T))
+        picks = picks_all[:, g * bg:(g + 1) * bg]
+        for k in range(picks.shape[-1]):
+            np.put_along_axis(rb[:, g * bw:g * bw + bg], picks[:, :, k:k + 1].astype(np.int64),
+                              2.0 - 0.01 * k, axis=-1)
+    return c, (
+        _global(world.mesh, pos), _global(world.mesh, hid.reshape(R * c.M, c.H).astype(jnp.bfloat16)),
+        _global(world.mesh, pt), _global(world.mesh, ck), _global(world.mesh, ro),
+        _global(world.mesh, np.tile(rb, (R, 1, 1))),
+    )
+
+
+@pytest.mark.parametrize("case", _subset("MK_BENCH_DP_CASES", DP_CASES))
+@pytest.mark.parametrize("variant", _subset("MK_BENCH_VARIANTS", VARIANTS))
+def test_step_dp(world, case, variant):
+    from vllm_torchtpu.kernels.qwen35_megakernel import dp_step
+
+    skip, scopes, tile_over, patch = VARIANTS[variant]
+    t_build = time.time()
+    c, args = _dp_inputs(world, case)
+    tiles = C.default_tiles(c)
+    if tile_over:
+        tiles = dataclasses.replace(tiles, **tile_over)
+    saved = {}
+    for (m, name), v in (patch or {}).items():
+        obj = getattr(_THIS, m)
+        saved[(m, name)] = getattr(obj, name)
+        setattr(obj, name, v)
+    try:
+        fn, _ = dp_step.make_dp_step(world.mesh, c, tiles, forced_routing=True, skip=skip,
+                                     scopes=scopes)
+    finally:
+        for (m, name), v in saved.items():
+            setattr(getattr(_THIS, m), name, v)
+    fn = jax.jit(fn, donate_argnums=(3,))
+    w = _dp_weights(world)
+    pos, hid_in, pt, ck, ro, rb = args
+    pools = world.pools
+
+    def one(pools):
+        return fn(pos, hid_in, w, pools, pt, ck, ro, rb)
+
+    hid, pools = one(pools)
+    jax.block_until_ready(pools)
+    t_compile = time.time() - t_build
+    for _ in range(2):
+        hid, pools = one(pools)
+    jax.block_until_ready(pools)
+    single = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        hid, pools = one(pools)
+        jax.block_until_ready(pools)
+        single.append((time.perf_counter() - t0) * 1e3)
+    t0 = time.perf_counter()
+    for _ in range(N_STEPS):
+        hid, pools = one(pools)
+    jax.block_until_ready(pools)
+    loop_ms = (time.perf_counter() - t0) * 1e3 / N_STEPS
+    trace_dir = os.path.join(OUT, "trace", f"dp_{case}_{variant}")
+    jax.profiler.start_trace(trace_dir)
+    for _ in range(5):
+        hid, pools = one(pools)
+    jax.block_until_ready(pools)
+    jax.profiler.stop_trace()
+    world.pools = pools
+    h = np.stack(_local_rows(hid, c.B))
+    _record({
+        "label": "dp", "placement": world.placement, "case": case, "variant": variant,
+        "rows": DP_CASES[case], "rows_per_chip": c.B, "mb_rows": c.mb_rows,
+        "loop_ms": round(loop_ms, 4), "single_ms": [round(x, 4) for x in sorted(single)],
+        "n_steps": N_STEPS, "compile_s": round(t_compile, 1),
+        "hidden_finite": bool(np.isfinite(h).all()),
+        "cores_agree": bool(all(np.array_equal(h[2 * g], h[2 * g + 1]) for g in range(len(h) // 2))),
+        "tiles": dataclasses.asdict(tiles), "trace": trace_dir,
+    })
