@@ -921,7 +921,20 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         name=kernel_name(cfg),
         **({} if interpret is None else {"interpret": interpret}),
     )
-    outs = call(*[ops[n] for n in SMEM_IN + STAGED_IN + HBM_IN])
+    # The kernel DMAs every non-SMEM operand itself. The in_specs only type
+    # the refs; XLA's memory-space assignment reads the operand avals, and
+    # without the constraint it stages some (W_UV, the `act` block) into VMEM
+    # with a serial copy before the call (2.9 us at T=16 in the t6 twin).
+    # HBM pins them, as moe_tp_decode's hbm_operands / fp8_skinny's hbm_pin.
+    on_tpu = interpret is None and jax.default_backend() == "tpu"
+    pin = (
+        (lambda x: pltpu.with_memory_space_constraint(x, pltpu.HBM))
+        if on_tpu
+        else (lambda x: x)
+    )
+    outs = call(
+        *[ops[n] for n in SMEM_IN], *[pin(ops[n]) for n in STAGED_IN + HBM_IN]
+    )
     return dict(zip(OUTS, outs, strict=True))
 
 
