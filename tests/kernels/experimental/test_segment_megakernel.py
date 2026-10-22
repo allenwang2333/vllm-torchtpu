@@ -1039,6 +1039,21 @@ def _pf_timing(mesh, d, T, n_valid, seed, cfgs, Ms, args, pref_for, sh_specs):
         arms[f"{name}_S_self"] = (c, c, "none")
         arms[f"{name}_S_io"] = (dataclasses.replace(c, pf_use=False), c, "none")
         arms[f"{name}_I_hit"] = (ci, c, "hit")
+        if not c.qkv_blocked:
+            arms[f"{name}_S_qkvlast"] = (
+                dataclasses.replace(c, pf_qkv_first=False),
+                c,
+                "none",
+            )
+    # Rank skew in front of every call (served runs have it, the clock does
+    # not): ranks >= tp/2 run ~2 x 12 MB of extra matmul before each call.
+    skew = os.environ.get("SEGMK_PF_SKEW") == "1"
+    if skew:
+        for k in list(arms):
+            arms[k + "+skew"] = arms[k] + ("skew",)
+    keep = [x for x in os.environ.get("SEGMK_PF_ARMS", "").split(",") if x]
+    if keep:  # e.g. "A0_off,_L_layout+skew": keep arms whose name ends with one
+        arms = {k: v for k, v in arms.items() if any(k.endswith(x) for x in keep)}
     # The per-rank weights once, outside the timed programs.
     pr_keys = tuple(
         jax.eval_shape(
@@ -1058,10 +1073,12 @@ def _pf_timing(mesh, d, T, n_valid, seed, cfgs, Ms, args, pref_for, sh_specs):
         )
     )(args[0])
     fns = {}
-    for name, (cfg, pcfg, kind) in arms.items():
+    for name, arm in arms.items():
+        cfg, pcfg, kind = arm[:3]
+        skewed = len(arm) > 3
         for M in Ms:
 
-            def body(rank, dst, sh_, pref, prs, cfg=cfg, M=M):
+            def body(rank, dst, sh_, pref, prs, cfg=cfg, M=M, skewed=skewed):
                 pr = {k: v[0] for k, v in prs.items()}
                 pf = None if cfg is None else dict(cfg=cfg, pref=pref[0])
                 # Every operand built once, outside the loop (block_qkv is an
@@ -1070,8 +1087,21 @@ def _pf_timing(mesh, d, T, n_valid, seed, cfgs, Ms, args, pref_for, sh_specs):
                     d, T, n_valid, sh_, pr, rank[0], dst[0], pf=pf, ops_only=True
                 )
 
+                def heavy(x):
+                    w = pr["oproj_w"].astype(BF16)  # [o_in, H]
+                    for _ in range(2):
+                        y = jnp.dot(x, w.T, preferred_element_type=F32).astype(BF16)
+                        x = x + (jnp.dot(y, w, preferred_element_type=F32) * 0).astype(
+                            BF16
+                        )
+                    return x
+
                 def step(i, carry):
                     res_in, _ = lax.optimization_barrier((sh_["res"], carry))
+                    if skewed:
+                        res_in = lax.cond(
+                            rank[0][0] >= N_RANKS // 2, heavy, lambda x: x, res_in
+                        )
                     o = seg.segment_call(
                         kcfg, dict(ops, act=seg.pack_act(res_in, cfull, sfull))
                     )

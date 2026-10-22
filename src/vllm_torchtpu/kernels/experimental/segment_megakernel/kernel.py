@@ -120,6 +120,10 @@ class SegCfg:
     # behind the pool DMAs (the rest go into free expert slots after the
     # routed experts, under AR2): trades pool slots for hidden q_a/kv_a bytes.
     qkv_early: int = 0
+    # Self-predicted pool with the incumbent q_a/kv_a layout: issue q_a/kv_a
+    # before AR1's barrier, as the prefetch-off kernel does (it streams under
+    # the barrier's rank-skew wait), instead of behind the pool.
+    pf_qkv_first: bool = False
     # Test-only positive control: "stale_slot" fills pool slot p with the
     # expert predicted for slot p + 1 (the map still says p).
     pf_fault: str = ""
@@ -859,6 +863,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     wuv_copy.start()
     pf_in = pf and cfg.pf_src == "input"
     pf_self = pf and cfg.pf_src == "self"
+    qkv_first = pf_self and cfg.pf_qkv_first and not cfg.qkv_blocked
     if pf_in:  # the pool's expert ids, needed when the pool DMAs are issued
         pref_copy = pltpu.make_async_copy(r["pref"], r["pref_s"], r["pf_sem"].at[0])
         pref_copy.start()
@@ -906,14 +911,14 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         if pf_in:  # the pool first; q_a/kv_a behind it
             pref_copy.wait()
             issue_pool()
-        elif not pf:
+        elif not pf or qkv_first:
             for cp in qkv:
                 cp.start()
 
     def issue_pool():
         """The pool's DMAs, then the q_a/kv_a bytes due early behind them."""
         _issue_pool(cfg, r, slot_k)
-        if not cfg.qkv_blocked:
+        if not cfg.qkv_blocked and not qkv_first:
             for cp in pre["qkv"]:
                 cp.start()
 
@@ -1296,6 +1301,7 @@ def kernel_name(cfg: SegCfg) -> str:
     name = f"segment_megakernel_skip-T_{cfg.T}-m_{cfg.m}-nb_{cfg.nb}-e_{cfg.experts}"
     if cfg.prefetch:
         name += f"-pf_{cfg.e_pre}_{cfg.pf_src}_qe{cfg.qkv_early}"
+        name += "_qf" if cfg.pf_qkv_first else ""
         name += "" if cfg.pf_use else "-issueonly"
         name += "" if cfg.pf_issue else "-noissue"
     return name
