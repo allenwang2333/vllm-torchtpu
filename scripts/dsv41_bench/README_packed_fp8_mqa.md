@@ -38,26 +38,28 @@ candidate publication and logical top-k IDs. Ragged queries are grouped by
 request and restored to their original order. Score chunks use the existing
 512-MiB score-element budget. The route does not materialize the BF16 candidate
 K pool: it reads the original FP8 cache directly. Candidate IDs remain necessary.
-Candidate consumers now build a sorted page union for each group of at most six
-queries from the same request, using the existing SparseCore union implementation
-when supported. Only those physical pages issue HBM DMAs. Invalid/padded tasks
-issue no DMA, and the receive wait counts only the bytes actually requested.
-Scores use compact page positions; query-specific candidate masks and visible
-lengths are applied before top-k, then selections map back to original token IDs.
+Candidate consumers mark pages needed by each group of at most six queries from
+the same request. Page slots retain their original logical positions; unused
+pages are marked `-1`. Only valid pages issue HBM DMAs, and the receive wait counts
+only the bytes actually requested. Query-specific block masks broadcast over
+scores before top-k. There is no page-union compaction, per-token membership
+gather or top-k ID remapping.
 Candidate publishers still score the full visible context. The whole-batch
 short-context bypass and the existing all-blocks-fit identity are preserved.
 
 Read granularity remains a 128-token physical page: a smaller candidate block
-can bring other tokens on that page into the computation. Dispersed candidates
-whose union touches every page therefore still read every page. The arithmetic
-pipeline retains its unrolled 32768-key tiles, including padding in a partial
-tile. Sparse calls leave skipped K pages unwritten and allocate no zero buffer.
+can bring other tokens on that page into the computation. Candidates that touch
+every page still read every page. The arithmetic pipeline retains its unrolled
+32768-key tiles, including page holes and padding in a partial tile. Preserving
+logical page positions can compute more tiles than compacting selected pages;
+the change removes metadata overhead without changing the scorer. Sparse calls
+leave skipped K pages unwritten and allocate no zero buffer.
 QK and both head-reduction paths operate independently on each token column;
 invalid pages are masked to `-inf` before top-k or any cross-token operation.
 Their arbitrary values, including NaNs, cannot contribute to valid columns.
-Do not add a cross-token reduction before this mask. Compacting pages can change
-which head-reduction path a valid token uses; bitwise agreement with dense
-scoring has not been established. Hardware performance remains unmeasured.
+Do not add a cross-token reduction before this mask. Sparse pages can select a
+different head-reduction path; bitwise agreement with dense scoring has not been
+established. Hardware performance of the logical-page route remains unmeasured.
 
 To exercise the scorer, use a context exceeding `index_topk` compressed keys
 and a model maximum length beyond that threshold; the existing all-indices-fit
@@ -72,7 +74,7 @@ Torch wrapper's dispatch arguments. CPU routing tests replace the TPU scorer
 with a stand-in and are not numerical validation of the kernel. A local
 sim-pjrt compile passed for the complete JAX two-bank writer, native-page
 scorer, candidate-page preparation and SparseCore top-k path at P-state 7.
-Metadata tests compare page coverage, per-query masks and mapped top-k IDs with
+Metadata tests compare page coverage, per-query masks and logical top-k IDs with
 a token-level reference, including page holes, duplicates, empty candidates and
 blocks crossing physical page boundaries. DMA descriptor tests verify that
 three valid page tasks issue three HBM reads and wait for three pages, rather
@@ -141,7 +143,7 @@ call.
 | --- | --- |
 | `packed_fp8_cache.py` | Page placement, byte format, complete-page encoder and incremental writer |
 | `packed_fp8_mqa.py` | Public API, metadata preparation, per-query operations and DMA descriptors |
-| `packed_fp8_sparse.py` | Candidate page tasks, per-query masks and logical top-k mapping |
+| `packed_fp8_sparse.py` | Candidate page validity and per-query block masks |
 | `_packed_fp8_math.py` | Head permutation and BF16 products / FP32 head accumulation |
 | `_packed_fp8_pipeline.py` | Buffer allocation, fragment schedule and DMA ownership |
 | `tuned_block_sizes.py:PACKED_FP8_MQA_CONFIG` | Measured static policy |

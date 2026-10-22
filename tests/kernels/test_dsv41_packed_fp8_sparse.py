@@ -12,7 +12,6 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import (
     candidate_pages,
     mask_candidate_scores,
-    restore_candidate_indices,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -41,9 +40,8 @@ def test_sparse_tasks_match_token_level_candidate_reference(block_size):
         jnp.asarray(table),
         block_size=block_size,
         cache_pages=cache_pages,
-        topk=5,
     )
-    logical, physical, offsets, groups, compact_lengths = map(np.asarray, tasks)
+    physical, offsets, task_lengths, block_mask = map(np.asarray, tasks)
     allowed = np.zeros((rows, width), bool)
     for row in range(rows):
         for candidate in candidates[row]:
@@ -62,37 +60,29 @@ def test_sparse_tasks_match_token_level_candidate_reference(block_size):
             .reshape(11, 128)
             .any(axis=1)
         )
-        actual = logical[group][logical[group] >= 0]
+        actual = np.flatnonzero(physical[group] >= 0)
         np.testing.assert_array_equal(actual, expected)
         if start < end:
             assert np.all(requests[start:end] == requests[start])
             np.testing.assert_array_equal(
-                physical[group, : len(actual)], table[requests[start], actual]
+                physical[group, actual], table[requests[start], actual]
             )
-            np.testing.assert_array_equal(groups[start:end], group)
-            np.testing.assert_array_equal(
-                compact_lengths[start:end],
-                np.where(lengths[start:end] > 0, len(expected) * 128, 0),
-            )
-        assert np.all(physical[group, len(actual) :] == -1)
+        assert np.all(physical[group, 11:] == -1)
+    assert np.all((task_lengths == 0) | (task_lengths == lengths))
 
-    # Integer scores deliberately create ties: compact order must still resolve
-    # top-k ties by original logical token ID, including reordered physical pages.
-    scores = rng.integers(-3, 4, (rows, width)).astype(np.float32)
-    positions = (logical[groups, :, None] * 128 + np.arange(128)).reshape(rows, -1)
-    compact = np.take_along_axis(scores, np.clip(positions, 0, width - 1), axis=1)
+    # Model the scorer's page-hole mask; tied scores must retain logical ID order.
+    scores = rng.integers(-3, 4, (rows, physical.shape[1] * 128)).astype(np.float32)
+    for group, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        scores[start:end, np.repeat(physical[group] < 0, 128)] = -np.inf
     masked = mask_candidate_scores(
-        jnp.asarray(compact),
-        tasks,
-        jnp.asarray(candidates),
+        jnp.asarray(scores),
+        tasks.block_mask,
         jnp.asarray(lengths),
         block_size=block_size,
         width=width,
     )
     values, indices = jax.lax.top_k(masked, 5)
-    actual = restore_candidate_indices(
-        jnp.where(jnp.isfinite(values), indices, -1), tasks
-    )
+    actual = jnp.where(jnp.isfinite(values), indices, -1)
     expected = np.full((rows, 5), -1, np.int32)
     for row in range(rows):
         chosen = sorted(
@@ -111,7 +101,6 @@ def test_sparse_tasks_empty_candidates_produce_no_live_tiles(candidate_count):
         jnp.arange(8, dtype=jnp.int32)[None, :],
         block_size=8,
         cache_pages=8,
-        topk=512,
     )
     assert np.all(np.asarray(tasks.physical) == -1)
     assert np.all(np.asarray(tasks.lengths) == 0)

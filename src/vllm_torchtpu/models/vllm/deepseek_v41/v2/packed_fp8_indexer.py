@@ -26,7 +26,6 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_mqa import (
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_sparse import (
     candidate_pages,
     mask_candidate_scores,
-    restore_candidate_indices,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     PACKED_FP8_MQA_CONFIG,
@@ -257,7 +256,6 @@ def _score_and_select(
                 pages[:, : (width + PAGE_RECORDS - 1) // PAGE_RECORDS],
                 block_size=block_size,
                 cache_pages=layout.pages,
-                topk=min(topk, width),
             )
             scores = packed_fp8_mqa_logits(
                 quantized,
@@ -272,8 +270,7 @@ def _score_and_select(
             )
             scores = mask_candidate_scores(
                 scores,
-                tasks,
-                row_candidates,
+                tasks.block_mask,
                 row_lengths,
                 block_size=block_size,
                 width=width,
@@ -289,7 +286,7 @@ def _score_and_select(
                 unordered,
                 batch_max,
             )
-            return restore_candidate_indices(selected, tasks), row_candidates
+            return selected, row_candidates
 
         if candidate_filter and candidates.shape[1] * block_size < width:
             # Match upstream's whole-batch short-context bypass, including TP
