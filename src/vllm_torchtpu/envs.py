@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SEND_GROUP_ROWS: int = 0
     TPU_DCP_MLA_SEND_SMALL_A2A: bool = False
     TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS: int = 8
+    TPU_DCP_A2A_INKERNEL: bool = False
+    TPU_DCP_A2A_INKERNEL_MAX_TOKENS: int = 32
     TPU_MLA_FUSED_SMALL_A2A: bool = False
     TPU_MLA_FUSED_SMALL_A2A_VMEM_MIB: int = 16
     TPU_MLA_FUSED_SMALL_A2A_PIN_MIN_TOKENS: int = 8
@@ -650,6 +652,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS": env_int(
         "TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS", 8
     ),
+    # The DCP merge's exchange as one Pallas round of remote DMAs
+    # (small_collectives.all_to_all: each rank pushes every destination block
+    # straight into its peer's receive buffer) on the decode buckets ABOVE the
+    # small caps, up to TPU_DCP_A2A_INKERNEL_MAX_TOKENS tokens: the backbone's
+    # send-layout buckets TPU_DCP_MLA_SEND_SMALL_A2A_MAX_TOKENS < T <= cap
+    # (otherwise XLA's row-group ragged all-to-all, 15-20 us per layer at
+    # T = 16 / 32 on the 2x2x2 mirror) and the MTP drafter's sized-merge
+    # all-to-all buckets T <= cap (otherwise XLA's all_to_all). The small caps
+    # stay where they are, so TPU_MLA_FUSED_SMALL_A2A keeps its buckets. Same
+    # received bits on every row the unpack reads, same merge: the output is
+    # bitwise the flag-off path's. Needs the small all-to-all's preconditions
+    # (TPU_DCP_INDEXER_SMALL_AG, TPU_SC_TOPK_DCP_MERGE_FLAT,
+    # TPU_DCP_RANK_OPERAND); otherwise off.
+    "TPU_DCP_A2A_INKERNEL": env_bool("TPU_DCP_A2A_INKERNEL", default=False),
+    "TPU_DCP_A2A_INKERNEL_MAX_TOKENS": env_int("TPU_DCP_A2A_INKERNEL_MAX_TOKENS", 32),
     # On the buckets TPU_DCP_MLA_SEND_SMALL_A2A takes (T <= its cap, a power of
     # 2) whose attention grid is one step (decode body lever "step8"): the
     # decode MLA kernel runs that exchange itself -- barrier signalled at
