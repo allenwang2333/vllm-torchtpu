@@ -59,6 +59,7 @@ from vllm_torchtpu.megakernel.cache import (
 )
 from vllm_torchtpu.megakernel.errors import MegakernelLayoutError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.model_def import ModelDef, get_model
 from vllm_torchtpu.megakernel.models import qwen35
 from vllm_torchtpu.megakernel.ops import rup
 from vllm_torchtpu.megakernel.pool.config import CacheExec, with_cache
@@ -938,8 +939,12 @@ class MegakernelDriver:
     """
 
     _model_name: str = qwen35.QWEN35_MODEL_NAME
-    _expected_num_layers: int = 60
-    _total_routed_experts: int = 512
+    _expected_num_layers: int = get_model(_model_name).derive_geometry().L
+    _total_routed_experts: int = get_model(_model_name).derive_geometry().E
+
+    @classmethod
+    def _model_def(cls) -> type[ModelDef]:
+        return get_model(cls._model_name)
 
     def __init__(
         self,
@@ -1071,16 +1076,18 @@ class MegakernelDriver:
 
     def _build_spec(self, mode: str, r_cnt: int, geom: Any = None) -> Any:
         del r_cnt
+        model_def = self._model_def()
         if geom is None:
             e_slots = 0
             if mode == "ep":
                 w13_0 = get_routed_experts(self.backbone.layers[0].mlp).w13_weight
                 e_slots = int(w13_0.shape[0])
-            geom = qwen35.Qwen35Geometry(
+            geom = model_def.derive_geometry(
+                model_def.default_hf_config,
                 moe_tp=(mode == "tp"),
                 e_slots=0 if mode == "tp" else e_slots,
             )
-        return qwen35.qwen35_spec(geom)
+        return model_def.to_model_spec(geom)
 
     def _prepare_and_pack_weights(
         self,
@@ -1140,11 +1147,66 @@ class MegakernelDriver:
         return weights
 
     @classmethod
+    def _validate_runner_hf_config(cls, runner: Any) -> None:
+        model_cfg = getattr(runner, "model_config", None)
+        hf_cfg = (
+            getattr(model_cfg, "hf_config", None) if model_cfg is not None else None
+        )
+        if hf_cfg is None:
+            return
+        mdef = cls._model_def()
+        tc = (
+            hf_cfg.get("text_config")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "text_config", None)
+        )
+        root = tc if tc is not None else hf_cfg
+        has_geom = (
+            ("hidden_size" in root)
+            if isinstance(root, dict)
+            else (getattr(root, "hidden_size", None) is not None)
+        )
+        if has_geom:
+            g_hf = mdef.derive_geometry(hf_cfg)
+            g_def = mdef.derive_geometry(mdef.default_hf_config)
+            if g_hf != g_def:
+                raise MegakernelConfigError(
+                    f"{mdef.__name__} checkpoint geometry {g_hf} does not match "
+                    f"expected geometry {g_def}"
+                )
+            return
+        archs = (
+            hf_cfg.get("architectures")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "architectures", None)
+        ) or ()
+        mtype = (
+            hf_cfg.get("model_type")
+            if isinstance(hf_cfg, dict)
+            else getattr(hf_cfg, "model_type", None)
+        )
+        raw_e = (
+            root.get("num_experts")
+            if isinstance(root, dict)
+            else getattr(root, "num_experts", None)
+        )
+        if (raw_e is not None and int(raw_e) <= 0) or (
+            ("Qwen3_5ForConditionalGeneration" in archs or mtype == "qwen3_5")
+            and "Qwen3_5MoeForConditionalGeneration" not in archs
+            and mtype != "qwen3_5_moe"
+            and not raw_e
+        ):
+            raise MegakernelConfigError(
+                f"{mdef.__name__} supports MoE checkpoints only"
+            )
+
+    @classmethod
     def maybe_create(cls, runner: Any) -> MegakernelDriver | None:
         """Create a `MegakernelDriver` for `runner` if enabled and compatible."""
         cfg = parse_megakernel_config(runner=runner)
         if not cfg["enabled"]:
             return None
+        cls._validate_runner_hf_config(runner)
         try:
             backbone = find_backbone(runner.model)
         except ValueError:
@@ -2465,15 +2527,20 @@ class MegakernelDriver:
 class Qwen35Megakernel(MegakernelDriver):
     """Qwen3.5 (`Qwen3_5MoeForConditionalGeneration`) megakernel driver."""
 
-    _expected_num_layers = 60
-    _total_routed_experts = 512
+    _model_name = qwen35.QWEN35_MODEL_NAME
+    _expected_num_layers = get_model(_model_name).derive_geometry().L
+    _total_routed_experts = get_model(_model_name).derive_geometry().E
+    _runtime_registry_keys = (
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "qwen3_5_moe",
+        "qwen3_5",
+    )
 
 
 _MODEL_DRIVER_REGISTRY: dict[str, Callable[[Any], Any]] = {
-    "Qwen3_5MoeForConditionalGeneration": Qwen35Megakernel.maybe_create,
-    "Qwen3_5ForConditionalGeneration": Qwen35Megakernel.maybe_create,
-    "qwen3_5_moe": Qwen35Megakernel.maybe_create,
-    "qwen3_5": Qwen35Megakernel.maybe_create,
+    key: Qwen35Megakernel.maybe_create
+    for key in Qwen35Megakernel._runtime_registry_keys
 }
 
 
