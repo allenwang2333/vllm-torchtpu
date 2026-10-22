@@ -185,8 +185,10 @@ def _select_mrope_positions(
 def _enable_in_graph_rope(self: RotaryEmbeddingBase, base_cls: type) -> None:
     """After upstream init: switch the instance to in-graph cos/sin if asked."""
     self._tpu_rope_in_graph = False
+    if not envs.TPU_ROPE_IN_GRAPH:
+        return
     cache = getattr(self, "cos_sin_cache", None)
-    if not envs.TPU_ROPE_IN_GRAPH or not isinstance(cache, torch.Tensor):
+    if not isinstance(cache, torch.Tensor):
         return
     if not _instance_in_graph_eligible(self, base_cls):
         logger.warning_once(
