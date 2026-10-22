@@ -15,15 +15,18 @@ no row has a near-tie in its top-k and every row is compared.
     dims. That checks the DMA / semaphore / all-reduce protocols, the operand
     layouts and the arithmetic -- not Mosaic lowering, VMEM limits or timing.
     Positive controls (a misaligned o_proj scale, swapped norm weights, a wrong
-    KV destination, the next layer's weights in the wrong slot) must fail it.
+    KV destination, the next layer's weights in the wrong slot, W_UV's heads
+    rotated) must fail it.
   * TPU 2x2x2 (16 cores, 2 hosts), full GLM-5.2 TP16 x DCP8 dims:
         python3 test_segment_megakernel.py --tpu
     under jax.distributed (simple-run-command-2node exports COORD / NPROC /
     JOBSET_JOB_INDEX). Runs the kernel AND the incumbent composition of the
-    production ops it replaces (the `_merge_received` merge, the fp8_skinny
-    o_proj, the small all-reduce, fused_add_rmsnorm.reference, the router dot,
-    moe_tp_decode, xla_quantized_matmul, the bf16 NeoX rope, quantize_kv,
-    pack_write_rows) on decode buckets b1/b2/b4/b8 (T = 4/8/16/32) and a
+    production ops it replaces (the backend's bf16 W_UV bmm after the merge,
+    the fused fp8 o_proj + all-reduce kernel at <= 16 rows / fp8_skinny + the
+    small valid-rows all-reduce at 32, fused_add_rmsnorm.reference, the router
+    dot, moe_tp_decode on its fast schedule, xla_quantized_matmul, the bf16
+    NeoX rope, quantize_kv, pack_write_rows) on decode buckets b1/b2/b4/b8
+    (T = 4/8/16/32) and a
     padded b3, compiled without excess precision as torch_tpu compiles the
     served model, judged by the campaign's rule: tol = max(1.5 x the incumbent's
     error, floor) per metric; the kernel passes if under tol everywhere.
@@ -131,7 +134,7 @@ TOL_FLOOR = dict(res_delta=2e-3, q_c=2e-3, kv_nope=2e-3, kv_rope=2e-3)
 # (j-679e2b07); a fault moves a metric by O(0.3) or more.
 CPU_TOL = dict(res_delta=0.12, q_c=0.12, kv_nope=0.12, kv_rope=0.12)
 METRICS = tuple(TOL_FLOOR)
-FAULTS = ("oproj_scale_roll", "norms_swapped", "wrong_dst", "wrong_qkv")
+FAULTS = ("oproj_scale_roll", "norms_swapped", "wrong_dst", "wrong_qkv", "wuv_heads_roll")
 
 
 def _tpu7x():
@@ -141,26 +144,6 @@ def _tpu7x():
 # =====================================================================================
 # Inputs, generated per rank on device
 # =====================================================================================
-def _pack_entry(o, lse, real, vdim):
-    """The packed real-rows receive buffer (cp_mla_attention._all_to_all_packed,
-    real_tokens path): o bf16 [S, T, h, V], lse f32 [S, T, h] -> int16
-    [S, extra + T*h, V]: lse high halves, low halves, zero pad, then the
-    partial rows; rows past the real tokens' are zero."""
-    S, T, h, V = o.shape
-    rows = T * h
-    extra = -(-2 * rows // vdim)
-    bits = lax.bitcast_convert_type(lse.reshape(S, rows), I32)
-    hi = (bits >> 16).astype(jnp.int16)
-    lo = (((bits & 0xFFFF) ^ 0x8000) - 0x8000).astype(jnp.int16)
-    words = jnp.pad(
-        jnp.concatenate([hi, lo], axis=1), ((0, 0), (0, extra * V - 2 * rows))
-    )
-    ow = lax.bitcast_convert_type(o.reshape(S, rows, V), jnp.int16)
-    live = jnp.arange(rows)[None, :, None] < real * h
-    ow = jnp.where(live, ow, jnp.int16(0))
-    return jnp.concatenate([words.reshape(S, extra, V), ow], axis=1)
-
-
 def _rank_key(seed, rank):
     return jax.random.fold_in(jax.random.PRNGKey(seed), rank)
 
@@ -178,18 +161,13 @@ def _per_rank_inputs(d: Dims, T: int, n_valid: int, seed: int, rank):
         keys = jax.random.split(key, shape[0])
         return lax.map(lambda k: jax.random.normal(k, shape[1:], F32).astype(F8), keys)
 
-    o = jax.random.normal(next(ks), (DCP, T, d.heads_rank, d.v_head), F32)
-    lse = jax.random.normal(next(ks), (DCP, T, d.heads_rank), F32) * 2.0
-    # Ranks owning none of a row's positions: -inf lse and a NaN partial
-    # (the attention kernel ran on a dummy key there); source 0 always owns.
-    unowned = jax.random.uniform(next(ks), (DCP, T, d.heads_rank)) < 0.25
-    unowned = unowned & (jnp.arange(DCP) > 0)[:, None, None]
-    lse = jnp.where(unowned, -jnp.inf, lse)
-    o = jnp.where(unowned[..., None], jnp.nan, o).astype(BF16)
+    # The merged DCP attention output (latent, a convex mix of KV rows) and
+    # this rank's heads of W_UV, bf16 as the backend keeps them.
+    lat = jax.random.normal(next(ks), (T, d.heads_rank, d.kv_lora), F32)
+    wuv = jax.random.normal(next(ks), (d.heads_rank, d.kv_lora, d.v_head), F32)
     return dict(
-        o=o,
-        lse=lse,
-        a2a=_pack_entry(o, lse, n_valid, d.v_head),
+        lat=lat.astype(BF16),
+        wuv=(wuv / np.sqrt(d.kv_lora)).astype(BF16),
         oproj_w=fp8(next(ks), (o_in, H)),
         oproj_s=jax.random.uniform(next(ks), (H,), F32, 0.5, 1.5)
         * (0.25 / (4 * np.sqrt(o_in))),
@@ -259,7 +237,10 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
     g_post, g_in = sh["g_post"], sh["g_in"]
     oproj_s = pr["oproj_s"]
     qkv_w, qkv_s = sh["qkv_w"], sh["qkv_s"]
-    if fault == "oproj_scale_roll":
+    wuv = pr["wuv"]
+    if fault == "wuv_heads_roll":
+        wuv = jnp.roll(wuv, 1, axis=0)
+    elif fault == "oproj_scale_roll":
         oproj_s = jnp.roll(oproj_s, 1)
     elif fault == "norms_swapped":
         g_post, g_in = g_in, g_post
@@ -285,8 +266,9 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
     decoy = jnp.flip(row) + 1.0
     ops = dict(
         meta=seg.pack_meta(n_valid, rank[0], 1, dst_rows),
-        a2a=pr["a2a"],
+        lat=pr["lat"].reshape(T, -1),
         act=seg.pack_act(sh["res"], cfull, sfull),
+        wuv=wuv,
         oproj_w=pr["oproj_w"],
         gate=sh["gate"],
         w13=pr["w13"],
@@ -320,16 +302,12 @@ def _reference_device(d, T, n_valid, sh, pr, rank):
     """The segment in f32 at HIGHEST precision: no activation quantization,
     dequantized weights, the exact routing (planted, so unambiguous)."""
     dot = functools.partial(jnp.dot, precision=HI, preferred_element_type=F32)
-    o = jnp.where(jnp.isnan(pr["o"].astype(F32)), 0.0, pr["o"].astype(F32))
-    real = (jnp.arange(T) < n_valid)[None, :, None, None]
-    o = jnp.where(real, o, 0.0)
-    lse = pr["lse"]
-    fin = jnp.isfinite(lse)
-    m = jnp.max(jnp.where(fin, lse, -jnp.inf), axis=0)
-    m = jnp.where(jnp.isfinite(m), m, 0.0)
-    w = jnp.where(fin, jnp.exp(lse - m[None]), 0.0)
-    w = w / jnp.where(w.sum(0) > 0, w.sum(0), 1.0)[None]
-    attn = jnp.sum(o * w[..., None], axis=0).reshape(T, -1)
+    attn = jnp.einsum(
+        "thk,hkv->thv",
+        pr["lat"].astype(F32),
+        pr["wuv"].astype(F32),
+        precision=HI,
+    ).reshape(T, -1)
     y = dot(attn, pr["oproj_w"].astype(F32)) * pr["oproj_s"][None]
     attn_sum = lax.psum(y, AXIS)
     s1 = attn_sum + sh["res"].astype(F32)
@@ -375,57 +353,47 @@ def _incumbent_device(d, T, n_valid, sh, pr, rank, dst_rows):
         all_reduce as small_ar,
     )
     from vllm_torchtpu.kernels.mla.sparse import native_sc_gather
-    from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+    from vllm_torchtpu.kernels.quantized_matmul import fp8_oproj_all_reduce, fp8_skinny
     from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
     H = d.hidden
-    # cp_mla_attention._all_to_all_packed receive side + _merge_received, .to(bf16)
-    recv = pr["a2a"]
-    rows = T * d.heads_rank
-    extra = -(-2 * rows // d.v_head)
-    o_recv = lax.bitcast_convert_type(recv[:, extra:], BF16).reshape(
-        DCP, T, d.heads_rank, -1
-    )
-    lw = recv[:, :extra].reshape(DCP, -1)
-    hi = lw[:, :rows].astype(I32)
-    lo = lw[:, rows : 2 * rows].astype(I32)
-    l_recv = lax.bitcast_convert_type((hi << 16) | (lo & 0xFFFF), F32).reshape(
-        DCP, T, -1
-    )
-    fin = jnp.isfinite(l_recv)
-    shift = jnp.max(jnp.where(fin, l_recv, -jnp.inf), axis=0)
-    shift = jnp.where(jnp.isfinite(shift), shift, 0.0)
-    w = jnp.where(fin, jnp.exp(l_recv - shift[None]), 0.0)
-    w = w / jnp.where(w.sum(0) > 0, w.sum(0), 1.0)
-    of = o_recv.astype(F32)
-    of = jnp.where(jnp.isnan(of), 0.0, of)
-    w_hi = w.astype(BF16).astype(F32)
-    w_lo = w - w_hi
-    attn = (jnp.sum(of * w_hi[..., None], 0) + jnp.sum(of * w_lo[..., None], 0)).astype(
-        BF16
-    )
-    attn = attn.reshape(T, -1)
-    # o_proj: linear_common._fp8_linear_pallas
+    # The backend after the merge: torch.bmm(outputs_t, W_UV) in bf16 (f32
+    # accumulation, the output rounded to bf16), heads back to [T, h * v].
+    lat_t = jnp.transpose(pr["lat"], (1, 0, 2))  # [h, T, kv]
+    attn = lax.dot_general(
+        lat_t, pr["wuv"], (((2,), (1,)), ((0,), (0,)))
+    )  # bf16 [h, T, v]
+    assert attn.dtype == BF16
+    attn = jnp.transpose(attn, (1, 0, 2)).reshape(T, -1)
     w_o, s_o = pr["oproj_w"], pr["oproj_s"]
-    if fp8_skinny.supports(T, w_o, s_o):
-        y = fp8_skinny.fp8_skinny_matmul(
-            attn,
-            w_o,
-            s_o,
-            n_logical=H,
-            scale_dma=fp8_skinny.scale_dma_applies(*w_o.shape),
+    if fp8_oproj_all_reduce.supports(T, w_o.shape[0], w_o.shape[1], N_RANKS):
+        # TPU_FUSED_OPROJ_AR: small_all_reduce_op.row_parallel_or
+        attn_sum = fp8_oproj_all_reduce.fp8_matmul_all_reduce(
+            attn, w_o, s_o, rank, num_cores=N_RANKS, axis=AXIS
         )
     else:
-        y = xla_quantized_matmul(attn, w_o, s_o)
-    # small_all_reduce_op._small_all_reduce
-    tile_rows = int(pltpu.get_tpu_info().get_sublane_tiling(BF16))
-    nv = jnp.full((1,), n_valid, I32)
-    if small_ar.fold_geometry(T, H, N_RANKS, tile_rows) is not None:
-        attn_sum = small_ar.small_all_reduce_valid_rows(
-            y, nv, rank, num_cores=N_RANKS, axis=AXIS, tile_rows=tile_rows
-        )
-    else:
-        attn_sum = small_ar.small_all_reduce(y, num_cores=N_RANKS, axis=AXIS, rank=rank)
+        # o_proj: linear_common._fp8_linear_pallas
+        if fp8_skinny.supports(T, w_o, s_o):
+            y = fp8_skinny.fp8_skinny_matmul(
+                attn,
+                w_o,
+                s_o,
+                n_logical=H,
+                scale_dma=fp8_skinny.scale_dma_applies(*w_o.shape),
+            )
+        else:
+            y = xla_quantized_matmul(attn, w_o, s_o)
+        # small_all_reduce_op._small_all_reduce
+        tile_rows = int(pltpu.get_tpu_info().get_sublane_tiling(BF16))
+        nv = jnp.full((1,), n_valid, I32)
+        if small_ar.fold_geometry(T, H, N_RANKS, tile_rows) is not None:
+            attn_sum = small_ar.small_all_reduce_valid_rows(
+                y, nv, rank, num_cores=N_RANKS, axis=AXIS, tile_rows=tile_rows
+            )
+        else:
+            attn_sum = small_ar.small_all_reduce(
+                y, num_cores=N_RANKS, axis=AXIS, rank=rank
+            )
     h, res1 = fused_add_rmsnorm.reference(attn_sum, sh["res"], sh["g_post"], d.eps)
     scores = _production_scores(h, sh["gate"])
     m = max(moe_kernel.ROW_BUCKETS[0], T)
@@ -447,6 +415,7 @@ def _incumbent_device(d, T, n_valid, sh, pr, rank, dst_rows):
         routed_scale=d.routed_scale,
         topk=d.topk,
         n_ranks=N_RANKS,
+        fast=True,  # TPU_MOE_TP_DECODE_FAST (the same bits as the plain schedule)
     )[:T]
     h2, res2 = fused_add_rmsnorm.reference(moe, res1, sh["g_in"], d.eps)
     width = d.qkv_width
