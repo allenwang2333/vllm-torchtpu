@@ -191,7 +191,11 @@ def fixture(requests, queries, width, seed):
 
 def compile_arm(modules, variant, mode, requests, queries, width, out):
     baseline, candidate = modules
-    if variant in ("packed_fp8_full_scores", "packed_fp8_separate_selection"):
+    if variant in (
+        "packed_fp8_full_scores",
+        "packed_fp8_separate_selection",
+        "packed_fp8_unsplit",
+    ):
         candidate = baseline
     write, filtering = mode == "publish", mode == "filter"
 
@@ -326,6 +330,8 @@ def profile_rows(path, expected):
                     dict(
                         name=e["name"],
                         duration_us=int(e["args"]["device_duration_ps"]) / 1e6,
+                        trace_start_us=e["ts"],
+                        trace_duration_us=e["dur"],
                     )
                     for e in enclosed
                     if "device_duration_ps" in e["args"]
@@ -354,6 +360,7 @@ def validate_outputs(outputs, lengths, candidates, filtering):
         "packed_fp8_scatter",
         "packed_fp8_full_scores",
         "packed_fp8_separate_selection",
+        "packed_fp8_unsplit",
     ):
         if baseline in outputs:
             for before, after in zip(outputs[baseline], outputs["packed_fp8"]):
@@ -456,14 +463,24 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--compare-cache-writers", action="store_true")
     parser.add_argument("--sparse-baseline", type=Path)
+    parser.add_argument("--query-chunks", type=int, default=1)
     args = parser.parse_args()
     modules = load_model()
     if args.sparse_baseline is not None:
         modules = (load_sparse_baseline(args.sparse_baseline), modules[1])
+    if args.query_chunks > 1:
+        from _split_indexer_queries import split_score_and_select
+
+        assert args.sparse_baseline is not None
+        modules[1]._score_and_select = split_score_and_select(
+            modules[1]._score_and_select, args.query_chunks
+        )
     for directory in ("benchmark", "compiler", "profiling"):
         (args.out / directory).mkdir(parents=True, exist_ok=True)
     variants = (
-        "packed_fp8_full_scores"
+        "packed_fp8_unsplit"
+        if args.query_chunks > 1
+        else "packed_fp8_full_scores"
         if args.sparse_baseline is not None
         else "packed_fp8_scatter"
         if args.compare_cache_writers
