@@ -6,17 +6,19 @@ GLM-5.2 (DeepSeek-V3.2 MLA + MoE) at TP16 x DCP8, decode token buckets of at
 most 32 rows. One call covers the tail of MoE layer N and the head of the
 following skip layer N+1 (a layer with no indexer, reusing the shared top-k):
 
-  entry: layer N's DCP LSE-merge all-to-all receive buffer, int16
-         [dcp, 1 + 4T, v_head] (the TPU_DCP_LSE_MERGE_A2A_PACK +
-         _REAL_ROWS layout: row 0 the lse words, rows 1.. the bf16 partials)
-   -> online LSE merge with the -inf / NaN guards of `_merge_received`
-   -> o_proj, fp8_skinny numerics (4 column tiles through 2 VMEM slots)
+  entry: layer N's merged DCP attention output in latent space, bf16
+         [T, heads * kv_lora] (what the send-layout / fused small all-to-all
+         MLA ops return after their LSE merge, W_UV not yet applied)
+   -> W_UV per head, as the backend's torch.bmm: bf16 x bf16, f32
+      accumulation, one rounding to bf16
+   -> o_proj, fp8_skinny numerics (4 column tiles through 2 VMEM slots; the
+      fused o_proj + all-reduce kernel's numerics too)
    -> AR1: attention TP all-reduce (moe_tp_decode's in-kernel all-reduce)
    -> post_attention_layernorm (fused add, `fused_add_rmsnorm.reference`)
    -> router as GateLinear: bf16 x bf16 -> bf16 logits, f32 sigmoid;
       top-k as argmax-and-mask
-   -> moe_tp_decode's body: compaction, ring of `nb` expert slots, shared
-      expert, combine
+   -> moe_tp_decode's body with its numerics: per-row fp8 x over the full
+      K, compaction, ring of `nb` expert slots, its shared expert, combine
    -> AR2: FFN all-reduce (own scratch; the barrier AR1 waited covers it)
    -> input_layernorm of N+1 (fused add) -> residual exit
    -> fused q_a/kv_a (xla_quantized_matmul numerics, weight padded to a lane
@@ -34,10 +36,14 @@ Ported from the segment-megakernel campaign's rung 2b for skip boundaries
 rung 2, md5 daa29cb4, plus the L3 MXU expert-id compaction, WHITEBOARD.v6 md5
 94d747cd; measured -7.7/-8.5/-6.8/-9.0/-3.8 us per skip boundary at
 decode_first/decode_last/b2/b4/b8 against the incumbent, j-b722fa4c), skip
-exit only, without the diagnostic arms and fault switches. Code reused from
-this package's siblings:
-  moe_tp_decode/kernel.py: `_route` constants, `_shared_expert`,
-    `_quantize_blocks`, `_combine`, the expert body;
+exit only, without the diagnostic arms and fault switches; then carried onto
+the trial-6 stack (kernel_work/decode-mk/port-t6/opmap.md): the entry moved
+from the packed merge receive buffer to the merged latent + W_UV (that stack
+merges in latent space, inside its MLA kernel at b1), and the MoE body takes
+moe_tp_decode's per-row full-K quantization and f32 expert arithmetic. Code
+reused from this package's siblings:
+  moe_tp_decode/kernel.py: `_route` constants, `_shared_expert`, `_combine`,
+    the routed expert body (gate_up / finish);
   moe_tp_decode/all_reduce.py: prologue / exchange / fold pieces;
   quantized_matmul/fp8_skinny.py:126-148: activation quant + bf16 x fp8 dot;
   quantized_matmul/util.py quantize_block; fused_add_rmsnorm.py reference.
@@ -79,7 +85,7 @@ class SegCfg:
     T: int  # token bucket: rows of every exit
     hidden: int = 6144
     tp: int = 16  # ranks of the in-kernel all-reduces
-    dcp: int = 8  # DCP group size: partials merged at entry
+    dcp: int = 8  # DCP group size (the KV write's owner ranks)
     heads_rank: int = 4  # attention heads per rank after the merge
     v_head: int = 256
     q_lora: int = 2048
@@ -106,10 +112,6 @@ class SegCfg:
         return -(-self.experts // LANES) * LANES
 
     @property
-    def R4(self) -> int:  # merge rows (t, h)
-        return self.T * self.heads_rank
-
-    @property
     def o_in(self) -> int:
         return self.heads_rank * self.v_head
 
@@ -118,8 +120,8 @@ class SegCfg:
         return -(-self.T // KV_TOKEN_ROUND) * KV_TOKEN_ROUND
 
     @property
-    def a2a_rows(self) -> int:  # entry rows per source: lse words + partials
-        return -(-2 * self.R4 // self.v_head) + self.R4
+    def lat_w(self) -> int:  # entry width: every head's latent
+        return self.heads_rank * self.kv_lora
 
     def fields(self) -> tuple[tuple[str, int, int], ...]:
         """(name, offset, width) of each small f32 constant in one row of the
@@ -157,8 +159,8 @@ def supported(cfg: SegCfg) -> str | None:
     """None if the kernel serves `cfg`, else the reason it does not."""
     if cfg.T not in TOKEN_BUCKETS:
         return f"token bucket {cfg.T} not in {TOKEN_BUCKETS}"
-    if cfg.a2a_rows != 1 + cfg.R4:
-        return "the merge entry expects one lse row per source (2 * 4T <= v_head)"
+    if cfg.v_head % LANES:
+        return "W_UV's output width is not a lane multiple"
     if cfg.e_pad != cfg.experts:
         return "the router gate must hold a lane multiple of experts"
     if (
@@ -433,8 +435,9 @@ META_DST = 8
 # and at T = 4 those copies ran serially in front of the call (j-7694e3a5,
 # 16 of them, 12.7 us): so the per-step inputs come as two operands and the
 # per-layer constants as rows of all-layer stacks too large to be placed.
-STAGED_IN = ("a2a", "act")  # act = [res (T rows); cfull (m); sfull (m)], width H
+STAGED_IN = ("lat", "act")  # act = [res (T rows); cfull (m); sfull (m)], width H
 HBM_IN = (
+    "wuv",  # bf16 [heads, kv_lora, v_head]: layer N's W_UV
     "oproj_w",
     "gate",
     "w13",
@@ -465,9 +468,9 @@ def scratch_table(cfg: SegCfg):
     """[(name, shape-object)] in kernel order, and the all-reduce spec."""
     H, m, T = cfg.hidden, cfg.m, cfg.T
     nb, ic = cfg.nb, cfg.moe_i
-    lanes = pltpu.get_tpu_info().num_lanes
     spec = MAR.make_spec(cfg.tp, m, H)
     sc = [
+        ("wuv_v", pltpu.VMEM((cfg.heads_rank, cfg.kv_lora, cfg.v_head), BF16)),
         ("o_tiles", pltpu.VMEM((cfg.o_slots, cfg.o_in, cfg.o_tile), F8)),
         ("gate_v", pltpu.VMEM((cfg.e_pad, H), BF16)),
         ("sw13_v", pltpu.VMEM((H, 2 * cfg.shared_i), F8)),
@@ -485,7 +488,7 @@ def scratch_table(cfg: SegCfg):
         ("h_v", pltpu.VMEM((m, H), BF16)),
         ("sxq", pltpu.VMEM((m, H), F8)),
         ("xq", pltpu.VMEM((m, H), F8)),
-        ("xs", pltpu.VMEM((H // MK._Q_BLOCK, m, lanes), BF16)),
+        ("xs", pltpu.VMEM((m, 2 * ic), F32)),
         ("owner", pltpu.VMEM((m, H), F32)),
         ("shared", pltpu.VMEM((m, H), F32)),
         ("wtab", pltpu.VMEM((m, cfg.e_pad), F32)),
@@ -499,7 +502,7 @@ def scratch_table(cfg: SegCfg):
         ("qc_m", pltpu.VMEM((m, cfg.q_lora), BF16)),
         ("qc_x", pltpu.VMEM((T, cfg.q_lora), BF16)),
         ("kvp_x", pltpu.VMEM((3 * cfg.tok_rows, LANES), U32)),
-        ("in_sem", pltpu.SemaphoreType.DMA((len(STAGED_IN),))),
+        ("in_sem", pltpu.SemaphoreType.DMA((len(STAGED_IN) + 1,))),  # + W_UV
         ("vec_sem", pltpu.SemaphoreType.DMA((len(VEC_FIELDS),))),
         ("o_sem", pltpu.SemaphoreType.DMA((cfg.o_slots,))),
         ("w_sem", pltpu.SemaphoreType.DMA((1 + cfg.qkv_chunks,))),  # gate, qkv
@@ -564,8 +567,12 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         return r["fstack"].at[slot_k, :, pl.ds(off, w)]
 
     # ---- 1. barrier signals for BOTH in-kernel all-reduces (one prologue;
-    #         AR2 skips its wait)
+    #         AR2 skips its wait); W_UV, the first weight the call reads
     MAR.prologue(spec)
+    wuv_copy = pltpu.make_async_copy(
+        r["wuv"], r["wuv_v"], r["in_sem"].at[len(STAGED_IN)]
+    )
+    wuv_copy.start()
 
     # ---- 2. o_proj weight stream: tiles 0..o_slots-1 + its scale
     n_ot = H // cfg.o_tile
@@ -608,13 +615,14 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
             qkv.append(cp)
         pre.update(gate=gate, shared=shared, qkv=qkv)
 
-    # ---- 3. entry: online LSE merge with guards -> attn [T, o_in] bf16
+    # ---- 3. entry: W_UV of the merged latent -> attn [T, o_in] bf16
     staged = {}
     for i, n in enumerate(STAGED_IN):
         staged[n] = pltpu.make_async_copy(r[f"in_{n}"], r[n], r["in_sem"].at[i])
         staged[n].start()
-    staged["a2a"].wait()
-    attn = _entry_merge(cfg, r)
+    staged["lat"].wait()
+    wuv_copy.wait()
+    attn = _entry_wuv(cfg, r)
 
     # ---- 4. o_proj (fp8_skinny numerics), tile ring; prefetch issued after the
     #         last tile
@@ -694,48 +702,46 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
             for c in transfers(jnp.int32(s_)):
                 c.start()
 
-    # ---- 8c. shared expert + x quant
+    # ---- 8c. x quant + shared expert, as moe_tp_decode's kernel: x per row
+    #          over the full K (multiply by the inverse, no clip) for the
+    #          routed experts; its `_shared_expert` (true division + clip)
+    ic = cfg.moe_i
+    r["owner"][...] = jnp.zeros((m, H), F32)
+    x = r["h_v"][...].astype(F32)
+    xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / FP8_MAX
+    r["xq"][...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(F8)
+    r["xs"][...] = jnp.broadcast_to(xsc, (m, 2 * ic))
     for c in pre["shared"]:
         c.wait()
     vec["ss13"].wait()
     vec["ss2"].wait()
-    x_bf = r["h_v"][...]
-    r["owner"][...] = jnp.zeros((m, H), F32)
-    sxq, sxs = quantize_block(x_bf, axis=1, target_dtype=F8)
-    r["sxq"][...] = sxq
     MK._shared_expert(
-        r["sxq"], sxs, r["sw13_v"], r["ss13_v"], r["sw2_v"], r["ss2_v"], r["shared"]
+        r["h_v"],
+        r["sxq"],
+        r["sw13_v"],
+        r["ss13_v"],
+        r["sw2_v"],
+        r["ss2_v"],
+        r["shared"],
     )
-    MK._quantize_blocks(x_bf, r["xq"], r["xs"])
 
-    # ---- 8d. routed experts (ring)
+    # ---- 8d. routed experts (ring), moe_tp_decode's gate_up / finish
     expert_columns = lax.broadcasted_iota(I32, r["wtab"].shape, 1)
-    lanes = r["xs"].shape[-1]
-    ic = cfg.moe_i
 
     def gate_up(slot):
-        w_scale = r["s1_r"][slot].astype(BF16)
-        acc = jnp.zeros((m, 2 * ic), BF16)
-        for k in range(0, H, MK._Q_BLOCK):
-            part = jnp.matmul(
-                r["xq"][:, k : k + MK._Q_BLOCK],
-                r["w1_r"][slot, k : k + MK._Q_BLOCK, :],
-                preferred_element_type=F32,
-            ).astype(BF16)
-            part *= jnp.concatenate(
-                [r["xs"][k // MK._Q_BLOCK]] * (2 * ic // lanes), axis=1
-            )
-            part *= w_scale
-            acc += part
-        return acc
+        return jnp.matmul(r["xq"][...], r["w1_r"][slot], preferred_element_type=F32)
 
     def finish(step, slot, acc1):
         e = ids[0, step]
         coeff = jnp.sum(
             jnp.where(expert_columns == e, r["wtab"][...], 0.0), axis=1, keepdims=True
         )
-        act = jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:]
-        mid = jnp.where(coeff != 0, act.astype(F32) * coeff, 0.0)
+        acc1 = acc1 * r["xs"][...] * r["s1_r"][slot]
+        # Mask, not multiply: a padded row with non-finite hidden would give
+        # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
+        mid = jnp.where(
+            coeff != 0, jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:] * coeff, 0.0
+        )
         ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
         mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(F8)
         for n in range(0, H, MK._N_CHUNK):
@@ -823,52 +829,18 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         c.wait()
 
 
-def _entry_merge(cfg: SegCfg, r):
-    """Per (t, h) row, online max / denominator / accumulator over the dcp
-    received partials, with the guards that make it equal `_zero_nan` +
-    `_merge_received` (non-finite lse -> weight 0; NaN partial -> 0), then the
-    [4T, v_head] result placed as attn[t, h*v:(h+1)*v] by exact 0/1 selection
-    matmuls."""
-    R, R4, T = cfg.dcp, cfg.R4, cfg.T
-    m_run = None
-    den = acc = None
-    for src in range(R):
-        # row 0 of the packed block = lse words (hi halves at lanes [0, R4), lo at
-        # [R4, 2 R4)); rows 1..R4 = the bf16 partial's bits.
-        head = r["a2a"][src, pl.ds(0, 8), :].astype(I32)  # [8, v_head]
-        words = jnp.transpose(head)  # [v_head, 8]; column 0 = the lse words
-        lane8 = lax.broadcasted_iota(I32, (R4, 8), 1)
-        hi = jnp.sum(jnp.where(lane8 == 0, words[0:R4], 0), axis=1, keepdims=True)
-        lo = jnp.sum(
-            jnp.where(lane8 == 0, words[R4 : 2 * R4], 0), axis=1, keepdims=True
-        )
-        lse = pltpu.bitcast((hi << 16) | (lo & 0xFFFF), F32)  # [R4, 1]
-        o = pltpu.bitcast(
-            r["a2a"][src, pl.ds(1, R4), :].astype(I32) << 16, F32
-        )  # bf16 -> f32
-        fin = jnp.isfinite(lse)
-        lse = jnp.where(fin, lse, -jnp.inf)
-        o = jnp.where(jnp.isnan(o), 0.0, o)
-        if m_run is None:
-            m_new = lse
-            m_safe = jnp.where(jnp.isfinite(m_new), m_new, 0.0)
-            p = jnp.where(fin, jnp.exp(lse - m_safe), 0.0)
-            den = p
-            acc = p * o
-        else:
-            m_new = jnp.maximum(m_run, lse)
-            m_safe = jnp.where(jnp.isfinite(m_new), m_new, 0.0)
-            alpha = jnp.where(jnp.isfinite(m_run), jnp.exp(m_run - m_safe), 0.0)
-            p = jnp.where(fin, jnp.exp(lse - m_safe), 0.0)
-            den = den * alpha + p
-            acc = acc * alpha + p * o
-        m_run = m_new
-    merged = (acc / jnp.where(den > 0, den, 1.0)).astype(BF16)  # [R4, v_head]
+def _entry_wuv(cfg: SegCfg, r):
+    """attn[t, h*v:(h+1)*v] = bf16(lat[t, h*kv:(h+1)*kv] . W_UV[h]) for each
+    head: the backend's `torch.bmm(outputs_t, W_UV)` after the DCP merge (bf16
+    operands, f32 accumulation, one rounding to bf16)."""
+    kv = cfg.kv_lora
     heads = []
     for hh in range(cfg.heads_rank):
-        P = _sel(T, R4, lambda i, j, hh=hh: j == i * cfg.heads_rank + hh)  # [T, R4]
+        lat = r["lat"][:, pl.ds(hh * kv, kv)]  # [T, kv_lora] bf16
         heads.append(
-            lax.dot_general(P, merged, _NN, preferred_element_type=F32).astype(BF16)
+            lax.dot_general(lat, r["wuv_v"][hh], _NN, preferred_element_type=F32).astype(
+                BF16
+            )
         )
     return jnp.concatenate(heads, axis=1)  # [T, o_in]
 
@@ -959,7 +931,8 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
     H, T, m = cfg.hidden, cfg.T, cfg.m
     return {
         "meta": ((META_DST + T,), I32),
-        "a2a": ((cfg.dcp, 1 + cfg.R4, cfg.v_head), jnp.int16),
+        "lat": ((T, cfg.lat_w), BF16),
+        "wuv": ((cfg.heads_rank, cfg.kv_lora, cfg.v_head), BF16),
         "act": ((T + 2 * m, H), BF16),
         "oproj_w": ((cfg.o_in, H), F8),
         "gate": ((cfg.e_pad, H), BF16),
