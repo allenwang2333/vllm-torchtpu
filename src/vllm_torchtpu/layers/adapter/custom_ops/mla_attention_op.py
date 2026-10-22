@@ -1028,12 +1028,17 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = fresh_buffer(
-                dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
+            # vLLM >= 0.32 registers W_UK_T_dcp_qrep as a Parameter; keep it one.
+            self.W_UK_T_dcp_qrep = Parameter(
+                fresh_buffer(dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)),
+                requires_grad=False,
             )
             if hasattr(self, "W_UK_T_scale"):
-                self.W_UK_T_dcp_qrep_scale = fresh_buffer(
-                    dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
+                self.W_UK_T_dcp_qrep_scale = Parameter(
+                    fresh_buffer(
+                        dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
+                    ),
+                    requires_grad=False,
                 )
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
