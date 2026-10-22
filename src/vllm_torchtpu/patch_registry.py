@@ -26,13 +26,21 @@ import logging
 import os
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 Stage = Literal[
-    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+    "import",
+    "platform_activation",
+    "engine_core",
+    "worker_init",
+    "model_load",
+    "omni_platform",
+    "diffusion_worker",
+    "diffusion_model_load",
 ]
 
 
@@ -43,6 +51,7 @@ class Patch:
     target: str
     stages: tuple[Stage, ...]
     model_config: bool = False
+    od_config: bool = False
     refresh: str | None = None
 
 
@@ -134,8 +143,10 @@ PATCHES = (
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
     # Platform runtime configuration.
+    # Diffusion workers rely on DEFER_AND_FUSE too.
     Patch(
-        "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
+        "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode",
+        (*_ACTIVE, "diffusion_worker"),
     ),
     Patch("vllm_torchtpu.platforms.tpu_platform:_unwrap_dynamic_compile_fns", _ACTIVE),
     Patch(
@@ -159,6 +170,46 @@ PATCHES = (
         "vllm_torchtpu.models.vllm.qwen2_patch:maybe_patch_qwen2",
         ("platform_activation", "model_load"),
         model_config=True,
+    ),
+    # vLLM-Omni diffusion patches. OmniTpuPlatform applies these stages, since
+    # diffusion workers do not run TPUWorker.
+    Patch(
+        "vllm_torchtpu.omni.patches:_extend_async_output_timeout", ("omni_platform",)
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_diffusion_ipc_cpu_pack",
+        ("diffusion_worker",),
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_diffusion_startup_warmup_sync",
+        ("diffusion_worker",),
+    ),
+    # Model-specific diffusion patches. Append new ones here with
+    # stages=("diffusion_model_load",) and od_config=True.
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_qwen_image_rope_txt_freqs_clone",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_wan_pair_swap_rope",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_wan_ffn_gelu_fence",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_wan_fused_qk_norm_rope",
+        ("diffusion_model_load",),
+        od_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.omni.patches:_patch_wan_fresh_timestep",
+        ("diffusion_model_load",),
+        od_config=True,
     ),
 )
 
@@ -189,20 +240,19 @@ def _invoke(target: str, **kwargs):
     return None
 
 
-def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
+def apply(
+    stage: Stage,
+    *,
+    model_config: "ModelConfig | None" = None,
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> None:
     """Applies a stage once per patch and refreshes late module bindings.
 
     Import-triggered re-entry into the same stage returns immediately: the
     outer invocation already owns that ordered pass. Failures propagate and
     leave the failing patch eligible for retry, retaining completed patches.
     """
-    if stage not in (
-        "import",
-        "platform_activation",
-        "engine_core",
-        "worker_init",
-        "model_load",
-    ):
+    if stage not in get_args(Stage):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
         if stage in _active_stages:
@@ -219,9 +269,11 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
                     continue
                 _applying.add(patch.target)
                 try:
-                    kwargs = (
-                        {"model_config": model_config} if patch.model_config else {}
-                    )
+                    kwargs = {}
+                    if patch.model_config:
+                        kwargs["model_config"] = model_config
+                    if patch.od_config:
+                        kwargs["od_config"] = od_config
                     result = _invoke(patch.target, **kwargs)
                 finally:
                     _applying.discard(patch.target)

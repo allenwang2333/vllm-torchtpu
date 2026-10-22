@@ -13,23 +13,58 @@
 # limitations under the License.
 """TPU runtime patches for vLLM-Omni diffusion models.
 
-vLLM-Omni diffusion workers run in separate worker processes spawned by
-vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
-model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
-itself: apply_omni_tpu_patches() when the platform is constructed, and
-apply_omni_model_specific_patches() at attention backend selection
-(get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
-patch_registry.py.
+vLLM-Omni diffusion workers do not run TPUWorker, so patch_registry.py
+applies these patches at the diffusion stages that OmniTpuPlatform enters:
+omni_platform, diffusion_worker and diffusion_model_load. Model-specific
+patches take od_config and return False unless od_config.model_class_name
+names a pipeline that builds the patched classes, so a model's module is only
+imported when that model is served.
 """
 
 from functools import cache as run_once
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm_torchtpu.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 logger = init_logger(__name__)
+
+# Keys of vLLM-Omni's diffusion model registry (vllm_omni/diffusion/registry.py).
+_QWEN_IMAGE_PIPELINES = frozenset(
+    {
+        "QwenImagePipeline",
+        "QwenImageEditPipeline",
+        "QwenImageEditPlusPipeline",
+        "QwenImageLayeredPipeline",
+        "QwenImageDMD2Pipeline",
+    }
+)
+# CausVid builds its transformer from the Wan 2.2 modules.
+_WAN_PIPELINES = frozenset(
+    {
+        "WanPipeline",
+        "WanDMDPipeline",
+        "WanVACEPipeline",
+        "WanImageToVideoPipeline",
+        "WanS2VPipeline",
+        "WanT2VDMD2Pipeline",
+        "WanI2VDMD2Pipeline",
+        "CausVidWanPipeline",
+    }
+)
+# LingBot-World and ABot-World build their own blocks around RotaryEmbeddingWan.
+_WAN_ROPE_PIPELINES = _WAN_PIPELINES | {
+    "LingBotWorldCausalDMDPipeline",
+    "ABotWorldCausalPipeline",
+}
+
+
+def _serves(od_config: "OmniDiffusionConfig | None", pipelines: frozenset[str]) -> bool:
+    return od_config is not None and od_config.model_class_name in pipelines
 
 
 @run_once
@@ -41,8 +76,7 @@ def _optimization_barrier_op() -> Any:
     return optimization_barrier_op()
 
 
-@run_once
-def apply_omni_tpu_patches() -> None:
+def _extend_async_output_timeout() -> None:
     """Extend the async output timeout for TPU compilation and execution."""
 
     # -------------------------------------------------------------------------
@@ -68,18 +102,6 @@ def apply_omni_tpu_patches() -> None:
 
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
-
-
-@run_once
-def apply_omni_model_specific_patches() -> None:
-    """Apply model-specific runtime patches."""
-    _patch_diffusion_ipc_cpu_pack()
-    _patch_qwen_image_rope_txt_freqs_clone()
-    _patch_wan_pair_swap_rope()
-    _patch_wan_ffn_gelu_fence()
-    _patch_diffusion_startup_warmup_sync()
-    _patch_wan_fused_qk_norm_rope()
-    _patch_wan_fresh_timestep()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -111,7 +133,9 @@ def _patch_diffusion_ipc_cpu_pack() -> None:
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
 
 
-def _patch_qwen_image_rope_txt_freqs_clone() -> None:
+def _patch_qwen_image_rope_txt_freqs_clone(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once torch_tpu supports torch.real/torch.imag
     # inside torch.inference_mode() on a complex tensor created outside it.
@@ -124,6 +148,8 @@ def _patch_qwen_image_rope_txt_freqs_clone() -> None:
     # affected. Cloning txt_freqs once per transformer forward gives the
     # attention blocks an inference tensor of the same values.
     # -------------------------------------------------------------------------
+    if not _serves(od_config, _QWEN_IMAGE_PIPELINES):
+        return False
     from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
     for rope_cls in (
@@ -142,7 +168,9 @@ def _clone_txt_freqs(forward: Any) -> Any:
     return _forward
 
 
-def _patch_wan_pair_swap_rope() -> None:
+def _patch_wan_pair_swap_rope(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once torch_tpu lowers size-2 minor unflatten/stack
     # without relayouts, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
@@ -154,14 +182,15 @@ def _patch_wan_pair_swap_rope() -> None:
     # plus strided relayout copies around every q/k rotation, costing ~7 ms
     # per Wan2.2-A14B layer at 480p on v7x (~9% of the layer).
     # The replacement computes the same rotation on the (..., head_dim)
-    # layout with an exact signed pair-swap matmul (see omni/rope.py). It is
-    # installed on the class because CustomOp binds _forward_method at init
-    # and the rotary op is constructed before the attention layer that
-    # triggers these patches.
+    # layout with an exact signed pair-swap matmul (see omni/rope.py). It
+    # replaces the class forward because CustomOp binds _forward_method at
+    # init.
     #
     # Complex sliced views crash on TPU under inference mode, which rules
     # out the complex-number RoPE form.
     # -------------------------------------------------------------------------
+    if not _serves(od_config, _WAN_ROPE_PIPELINES):
+        return False
     from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 
     from vllm_torchtpu.omni.rope import rotary_embedding_wan_forward
@@ -170,7 +199,9 @@ def _patch_wan_pair_swap_rope() -> None:
     logger.info("Applied TPU patch: pair-swap matmul RotaryEmbeddingWan.")
 
 
-def _patch_wan_ffn_gelu_fence() -> None:
+def _patch_wan_ffn_gelu_fence(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once XLA stops duplicating the elementwise producer
     # into the matmul operand fusion here, or torch_tpu exposes a fusion fence.
@@ -186,6 +217,8 @@ def _patch_wan_ffn_gelu_fence() -> None:
     # 32,760 tokens on one core; 0.939 -> 0.927 s/step end to end at
     # 480x832x81 on 8 cores (CFG 2 x Ulysses 4).
     # -------------------------------------------------------------------------
+    if not _serves(od_config, _WAN_PIPELINES):
+        return False
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         ColumnParallelGELU,
     )
@@ -237,7 +270,9 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     logger.info("Applied TPU patch: device sync after diffusion startup warmup.")
 
 
-def _patch_wan_fused_qk_norm_rope() -> None:
+def _patch_wan_fused_qk_norm_rope(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once XLA fuses the q/k RMSNorm and RoPE into one
     # pass at HBM bandwidth, or vLLM-Omni's CustomOp gains an out-of-tree dispatch
@@ -251,6 +286,8 @@ def _patch_wan_fused_qk_norm_rope() -> None:
     # core on v7x. A Pallas kernel that reads q and k once and writes them
     # once takes 0.23 ms and is closer to an f64 reference (single rounding).
     # -------------------------------------------------------------------------
+    if not _serves(od_config, _WAN_PIPELINES):
+        return False
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanSelfAttention,
     )
@@ -280,7 +317,9 @@ def _patch_wan_fused_qk_norm_rope() -> None:
     logger.info("Applied TPU patch: fused q/k RMSNorm + RoPE for Wan attention.")
 
 
-def _patch_wan_fresh_timestep() -> None:
+def _patch_wan_fresh_timestep(
+    od_config: "OmniDiffusionConfig | None" = None,
+) -> bool | None:
     # Wan: give the transformer its own copy of the timestep.
     #
     # Problem: Wan pipelines pass `t.expand(batch)`, a view into
@@ -295,6 +334,8 @@ def _patch_wan_fresh_timestep() -> None:
     #   WanS2VTransformer3DModel (separate class). The numbers above are T2V;
     #   the VACE and S2V classes are covered but not measured on TPU.
     # TODO: remove once torch_tpu passes view offsets as runtime inputs.
+    if not _serves(od_config, _WAN_PIPELINES):
+        return False
     from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
         WanS2VTransformer3DModel,
     )

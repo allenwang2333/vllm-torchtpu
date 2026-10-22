@@ -14,14 +14,15 @@
 """TPU platform plugin for vllm-omni."""
 
 import os
+from typing import Any
 
 import torch
 from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu import patch_registry
 from vllm_torchtpu.env_override import set_libtpu_flag_default
-from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
@@ -47,7 +48,22 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     def __init__(self) -> None:
         super().__init__()
-        apply_omni_tpu_patches()
+        patch_registry.apply("omni_platform")
+
+    @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        super().init_diffusion_worker_vllm_config(vllm_config)
+        patch_registry.apply("diffusion_worker")
+
+    @classmethod
+    def init_diffusion_model_runner_runtime(
+        cls,
+        vllm_config: Any,
+        od_config: Any,
+        device: torch.device,
+    ) -> None:
+        super().init_diffusion_model_runner_runtime(vllm_config, od_config, device)
+        patch_registry.apply("diffusion_model_load", od_config=od_config)
 
     @classmethod
     def get_diffusion_attn_backend_cls(
@@ -56,9 +72,6 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         head_size: int,
         allow_trtllm_default: bool = False,
     ) -> str:
-        from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
-
-        apply_omni_model_specific_patches()
         if selected_backend is not None and selected_backend.upper() in (
             "SDPA",
             "TPU_SDPA",
