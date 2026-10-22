@@ -26,8 +26,9 @@ from __future__ import annotations
 import difflib
 import multiprocessing
 import os
+import queue as queue_lib
 import traceback
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 import pytest
 from vllm import LLM, EngineArgs, SamplingParams
@@ -39,6 +40,9 @@ from vllm_torchtpu import tpu_info
 pytestmark = pytest.mark.tpu_test
 
 MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
+MAX_MODEL_LEN = 4096
+# Worker results arrive over a queue; a child that dies hard never sends one.
+WORKER_TIMEOUT_S = 1100
 
 # Known-good partial text outputs for the cherry-blossom image.
 EXPECTED_TEXTS = (
@@ -71,6 +75,20 @@ def _build_qwen2_5_vl_prompt(question: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class BatchOutcome:
+    """Result or captured traceback for one generation batch inside a worker."""
+
+    texts: list[str] | None = None
+    error: str | None = None
+
+    def unwrap(self, label: str) -> list[str]:
+        if self.error is not None:
+            pytest.fail(f"{label} failed in multimodal worker:\n{self.error}")
+        assert self.texts is not None
+        return self.texts
+
+
 def _run_mm_generation_worker(
     batches: list[tuple[list[str], list, int]],
     cudagraph_mm_encoder: bool,
@@ -82,7 +100,6 @@ def _run_mm_generation_worker(
         os.environ["SKIP_JAX_PRECOMPILE"] = "1"
         os.environ["VLLM_XLA_CHECK_RECOMPILATION"] = "0"
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         tp_size = _get_tensor_parallel_size()
 
@@ -95,16 +112,17 @@ def _run_mm_generation_worker(
         # tokens + ~25 prompt tokens + 64 output tokens (~1369 total), so a
         # single-sequence run fits in the 2048 bucket and never reaches 4096.
         # A 2-sequence batch needs ~2610 prefill tokens and caps at 4096.
-        max_tokens_budget = 2048 if max_num_seqs == 1 else 4096
+        # Keep max_model_len=4096 across both modes so RPA tuned block sizes
+        # (keyed on max_model_len) stay identical between eager and compiled.
+        max_tokens_budget = 2048 if max_num_seqs == 1 else MAX_MODEL_LEN
 
         engine_args = EngineArgs(
             model=MODEL_NAME,
-            max_model_len=max_tokens_budget,
+            max_model_len=MAX_MODEL_LEN,
             max_num_batched_tokens=max_tokens_budget,
             tensor_parallel_size=tp_size,
             gpu_memory_utilization=0.5,
             max_num_seqs=max_num_seqs,
-            enable_prefix_caching=False,
             compilation_config=compilation_config,
             mm_processor_kwargs={
                 "size": {"longest_edge": 1003520, "shortest_edge": 3136},
@@ -125,35 +143,38 @@ def _run_mm_generation_worker(
 
         llm = LLM(**args_dict)
 
-        all_results: list[list[str]] = []
+        all_results: list[BatchOutcome] = []
         for idx, (prompts, images, max_tokens) in enumerate(batches):
-            sampling_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=max_tokens,
-            )
-            # Tag each batch with a distinct multi_modal_uuids key so subsequent
-            # batches execute the vision encoder instead of reusing cached
-            # embeddings from an earlier batch while keeping Scheduler's
-            # EncoderCacheManager in sync with TPUModelRunner.encoder_cache.
-            mm_uuids = {"image": f"batch-{idx}"}
-            if len(prompts) == 1:
-                inputs: dict | list[dict] = {
-                    "prompt": prompts[0],
-                    "multi_modal_data": {"image": images[0]},
-                    "multi_modal_uuids": mm_uuids,
-                }
-            else:
-                inputs = [
-                    {
-                        "prompt": p,
-                        "multi_modal_data": {"image": img},
-                        "multi_modal_uuids": mm_uuids,
+            try:
+                sampling_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=max_tokens,
+                )
+                # Tag each image item with a distinct multi_modal_uuids key so every
+                # item within and across batches runs through the vision encoder
+                # instead of deduplicating or reusing cached embeddings.
+                if len(prompts) == 1:
+                    inputs: dict | list[dict] = {
+                        "prompt": prompts[0],
+                        "multi_modal_data": {"image": images[0]},
+                        "multi_modal_uuids": {"image": f"batch-{idx}-0"},
                     }
-                    for p, img in zip(prompts, images)
-                ]
+                else:
+                    inputs = [
+                        {
+                            "prompt": p,
+                            "multi_modal_data": {"image": img},
+                            "multi_modal_uuids": {"image": f"batch-{idx}-{j}"},
+                        }
+                        for j, (p, img) in enumerate(zip(prompts, images))
+                    ]
 
-            outputs = llm.generate(inputs, sampling_params=sampling_params)
-            all_results.append([o.outputs[0].text.strip() for o in outputs])
+                outputs = llm.generate(inputs, sampling_params=sampling_params)
+                all_results.append(
+                    BatchOutcome(texts=[o.outputs[0].text.strip() for o in outputs])
+                )
+            except Exception:
+                all_results.append(BatchOutcome(error=traceback.format_exc()))
 
         queue.put(("SUCCESS", all_results))
     except Exception:
@@ -164,7 +185,7 @@ def run_mm_batches_in_isolated_process(
     batches: list[tuple[list[str], list, int]],
     cudagraph_mm_encoder: bool = True,
     max_num_seqs: int = 1,
-) -> list[list[str]]:
+) -> list[BatchOutcome]:
     """Runs one or more generation batches in an isolated OS process."""
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
@@ -173,8 +194,18 @@ def run_mm_batches_in_isolated_process(
         args=(batches, cudagraph_mm_encoder, max_num_seqs, queue),
     )
     p.start()
+    try:
+        # Drain before join: a child blocks on exit until its queued payload
+        # has been read.
+        status, result = queue.get(timeout=WORKER_TIMEOUT_S)
+    except queue_lib.Empty:
+        p.kill()
+        p.join()
+        raise RuntimeError(
+            f"Isolated multimodal worker (cudagraph_mm_encoder={cudagraph_mm_encoder}) "
+            f"sent no result within {WORKER_TIMEOUT_S}s; exit code {p.exitcode}."
+        ) from None
     p.join()
-    status, result = queue.get()
     if status == "ERROR":
         raise RuntimeError(f"Isolated multimodal worker failed:\n{result}")
     return result
@@ -188,16 +219,18 @@ def run_mm_generation_in_isolated_process(
     max_num_seqs: int = 1,
 ) -> list[str]:
     """Runs generation in an isolated OS process to ensure clean device cleanup."""
-    [result] = run_mm_batches_in_isolated_process(
+    [outcome] = run_mm_batches_in_isolated_process(
         batches=[(prompts, images, max_tokens)],
         cudagraph_mm_encoder=cudagraph_mm_encoder,
         max_num_seqs=max_num_seqs,
     )
-    return result
+    return outcome.unwrap(
+        f"Multimodal generation (cudagraph_mm_encoder={cudagraph_mm_encoder})"
+    )
 
 
 @pytest.fixture(scope="module")
-def compiled_mm_encoder_outputs() -> tuple[list[str], list[str]]:
+def compiled_mm_encoder_outputs() -> tuple[BatchOutcome, BatchOutcome]:
     """Runs single-image and batched-image checks in one compiled encoder boot."""
     image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
     single_prompt = _build_qwen2_5_vl_prompt("What is the content of this image?")
@@ -207,7 +240,7 @@ def compiled_mm_encoder_outputs() -> tuple[list[str], list[str]]:
     ]
     batch_prompts = [_build_qwen2_5_vl_prompt(q) for q in batch_questions]
 
-    single_texts, batch_texts = run_mm_batches_in_isolated_process(
+    single_outcome, batch_outcome = run_mm_batches_in_isolated_process(
         batches=[
             ([single_prompt], [image], 64),
             (batch_prompts, [image, image], 32),
@@ -215,7 +248,7 @@ def compiled_mm_encoder_outputs() -> tuple[list[str], list[str]]:
         cudagraph_mm_encoder=True,
         max_num_seqs=2,
     )
-    return single_texts, batch_texts
+    return single_outcome, batch_outcome
 
 
 @pytest.mark.timeout(1200)
@@ -226,8 +259,10 @@ def test_multi_modal_inference(
 ):
     """Verifies that multi-modal inference accurately describes an image."""
     if cudagraph_mm_encoder:
-        single_texts, _ = request.getfixturevalue("compiled_mm_encoder_outputs")
-        generated_texts = single_texts
+        single_outcome, _ = request.getfixturevalue("compiled_mm_encoder_outputs")
+        generated_texts = single_outcome.unwrap(
+            "Single-image generation (cudagraph_mm_encoder=True)"
+        )
     else:
         image = convert_image_mode(ImageAsset("cherry_blossom").pil_image, "RGB")
         prompt = _build_qwen2_5_vl_prompt("What is the content of this image?")
@@ -255,10 +290,13 @@ def test_multi_modal_inference(
 
 @pytest.mark.timeout(1200)
 def test_multi_modal_batch_inference_with_mm_encoder_manager(
-    compiled_mm_encoder_outputs: tuple[list[str], list[str]],
+    compiled_mm_encoder_outputs: tuple[BatchOutcome, BatchOutcome],
 ):
     """Verifies batch multi-modal inference with MMEncoderManager."""
-    _, generated_texts = compiled_mm_encoder_outputs
+    _, batch_outcome = compiled_mm_encoder_outputs
+    generated_texts = batch_outcome.unwrap(
+        "Batched-image generation (cudagraph_mm_encoder=True)"
+    )
 
     assert len(generated_texts) == 2
     for text in generated_texts:
