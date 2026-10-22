@@ -286,7 +286,7 @@ class PoolLayout:
         R = ex.R
         _need(
             self.kh % R == 0 and self.vh % R == 0,
-            f"recurrent heads (kh={self.kh}, vh={self.vh}) must divide R={R}",
+            f"recurrent heads (kh={self.kh}, vh={self.vh}) must be divisible by R={R}",
         )
         _need(
             self.qkv_per_rank(R) % LANES == 0,

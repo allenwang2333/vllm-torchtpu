@@ -36,8 +36,9 @@ if TYPE_CHECKING:
 # once here and shared across the pool and execution layers.
 POOL_STATE_NAME = "raw"
 
-# Valid `CacheExec.pool_gather` values (see the field comment).
+# Valid `CacheExec.pool_gather` and `CacheExec.act_mode` values.
 POOL_GATHER_VALUES: tuple[Any, ...] = (False, "split", None, "eligible", True)
+ACT_MODE_VALUES: tuple[str, ...] = ("from_ckpt", "all", "ref")
 
 # Numerics class of each pool-I/O mode.
 POOL_IO_NUMERICS: dict[str, NumericsClass] = {
@@ -58,7 +59,7 @@ class CacheExec:
     paged_kv: bool = False  # True: stream KV from paged FP8 pools via page_table
     page_size: int = 128  # Tokens per KV page
     num_pages: int = 4096  # Total pages per attention pool per rank
-    max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ctx // page_size)
+    max_pages_per_seq: int = 0  # Page-table width per sequence (0 -> ceil(ctx / page))
     fused_pool_io: bool = False  # True: fuse KV RMW and recurrent I/O in-kernel
     # In-kernel recurrent gather (GPR): False (default) = split gather
     # (overridable by caller); "split" = split, explicitly; None = auto
@@ -66,19 +67,29 @@ class CacheExec:
     # pool backend can gather on; True = required (`MegakernelConfigError`
     # if the bucket cannot).
     pool_gather: bool | None | Literal["eligible", "split"] = False
-    act_mode: str = "from_ckpt"  # Sequence activity mode ("from_ckpt", "all", "ref")
-    ckpt_2d: bool = False  # True: 2D ckpt_indices (NS, K); False: 3D (G_PER_ATT, NS, K)
+    # Sequence activity mode ("from_ckpt", "all", "ref")
+    act_mode: Literal["from_ckpt", "all", "ref"] = "from_ckpt"
+    ckpt_2d: bool = False  # True: 2D (NS, K); False: 3D (slots_per_pool, NS, K)
     ckpt_k: int = 0  # Last-axis width of ckpt_indices (0 -> T)
-    roff_1d: bool = False  # True: 1D read_offsets (NS,); False: 2D (G_PER_ATT, NS)
+    roff_1d: bool = False  # True: 1D (NS,); False: 2D (slots_per_pool, NS)
     # Host-side ckpt_indices bounds validation on every eager pooled-step call
     # (device-to-host sync + Python loop). In-kernel clamps always apply.
     check_ckpt_bounds: bool = False
 
     def __post_init__(self) -> None:
-        if self.pool_gather not in POOL_GATHER_VALUES:
+        if not any(
+            self.pool_gather is v
+            or (type(self.pool_gather) is str and self.pool_gather == v)
+            for v in POOL_GATHER_VALUES
+        ):
             raise ValueError(
                 f"CacheExec.pool_gather must be one of {POOL_GATHER_VALUES}, "
                 f"got {self.pool_gather!r}"
+            )
+        if self.act_mode not in ACT_MODE_VALUES:
+            raise ValueError(
+                f"CacheExec.act_mode must be one of {ACT_MODE_VALUES}, "
+                f"got {self.act_mode!r}"
             )
 
     @property
@@ -112,12 +123,12 @@ def with_cache(ex: ExecSpec, **fields: Any) -> ExecSpec:
 
 
 def resolved_max_pages_per_seq(ex: ExecSpec) -> int:
-    """Page-table width per sequence (`max_pages_per_seq`, else `ctx // page_size`)."""
+    """Page-table width per sequence (`max_pages_per_seq`, else `ceil(ctx / page)`)."""
     cx = cache_exec(ex)
     return (
         cx.max_pages_per_seq
         if cx.max_pages_per_seq > 0
-        else max(1, ex.ctx // cx.page_size)
+        else max(1, (ex.ctx + cx.page_size - 1) // cx.page_size)
     )
 
 
@@ -156,6 +167,7 @@ class PoolBackend:
 
 
 __all__ = [
+    "ACT_MODE_VALUES",
     "DEFAULT_CACHE_EXEC",
     "POOL_GATHER_VALUES",
     "POOL_IO_NUMERICS",

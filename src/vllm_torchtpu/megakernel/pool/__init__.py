@@ -30,6 +30,7 @@ from .backend import (
     make_pool_backend,
 )
 from .config import (
+    ACT_MODE_VALUES,
     DEFAULT_CACHE_EXEC,
     POOL_GATHER_VALUES,
     POOL_IO_NUMERICS,
@@ -56,6 +57,7 @@ from .pack import (
 from .scatter import scatter_pool_states
 
 __all__ = [
+    "ACT_MODE_VALUES",
     "DEFAULT_CACHE_EXEC",
     "GATHER_KERNEL_NAME",
     "POOL_GATHER_VALUES",

@@ -48,8 +48,13 @@ def test_cache_exec_pool_gather_default_is_split():
     assert CacheExec(paged_kv=True, fused_pool_io=True).FUSED
     for val in pool.POOL_GATHER_VALUES:
         assert CacheExec(pool_gather=val).pool_gather == val
-    with pytest.raises(ValueError, match="pool_gather must be one of"):
-        CacheExec(pool_gather="sometimes")  # type: ignore[arg-type]
+    for bad_gather in ("sometimes", 0, 1, 1.0):
+        with pytest.raises(ValueError, match="pool_gather must be one of"):
+            CacheExec(pool_gather=bad_gather)  # type: ignore[arg-type]
+    for mode in pool.ACT_MODE_VALUES:
+        assert CacheExec(act_mode=mode).act_mode == mode
+    with pytest.raises(ValueError, match="act_mode must be one of"):
+        CacheExec(act_mode="al")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="CacheExec"):
         cache_exec(ExecSpec(cache="invalid"))
     ex = with_cache(ExecSpec(B=24, T=4), paged_kv=True, pool_gather=True)
@@ -59,6 +64,7 @@ def test_cache_exec_pool_gather_default_is_split():
 def test_resolved_max_pages_per_seq_and_pool_backend_properties():
     ex = ExecSpec(ctx=512)
     assert resolved_max_pages_per_seq(ex) == 4
+    assert resolved_max_pages_per_seq(ExecSpec(ctx=513)) == 5
     assert resolved_max_pages_per_seq(with_cache(ex, max_pages_per_seq=16)) == 16
 
     for slots in (3, 1, 0):

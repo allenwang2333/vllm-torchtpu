@@ -90,6 +90,11 @@ def test_layout_validate_rejects_unvalidated_geometry():
             bad.validate()
     with pytest.raises(MegakernelConfigError, match="page_size"):
         _layout(3).validate(with_cache(_exec(R=2, B=2, T=1), page_size=64))
+    with pytest.raises(
+        MegakernelConfigError,
+        match=r"recurrent heads \(kh=2, vh=4\) must be divisible by R=8",
+    ):
+        _layout(3).validate(_exec(R=8, B=8, T=1))
 
 
 def test_layout_validate_checks_in_kernel_conv_windows():
