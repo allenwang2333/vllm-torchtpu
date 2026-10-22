@@ -181,15 +181,24 @@ def _build_valid_rows_all_reduce(mesh, tile_rows: int):
     )
 
 
-def _build_matmul_all_reduce(mesh, waves: bool):
+def _build_matmul_all_reduce(mesh, waves: bool, weight_vmem: bool = False):
     """The fused op over ``mesh``: fn(x [rows, k] bf16, w [k, n] fp8, w_s [n] f32,
-    rank int32 [1]) per core -> the sum over the cores of x @ w * scales, [rows, n]."""
+    rank int32 [1]) per core -> the sum over the cores of x @ w * scales, [rows, n].
+    `weight_vmem` (TPU_FUSED_OPROJ_AR_VMEM_W): the weight is a VMEM operand XLA
+    prefetches ahead of the call (fp8_oproj_all_reduce `weight_vmem`)."""
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
 
     def body(x, w, w_s, rank):
         return fp8_oproj_all_reduce.fp8_matmul_all_reduce(
-            x, w, w_s, rank, num_cores=n, axis=EP_AXIS_NAME, waves=waves
+            x,
+            w,
+            w_s,
+            rank,
+            num_cores=n,
+            axis=EP_AXIS_NAME,
+            waves=waves,
+            weight_vmem=weight_vmem,
         )
 
     def fn(
@@ -203,7 +212,7 @@ def _build_matmul_all_reduce(mesh, waves: bool):
         return x.new_empty((x.shape[0], w.shape[1]))
 
     return sharded_jax_op(
-        "pallas::fp8_matmul_all_reduce",
+        "pallas::fp8_matmul_all_reduce" + ("_wv" if weight_vmem else ""),
         fn,
         mesh=mesh,
         input_partition_specs=(spec,) * 4,
@@ -273,11 +282,14 @@ def prebuild() -> None:
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
     tp_all_reduce = tuple(int(r) for r in get_tp_group().ranks) == _MESH_RANKS
     if envs.TPU_FUSED_OPROJ_AR and tp_all_reduce:
-        _MM_AR_OP = _build_matmul_all_reduce(mesh, envs.TPU_FUSED_OPROJ_AR_WAVES)
+        _MM_AR_OP = _build_matmul_all_reduce(
+            mesh, envs.TPU_FUSED_OPROJ_AR_WAVES, envs.TPU_FUSED_OPROJ_AR_VMEM_W
+        )
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s | fused_oproj_ar=%s "
+        "(vmem weight=%s)",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -291,6 +303,7 @@ def prebuild() -> None:
         if _AR_VALID_OP is not None
         else "off",
         _MM_AR_OP is not None,
+        bool(envs.TPU_FUSED_OPROJ_AR_VMEM_W),
     )
 
 

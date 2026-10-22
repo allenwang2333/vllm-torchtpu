@@ -56,6 +56,9 @@ FP8_PALLAS_SCHED_GROUP_ATTR = "_tpu_fp8_pallas_sched_group"
 # TPU_FP8_SKINNY_HBM_PIN_SITES: set (True) on a layer whose kernel weight operand is
 # constrained to HBM, so XLA cannot stage it into VMEM ahead of the call.
 FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
+# TPU_FP8_SKINNY_VMEM_SITES: set (True) on a layer whose kernel weight operand is a
+# whole-array VMEM operand that XLA prefetches ahead of the call.
+FP8_PALLAS_VMEM_ATTR = "_tpu_fp8_pallas_vmem"
 # TPU_FUSED_ADD_RMSNORM_QUANT: a per-channel FP8 linear paired with the
 # residual-stream norm in front of it holds a PrequantSlot under this attribute;
 # the norm holds the same slot. The norm's forward puts
@@ -263,6 +266,18 @@ def _fp8_linear_pallas_hbm_pinned_jax(
     return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=True)
 
 
+def _fp8_linear_pallas_vmem_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    """`_fp8_linear_pallas_jax` with the kernel's weight a VMEM operand XLA
+    prefetches (TPU_FP8_SKINNY_VMEM_SITES)."""
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, weight_vmem=True)
+
+
 def _fp8_linear_pallas(
     x: jax.Array,
     w_q: jax.Array,
@@ -271,6 +286,7 @@ def _fp8_linear_pallas(
     s_k: jax.Array | None,
     scheduling_group_id: int | None = None,
     hbm_pin: bool = False,
+    weight_vmem: bool = False,
 ) -> jax.Array:
     n_out = w_q.shape[1]
     kw, ks = (w_q, w_s) if w_k is None else (w_k, s_k)
@@ -283,6 +299,7 @@ def _fp8_linear_pallas(
             scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
             and fp8_skinny.scale_dma_applies(*kw.shape),
             hbm_pin=hbm_pin,
+            weight_vmem=weight_vmem,
         )
         if scheduling_group_id is not None:
             # Tags the op that produced `out`: the kernel itself only when no
@@ -297,7 +314,7 @@ def _fp8_linear_pallas(
 
 
 def _fp8_linear_pallas_grouped_jax(
-    scheduling_group_id: int, hbm_pin: bool = False
+    scheduling_group_id: int, hbm_pin: bool = False, weight_vmem: bool = False
 ) -> Callable:
     """`_fp8_linear_pallas_jax` with the kernel in XLA scheduling group
     `scheduling_group_id` (`TPU_IDX_TOPK_SCHED_GROUPS`). The id is baked into
@@ -311,23 +328,38 @@ def _fp8_linear_pallas_grouped_jax(
         s_k: jax.Array | None = None,
     ) -> jax.Array:
         return _fp8_linear_pallas(
-            x, w_q, w_s, w_k, s_k, scheduling_group_id, hbm_pin=hbm_pin
+            x,
+            w_q,
+            w_s,
+            w_k,
+            s_k,
+            scheduling_group_id,
+            hbm_pin=hbm_pin,
+            weight_vmem=weight_vmem,
         )
 
     return _fp8_linear_pallas_grouped
 
 
-_fp8_linear_pallas_ops: dict[tuple[bool, int | None, bool], Callable] = {}
+_fp8_linear_pallas_ops: dict[tuple, Callable] = {}
 
 
 def get_fp8_linear_pallas_op(
-    padded_copy: bool, scheduling_group_id: int | None = None, hbm_pin: bool = False
+    padded_copy: bool,
+    scheduling_group_id: int | None = None,
+    hbm_pin: bool = False,
+    weight_vmem: bool = False,
 ) -> Callable:
     """The cached torch op; build it outside Dynamo (load time), it takes a Lock.
 
     A `scheduling_group_id` gets its own op (`TPU_IDX_TOPK_SCHED_GROUPS`), and so
-    does `hbm_pin` (TPU_FP8_SKINNY_HBM_PIN_SITES)."""
+    do `hbm_pin` (TPU_FP8_SKINNY_HBM_PIN_SITES) and `weight_vmem`
+    (TPU_FP8_SKINNY_VMEM_SITES, which wins over `hbm_pin`)."""
+    if weight_vmem:
+        hbm_pin = False
     key = (padded_copy, scheduling_group_id, hbm_pin)
+    if weight_vmem:
+        key += (True,)
     op = _fp8_linear_pallas_ops.get(key)
     if op is not None:
         return op
@@ -337,11 +369,17 @@ def get_fp8_linear_pallas_op(
             return op
         name = "pallas::fp8_linear_pallas" + ("_padded" if padded_copy else "")
         fn = _fp8_linear_pallas_hbm_pinned_jax if hbm_pin else _fp8_linear_pallas_jax
+        if weight_vmem:
+            fn = _fp8_linear_pallas_vmem_jax
         if scheduling_group_id is not None:
             name += f"_g{scheduling_group_id}"
-            fn = _fp8_linear_pallas_grouped_jax(scheduling_group_id, hbm_pin)
+            fn = _fp8_linear_pallas_grouped_jax(
+                scheduling_group_id, hbm_pin, weight_vmem
+            )
         if hbm_pin:
             name += "_hbm"
+        if weight_vmem:
+            name += "_vmem"
         op = pallas.jax_op(name, fn)
 
         def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *rest):
@@ -361,11 +399,12 @@ def quantized_matmul_pallas(
     s_kernel: torch.Tensor | None = None,
     scheduling_group_id: int | None = None,
     hbm_pin: bool = False,
+    weight_vmem: bool = False,
 ) -> torch.Tensor:
     """Torch entry point for `TPU_FP8_LINEAR_PALLAS` (per-channel FP8, (k, n) weight).
     Same contract as `quantized_matmul`; `(w_kernel, s_kernel)` is the optional padded
     kernel copy, `scheduling_group_id` the kernel's XLA scheduling group, `hbm_pin`
-    constrains the kernel's weight operand to HBM."""
+    constrains the kernel's weight operand to HBM, `weight_vmem` to VMEM."""
     if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
@@ -373,11 +412,15 @@ def quantized_matmul_pallas(
         )
     x_2d = x.reshape(-1, x.shape[-1])
     if w_kernel is None:
-        out_2d = get_fp8_linear_pallas_op(False, scheduling_group_id, hbm_pin)(
+        out_2d = get_fp8_linear_pallas_op(
+            False, scheduling_group_id, hbm_pin, weight_vmem
+        )(
             x_2d, w_q, w_s
         )
     else:
-        out_2d = get_fp8_linear_pallas_op(True, scheduling_group_id, hbm_pin)(
+        out_2d = get_fp8_linear_pallas_op(
+            True, scheduling_group_id, hbm_pin, weight_vmem
+        )(
             x_2d, w_q, w_s, w_kernel, s_kernel
         )
     return out_2d.reshape(*x.shape[:-1], w_q.shape[1])

@@ -100,6 +100,7 @@ def _kernel(
     nbuf,
     q_dtype,
     waves,
+    weight_vmem=False,
 ):
     s = idx_ref[0]
     me = rank_ref[0]
@@ -114,8 +115,9 @@ def _kernel(
             w_hbm.at[s, :, pl.ds(j * t, t)], wbuf.at[j % nbuf], wsem.at[j % nbuf]
         )
 
-    for j in range(min(nbuf, n_tiles)):
-        copy(j).start()
+    if not weight_vmem:
+        for j in range(min(nbuf, n_tiles)):
+            copy(j).start()
     for j in range(n):
         pl.semaphore_signal(
             bsem, 1, device_id={axis: jnp.int32(j)}, device_id_type=MESH
@@ -156,15 +158,20 @@ def _kernel(
     wave_of = owner_waves(n, o_ref.shape[1], t) if waves else None
     dn = (((1,), (0,)), ((), ()))
     for j in range(n_tiles):
-        copy(j).wait()
+        if weight_vmem:
+            # The whole weight is a VMEM operand XLA staged before the call.
+            w = w_hbm[s, :, pl.ds(j * t, t)]
+        else:
+            copy(j).wait()
+            w = wbuf[j % nbuf]
         y = jax.lax.dot_general(
-            xq_ref[...], wbuf[j % nbuf], dn, preferred_element_type=jnp.float32
+            xq_ref[...], w, dn, preferred_element_type=jnp.float32
         )
         if j == 0:
             ws_copy.wait()
         cols = slice(j * t, (j + 1) * t)
         o_ref[:, cols] = (y * xs_ref[...] * ws_vmem[:, cols]).astype(o_ref.dtype)
-        if j + nbuf < n_tiles:
+        if not weight_vmem and j + nbuf < n_tiles:
             copy(j + nbuf).start()
         if wave_of is not None:
             if j == 0:
@@ -207,7 +214,9 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
+def _build(
+    m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves, weight_vmem=False
+):
     t, nbuf = TUNED[(k, n_out)]
     n_tiles = n_out // t
     nbuf = max(1, min(nbuf, n_tiles))
@@ -215,8 +224,9 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
     scratch = [
         pltpu.VMEM((m, k), jnp.bfloat16),  # x_q (fp8 values held as bf16)
         pltpu.VMEM((m, 1), jnp.float32),  # x scale
-        pltpu.VMEM((nbuf, k, t), w_dtype),  # weight ring
-        pltpu.SemaphoreType.DMA((nbuf,)),
+        # weight ring (`weight_vmem`: an unused 1-slot placeholder)
+        pltpu.VMEM((1, 32, LANES) if weight_vmem else (nbuf, k, t), w_dtype),
+        pltpu.SemaphoreType.DMA((1 if weight_vmem else nbuf,)),
         pltpu.VMEM((1, n_out), jnp.float32),  # weight scale
         pltpu.SemaphoreType.DMA,
         pltpu.VMEM((num_cores, m, own), x_dtype),  # receive slots, by sender rank
@@ -236,6 +246,7 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         nbuf=nbuf,
         q_dtype=w_dtype,
         waves=waves,
+        weight_vmem=weight_vmem,
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     grid_spec = pltpu.PrefetchScalarGridSpec(
@@ -243,7 +254,7 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         in_specs=[
             vmem,
             pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
+            vmem if weight_vmem else pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=vmem,
         scratch_shapes=scratch,
@@ -253,30 +264,43 @@ def _build(m, k, n_out, n_stack, w_dtype, x_dtype, num_cores, axis, waves):
         out_shape=jax.ShapeDtypeStruct((m, n_out), x_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
-        name=f"fp8_oproj_all_reduce{'_w' if waves else ''}_m{m}_k{k}_n{n_out}",
+        name=(
+            f"fp8_oproj_all_reduce{'_w' if waves else ''}{'_wv' if weight_vmem else ''}"
+            f"_m{m}_k{k}_n{n_out}"
+        ),
     )
 
 
-@functools.partial(jax.jit, static_argnums=(0,))
-def _call_constrained(call, idx, rank, x, w_s2, w_stack):
-    # Scale and weight constrained to HBM, as fp8_skinny's scale_dma + hbm_pin.
+@functools.partial(jax.jit, static_argnums=(0, 6))
+def _call_constrained(call, idx, rank, x, w_s2, w_stack, weight_vmem=False):
+    # Scale and weight constrained to HBM, as fp8_skinny's scale_dma + hbm_pin;
+    # `weight_vmem`: the weight constrained to VMEM instead (fp8_skinny weight_vmem).
     return call(
         idx,
         rank,
         x,
         pltpu.with_memory_space_constraint(w_s2, pltpu.HBM),
-        pltpu.with_memory_space_constraint(w_stack, pltpu.HBM),
+        pltpu.with_memory_space_constraint(
+            w_stack, pltpu.VMEM if weight_vmem else pltpu.HBM
+        ),
     )
 
 
 def fp8_matmul_all_reduce_stacked(
-    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False
+    x, w_stack, idx, w_s, rank, *, num_cores, axis, waves=False, weight_vmem=False
 ):
     """sum over the num_cores ranks of mesh axis `axis` of
     fp8_skinny(x, w_stack[idx[0]], w_s), inside a shard_map over that axis.
 
     x bf16 [m <= 16, k]; w_stack fp8_e4m3fn [L, k, n] (K-major); idx, rank int32 [1]
     (rank = this core's index on the axis, as data); w_s f32 [n] -> bf16 [m, n].
+
+    `weight_vmem` (TPU_FUSED_OPROJ_AR_VMEM_W): the weight is a whole-array VMEM
+    operand that XLA stages with its own async copy (which its memory-space
+    assignment can start under the collectives and latency-bound ops before the
+    call, steered with `--xla_tpu_preferred_prefetch_overrides`), read in place
+    instead of streamed through the in-kernel ring. Same tiles, same dots, same
+    exchange: bitwise the ring path.
     """
     m, k = x.shape
     n_stack, _, n_out = w_stack.shape
@@ -284,14 +308,25 @@ def fp8_matmul_all_reduce_stacked(
         raise ValueError(
             f"[{m}, {k}] x [{k}, {n_out}] over {num_cores} ranks: unsupported"
         )
-    call = _build(m, k, n_out, n_stack, w_stack.dtype, x.dtype, num_cores, axis, waves)
+    call = _build(
+        m, k, n_out, n_stack, w_stack.dtype, x.dtype, num_cores, axis, waves,
+        weight_vmem,
+    )
     w_s2 = w_s.reshape(1, n_out).astype(jnp.float32)
     return _call_constrained(
-        call, idx.astype(jnp.int32), rank.astype(jnp.int32), x, w_s2, w_stack
+        call,
+        idx.astype(jnp.int32),
+        rank.astype(jnp.int32),
+        x,
+        w_s2,
+        w_stack,
+        weight_vmem,
     )
 
 
-def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
+def fp8_matmul_all_reduce(
+    x, w_q, w_s, rank, *, num_cores, axis, waves=False, weight_vmem=False
+):
     """`fp8_matmul_all_reduce_stacked` on one [k, n] weight."""
     return fp8_matmul_all_reduce_stacked(
         x,
@@ -302,4 +337,5 @@ def fp8_matmul_all_reduce(x, w_q, w_s, rank, *, num_cores, axis, waves=False):
         num_cores=num_cores,
         axis=axis,
         waves=waves,
+        weight_vmem=weight_vmem,
     )

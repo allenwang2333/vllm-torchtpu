@@ -91,6 +91,7 @@ def _kernel(
     nbuf,
     q_dtype,
     scale_dma,
+    weight_vmem=False,
 ):
     # Weight slice: 0 in production (a [1, ...] view); a stack index in the benchmark.
     s = idx_ref[0]
@@ -111,8 +112,18 @@ def _kernel(
             src = w_hbm.at[s, pl.ds(j * t, t), :]
         return pltpu.make_async_copy(src, wbuf.at[j % nbuf], sem.at[j % nbuf])
 
-    for j in range(min(nbuf, n_tiles)):
-        copy(j).start()
+    def tile(j):
+        # `weight_vmem`: the whole weight is a VMEM operand (XLA staged it before the
+        # call); read tile j in place. Otherwise tile j of the HBM ring.
+        if not weight_vmem:
+            return wbuf[j % nbuf]
+        if split == "n":
+            return w_hbm[s, :, pl.ds(j * t, t)]
+        return w_hbm[s, pl.ds(j * t, t), :]
+
+    if not weight_vmem:
+        for j in range(min(nbuf, n_tiles)):
+            copy(j).start()
 
     q_max = float(jnp.finfo(q_dtype).max)
     x = x_ref[...]
@@ -128,8 +139,9 @@ def _kernel(
 
     dn = (((1,), (0,)), ((), ()))
     for j in range(n_tiles):
-        copy(j).wait()
-        w = wbuf[j % nbuf]
+        if not weight_vmem:
+            copy(j).wait()
+        w = tile(j)
         if split == "n":
             cols = slice(j * t, (j + 1) * t)
             y = jax.lax.dot_general(
@@ -149,7 +161,7 @@ def _kernel(
                 acc[0][...] = y
             else:
                 acc[0][...] += y
-        if j + nbuf < n_tiles:
+        if not weight_vmem and j + nbuf < n_tiles:
             copy(j + nbuf).start()
     if split == "k":
         if scale_dma:
@@ -158,7 +170,10 @@ def _kernel(
 
 
 @functools.cache
-def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False):
+def _build(
+    m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False,
+    weight_vmem=False,
+):
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -167,11 +182,14 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
     n_tiles = full // t
     nbuf = max(1, min(nbuf, n_tiles))
     tile = (k, t) if split == "n" else (t, n)
+    # `weight_vmem` keeps a 1-slot ring placeholder so the kernel signature is the
+    # same; it is never written.
+    ring = (1, 32, LANE) if weight_vmem else (nbuf, *tile)
     scratch = [
         pltpu.VMEM((m, k), jnp.bfloat16),
         pltpu.VMEM((m, 1), jnp.float32),
-        pltpu.VMEM((nbuf, *tile), w_dtype),
-        pltpu.SemaphoreType.DMA((nbuf,)),
+        pltpu.VMEM(ring, w_dtype),
+        pltpu.SemaphoreType.DMA((1 if weight_vmem else nbuf,)),
     ]
     if split == "k":
         scratch.append(pltpu.VMEM((m, n), jnp.float32))
@@ -185,6 +203,7 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
         nbuf=nbuf,
         q_dtype=w_dtype,
         scale_dma=scale_dma,
+        weight_vmem=weight_vmem,
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
@@ -197,13 +216,17 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False
             if scale_dma
             else pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
             # W [s, k, n] as an HBM ref in the kernel. This alone does not stop
-            # XLA staging the operand in VMEM first; see `hbm_pin`.
-            pl.BlockSpec(memory_space=pltpu.HBM),
+            # XLA staging the operand in VMEM first; see `hbm_pin`. With
+            # `weight_vmem` the whole operand is a VMEM ref (constrained to VMEM,
+            # so XLA prefetches it ahead of the call; see `weight_vmem`).
+            pl.BlockSpec(memory_space=pltpu.VMEM)
+            if weight_vmem
+            else pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=pl.BlockSpec((m, n), lambda g, idx: (0, 0)),
         scratch_shapes=scratch,
     )
-    sd = "_sd" if scale_dma else ""
+    sd = ("_sd" if scale_dma else "") + ("_wv" if weight_vmem else "")
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
@@ -222,9 +245,10 @@ def fp8_skinny_matmul(
     config: tuple[str, int, int] | None = None,
     scale_dma: bool = False,
     hbm_pin: bool = False,
+    weight_vmem: bool = False,
 ) -> jax.Array:
     """x [m<=16, k] bf16, w_q fp8 [k, n] with n % 128 == 0, w_s f32 [n]
-    -> [m, n_logical or n] in x.dtype. `scale_dma`, `hbm_pin`: see
+    -> [m, n_logical or n] in x.dtype. `scale_dma`, `hbm_pin`, `weight_vmem`: see
     `fp8_skinny_matmul_stacked`."""
     return fp8_skinny_matmul_stacked(
         x,
@@ -235,18 +259,23 @@ def fp8_skinny_matmul(
         config=config,
         scale_dma=scale_dma,
         hbm_pin=hbm_pin,
+        weight_vmem=weight_vmem,
     )
 
 
-@functools.partial(jax.jit, static_argnums=(0, 5, 6))
-def _call_constrained(call, idx, x, w_s, w_stack, scale_hbm, weight_hbm):
+@functools.partial(jax.jit, static_argnums=(0, 5, 6, 7))
+def _call_constrained(
+    call, idx, x, w_s, w_stack, scale_hbm, weight_hbm, weight_vmem=False
+):
     # The constraint sets the operand aval's memory space, which pallas_call lowers
-    # to the custom call's `input_memory_space_colors` (HBM = 0). It only binds a
-    # pallas_call input and cannot run eagerly, hence the jit around both.
+    # to the custom call's `input_memory_space_colors` (HBM = 0, VMEM = 1). It only
+    # binds a pallas_call input and cannot run eagerly, hence the jit around both.
     if scale_hbm:
         w_s = pltpu.with_memory_space_constraint(w_s, pltpu.HBM)
     if weight_hbm:
         w_stack = pltpu.with_memory_space_constraint(w_stack, pltpu.HBM)
+    elif weight_vmem:
+        w_stack = pltpu.with_memory_space_constraint(w_stack, pltpu.VMEM)
     return call(idx, x, w_s, w_stack)
 
 
@@ -260,6 +289,7 @@ def fp8_skinny_matmul_stacked(
     config=None,
     scale_dma=False,
     hbm_pin=False,
+    weight_vmem=False,
 ):
     """As `fp8_skinny_matmul`; the kernel reads the weight from `w_stack[idx[0]]`.
 
@@ -276,14 +306,30 @@ def fp8_skinny_matmul_stacked(
     the weight into VMEM with a copy before the call (whose wait is exposed when
     nothing long runs between the copy's start and the call). Same kernel, same
     arithmetic: bit-identical outputs.
+
+    `weight_vmem` (TPU_FP8_SKINNY_VMEM_SITES): the opposite of `hbm_pin` -- the
+    weight operand is a whole-array VMEM ref, constrained to VMEM, and the kernel
+    reads its tiles in place (no ring). XLA must then stage the weight into VMEM
+    with an async copy it schedules itself, which (unlike the in-kernel ring) can
+    run under the collectives and latency-bound ops before the call; where it
+    starts is XLA's memory-space assignment's choice, steered with
+    `--xla_tpu_preferred_prefetch_overrides`. Same tiles, same dots in the same
+    order: bit-identical outputs. Overrides `hbm_pin`.
     """
     m, k = x.shape
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
-    call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf, scale_dma)
+    if weight_vmem:
+        hbm_pin = False
+    call = _build(
+        m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf, scale_dma,
+        weight_vmem,
+    )
     w_s2 = w_s.reshape(1, n).astype(jnp.float32)
-    if scale_dma or hbm_pin:
-        out = _call_constrained(call, idx, x, w_s2, w_stack, scale_dma, hbm_pin)
+    if scale_dma or hbm_pin or weight_vmem:
+        out = _call_constrained(
+            call, idx, x, w_s2, w_stack, scale_dma, hbm_pin, weight_vmem
+        )
     else:
         out = call(idx, x, w_s2, w_stack)
     if n_logical is not None and n_logical != n:

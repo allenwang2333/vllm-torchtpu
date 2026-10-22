@@ -89,6 +89,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
     FP8_PALLAS_HBM_PIN_ATTR,
+    FP8_PALLAS_VMEM_ATTR,
     FP8_PALLAS_SCHED_GROUP_ATTR,
     FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
@@ -1354,10 +1355,23 @@ def _fp8_linear_pallas_selected(prefix: str) -> bool:
     return False
 
 
+def fp8_skinny_vmem_selected(prefix: str) -> bool:
+    """TPU_FP8_SKINNY_VMEM_SITES lists `prefix`'s site, "."-bounded: the layer's
+    fp8_skinny weight operand is a VMEM operand XLA prefetches."""
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_SKINNY_VMEM_SITES.split(","):
+        site = site.strip()
+        if site and (prefix == site or prefix.endswith("." + site)):
+            return True
+    return False
+
+
 def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
     """TPU_FP8_SKINNY_HBM_PIN_SITES lists `prefix`'s site, "."-bounded: the layer's
-    fp8_skinny weight operand is constrained to HBM."""
-    if not prefix:
+    fp8_skinny weight operand is constrained to HBM. A TPU_FP8_SKINNY_VMEM_SITES
+    site is not pinned (VMEM takes precedence)."""
+    if not prefix or fp8_skinny_vmem_selected(prefix):
         return False
     for site in envs.TPU_FP8_SKINNY_HBM_PIN_SITES.split(","):
         site = site.strip()
@@ -1705,8 +1719,13 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             if hbm_pin:
                 setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
+            weight_vmem = fp8_skinny_vmem_selected(
+                getattr(layer, "prefix", "") or self.prefix
+            )
+            if weight_vmem:
+                setattr(layer, FP8_PALLAS_VMEM_ATTR, True)
             get_fp8_linear_pallas_op(
-                padded_copy, sched_group, hbm_pin
+                padded_copy, sched_group, hbm_pin, weight_vmem
             )  # build now: Dynamo cannot trace its Lock
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
@@ -1778,6 +1797,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             )
             if getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False):
                 sched_kwargs["hbm_pin"] = True
+            if getattr(layer, FP8_PALLAS_VMEM_ATTR, False):
+                sched_kwargs["weight_vmem"] = True
             out = quantized_matmul_pallas(
                 x,
                 weight,

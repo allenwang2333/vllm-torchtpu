@@ -85,6 +85,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     _fp8_linear_pallas_hbm_pinned_jax,
+    _fp8_linear_pallas_vmem_jax,
     _fp8_linear_pallas_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
@@ -767,11 +768,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             # layer's own op would, so it pins its weight when that layer does.
             from vllm_torchtpu.layers.adapter.quantization.fp8 import (
                 fp8_skinny_hbm_pin_selected,
+                fp8_skinny_vmem_selected,
             )
 
             layer_prefix = self.k_cache.prefix.split(".self_attn")[0]
             if fp8_skinny_hbm_pin_selected(f"{layer_prefix}.self_attn.q_b_proj"):
                 qb_overlap_fn = _fp8_linear_pallas_hbm_pinned_jax
+            # TPU_FP8_SKINNY_VMEM_SITES: likewise its VMEM-operand weight.
+            if fp8_skinny_vmem_selected(f"{layer_prefix}.self_attn.q_b_proj"):
+                qb_overlap_fn = _fp8_linear_pallas_vmem_jax
 
         def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q

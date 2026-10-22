@@ -366,3 +366,90 @@ def test_hbm_pin_lowers_to_hbm_color_and_no_vmem_staging(k, n, staged):
     if staged:
         assert _weight_vmem_lines(unpinned_hlo, k, n), "no staging to remove here"
     assert _weight_vmem_lines(pinned_hlo, k, n) == []
+
+
+# --------------------------------------------------------------------------------
+# weight_vmem (TPU_FP8_SKINNY_VMEM_SITES): the weight is a whole-array VMEM operand
+# XLA stages before the call; the kernel reads its tiles in place (no ring).
+# --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("k,n", PIN_SITES)
+@pytest.mark.parametrize("m,real", [(4, 4), (16, 16), (16, 5)])
+@pytest.mark.parametrize("sd", [False, True])
+def test_weight_vmem_is_bit_identical(k, n, m, real, sd):
+    """Same tiles and dots as the HBM ring (pinned and unpinned): bitwise."""
+    x = _x(m, k, real, seed=k + n + m)
+    wq, ws = _w(k, n, seed=n)
+    sd = sd and fp8_skinny.scale_dma_applies(k, n)
+
+    def f(**kw):
+        return np.asarray(
+            jax.jit(
+                lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+                    a, b, c, scale_dma=sd, **kw
+                )
+            )(x, wq, ws),
+            np.float32,
+        )
+
+    ring, pinned, vmem = f(), f(hbm_pin=True), f(weight_vmem=True)
+    assert np.count_nonzero(ring[:real]) > 0
+    np.testing.assert_array_equal(vmem, ring)
+    np.testing.assert_array_equal(vmem, pinned)
+    # weight_vmem wins over hbm_pin
+    np.testing.assert_array_equal(f(weight_vmem=True, hbm_pin=True), ring)
+
+
+def test_weight_vmem_positive_control():
+    """The comparison above can fail: one flipped weight column changes the output."""
+    k, n = 1024, 6144
+    x = _x(16, k, 16)
+    wq, ws = _w(k, n)
+    bad = wq.at[:, 4097].set(-wq[:, 4097])
+    run = jax.jit(
+        lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, weight_vmem=True)
+    )
+    good, flipped = np.asarray(run(x, wq, ws), np.float32), np.asarray(
+        run(x, bad, ws), np.float32
+    )
+    diff = np.nonzero((good != flipped).any(axis=0))[0]
+    assert list(diff) == [4097]
+
+
+def test_weight_vmem_stacked_eager_bit_identical():
+    k, n = 2048, 8192
+    x = _x(4, k, 4)
+    ws_list = [_w(k, n, seed=s) for s in (5, 6)]
+    stack = jnp.stack([w for w, _ in ws_list])
+    for i, (_, ws) in enumerate(ws_list):
+        idx = jnp.array([i], jnp.int32)
+        y0 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws)
+        y1 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws, weight_vmem=True)
+        np.testing.assert_array_equal(
+            np.asarray(y0, np.float32), np.asarray(y1, np.float32)
+        )
+
+
+@pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 8192), (2048, 16384)])
+def test_weight_vmem_lowers_to_vmem_color_and_staged_operand(k, n):
+    """The custom call carries `input_memory_space_colors`, and in the compiled
+    module its weight operand sits in VMEM (S(1)), i.e. XLA staged it."""
+    x = _x(16, k, 4)
+    wq, ws = _w(k, n)
+    lowered = jax.jit(
+        lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, weight_vmem=True)
+    ).lower(x, wq, ws)
+    assert "input_memory_space_colors" in lowered.as_text()
+    hlo = lowered.compile().as_text()
+    call = [
+        ln
+        for ln in hlo.splitlines()
+        if "custom-call(" in ln and "fp8_skinny" in ln and "_wv_" in ln
+    ]
+    assert len(call) == 1, call
+    print(call[0][:600])
+    weight_arg = call[0].split("custom-call(", 1)[1].split("),")[0].split(", ")[-2:]
+    assert any(
+        a.startswith(f"f8e4m3fn[1,{k},{n}]") and "S(1)" in a for a in weight_arg
+    ), weight_arg

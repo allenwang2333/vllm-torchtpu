@@ -296,6 +296,8 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_PALLAS: bool = False
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
     TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_FP8_SKINNY_VMEM_SITES: str = ""
+    TPU_FUSED_OPROJ_AR_VMEM_W: bool = False
     TPU_MOE_ROUTER_HBM_PIN: bool = False
     TPU_LM_HEAD_HBM: str = ""
     TPU_FUSED_ADD_RMSNORM: bool = False
@@ -2003,6 +2005,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of all after the last tile. 0.3-0.7 us/call faster on 2x2x2 tpu7x
     # (t5-oproj-ar probe 02b); 0 keeps every push after the last tile.
     "TPU_FUSED_OPROJ_AR_WAVES": env_bool("TPU_FUSED_OPROJ_AR_WAVES", True),
+    # With TPU_FUSED_OPROJ_AR: the kernel takes its 6 MB weight as a whole-array VMEM
+    # operand (constrained to VMEM) instead of streaming it from HBM through its
+    # ring, so XLA stages it with an async copy that its memory-space assignment can
+    # start under the collectives / latency-bound ops before the call (steer with
+    # --xla_tpu_preferred_prefetch_overrides on the f8e4m3fn[1,1024,6144] operand,
+    # operand_number 4). Bitwise the ring path.
+    "TPU_FUSED_OPROJ_AR_VMEM_W": env_bool("TPU_FUSED_OPROJ_AR_VMEM_W"),
     # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
     # M <= 16 through the weight-streaming Pallas kernel
     # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
@@ -2081,6 +2090,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copy's start and the call. Per site, not global: a site whose staging copy is
     # hidden (qkv_a under its prefetch override) keeps it. Bit-identical outputs.
     "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    # With TPU_FP8_LINEAR_PALLAS: comma-separated sites (as TPU_FP8_SKINNY_HBM_PIN_
+    # SITES) whose skinny kernel takes its weight as a whole-array VMEM operand
+    # constrained to VMEM, read in place (no in-kernel ring): XLA stages it with an
+    # async copy its memory-space assignment schedules, which can run under the
+    # collectives / latency-bound ops before the call instead of the weight being
+    # streamed on the critical path (q_b 16.8 MB at TP16 x DCP8 decode). Steer the
+    # copy with --xla_tpu_preferred_prefetch_overrides (custom-call operand 3).
+    # Takes precedence over TPU_FP8_SKINNY_HBM_PIN_SITES. Bit-identical outputs.
+    "TPU_FP8_SKINNY_VMEM_SITES": env_str("TPU_FP8_SKINNY_VMEM_SITES", ""),
     # MoE router logits (the bf16 gate GEMM, [T, hidden] x [E, hidden]^T) of a layer
     # armed for USE_MOE_TP_DECODE_KERNEL run at decode token counts (<= 16) as a
     # Pallas kernel that streams the router weight from HBM (operand constrained
