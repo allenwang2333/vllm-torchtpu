@@ -151,14 +151,21 @@ def test_blocks_do_not_import_experimental_code():
     rel_paths = {p.relative_to(blocks_root).as_posix() for p in py_files}
     expected_block_files = {
         "__init__.py",
+        "norm.py",
         "gqa/__init__.py",
         "gqa/block.py",
+        "gqa/decls.py",
         "gqa/kv.py",
+        "gqa/reference.py",
         "gdn/__init__.py",
         "gdn/block.py",
+        "gdn/decls.py",
         "gdn/states.py",
+        "gdn/reference.py",
         "moe/__init__.py",
         "moe/block.py",
+        "moe/decls.py",
+        "moe/reference.py",
     }
     assert expected_block_files <= rel_paths, expected_block_files - rel_paths
     for path in py_files:
@@ -197,7 +204,7 @@ def test_pool_package_is_framework_free():
     assert len(required_pool_modules) > 1
     assert required_pool_modules <= rel_paths, required_pool_modules - rel_paths
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
-    allowed_core = {"ops", "errors", "spec", "exec_spec"}
+    allowed_core = {"ops", "errors", "spec", "decls", "exec_spec"}
     for path in py_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):

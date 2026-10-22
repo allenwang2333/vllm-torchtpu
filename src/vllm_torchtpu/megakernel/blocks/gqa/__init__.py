@@ -11,9 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GQA block package: `GQABlock` and its parameters / tunables."""
+"""GQA block package: `GQABlock` (`GQA`) and its parameters / tunables."""
 
 from .block import GQABlock
 from .params import GQAParams, GQATunables
 
-__all__ = ["GQABlock", "GQAParams", "GQATunables"]
+GQA = GQABlock
+
+__all__ = ["GQA", "GQABlock", "GQAParams", "GQATunables"]

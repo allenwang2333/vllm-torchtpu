@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
 from typing import Any
 
 import jax
@@ -24,13 +25,30 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...decls import (
+    BlockBinding,
+    FrozenDict,
+    HFParamDecl,
+    ResolvedBlockGeometry,
+)
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...ops import BF16, F32, FP8, I32, rnd, rup
 from ...spec import Block, ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
+from .decls import (
+    MOE_FIELD_ALIASES,
+    MOE_GEOMETRY_FIELDS,
+    MOE_GEOMETRY_METHODS,
+    MOE_OPTIONS,
+    MOE_PARAM_NAMES,
+    moe_hf_params,
+    resolve_moe_binding,
+    validate_moe_options,
+)
 from .experts import expert, experts_piped, experts_piped_ep
-from .params import MoEDebug, MoEParams, MoETunables
+from .params import MoEDebug, MoEParams, MoETunables, derive_moe_params
+from .reference import moe_reference
 from .routing import route
 
 
@@ -42,6 +60,91 @@ class MoEBlock(Block):
     input_norm: str | None = "post_norm"
     Tunables = MoETunables
     Debug = MoEDebug
+    PARAM_NAMES = MOE_PARAM_NAMES
+    GEOMETRY_FIELDS = MOE_GEOMETRY_FIELDS
+    FIELD_ALIASES = MOE_FIELD_ALIASES
+    OPTIONS = MOE_OPTIONS
+    GEOMETRY_METHODS = MOE_GEOMETRY_METHODS
+
+    def __init__(
+        self,
+        *,
+        geometry: Any = None,
+        prefix: str = "mlp",
+        shared_gate: bool = True,
+        moe_tp: bool | None = None,
+        e_slots: int | None = None,
+    ) -> None:
+        self.geometry = geometry
+        self.prefix = prefix
+        self.shared_gate = bool(shared_gate)
+        self._explicit_moe_tp = None if moe_tp is None else bool(moe_tp)
+        self._explicit_e_slots = None if e_slots is None else int(e_slots)
+        self.moe_tp = (
+            self._explicit_moe_tp
+            if self._explicit_moe_tp is not None
+            else bool(getattr(geometry, "moe_tp", True))
+        )
+        self.e_slots = (
+            self._explicit_e_slots
+            if self._explicit_e_slots is not None
+            else int(getattr(geometry, "e_slots", 0))
+        )
+        self._validate_options({"shared_gate": self.shared_gate})
+        if geometry is not None:
+            self._check_option_consistency(geometry)
+        self.options = FrozenDict(
+            {
+                "shared_gate": self.shared_gate,
+                "moe_tp": self.moe_tp,
+                "e_slots": self.e_slots,
+            }
+        )
+
+    def _check_option_consistency(self, g: Any) -> tuple[bool, int]:
+        g_tp = getattr(g, "moe_tp", None)
+        if (
+            self._explicit_moe_tp is not None
+            and g_tp is not None
+            and bool(g_tp) != self._explicit_moe_tp
+        ):
+            raise MegakernelConfigError(
+                f"MoEBlock(moe_tp={self._explicit_moe_tp}) disagrees with "
+                f"geometry moe_tp={g_tp}"
+            )
+        g_slots = getattr(g, "e_slots", None)
+        if (
+            self._explicit_e_slots is not None
+            and g_slots is not None
+            and int(g_slots) != self._explicit_e_slots
+        ):
+            raise MegakernelConfigError(
+                f"MoEBlock(e_slots={self._explicit_e_slots}) disagrees with "
+                f"geometry e_slots={g_slots}"
+            )
+        moe_tp = (
+            self._explicit_moe_tp
+            if self._explicit_moe_tp is not None
+            else (bool(g_tp) if g_tp is not None else self.moe_tp)
+        )
+        e_slots = (
+            self._explicit_e_slots
+            if self._explicit_e_slots is not None
+            else (int(g_slots) if g_slots is not None else self.e_slots)
+        )
+        return moe_tp, e_slots
+
+    @classmethod
+    def _validate_options(cls, options: Mapping[str, Any]) -> None:
+        validate_moe_options(options)
+
+    @classmethod
+    def _resolve_binding(
+        cls, binding: BlockBinding, hf_config: Any
+    ) -> ResolvedBlockGeometry:
+        return resolve_moe_binding(
+            cls, binding, super()._resolve_binding(binding, hf_config)
+        )
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
         """Debug routing inputs: `rbias` (HBM, `forced_routing`) and `moe_rows`
@@ -55,10 +158,11 @@ class MoEBlock(Block):
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
+        moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
         isr = g.IS // ex.R
-        ir = g.I // ex.R if g.moe_tp else g.I
-        ew = g.e_slots if g.e_slots > 0 else (g.E if g.moe_tp else er)
+        ir = g.I // ex.R if moe_tp else g.I
+        ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
         layout_e = "stacked" if ex.stack_e else "per_layer"
         return [
             WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
@@ -93,6 +197,7 @@ class MoEBlock(Block):
         ]
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
+        moe_tp, e_slots = self._check_option_consistency(g)
         er = g.E // ex.R
         isr = g.IS // ex.R
         fields = [
@@ -101,89 +206,26 @@ class MoEBlock(Block):
             SmallField("sh2_s", g.H),
             SmallField("sh_gate", g.H),
         ]
-        if not g.moe_tp and g.e_slots > er:
+        if not moe_tp and e_slots > er:
             fields.append(SmallField("ecopy", g.E))
         return fields
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
+        moe_tp, _ = self._check_option_consistency(g)
         isr = g.IS // ex.R
-        ir = g.I // ex.R if g.moe_tp else g.I
-        return {
-            "acc": max(g.H, g.E, 2 * isr, 2 * ir),
-            "xb2": max(isr, ir),
-        }
+        ir = g.I // ex.R if moe_tp else g.I
+        return {"acc": max(g.H, g.E, 2 * isr, 2 * ir), "xb2": max(isr, ir)}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> MoEParams:
-        tiles = ex.resolve_tiles(g)
-        tt: MoETunables = self.tunables(ex)
-        er = g.E // ex.R
-        isr = g.IS // ex.R
-        ir = g.I // ex.R if g.moe_tp else g.I
-        ew = g.e_slots if g.e_slots > 0 else (g.E if g.moe_tp else er)
-        extra = ew - er
-        ch = min(1024, g.H)
-        assert g.H % ch == 0, (g.H, ch)
-        t13, t2 = plan.nt["e13"], plan.nt["e2"]
-        te = t13 + t2
-        nbe = tiles.nbe
-        nss = 3 + (nbe - 1) // te
-        pipe = tt.pipe and t13 == 1 and t2 == 1
-        pipe_ep = (
-            tt.pipe_ep and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
-        )
-        n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
-        lazy_moe = tiles.lazy and n_moe <= tiles.nbd
-        ecopy = not g.moe_tp and g.e_slots > er
-        assert not (self.debug_flags(ex).row_mask and ecopy), (
-            "row_mask: identity expert placement only"
-        )
-        if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
-            raise MegakernelConfigError(
-                "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
-                f"for 9-bit float32 mantissa packing), got E={g.E}"
-            )
-        nb_picks = rup(ex.B * g.TOPK, 128)
-        route_vec = bool(
-            tt.route_vec
-            and ecopy  # redundant-expert placement table active
-            and g.E > 0
-            and g.E % 128 == 0  # 128-lane expert bitmask tiling
-            and (g.E >> 5) <= 256  # packed bitmask rows fit 256-lane scratch
-            and g.E // 128 + 1 <= ex.MR  # MROW + 1 <= MR for route_topk scratch
-            and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
-            and nb_picks >= er  # elist/wlist capacity covers ER local slots
-        )
-        return MoEParams(
-            H=g.H,
-            E=g.E,
-            TOPK=g.TOPK,
-            IR=ir,
-            ISR=isr,
-            ER=er,
-            EW=ew,
-            EXTRA=extra,
-            CH=ch,
-            T13=t13,
-            T2=t2,
-            TE=te,
-            NBE=nbe,
-            NSS=nss,
-            PIPE=pipe,
-            PIPE_EP=pipe_ep,
-            LAZY_MOE=lazy_moe,
-            N_MOE=n_moe,
-            ECOPY=ecopy,
-            moe_tp=g.moe_tp,
-            stack_e=ex.stack_e,
-            topk_packed=tt.topk,
-            topk_lanes=tt.topk_lanes,
-            route_vec=route_vec,
-            r2_direct_store=tt.r2_direct_store,
-            unroll=bool(tt.moe_unroll or pipe_ep),
-            group_rel=tt.moe_group_rows >= ex.B,
-            ecopy_opt=tt.ecopy_opt,
-            eps=g.eps,
-            zero_centered_norm=bool(g.zero_centered_norm),
+        moe_tp, e_slots = self._check_option_consistency(g)
+        return derive_moe_params(
+            g,
+            ex,
+            plan,
+            self.tunables(ex),
+            self.debug_flags(ex),
+            moe_tp=moe_tp,
+            e_slots=e_slots,
         )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
@@ -306,3 +348,37 @@ class MoEBlock(Block):
                 else:
                     lax.fori_loop(0, n_hit, functools.partial(expert, m, l), 0)
         return scr["part"][...]
+
+    def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
+        geom = self._require_geometry(g)
+        moe_tp, _ = self._check_option_consistency(geom)
+        return moe_hf_params(
+            self.prefix if prefix is None else prefix,
+            geom,
+            shared_gate=self.shared_gate,
+            moe_tp=moe_tp,
+        )
+
+    def cache_decl(self, g: Any = None) -> None:
+        return None
+
+    def reference(
+        self,
+        params: Any,
+        x: Any,
+        state: Any = None,
+        *,
+        g: Any = None,
+        ex: ExecSpec,
+        layer_idx: int = 0,
+    ) -> tuple[jax.Array, Any]:
+        geom = self._require_geometry(g)
+        self._check_option_consistency(geom)
+        return moe_reference(
+            params,
+            x,
+            state,
+            g=geom,
+            ex=ex,
+            layer_idx=layer_idx,
+        )

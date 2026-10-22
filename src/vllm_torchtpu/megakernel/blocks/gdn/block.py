@@ -15,19 +15,35 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
+from ...decls import (
+    BlockBinding,
+    FrozenDict,
+    HFParamDecl,
+    RecurrentCacheDecl,
+    ResolvedBlockGeometry,
+)
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
 from ...ops import BF16, F32, FP8, I32, rup
 from ...pool.config import cache_exec
 from ...spec import Block, SmallField, StateDecl, WeightDecl
 from .conv import conv_step, gdn_in
+from .decls import (
+    GDN_FIELD_ALIASES,
+    GDN_GEOMETRY_FIELDS,
+    GDN_GEOMETRY_METHODS,
+    GDN_PARAM_NAMES,
+    gdn_cache_decl,
+    gdn_hf_params,
+    resolve_gdn_binding,
+)
 from .params import (
     GDNLinInLayout,
     GDNParams,
@@ -36,6 +52,7 @@ from .params import (
     gdn_lin_in_layout,
 )
 from .recurrence import gdn_rec, gdn_rec_chunked
+from .reference import gdn_reference
 from .states import conv_out_src, rec_drain, rec_in
 
 
@@ -46,6 +63,29 @@ class GDNBlock(Block):
     reduction = "allreduce"
     input_norm: str | None = "in_norm"
     Tunables = GDNTunables
+    PARAM_NAMES = GDN_PARAM_NAMES
+    GEOMETRY_FIELDS = GDN_GEOMETRY_FIELDS
+    FIELD_ALIASES = GDN_FIELD_ALIASES
+    OPTIONS: ClassVar[dict[str, Any]] = {}
+    GEOMETRY_METHODS = GDN_GEOMETRY_METHODS
+
+    def __init__(
+        self,
+        *,
+        geometry: Any = None,
+        prefix: str = "linear_attn",
+    ) -> None:
+        self.geometry = geometry
+        self.prefix = prefix
+        self.options = FrozenDict()
+
+    @classmethod
+    def _resolve_binding(
+        cls, binding: BlockBinding, hf_config: Any
+    ) -> ResolvedBlockGeometry:
+        return resolve_gdn_binding(
+            cls, binding, super()._resolve_binding(binding, hf_config)
+        )
 
     @classmethod
     def chunk_rows(cls, ex: ExecSpec) -> tuple[int, int]:
@@ -78,13 +118,13 @@ class GDNBlock(Block):
         acc_arr = jnp.asarray(acc, dtype=I32)
         assert acc_arr.shape == (NS,), (acc_arr.shape, NS)
 
-        def _accept_conv_seq(c_seq, a_s):
-            taps = lax.dynamic_slice_in_dim(c_seq, a_s, 3, axis=-2)
-            return c_seq.at[..., 0:3, :].set(taps)
-
-        conv_next = jax.vmap(_accept_conv_seq, in_axes=(-3, 0), out_axes=-3)(
-            c_ckpt, acc_arr
-        )
+        conv_next = jax.vmap(
+            lambda c_seq, a_s: c_seq.at[..., 0:3, :].set(
+                lax.dynamic_slice_in_dim(c_seq, a_s, 3, axis=-2)
+            ),
+            in_axes=(-3, 0),
+            out_axes=-3,
+        )(c_ckpt, acc_arr)
 
         lead = r_ckpt.shape[:-3]
         KD, VD = r_ckpt.shape[-2], r_ckpt.shape[-1]
@@ -96,10 +136,8 @@ class GDNBlock(Block):
             in_axes=(-5, 0),
             out_axes=-4,
         )(r_unflat, acc_arr)
-        rec_next = r_sel.reshape((*lead, NS * vh, KD, VD))
-
         out["conv"] = conv_next
-        out["rec"] = rec_next
+        out["rec"] = r_sel.reshape((*lead, NS * vh, KD, VD))
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
@@ -202,12 +240,7 @@ class GDNBlock(Block):
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         lay = self.lin_in_layout(g, ex)
-        return {
-            "acc": lay.NLI,
-            "ybuf": lay.NLI,
-            "xb2": lay.Z,
-            "mix": lay.Z,
-        }
+        return {"acc": lay.NLI, "ybuf": lay.NLI, "xb2": lay.Z, "mix": lay.Z}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
         return derive_params(g, ex, plan, self.tunables(ex), self.name)
@@ -256,8 +289,7 @@ class GDNBlock(Block):
     def init_buffers(self, ctx: Any) -> None:
         if not cache_exec(ctx.ex).FUSED:
             return
-        gp: GDNParams = ctx.block_params(self.name)
-        fused_io().gdn_fused_init_buffers(ctx, gp)
+        fused_io().gdn_fused_init_buffers(ctx, ctx.block_params(self.name))
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         ex = ctx.ex
@@ -265,11 +297,9 @@ class GDNBlock(Block):
         o = ctx.stream.sp.block_ord(l, self.name)
         if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_emit(ctx, gp, o, slot)
-        scr, O = ctx.scr, ctx.O  # noqa: E741
-        skip, sc, stream = ctx.skip, ctx.sc, ctx.stream
-        VER = ex.VER
+        scr, O, skip, sc, stream = ctx.scr, ctx.O, ctx.skip, ctx.sc, ctx.stream  # noqa: E741
         Z, H, GCH = gp.Z, gp.H, gp.GCH
-        rec_out_key = "rec_ckpt" if VER else "rec"
+        rec_out_key = "rec_ckpt" if ex.VER else "rec"
         recb, sem = scr["recb"], scr["st_sem"]
         with stream.segment(lazy=False):
             ybuf = gdn_in(ctx, gp, o, slot)
@@ -285,7 +315,6 @@ class GDNBlock(Block):
                 if "gdn" not in skip:
                     with sc("gdn_rec"):
                         gdn_rec(ctx, gp, u, ybuf, slot)
-
             with sc("gdn_out"):
                 if not GCH and "gdn_state" not in skip:
                     pltpu.make_async_copy(recb, O[rec_out_key].at[o], sem.at[3]).start()
@@ -332,3 +361,18 @@ class GDNBlock(Block):
                 "rec_ckpt": raw_outputs["rec_ckpt"],
             }
         return {"conv": raw_outputs["conv"], "rec": raw_outputs["rec"]}
+
+    def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
+        geom = self._require_geometry(g)
+        return gdn_hf_params(self.prefix if prefix is None else prefix, geom)
+
+    def cache_decl(self, g: Any = None) -> RecurrentCacheDecl:
+        return gdn_cache_decl(self._require_geometry(g))
+
+    def reference(
+        self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any
+    ) -> tuple[jax.Array, dict[str, Any]]:
+        assert state is not None, (
+            "GDNBlock.reference requires `state` with 'conv'/'rec'"
+        )
+        return gdn_reference(params, x, state, g=self._require_geometry(g), **kw)

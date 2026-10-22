@@ -61,6 +61,7 @@ def pytest_configure(config: Any) -> None:
     config.addinivalue_line(
         "markers", "slow: multi-rank or large-batch CPU interpret tests"
     )
+    config.addinivalue_line("markers", "golden: bit-exact golden hash regression tests")
 
 
 @dataclass(frozen=True)

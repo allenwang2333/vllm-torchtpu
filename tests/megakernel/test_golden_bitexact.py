@@ -58,6 +58,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu import megakernel as mk
+from vllm_torchtpu.megakernel.blocks.gqa import GQATunables
 from vllm_torchtpu.megakernel.models import qwen35
 
 GOLDEN = pathlib.Path(__file__).parent / "golden" / "b1_bitexact.json"
@@ -117,7 +118,10 @@ def _write_golden_case(
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         gold = json.loads(golden_path.read_text()) if golden_path.exists() else {}
-        gold[_META_KEY] = {**_host_fingerprint(), "gpr_resolved": True}
+        if "gpr" in got:
+            gold[_META_KEY] = {**_host_fingerprint(), "gpr_resolved": True}
+        elif _META_KEY not in gold:
+            gold[_META_KEY] = _host_fingerprint()
         gold[name] = got
         golden_path.write_text(json.dumps(gold, indent=1, sort_keys=True) + "\n")
 
@@ -149,6 +153,20 @@ CASES: dict[str, dict[str, Any]] = {
     "c30_fused_t1_b4": dict(profile="qwen35-candidate30", T=1, B=4, fused=True),
     "c30_fused_t4_b8": dict(profile="qwen35-candidate30", T=4, B=8, fused=True),
     "c30_fused_t4_b24": dict(profile="qwen35-candidate30", T=4, B=24, fused=True),
+    # Pure-JAX reference_step output and state hashes across TP, EP+EPLB,
+    # paged pool I/O, float32 RoPE intermediates, and attention-only configs.
+    "ref_tiny_t1_tp": dict(kind="ref", seed=0, T=1, B=2, ctx=64),
+    "ref_tiny_t2_tp": dict(kind="ref", seed=1, T=2, B=4, ctx=64),
+    "ref_tiny_t1_ep_eplb72": dict(
+        kind="ref", seed=2, T=1, B=2, ctx=64, moe_tp=False, e_slots=72
+    ),
+    "ref_tiny_t2_paged_pool": dict(
+        kind="ref", seed=3, T=2, B=4, ctx=128, paged_pool=True
+    ),
+    "ref_tiny_t1_rope_fp32": dict(kind="ref", seed=4, T=1, B=2, ctx=64, rope_fp32=True),
+    "ref_tiny_t1_att_only": dict(
+        kind="ref", seed=5, T=1, B=2, ctx=64, L=2, att_every=1
+    ),
 }
 
 
@@ -186,6 +204,54 @@ def _tiny(t: mk.Tiles, ctx: int) -> mk.Tiles:
 
 def _h(a: Any) -> str:
     return hashlib.sha256(np.asarray(a).view(np.uint8).tobytes()).hexdigest()[:24]
+
+
+def _arr_hash(arr: jax.Array) -> str:
+    np_arr = np.asarray(arr)
+    raw = np_arr.view(np.uint8).tobytes()
+    return f"{np_arr.dtype}:{list(np_arr.shape)}:{hashlib.sha256(raw).hexdigest()}"
+
+
+def run_ref_case(
+    *,
+    seed: int,
+    T: int,
+    B: int,
+    ctx: int,
+    moe_tp: bool = True,
+    e_slots: int = 0,
+    paged_pool: bool = False,
+    rope_fp32: bool = False,
+    L: int | None = None,
+    att_every: int | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    g = qwen35.TINY if moe_tp else qwen35.TINY_EP
+    if e_slots:
+        g = dataclasses.replace(g, e_slots=e_slots)
+    if L is not None:
+        g = dataclasses.replace(g, L=L)
+    if att_every is not None:
+        g = dataclasses.replace(g, att_every=att_every)
+    cache = mk.CacheExec(paged_kv=True, num_pages=64) if paged_pool else mk.CacheExec()
+    tiles: mk.Tiles | None = None
+    if rope_fp32:
+        if "rope_fp32" not in GQATunables.__dataclass_fields__:
+            pytest.skip("GQATunables.rope_fp32 not supported at this ref")
+        tiles = mk.Tiles(blocks={"gqa": GQATunables(rope_fp32=True)})
+    ex = mk.ExecSpec(R=R, B=B, T=T, ctx=ctx, cache=cache, tiles=tiles)
+    pos, hid, w_l, st_l = qwen35.random_logical_inputs(jax.random.PRNGKey(seed), g, ex)
+    out, st = qwen35.reference_step(g, ex, pos, hid, w_l, st_l, pool_io=paged_pool)
+    return {
+        "out": _arr_hash(out),
+        "states": {k: _arr_hash(st[k]) for k in sorted(st)},
+    }
+
+
+def _dispatch_case(cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg.get("kind") == "ref":
+        return run_ref_case(**cfg)
+    return run_case(**cfg)
 
 
 def run_case(
@@ -256,18 +322,24 @@ def run_case(
     }
 
 
+@pytest.mark.golden
 @pytest.mark.slow
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_golden_bitexact(name: str):
-    """Hidden + every pool output reproduces the golden hash bit-for-bit."""
+    """Hidden + every pool or reference_step output reproduces the golden hash."""
     golden_path, is_custom_golden = _golden_path()
     if os.environ.get("MK_REGEN_GOLDEN"):
-        got = run_case(**CASES[name])
+        got = _dispatch_case(CASES[name])
         _write_golden_case(golden_path, name, got)
         pytest.skip("regenerated golden")
     all_gold = json.loads(golden_path.read_text())
     if not is_custom_golden:
-        meta = all_gold.get(_META_KEY)
+        case_entry = all_gold.get(name, {})
+        meta = (
+            case_entry.get(_META_KEY)
+            if isinstance(case_entry, dict) and _META_KEY in case_entry
+            else all_gold.get(_META_KEY)
+        )
         cur = _host_fingerprint()
         if not _fingerprint_matches(meta, cur):
             pytest.skip(
@@ -278,12 +350,26 @@ def test_golden_bitexact(name: str):
             )
     elif name not in all_gold:
         pytest.skip(f"case {name!r} only exists in HEAD (not in {golden_path})")
-    got = run_case(**CASES[name])
+    got = _dispatch_case(CASES[name])
     gold = all_gold[name]
-    assert got["hid"] == gold["hid"], (name, "hidden", got["hid"], gold["hid"])
-    assert got["pools"] == gold["pools"], (name, "pools", got["pools"], gold["pools"])
-    if all_gold.get(_META_KEY, {}).get("gpr_resolved"):
-        assert got["gpr"] == gold["gpr"], (name, "gpr", got["gpr"], gold["gpr"])
+    if "out" in gold:
+        assert got["out"] == gold["out"], (name, "out", got["out"], gold["out"])
+        assert got["states"] == gold["states"], (
+            name,
+            "states",
+            got["states"],
+            gold["states"],
+        )
+    else:
+        assert got["hid"] == gold["hid"], (name, "hidden", got["hid"], gold["hid"])
+        assert got["pools"] == gold["pools"], (
+            name,
+            "pools",
+            got["pools"],
+            gold["pools"],
+        )
+        if all_gold.get(_META_KEY, {}).get("gpr_resolved"):
+            assert got["gpr"] == gold["gpr"], (name, "gpr", got["gpr"], gold["gpr"])
 
 
 def test_golden_covers_every_case():

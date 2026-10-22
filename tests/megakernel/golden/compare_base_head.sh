@@ -89,7 +89,20 @@ fi
     PYTHONPATH="$WT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
     MK_REGEN_GOLDEN=1 \
     MK_GOLDEN_JSON="$BASE_JSON" \
-    "$PYTEST_BIN" "$BASE_TEST" "$@"
+    "$PYTEST_BIN" "$BASE_TEST" "$@" || [[ $? -eq 5 ]]
+  if grep -q "ref_tiny_" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" && ! grep -q "ref_tiny_" "$BASE_TEST"; then
+    REF_ARGS=("$@")
+    if [[ " $* " != *" -k "* ]]; then
+      REF_ARGS+=("-k" "ref_tiny_")
+    fi
+    if [[ " ${REF_ARGS[*]} " == *"ref_tiny_"* ]]; then
+      JAX_PLATFORMS="${JAX_PLATFORMS:-cpu}" \
+        PYTHONPATH="$WT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" \
+        MK_REGEN_GOLDEN=1 \
+        MK_GOLDEN_JSON="$BASE_JSON" \
+        "$PYTEST_BIN" "$REPO_ROOT/tests/megakernel/test_golden_bitexact.py" "${REF_ARGS[@]}" || [[ $? -eq 5 ]]
+    fi
+  fi
 )
 
 echo "=== [2/2] Comparing current tree against $BASE_REF ($BASE_SHA) ==="

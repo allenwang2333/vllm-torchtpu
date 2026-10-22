@@ -11,13 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE block package: `MoEBlock` and its parameters / tunables."""
+"""MoE block package: `MoEBlock` (`MoE`) and its parameters / tunables."""
 
 from .block import MoEBlock
 from .params import MoEDebug, MoEParams, MoETunables
 from .topk import topk_rows_on_lanes
 
+MoE = MoEBlock
+
 __all__ = [
+    "MoE",
     "MoEBlock",
     "MoEDebug",
     "MoEParams",

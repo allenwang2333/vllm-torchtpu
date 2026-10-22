@@ -13,21 +13,32 @@
 # limitations under the License.
 """Composable megakernel building blocks."""
 
+from __future__ import annotations
+
 from .gdn import (
+    GDN,
     GDNBlock,
     GDNLinInLayout,
     GDNParams,
 )
-from .gqa import GQABlock, GQAParams
-from .moe import MoEBlock, MoEDebug, MoEParams
+from .gqa import GQA, GQABlock, GQAParams
+from .moe import MoE, MoEBlock, MoEDebug, MoEParams
+from .norm import Embedding, EmbeddingBlock, Norm, NormBlock
 
 __all__ = [
+    "Embedding",
+    "EmbeddingBlock",
+    "GDN",
     "GDNBlock",
     "GDNLinInLayout",
     "GDNParams",
+    "GQA",
     "GQABlock",
     "GQAParams",
+    "MoE",
     "MoEBlock",
     "MoEDebug",
     "MoEParams",
+    "Norm",
+    "NormBlock",
 ]

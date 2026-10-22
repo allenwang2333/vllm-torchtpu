@@ -18,9 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from jax.experimental.pallas import tpu as pltpu
+
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec, NumericsClass
-from ...ops import rup
+from ...fused_io_hook import fused_io
+from ...ops import BF16, F32, FP8, I32, rup
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
 
 NN = (((1,), (0,)), ((), ()))
@@ -249,3 +252,70 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         zero_centered_norm=bool(g.zero_centered_norm),
         rope_fp32=bool(tt.rope_fp32),
     )
+
+
+def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
+    """Allocate `GQABlock` VMEM/SMEM/semaphore scratch descriptors."""
+    scr: dict[str, Any] = {}
+    if not cache_exec(ex).paged_kv:
+        scr["kbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
+        scr["vbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
+    scr.update(
+        {
+            "kv_sem": pltpu.SemaphoreType.DMA(
+                (ap.NKVR,) if cache_exec(ex).paged_kv else (2, ap.NKV)
+            ),
+            "wl_b": pltpu.SMEM((ap.NWL,), I32),
+            "wl_t": pltpu.SMEM((ap.NWL,), I32),
+            "wl_cnt": pltpu.SMEM((1,), I32),
+            "qb": pltpu.VMEM((ex.NS, ap.TQ, ap.HD), BF16),
+            "am": pltpu.VMEM((ex.NS, ap.TQ, 128), F32),
+            "al": pltpu.VMEM((ex.NS, ap.TQ, 128), F32),
+            "aacc": pltpu.VMEM((ex.NS, ap.TQ, ap.HD), F32),
+            "knew": pltpu.VMEM((ex.MR, ap.HD), F32),
+            "vnew": pltpu.VMEM((ex.MR, ap.HD), F32),
+            "gate": pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32),
+            "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
+        }
+    )
+    if not cache_exec(ex).FUSED:
+        scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
+    else:
+        scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
+    if cache_exec(ex).paged_kv:
+        if not ap.KVE:
+            scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
+        scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
+        scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
+        scr["wl_kp"] = pltpu.SMEM((ap.NWL * (ap.BLK // cache_exec(ex).page_size),), I32)
+    if ap.SPLIT:
+        q_rows = ap.NBP if ap.PACK else ex.B
+        scr.update(
+            {
+                "qg": pltpu.VMEM((ap.G, q_rows, 8, ap.HD), F32),
+                "pso": pltpu.VMEM((ap.G, q_rows, 8, ap.PW), F32),
+                "pri": pltpu.VMEM((ap.G, q_rows, 8, ap.PW), F32),
+                "sq_ssem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
+                "sq_rsem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
+                "sp_ssem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
+                "sp_rsem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
+            }
+        )
+    elif ex.VER:
+        scr["qg"] = pltpu.VMEM((1, ex.B, 8, ap.HD), F32)
+    if ap.QV:
+        scr["rope"] = pltpu.VMEM((2, ex.MR, 128), F32)  # QV-only cos / sin table
+        scr["qg"] = pltpu.VMEM(
+            (ap.G if ap.SPLIT and not ap.GQ else 1, ap.NHH, ap.QVR, 128), F32
+        )
+        scr["ost"] = pltpu.VMEM((ap.NHH, ap.QVR, 128), F32)
+    if ap.GQ:
+        del scr["pso"]
+        scr.update(
+            {
+                "qxb": pltpu.VMEM((ap.G, ex.NS, ap.QG, ap.HD), BF16),
+                "psend": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
+                "pri": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
+            }
+        )
+    return scr

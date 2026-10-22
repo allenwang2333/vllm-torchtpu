@@ -15,12 +15,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import jax.numpy as jnp
 from jax import lax
-from jax.experimental.pallas import tpu as pltpu
 
+from ...decls import (
+    BlockBinding,
+    FrozenDict,
+    HFParamDecl,
+    KVCacheDecl,
+    ResolvedBlockGeometry,
+)
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...fused_io_hook import fused_io
@@ -29,10 +36,22 @@ from ...pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_s
 from ...spec import Block, SmallField, StateDecl, WeightDecl
 from .attention import att_core
 from .context import GQAEmit
+from .decls import (
+    GQA_FIELD_ALIASES,
+    GQA_GEOMETRY_FIELDS,
+    GQA_GEOMETRY_METHODS,
+    GQA_OPTIONS,
+    GQA_PARAM_NAMES,
+    gqa_cache_decl,
+    gqa_hf_params,
+    resolve_gqa_binding,
+    validate_gqa_options,
+)
 from .kv import build_worklist, make_kv_ring
 from .merge import split_merge
 from .new_token import att_new
-from .params import GQAParams, GQATunables, derive_params
+from .params import GQAParams, GQATunables, derive_params, gqa_scratch
+from .reference import gqa_reference
 from .staging import att_q, kv_new, q_exchange_start, q_gather_finish
 
 
@@ -43,11 +62,43 @@ class GQABlock(Block):
     reduction = "allreduce"
     input_norm: str | None = "in_norm"
     Tunables = GQATunables
+    PARAM_NAMES = GQA_PARAM_NAMES
+    GEOMETRY_FIELDS = GQA_GEOMETRY_FIELDS
+    FIELD_ALIASES = GQA_FIELD_ALIASES
+    OPTIONS = GQA_OPTIONS
+    GEOMETRY_METHODS = GQA_GEOMETRY_METHODS
 
-    def __init__(self, pool_layout: Any = None) -> None:
+    def __init__(
+        self,
+        pool_layout: Any = None,
+        *,
+        geometry: Any = None,
+        prefix: str = "self_attn",
+        qk_norm: bool = True,
+        output_gate: bool = True,
+    ) -> None:
         # `PoolLayout` of the model's paged pools (None: the default page
         # packing `(2, HD // 4, 4, page_size)`, the only one the paged reads use).
         self.pool_layout = pool_layout
+        self.geometry = geometry
+        self.prefix = prefix
+        self.qk_norm = bool(qk_norm)
+        self.output_gate = bool(output_gate)
+        opts = {"qk_norm": self.qk_norm, "output_gate": self.output_gate}
+        self._validate_options(opts)
+        self.options = FrozenDict(opts)
+
+    @classmethod
+    def _validate_options(cls, options: Mapping[str, Any]) -> None:
+        validate_gqa_options(options)
+
+    @classmethod
+    def _resolve_binding(
+        cls, binding: BlockBinding, hf_config: Any
+    ) -> ResolvedBlockGeometry:
+        return resolve_gqa_binding(
+            cls, binding, super()._resolve_binding(binding, hf_config)
+        )
 
     def kv_page_shape(self, g: Any, ex: ExecSpec) -> tuple[int, ...]:
         """Shape of one pool page, from `pool_layout` when the model sets one.
@@ -126,12 +177,7 @@ class GQABlock(Block):
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         nh = g.NH // ex.R
         nai = (2 * nh + 2) * g.HD
-        return {
-            "acc": max(nai, g.H),
-            "ybuf": nai,
-            "xb2": nh * g.HD,
-            "mix": nh * g.HD,
-        }
+        return {"acc": max(nai, g.H), "ybuf": nai, "xb2": nh * g.HD, "mix": nh * g.HD}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GQAParams:
         if cache_exec(ex).paged_kv:
@@ -153,72 +199,7 @@ class GQABlock(Block):
             )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
-        ap: GQAParams = plan.block_params[self.name]
-        scr: dict[str, Any] = {}
-        if not cache_exec(ex).paged_kv:
-            scr["kbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
-            scr["vbuf"] = pltpu.VMEM((ap.NKV, ap.BLK, ap.HD), BF16)
-        scr.update(
-            {
-                "kv_sem": pltpu.SemaphoreType.DMA(
-                    (ap.NKVR,) if cache_exec(ex).paged_kv else (2, ap.NKV)
-                ),
-                "wl_b": pltpu.SMEM((ap.NWL,), I32),
-                "wl_t": pltpu.SMEM((ap.NWL,), I32),
-                "wl_cnt": pltpu.SMEM((1,), I32),
-                "qb": pltpu.VMEM((ex.NS, ap.TQ, ap.HD), BF16),
-                "am": pltpu.VMEM((ex.NS, ap.TQ, 128), F32),
-                "al": pltpu.VMEM((ex.NS, ap.TQ, 128), F32),
-                "aacc": pltpu.VMEM((ex.NS, ap.TQ, ap.HD), F32),
-                "knew": pltpu.VMEM((ex.MR, ap.HD), F32),
-                "vnew": pltpu.VMEM((ex.MR, ap.HD), F32),
-                "gate": pltpu.VMEM((ex.MR, ap.nh * ap.HD), F32),
-                "rcs": pltpu.VMEM((2, ex.MR, ap.ROT // 2), F32),
-            }
-        )
-        if not cache_exec(ex).FUSED:
-            scr["kv_out_sem"] = pltpu.SemaphoreType.DMA((2,))
-        else:
-            scr.update(fused_io().gqa_fused_scratch(ex, ap.HD))
-        if cache_exec(ex).paged_kv:
-            if not ap.KVE:
-                scr["kvbuf"] = pltpu.VMEM((ap.NKV, 2, ap.HD // 4, 4, ap.BLK), FP8)
-            scr["knew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
-            scr["vnew_o"] = pltpu.VMEM((ex.MR, ap.HD), FP8)
-            scr["wl_kp"] = pltpu.SMEM(
-                (ap.NWL * (ap.BLK // cache_exec(ex).page_size),), I32
-            )
-        if ap.SPLIT:
-            q_rows = ap.NBP if ap.PACK else ex.B
-            scr.update(
-                {
-                    "qg": pltpu.VMEM((ap.G, q_rows, 8, ap.HD), F32),
-                    "pso": pltpu.VMEM((ap.G, q_rows, 8, ap.PW), F32),
-                    "pri": pltpu.VMEM((ap.G, q_rows, 8, ap.PW), F32),
-                    "sq_ssem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
-                    "sq_rsem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
-                    "sp_ssem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
-                    "sp_rsem": pltpu.SemaphoreType.DMA((ap.G - 1,)),
-                }
-            )
-        elif ex.VER:
-            scr["qg"] = pltpu.VMEM((1, ex.B, 8, ap.HD), F32)
-        if ap.QV:
-            scr["rope"] = pltpu.VMEM((2, ex.MR, 128), F32)  # QV-only cos / sin table
-            scr["qg"] = pltpu.VMEM(
-                (ap.G if ap.SPLIT and not ap.GQ else 1, ap.NHH, ap.QVR, 128), F32
-            )
-            scr["ost"] = pltpu.VMEM((ap.NHH, ap.QVR, 128), F32)
-        if ap.GQ:
-            del scr["pso"]
-            scr.update(
-                {
-                    "qxb": pltpu.VMEM((ap.G, ex.NS, ap.QG, ap.HD), BF16),
-                    "psend": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
-                    "pri": pltpu.VMEM((ap.G, ex.NS + 1, ap.QG, ap.HD), F32),
-                }
-            )
-        return scr
+        return gqa_scratch(ex, plan.block_params[self.name])
 
     def prologue(self, ctx: Any) -> None:
         """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)."""
@@ -258,7 +239,6 @@ class GQABlock(Block):
         ap: GQAParams = ctx.block_params(self.name)
         cx = GQAEmit.build(ctx, ap, l, self.name)
         ex, scr, sc, stream, a = cx.ex, cx.scr, cx.sc, cx.stream, cx.a
-        VER = ex.VER
         nh, HD, H, SPLIT, LAZY_ATT = ap.nh, ap.HD, ap.H, ap.SPLIT, ap.LAZY_ATT
         kv = make_kv_ring(cx)
         with stream.segment(lazy=LAZY_ATT):
@@ -268,7 +248,7 @@ class GQABlock(Block):
                 with sc("att_kvrd"):
                     fused_io().gqa_fused_kvrd_issue(ctx, a)
             kv_out = kv_new(cx, ybuf, kn, half, koff, rcs)
-            if SPLIT or VER:
+            if SPLIT or ex.VER:
                 q_gather_finish(cx, qx)
             att_core(cx, kv)
             if SPLIT:
@@ -283,7 +263,6 @@ class GQABlock(Block):
                 NO = nh * HD
                 scr["xb2"][:, :NO] = scr["mix"][:, :NO].astype(BF16)
                 yo = stream.dmatmul("att_out", scr["xb2"], H)
-
         return yo * ctx.sm(slot, "out_s")
 
     def epilogue(self, ctx: Any) -> None:
@@ -325,3 +304,26 @@ class GQABlock(Block):
                 vc, vnew[:, None, b0 : b0 + ex.T].astype(BF16), upd
             )
         return {"kc": kc, "vc": vc}
+
+    def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
+        geom = self._require_geometry(g)
+        return gqa_hf_params(
+            self.prefix if prefix is None else prefix,
+            geom,
+            qk_norm=self.qk_norm,
+            output_gate=self.output_gate,
+        )
+
+    def cache_decl(self, g: Any = None) -> KVCacheDecl:
+        geom = g if g is not None else self.geometry
+        if geom is None and self.pool_layout is None:
+            geom = self._require_geometry(g)
+        return gqa_cache_decl(geom, pool_layout=self.pool_layout)
+
+    def reference(
+        self, params: Any, x: Any, state: Any = None, *, g: Any = None, **kw: Any
+    ) -> tuple[Any, dict[str, Any]]:
+        assert state is not None, "GQABlock.reference requires `state` with 'kc'/'vc'"
+        return gqa_reference(
+            params, x, state, g=self._require_geometry(g), block_name=self.name, **kw
+        )

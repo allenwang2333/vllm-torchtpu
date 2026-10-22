@@ -27,6 +27,8 @@ import jax
 
 from .. import pool
 from ..blocks.gdn import GDNBlock
+from ..blocks.gqa import GQABlock
+from ..decls import KVCacheDecl, RecurrentCacheDecl
 from ..exec_spec import ExecSpec
 from ..pool import (
     PoolLayout,
@@ -40,19 +42,23 @@ from ..pool import (
 from ..pool.config import PoolBackend
 
 
-def qwen35_pool_layout(g: Any) -> PoolLayout:
-    """`PoolLayout` of `Qwen35Geometry`: one pool per attention layer, one KV head
-    pair per rank and page, `att_every - 1` GDN checkpoint slots per pool."""
-    return PoolLayout(
-        num_pools=g.NATT,
-        slots_per_pool=g.att_every - 1,
-        hd=g.HD,
-        kvh=1,
-        kh=g.KH,
-        vh=g.VH,
-        KD=g.KD,
-        VD=g.VD,
-    )
+def qwen35_layer_cache_decls(
+    g: Any,
+) -> list[KVCacheDecl | RecurrentCacheDecl]:
+    """Build the per-layer cache declaration sequence for `Qwen35Geometry`."""
+    kv_decl = GQABlock(geometry=g).cache_decl(g)
+    if g.att_every == 1:
+        return [kv_decl] * g.NATT
+    rec_decl = GDNBlock(geometry=g).cache_decl(g)
+    group: list[KVCacheDecl | RecurrentCacheDecl] = [rec_decl] * (g.att_every - 1) + [
+        kv_decl
+    ]
+    return group * g.NATT
+
+
+def qwen35_pool_layout(g: Any, *, R: int = 8) -> PoolLayout:
+    """`PoolLayout` of `Qwen35Geometry`, derived from per-layer block cache decls."""
+    return pool.derive_pool_layout(qwen35_layer_cache_decls(g), R=R)
 
 
 def qwen35_pool_backend(g: Any) -> PoolBackend:
@@ -97,6 +103,7 @@ __all__ = [
     "gather_gdn_states",
     "kv_to_raw_page",
     "pool_to_states",
+    "qwen35_layer_cache_decls",
     "qwen35_pool_backend",
     "qwen35_pool_layout",
     "raw_page_to_conv",

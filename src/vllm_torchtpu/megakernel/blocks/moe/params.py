@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
-from ...exec_spec import NumericsClass
+from ...errors import MegakernelConfigError
+from ...exec_spec import ExecSpec, NumericsClass
+from ...ops import rup
 
 
 @dataclass(frozen=True)
@@ -110,3 +112,82 @@ class MoEDebug:
 
     forced_routing: bool = False
     row_mask: bool = False
+
+
+def derive_moe_params(
+    g: Any,
+    ex: ExecSpec,
+    plan: Any,
+    tt: MoETunables,
+    dbg: MoEDebug,
+    *,
+    moe_tp: bool,
+    e_slots: int,
+) -> MoEParams:
+    """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
+    tiles = ex.resolve_tiles(g)
+    er = g.E // ex.R
+    isr = g.IS // ex.R
+    ir = g.I // ex.R if moe_tp else g.I
+    ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
+    extra = ew - er
+    ch = min(1024, g.H)
+    assert g.H % ch == 0, (g.H, ch)
+    t13, t2 = plan.nt["e13"], plan.nt["e2"]
+    te = t13 + t2
+    nbe = tiles.nbe
+    nss = 3 + (nbe - 1) // te
+    pipe = tt.pipe and t13 == 1 and t2 == 1
+    pipe_ep = tt.pipe_ep and not pipe and t13 == 2 * t2 and nbe >= te and nbe % te == 0
+    n_moe = plan.nt["router"] + plan.nt["sh13"] + plan.nt["sh2"]
+    lazy_moe = tiles.lazy and n_moe <= tiles.nbd
+    ecopy = not moe_tp and e_slots > er
+    assert not (dbg.row_mask and ecopy), "row_mask: identity expert placement only"
+    if tt.topk and not (g.E > 0 and (g.E - 1).bit_length() <= 9):
+        raise MegakernelConfigError(
+            "topk_packed requires 1 <= E <= 512 ((E - 1).bit_length() <= 9 "
+            f"for 9-bit float32 mantissa packing), got E={g.E}"
+        )
+    nb_picks = rup(ex.B * g.TOPK, 128)
+    route_vec = bool(
+        tt.route_vec
+        and ecopy  # redundant-expert placement table active
+        and g.E > 0
+        and g.E % 128 == 0  # 128-lane expert bitmask tiling
+        and (g.E >> 5) <= 256  # packed bitmask rows fit 256-lane scratch
+        and g.E // 128 + 1 <= ex.MR  # MROW + 1 <= MR for route_topk scratch
+        and ex.R * extra + ex.R + 1 <= 128  # NCP + R + 1 <= 128 VREG lanes
+        and nb_picks >= er  # elist/wlist capacity covers ER local slots
+    )
+    return MoEParams(
+        H=g.H,
+        E=g.E,
+        TOPK=g.TOPK,
+        IR=ir,
+        ISR=isr,
+        ER=er,
+        EW=ew,
+        EXTRA=extra,
+        CH=ch,
+        T13=t13,
+        T2=t2,
+        TE=te,
+        NBE=nbe,
+        NSS=nss,
+        PIPE=pipe,
+        PIPE_EP=pipe_ep,
+        LAZY_MOE=lazy_moe,
+        N_MOE=n_moe,
+        ECOPY=ecopy,
+        moe_tp=moe_tp,
+        stack_e=ex.stack_e,
+        topk_packed=tt.topk,
+        topk_lanes=tt.topk_lanes,
+        route_vec=route_vec,
+        r2_direct_store=tt.r2_direct_store,
+        unroll=bool(tt.moe_unroll or pipe_ep),
+        group_rel=tt.moe_group_rows >= ex.B,
+        ecopy_opt=tt.ecopy_opt,
+        eps=g.eps,
+        zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
+    )
