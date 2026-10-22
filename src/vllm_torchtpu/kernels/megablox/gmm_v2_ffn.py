@@ -162,9 +162,20 @@ def make_ffn_configs(
     ) and up.dims.size_lhs_sublane == down.dims.size_lhs_sublane
     if not (same_m_tiling and single_tile(up) and single_tile(down)):
         return None
-    if _ffn_vmem_estimate(up, down) > vmem_limit_bytes:
-        return None
+    # Both legs' weight pipes are resident at once, so drop m buckets (never
+    # k or n, which would change the accumulation order) until they fit.
+    while _ffn_vmem_estimate(up, down) > vmem_limit_bytes:
+        tile_m = up.tiles.tile_m - up.tiles.bucket_base
+        if tile_m < up.tiles.bucket_base:
+            return None
+        up, down = _with_tile_m(up, tile_m), _with_tile_m(down, tile_m)
     return up, down
+
+
+def _with_tile_m(cfgs: GmmConfigs, tile_m: int) -> GmmConfigs:
+    return dataclasses.replace(
+        cfgs, tiles=dataclasses.replace(cfgs.tiles, tile_m=tile_m)
+    )
 
 
 def ffn_inner_kernel(

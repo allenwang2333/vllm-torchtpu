@@ -155,3 +155,34 @@ def test_make_ffn_configs_declines_unmatched_widths():
         )
         is None
     )
+
+
+def test_make_ffn_configs_drops_m_buckets_to_fit_vmem():
+    """At Qwen3.5-397B's per-rank expert shape both legs' weight pipes only fit
+    with fewer m buckets; k and n tiles must stay whole."""
+    _require_tpu()
+    groups, size_k, size_i = 64, 4096, 1024
+    x = jax.ShapeDtypeStruct((5120, size_k), jnp.bfloat16)
+    w1 = jax.ShapeDtypeStruct((groups, size_k, 2 * size_i), jnp.float8_e4m3fn)
+    w1_scale = jax.ShapeDtypeStruct((groups, 1, 1, 2 * size_i), jnp.float32)
+    w2 = jax.ShapeDtypeStruct((groups, size_i, size_k), jnp.float8_e4m3fn)
+    w2_scale = jax.ShapeDtypeStruct((groups, 1, 1, size_k), jnp.float32)
+    gs = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    cfgs = make_ffn_configs(
+        x,
+        w1,
+        w1_scale,
+        None,
+        w2,
+        w2_scale,
+        None,
+        gs,
+        fuse_act="silu",
+        maybe_quantize_lhs=True,
+        rhs_quant_dtype=None,
+    )
+    assert cfgs is not None
+    up, down = cfgs
+    assert up.tiles.tile_m == down.tiles.tile_m < 512
+    assert up.tiles.tile_m % up.tiles.bucket_base == 0
+    assert (up.tiles.tile_k, down.tiles.tile_k) == (size_k, size_i)
