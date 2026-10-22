@@ -49,6 +49,7 @@ class FrozenDict(Mapping[str, Any]):
     """Order-independent hashable, picklable, deep-copyable immutable mapping."""
 
     __slots__ = ("_dict",)
+    _dict: dict[str, Any]
 
     def __init__(self, data: Any = ()) -> None:
         d = {k: _freeze_val(v) for k, v in dict(data).items()}
