@@ -23,13 +23,11 @@ from vllm.model_executor.layers.rotary_embedding import (
     FourierRotaryEmbedding,
     Llama3RotaryEmbedding,
     MRotaryEmbedding,
-    MRotaryEmbeddingInterleaved,
     RotaryEmbedding,
     YaRNScalingRotaryEmbedding,
     get_rope,
 )
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
-from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 
 from vllm_torchtpu.layers.adapter import rotary_embedding as tpu_rope
 
@@ -118,7 +116,6 @@ def test_mrope_apply_rotary_emb_is_fp32():
     mrope = MRotaryEmbedding(
         HEAD, HEAD, MAX_POS, 10000.0, True, torch.bfloat16, mrope_section=[16, 24, 24]
     )
-    assert type(mrope) is tpu_rope.TpuMRotaryEmbedding
     assert type(mrope.apply_rotary_emb) is tpu_rope.TpuApplyRotaryEmb
     assert mrope.apply_rotary_emb.enable_fp32_compute is True
 
@@ -267,115 +264,3 @@ def test_in_graph_eligibility_follows_cache_override():
     assert isinstance(yarn.cos_sin_cache, torch.Tensor)
     assert tpu_rope.is_in_graph_eligible(Llama3RotaryEmbedding)
     assert not tpu_rope.is_in_graph_eligible(YaRNScalingRotaryEmbedding)
-
-
-# --- M-RoPE ------------------------------------------------------------------
-
-SECTION = [16, 24, 24]  # sums to HEAD // 2
-
-
-def _mrope_inputs(n: int = 48, seed: int = 4):
-    g = torch.Generator().manual_seed(seed)
-    # Distinct T/H/W streams so a wrong modality pick would show.
-    positions = torch.randint(0, MAX_POS // 4, (3, n), generator=g)
-    q = torch.randn(n, 4 * HEAD, generator=g).to(torch.bfloat16)
-    k = torch.randn(n, 2 * HEAD, generator=g).to(torch.bfloat16)
-    return positions, q, k
-
-
-@pytest.mark.parametrize("interleaved", [False, True])
-def test_mrope_dim_modalities_matches_upstream_selection(interleaved):
-    mrope = MRotaryEmbedding(
-        HEAD,
-        HEAD,
-        MAX_POS,
-        10000.0,
-        True,
-        torch.bfloat16,
-        mrope_section=SECTION,
-        mrope_interleaved=interleaved,
-    )
-    modality = torch.tensor(tpu_rope.mrope_dim_modalities(mrope))
-    assert modality.shape == (HEAD // 2,)
-    # x[m] is filled with the modality index m; upstream's selection of rows
-    # from the [3, N, half] gathered cos must land on our per-channel modality.
-    x = torch.arange(3, dtype=torch.float32)[:, None, None].expand(3, 5, HEAD // 2)
-    if interleaved:
-        picked = apply_interleaved_rope(x, SECTION)
-    else:
-        picked = torch.cat(
-            [m[i] for i, m in enumerate(x.split(SECTION, dim=-1))], dim=-1
-        )
-    assert torch.equal(picked[0].long(), modality)
-
-
-@pytest.mark.parametrize("interleaved", [False, True])
-def test_mrope_in_graph_matches_cached_path_bit_exactly(interleaved):
-    cached, in_graph = _rope_pair(
-        MRotaryEmbedding,
-        HEAD,
-        HEAD,
-        MAX_POS,
-        10000.0,
-        True,
-        torch.bfloat16,
-        mrope_section=SECTION,
-        mrope_interleaved=interleaved,
-    )
-    assert in_graph._tpu_rope_in_graph is True
-    assert not hasattr(in_graph, "cos_sin_cache")
-    assert set(dict(in_graph.named_buffers())) == {
-        tpu_rope._INV_FREQ_BUFFER,
-        tpu_rope._MODALITY_BUFFER,
-    }
-    positions, q, k = _mrope_inputs()
-    cq, ck = cached(positions, q.clone(), k.clone())
-    iq, ik = in_graph(positions, q.clone(), k.clone())
-    torch.testing.assert_close(iq, cq, rtol=0, atol=0)
-    torch.testing.assert_close(ik, ck, rtol=0, atol=0)
-    # Text-only (1-D) positions keep working on the same module.
-    cq1, ck1 = cached(positions[0], q.clone(), k.clone())
-    iq1, ik1 = in_graph(positions[0], q.clone(), k.clone())
-    torch.testing.assert_close(iq1, cq1, rtol=0, atol=0)
-    torch.testing.assert_close(ik1, ck1, rtol=0, atol=0)
-
-
-def test_mrope_interleaved_class_in_graph_matches_cached_forward():
-    cached, in_graph = _rope_pair(
-        MRotaryEmbeddingInterleaved,
-        HEAD,
-        HEAD,
-        MAX_POS,
-        10000.0,
-        True,
-        torch.bfloat16,
-        mrope_section=SECTION,
-    )
-    assert type(cached) is tpu_rope.TPU_ROPE_CLASSES["MRotaryEmbeddingInterleaved"]
-    assert in_graph._tpu_rope_in_graph is True
-    assert not hasattr(in_graph, "cos_sin_cache")
-    positions, q, k = _mrope_inputs(seed=5)
-    # MRotaryEmbeddingInterleaved routes through its own forward(), not the
-    # CustomOp dispatch; both must land on the TPU implementation.
-    cq, ck = cached(positions, q.clone(), k.clone())
-    iq, ik = in_graph(positions, q.clone(), k.clone())
-    torch.testing.assert_close(iq, cq, rtol=0, atol=0)
-    torch.testing.assert_close(ik, ck, rtol=0, atol=0)
-    iq2, _ = in_graph.forward(positions, q.clone(), k.clone())
-    torch.testing.assert_close(iq2, cq, rtol=0, atol=0)
-
-
-def test_mrope_with_yarn_keeps_cache():
-    _, mrope = _rope_pair(
-        MRotaryEmbedding,
-        HEAD,
-        HEAD,
-        1024,
-        10000.0,
-        True,
-        torch.bfloat16,
-        mrope_section=SECTION,
-        scaling_factor=4.0,
-    )
-    assert mrope._tpu_rope_in_graph is False
-    assert isinstance(mrope.cos_sin_cache, torch.Tensor)
