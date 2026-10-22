@@ -177,6 +177,10 @@ def _split_calls(B: int):
 
 CASES.update({k: _split_calls(B) for k, B in WIDE_CASES.items()})
 CASES.update({k: ((B, 0),) for k, B in A2_CASES.items()})
+# TP8 wide step over more than 256 rows: back-to-back wide calls of at most 256 rows on their own
+# sequences (the dp split plan's calls), against the 80-row split plan r128 / r200
+WIDE_SPLIT = {"w64x2": ((256, 0), (256, 64)), "w200x": ((256, 0), (256, 64), (256, 128), (32, 192))}
+CASES.update(WIDE_SPLIT)
 # regular-kernel splits of the same rows in 64-row calls (and the 80-row call against 64 + 16):
 # whether the 80-row and 64-row regular kernels agree on rows 0-15
 CASES.update({
@@ -194,6 +198,7 @@ CASE_RKEY_EXTRA = {"r20b": None, "r24b": 192, "w24": 192, "r32b": 192, "w32": 19
 # case -> routing bucket of the whole case (None: each call uses its own b<rows> routing)
 CASE_RKEY = {k: WIDE_CASES.get(k) for k in CASES}
 CASE_RKEY.update(CASE_RKEY_EXTRA)
+CASE_RKEY.update({"w64x2": 512, "w200x": 800})
 _PAIRS = (("w8", "b32"), ("w16", "b64"), ("w48", "r48"), ("w64", "r64"),
           ("b80", "r20b"), ("w48", "r48b"), ("w64", "r64b"), ("w24", "r24b"), ("w32", "r32b"),
           # split plan against split plan (both legs the regular kernel; they pick different copy
@@ -638,7 +643,7 @@ def _run_case(world, mod, case, variant, label, n_steps=N_STEPS, trace=True):
     calls = []
     t_build = time.time()
     rkey = CASE_RKEY.get(case)
-    wide = case in A2_CASES
+    wide = case in A2_CASES or case in WIDE_SPLIT
     for b, s0 in CASES[case]:
         fn, tiles = world.step_fn(mod, b, skip, scopes, tile_over, patch, wide=wide)
         calls.append((fn, world.inputs(b, s0, rkey, wide=wide), b, tiles))
@@ -1006,12 +1011,15 @@ DP_RKEY = {"ds128": 512, "ds200": 800}
 DPG = 4
 
 
-DP_MB = int(os.environ.get("P3_MK_DP_MB", WIDE_MB))  # dp microbatch rows (per chip)
+# dp microbatch rows (per chip): one microbatch up to 48 rows (the per-core mixer weights stream
+# once per microbatch; a 64-row microbatch overflows VMEM), else WIDE_MB
+DP_MB = int(os.environ.get("P3_MK_DP_MB", "0"))
 
 
 def _dp_cfg(b_all: int, e_slots: int = E_SLOTS) -> C.MKConfig:
     bg = b_all // DPG
-    mb = min(DP_MB, -(-bg // 16) * 16)
+    grid = -(-bg // 16) * 16
+    mb = min(DP_MB, grid) if DP_MB else (grid if grid <= 48 else WIDE_MB)
     return dataclasses.replace(_cfg(bg, e_slots, wide=True), mb_rows=mb, dp=DPG, dcp=1)
 
 
