@@ -176,3 +176,91 @@ def test_apply_rotary_emb_instance_forward_is_fp32():
     ref = ApplyRotaryEmb.forward_static(x, cos, sin, True, enable_fp32_compute=True)
     torch.testing.assert_close(emb(x, cos, sin), ref, rtol=0, atol=0)
     torch.testing.assert_close(emb.forward_native(x, cos, sin), ref, rtol=0, atol=0)
+
+
+# --- TPU_ROPE_IN_GRAPH -------------------------------------------------------
+
+
+def _rope_pair(cls, *args, **kwargs):
+    """The same module built with the cache (flag off) and in-graph (flag on)."""
+    with _flag(False):
+        cached = cls(*args, **kwargs)
+    with _flag(True):
+        in_graph = cls(*args, **kwargs)
+    return cached, in_graph
+
+
+class _flag:
+    def __init__(self, value: bool):
+        self.value = value
+
+    def __enter__(self):
+        self._mp = pytest.MonkeyPatch()
+        self._mp.setattr(tpu_rope.envs, "TPU_ROPE_IN_GRAPH", self.value, raising=False)
+
+    def __exit__(self, *exc):
+        self._mp.undo()
+
+
+def test_in_graph_flag_off_keeps_cache():
+    with _flag(False):
+        rope = RotaryEmbedding(HEAD, HEAD, MAX_POS, 10000.0, True, torch.bfloat16)
+    assert rope._tpu_rope_in_graph is False
+    assert isinstance(rope.cos_sin_cache, torch.Tensor)
+    assert not hasattr(rope, tpu_rope._INV_FREQ_BUFFER)
+
+
+def test_in_graph_drops_cache_and_matches_cached_path_bit_exactly():
+    cached, in_graph = _rope_pair(
+        RotaryEmbedding, HEAD, HEAD, MAX_POS, 10000.0, True, torch.bfloat16
+    )
+    assert in_graph._tpu_rope_in_graph is True
+    assert "cos_sin_cache" not in in_graph._buffers
+    assert not hasattr(in_graph, "cos_sin_cache")
+    inv_freq = getattr(in_graph, tpu_rope._INV_FREQ_BUFFER)
+    assert inv_freq.shape == (HEAD // 2,) and inv_freq.dtype == torch.float32
+    assert dict(in_graph.named_buffers()) == {tpu_rope._INV_FREQ_BUFFER: inv_freq}
+
+    g = torch.Generator().manual_seed(3)
+    positions = torch.randint(0, MAX_POS, (64,), generator=g)
+    q = torch.randn(64, 4 * HEAD, generator=g).to(torch.bfloat16)
+    k = torch.randn(64, 2 * HEAD, generator=g).to(torch.bfloat16)
+
+    # In-graph cos/sin reproduce the cache rows (same FP32 product and trig,
+    # same rounding to the cache dtype)...
+    cos, sin = tpu_rope.in_graph_cos_sin(positions, inv_freq, torch.bfloat16)
+    ref_cos, ref_sin = cached.cos_sin_cache[positions].chunk(2, dim=-1)
+    torch.testing.assert_close(cos, ref_cos, rtol=0, atol=0)
+    torch.testing.assert_close(sin, ref_sin, rtol=0, atol=0)
+    # ...so the module output is identical to the cached FP32 path.
+    cq, ck = cached(positions, q.clone(), k.clone())
+    iq, ik = in_graph(positions, q.clone(), k.clone())
+    torch.testing.assert_close(iq, cq, rtol=0, atol=0)
+    torch.testing.assert_close(ik, ck, rtol=0, atol=0)
+
+
+def test_in_graph_eligibility_follows_cache_override():
+    # Llama3 only overrides _compute_inv_freq: cache = f(position, inv_freq).
+    _, llama3 = _rope_pair(
+        Llama3RotaryEmbedding,
+        HEAD,
+        HEAD,
+        MAX_POS,
+        500000.0,
+        True,
+        torch.bfloat16,
+        scaling_factor=8.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        orig_max_position=8192,
+    )
+    assert llama3._tpu_rope_in_graph is True
+    assert not hasattr(llama3, "cos_sin_cache")
+    # YaRN rewrites the cache itself (mscale), so it must keep the buffer.
+    _, yarn = _rope_pair(
+        YaRNScalingRotaryEmbedding, HEAD, HEAD, 1024, 10000.0, True, 4.0, torch.bfloat16
+    )
+    assert yarn._tpu_rope_in_graph is False
+    assert isinstance(yarn.cos_sin_cache, torch.Tensor)
+    assert tpu_rope.is_in_graph_eligible(Llama3RotaryEmbedding)
+    assert not tpu_rope.is_in_graph_eligible(YaRNScalingRotaryEmbedding)
