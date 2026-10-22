@@ -35,11 +35,26 @@ def _make_dummy_vllm_config(max_num_seqs=4, max_model_len=4096):
     )
 
 
-def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
+@pytest.mark.parametrize("candidate_mode", ["none", "consume", "publish"])
+def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch, candidate_mode):
     """Test __init__ buffer registration and flags when FP8 KV is enabled."""
 
     def fake_upstream_init(self, vllm_config, *args, **kwargs):
         torch.nn.Module.__init__(self)
+        self.indexer = None
+        self.compress_ratio = 0
+        self.swa_cache_layer = SimpleNamespace()
+        if candidate_mode != "none":
+            self.candidate_block_size = 8
+            self.candidate_source_layer = 20
+            self.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
+            self.indexer = SimpleNamespace(
+                k_cache=SimpleNamespace(prefix="index-keys"),
+                indexer_op=SimpleNamespace(
+                    candidate_blocks=self.candidate_block_buffer,
+                    candidate_write=candidate_mode == "publish",
+                ),
+            )
         self.kv_cache_torch_dtype = torch.float8_e4m3fn
         self.rotary_emb = SimpleNamespace(
             cos_sin_cache=torch.zeros(128, 64, dtype=torch.float32)
@@ -53,6 +68,7 @@ def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 8)
 
     cfg = _make_dummy_vllm_config(max_num_seqs=4)
+    cfg.model_config.hf_config.to_dict = lambda: {"index_topk": 512}
     attn = v2_attn.DeepseekV41Attention(cfg)
 
     # Invariant: _tp_rank_1d is a 1D tensor of shape (1,) holding TP rank
@@ -68,6 +84,13 @@ def test_dsv41_attention_init_buffers_and_flags_fp8(monkeypatch):
     assert attn._precompact_records is True
     assert attn._token_parallel_attn is True
     assert attn._swa_max_requests == 4
+    if candidate_mode == "consume":
+        assert isinstance(attn.indexer.indexer_op, v2_attn.SparseMQAIndexer)
+        assert attn.indexer.indexer_op.k_cache is attn.indexer.k_cache
+        assert attn.indexer.indexer_op.candidate_blocks is attn.candidate_block_buffer
+    elif candidate_mode == "publish":
+        assert attn.indexer.indexer_op.candidate_write
+        assert not isinstance(attn.indexer.indexer_op, v2_attn.SparseMQAIndexer)
 
 
 def test_dsv41_attention_init_buffers_and_flags_bfloat16(monkeypatch):
@@ -75,6 +98,9 @@ def test_dsv41_attention_init_buffers_and_flags_bfloat16(monkeypatch):
 
     def fake_upstream_init(self, vllm_config, *args, **kwargs):
         torch.nn.Module.__init__(self)
+        self.indexer = None
+        self.compress_ratio = 0
+        self.swa_cache_layer = SimpleNamespace()
         self.kv_cache_torch_dtype = torch.bfloat16
         self.rotary_emb = SimpleNamespace(
             cos_sin_cache=torch.zeros(64, 64, dtype=torch.float32)
@@ -717,7 +743,7 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
     select_paged_called = []
 
     def fake_select_paged(
-        qr, pos, cache, records, reqs, weights, lengths, slots, pending
+        qr, pos, cache, records, reqs, query_offsets, weights, lengths, slots, pending
     ):
         select_paged_called.append(True)
         return torch.zeros((count, 2), dtype=torch.int32)

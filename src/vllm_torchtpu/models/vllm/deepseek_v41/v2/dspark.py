@@ -44,11 +44,12 @@ from .attention import (
     _token_requests,
     stage_attention_cache_scope,
 )
-from .attention_kernels import initialize_indexer, initialize_paged_attention
+from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .engram import Engram, NgramHashState
 from .model import DeepseekV41DecoderLayer
 from .ops import compact_rope_caches, device_hooks
+from .sparse_mqa_indexer import initialize_indexer
 
 logger = init_logger(__name__)
 

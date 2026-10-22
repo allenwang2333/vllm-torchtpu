@@ -162,6 +162,8 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         attention_kernels,
         cache,
         candidate_cache,
+        packed_fp8_indexer,
+        sparse_mqa_indexer,
     )
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         set_vllm_model_wrapper_context,
@@ -179,14 +181,17 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
                 mesh=mesh,
                 input_partition_specs=(P(), P(), None, None),
             )
-        # Match the six startup registration calls in v2/model.py. These are
+        # Match the startup registration calls in v2/model.py. These are
         # real jax_op registrations, with no model weights or TPU execution.
         cache.initialize_cache_ops()
         initialize_delayed_mhc()
         deepseek_v41_mhc_op.initialize_shifted_mhc()
         initialize_mhc_post()
         attention_kernels.initialize_paged_attention()
-        attention_kernels.initialize_indexer()
+        selected_before = sparse_mqa_indexer._select_op
+        candidate_cache.initialize_sparse_mqa_cache()
+        assert sparse_mqa_indexer._select_op is selected_before
+        sparse_mqa_indexer.initialize_indexer()
         assert all(
             operation is not None
             for operation in (
@@ -200,17 +205,27 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
                 attention_kernels._indexer_2bank_op,
                 candidate_cache._prepare_op,
                 candidate_cache._prepare_2bank_op,
-                candidate_cache._select_op,
-                candidate_cache._select_2bank_op,
+                sparse_mqa_indexer._select_op,
+                sparse_mqa_indexer._select_2bank_op,
+                packed_fp8_indexer._write_op,
+                packed_fp8_indexer._write_2bank_op,
+                packed_fp8_indexer._read_op,
+                packed_fp8_indexer._read_2bank_op,
+                packed_fp8_indexer._select_op,
+                packed_fp8_indexer._select_2bank_op,
             )
         )
         # Re-entering initialization must retain the already registered ops.
         read = cache._read_values_op
         indexer = attention_kernels._indexer_op
+        prepared = candidate_cache._prepare_op
+        selected = sparse_mqa_indexer._select_op
         cache.initialize_cache_ops()
-        attention_kernels.initialize_indexer()
+        sparse_mqa_indexer.initialize_indexer()
         assert cache._read_values_op is read
         assert attention_kernels._indexer_op is indexer
+        assert candidate_cache._prepare_op is prepared
+        assert sparse_mqa_indexer._select_op is selected
 
 
 @pytest.mark.parametrize("after", [False, True])
@@ -255,6 +270,7 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
         attention_kernels,
         candidate_cache,
+        sparse_mqa_indexer,
     )
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         set_vllm_model_wrapper_context,
@@ -262,14 +278,15 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
 
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), ("registration",))
     with set_vllm_model_wrapper_context(mesh=mesh):
-        candidate_cache.initialize_candidate_cache()
+        candidate_cache.initialize_sparse_mqa_cache()
     pool = torch.empty((128, 128), dtype=torch.int32, device="meta")
     records = torch.empty((48, 98816), dtype=torch.int32, device="meta")
     candidates = torch.empty((rows, 2048), dtype=torch.int32, device="meta")
     requests = torch.empty((rows,), dtype=torch.int32, device="meta")
+    query_offsets = torch.empty((49,), dtype=torch.int32, device="meta")
     assert candidate_cache._prepare_2bank_op is not None
     fake = candidate_cache._prepare_2bank_op(
-        pool, pool, records, candidates, requests, requests, 8, 49152
+        pool, pool, records, candidates, query_offsets, requests, 8, 49152
     )
     assert fake[0].shape == (48, 24576, 128)
     assert fake[0].dtype == torch.int32
@@ -281,11 +298,11 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
         (shape(pool), shape(pool)),
         shape(records),
         shape(candidates),
-        shape(requests),
+        shape(query_offsets),
         shape(requests),
     )
     prepared = jax.eval_shape(
-        lambda *args: candidate_cache.prepare_candidate_cache_jax(*args, 8, 49152),
+        lambda *args: candidate_cache.prepare_sparse_mqa_cache_jax(*args, 8, 49152),
         *inputs,
     )
     assert prepared[0].shape == tuple(fake[0].shape)
@@ -299,18 +316,21 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     cached_calls = []
 
     def cached(q, *args, **kwargs):
-        cached_calls.append(q.shape[:2])
-        return jnp.full((q.shape[0] * q.shape[1], 512), -1, jnp.int32)
+        cached_calls.append(q.shape)
+        return jnp.full((q.shape[0], 512), -1, jnp.int32)
 
     monkeypatch.setattr(attention_kernels, "paged_indexer_jax", fallback)
-    monkeypatch.setattr(candidate_cache.candidate, "candidate_indexer", cached)
+    monkeypatch.setattr(
+        sparse_mqa_indexer.sparse_mqa_logits, "sparse_mqa_indexer", cached
+    )
     selected = jax.eval_shape(
         lambda q,
         weights,
         keys,
         ids,
         membership,
-        usable: candidate_cache.select_candidate_cache_jax(
+        counts,
+        usable: sparse_mqa_indexer._select_indices_jax(
             q,
             (jnp.zeros((128, 128), jnp.int32),) * 2,
             jnp.zeros((48, 98816), jnp.int32),
@@ -322,17 +342,17 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
             keys,
             ids,
             membership,
+            counts,
             usable,
+            jnp.arange(49, dtype=jnp.int32) * rows // 48,
             8,
             128,
             None,
         ),
         jax.ShapeDtypeStruct((rows, 32, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, 32), jnp.float32),
-        *prepared[:3],
-        prepared[4],
+        *prepared,
     )
     assert selected.shape == (rows, 512)
-    assert calls == [rows]
-    # Both cond branches trace for uniform Q8/Q9; ragged buckets bypass scoring.
-    assert cached_calls == ([(48, rows // 48)] if rows % 48 == 0 else [])
+    assert calls == [6, rows]
+    assert cached_calls == [(rows, 32, 128)]

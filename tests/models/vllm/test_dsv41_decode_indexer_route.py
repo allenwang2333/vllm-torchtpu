@@ -2,13 +2,104 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Decode routing preserves request ownership and candidate semantics."""
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import sparse_mqa_indexer as mqa
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import IndexCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import SparseMQACache
+
+
+@pytest.fixture
+def sparse_mqa_model():
+    candidates = torch.arange(32 * 512, dtype=torch.int32).reshape(32, 512)
+    indexer = mqa.SparseMQAIndexer(
+        SimpleNamespace(prefix="index-keys"),
+        512,
+        candidates,
+        8,
+        candidate_source_layer=20,
+    )
+    cache = IndexCacheRows(
+        torch.zeros((128, 128), dtype=torch.int32),
+        ((2, 128, 128), torch.bfloat16, 128 * 256, 0),
+    )
+    inputs = dict(
+        cache=cache,
+        records=torch.zeros((2, 65536), dtype=torch.int32),
+        batch_max=torch.tensor(65536, dtype=torch.int32),
+    )
+    return indexer, inputs
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("banks", [1, 2])
+@pytest.mark.parametrize("per_query_candidates", [False, True])
+def test_sparse_mqa_module_compiles_with_dynamic_query_rows(
+    monkeypatch, sparse_mqa_model, banks, per_query_candidates
+):
+    indexer, inputs = sparse_mqa_model
+    indexer.per_query_candidates = per_query_candidates
+    if banks == 2:
+        inputs["cache"] = IndexCacheRows(
+            (inputs["cache"].raw, inputs["cache"].raw.clone()),
+            ((4, 128, 128), torch.bfloat16, 128 * 256, 0),
+        )
+
+    def prepare(cache, records, candidates, offsets, lengths, **kwargs):
+        return SparseMQACache(
+            cache.raw + 1, candidates, candidates, lengths, lengths > 0, offsets
+        )
+
+    def select(
+        q, pool, records, weights, lengths, candidates, requests, maximum, keys, *args
+    ):
+        return candidates[:, :512] + keys[0, 0] + weights[:, :1].int() + int(args[-1])
+
+    def select_banked(q, lo, hi, *args):
+        return select(q, lo, *args) + hi[0, 0]
+
+    monkeypatch.setattr(mqa, "prepare_sparse_mqa_cache", prepare)
+    monkeypatch.setattr(mqa, "_select_op", select)
+    monkeypatch.setattr(mqa, "_select_2bank_op", select_banked)
+
+    def run(q):
+        rows = q.shape[0]
+        offsets = torch.stack(
+            (
+                torch.zeros((), dtype=torch.int32),
+                torch.zeros((), dtype=torch.int32) + rows // 2,
+                torch.zeros((), dtype=torch.int32) + rows,
+            )
+        )
+        return indexer(
+            q,
+            q.sum(-1).float(),
+            inputs["cache"],
+            inputs["records"],
+            torch.full((rows,), 65536, dtype=torch.int32),
+            (torch.arange(rows) >= rows // 2).int(),
+            offsets,
+            batch_max=inputs["batch_max"],
+            page_records=128,
+            capacity=49152,
+            stage_cache={},
+        )
+
+    compiled = torch.compile(run, backend="eager", fullgraph=True)
+    for rows in (6, 7, 12):
+        q = torch.ones((rows, 32, 128), dtype=torch.bfloat16)
+        torch._dynamo.mark_dynamic(q, 0, min=2, max=32)
+        torch.testing.assert_close(
+            compiled(q), indexer.candidate_blocks[:rows] + 129 + per_query_candidates
+        )
 
 
 @pytest.mark.cpu_test
@@ -148,12 +239,13 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
 
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
+@pytest.mark.parametrize("per_query_candidates", [False, True])
 @pytest.mark.parametrize(
     "mode",
     [
         "regular",
         "overflow",
-        "reordered",
+        "uneven",
         "short",
         "ties",
         "invalid",
@@ -161,8 +253,14 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
         "shifted_pages",
     ],
 )
-def test_candidate_cache_matches_existing_with_fallback(mode):
-    _check_candidate_cache(mode, groups=2, width=8192, capacity=4096)
+def test_sparse_mqa_cache_matches_existing_with_fallback(mode, per_query_candidates):
+    _check_sparse_mqa_cache(
+        mode,
+        groups=2,
+        width=8192,
+        capacity=4096,
+        per_query_candidates=per_query_candidates,
+    )
 
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
@@ -174,18 +272,22 @@ def test_candidate_cache_matches_existing_with_fallback(mode):
         (1, "invalid"),
         (1, "short"),
         (4, "regular"),
-        (4, "reordered"),
+        (4, "uneven"),
     ],
 )
-def test_long_candidate_cache_matches_existing(groups, mode):
-    _check_candidate_cache(mode, groups=groups, width=1048576, capacity=49152)
+def test_long_sparse_mqa_cache_matches_existing(groups, mode):
+    _check_sparse_mqa_cache(mode, groups=groups, width=1048576, capacity=49152)
 
 
-def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
+def _check_sparse_mqa_cache(
+    mode, *, groups, width, capacity, queries=6, per_query_candidates=False
+):
     from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import (
-        prepare_candidate_cache_jax,
-        select_candidate_cache_jax,
+        prepare_sparse_mqa_cache_jax,
+    )
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.sparse_mqa_indexer import (
+        _select_indices_jax,
     )
 
     rng = np.random.default_rng(104)
@@ -218,11 +320,11 @@ def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
         lengths = lengths.at[-1].set(0)
     requests = jnp.repeat(jnp.arange(groups, dtype=jnp.int32), queries)
     if mode == "ragged_rows":
-        requests = jnp.concatenate((requests, jnp.array([1], jnp.int32)))
+        requests = jnp.concatenate((requests, jnp.array([groups - 1], jnp.int32)))
     if mode == "overflow":
         candidates += jnp.tile(jnp.arange(queries) * candidate_count, groups)[:, None]
-    elif mode == "reordered":
-        requests = requests[::-1]
+    elif mode == "uneven":
+        requests = requests.at[queries].set(0)
     elif mode == "short":
         lengths = jnp.arange(rows, dtype=jnp.int32) * 7
     elif mode == "ties":
@@ -232,14 +334,18 @@ def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
         candidates = candidates.at[0].set(-1)
         lengths = lengths.at[min(1, rows - 1)].set(519)
     batch_max = lengths.max().reshape(1)
-    prepare = jax.jit(prepare_candidate_cache_jax, static_argnums=(5, 6))
-    dense, ids, bits, actual, usable = prepare(
-        pool, records, candidates, requests, lengths, 8, capacity
+    prepare = jax.jit(prepare_sparse_mqa_cache_jax, static_argnums=(5, 6))
+    query_offsets = jnp.asarray(
+        np.r_[0, np.cumsum(np.bincount(np.asarray(requests), minlength=groups))],
+        jnp.int32,
     )
-    assert bool(usable[0]) == (mode not in ("overflow", "reordered", "ragged_rows"))
+    dense, ids, bits, actual, usable = prepare(
+        pool, records, candidates, query_offsets, lengths, 8, capacity
+    )
+    assert bool(usable[0]) == (mode != "overflow")
     if mode == "overflow":
         assert np.all(np.asarray(actual) * 8 > capacity)
-    select = jax.jit(select_candidate_cache_jax, static_argnums=(12, 13, 14))
+    select = jax.jit(_select_indices_jax, static_argnums=(14, 15, 16, 17))
     result = select(
         q,
         pool,
@@ -252,10 +358,13 @@ def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
         dense,
         ids,
         bits,
+        actual,
         usable,
+        query_offsets,
         8,
         128,
         None,
+        per_query_candidates,
     )
     expected, _ = ak.paged_indexer_jax(
         q,
@@ -279,7 +388,7 @@ def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
 @pytest.mark.parametrize("groups,queries", [(1, 1), (3, 2), (4, 3), (7, 5), (8, 8)])
 @pytest.mark.parametrize("mode", ["regular", "invalid"])
-def test_candidate_cache_basic_config_covers_non_k5_batches(groups, queries, mode):
-    _check_candidate_cache(
+def test_sparse_mqa_cache_basic_config_covers_non_k5_batches(groups, queries, mode):
+    _check_sparse_mqa_cache(
         mode, groups=groups, queries=queries, width=8192, capacity=4096
     )

@@ -108,18 +108,22 @@ def test_grouped_decode_page_table_beyond_128_entries():
 
 @pytest.mark.cpu_test
 def test_candidate_union_membership_overflow_and_invalid_pages():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        union_metadata,
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_metadata import (
+        grouped_union_metadata,
         union_record_starts,
     )
 
     candidate_block_ids = jnp.array([[[2, 0, 2, -1], [1, 2, 9, -1]]], jnp.int32)
-    meta = union_metadata(candidate_block_ids, logical_blocks=4, capacity_blocks=4)
+    meta = grouped_union_metadata(
+        candidate_block_ids, logical_blocks=4, capacity_blocks=4
+    )
     np.testing.assert_array_equal(meta.union_block_ids, [[0, 1, 2, -1]])
     np.testing.assert_array_equal(meta.membership, [[1, 2, 3, 0]])
     np.testing.assert_array_equal(meta.union_block_count, [3])
     np.testing.assert_array_equal(meta.overflow, [False])
-    truncated = union_metadata(candidate_block_ids, logical_blocks=4, capacity_blocks=2)
+    truncated = grouped_union_metadata(
+        candidate_block_ids, logical_blocks=4, capacity_blocks=2
+    )
     np.testing.assert_array_equal(truncated.union_block_count, [3])
     np.testing.assert_array_equal(truncated.overflow, [True])
     records = jnp.arange(32, dtype=jnp.int32)[None].at[:, 8:16].set(-1)
@@ -140,8 +144,8 @@ def test_candidate_union_membership_overflow_and_invalid_pages():
 def test_long_candidate_union_preserves_membership_and_overflow(
     logical_blocks, capacity, queries
 ):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        union_metadata,
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_metadata import (
+        grouped_union_metadata,
     )
 
     rng = np.random.default_rng(927)
@@ -153,7 +157,7 @@ def test_long_candidate_union_preserves_membership_and_overflow(
         0, logical_blocks, (queries, 17), dtype=np.int32
     )
     result = jax.jit(
-        lambda x: union_metadata(
+        lambda x: grouped_union_metadata(
             x, logical_blocks=logical_blocks, capacity_blocks=capacity
         )
     )(jnp.asarray(candidate_block_ids))
@@ -181,29 +185,31 @@ def test_long_candidate_union_preserves_membership_and_overflow(
     "requests,queries", [(1, 1), (2, 6), (3, 3), (7, 5), (7, 6), (8, 4), (8, 8)]
 )
 @pytest.mark.parametrize(
-    "interpret,start,head_stripe",
-    [(True, 0, None), (True, 1, 8), (False, 0, None), (False, 1, 8)],
+    "interpret,start",
+    [(True, 0), (True, 1), (False, 0), (False, 1)],
 )
-def test_candidate_scores_match_independent_per_head_reference(
-    seed, requests, queries, interpret, start, head_stripe
+def test_sparse_mqa_logits_match_independent_per_head_reference(
+    seed, requests, queries, interpret, start
 ):
     if not interpret and jax.default_backend() != "tpu":
         pytest.skip("Native candidate DMA scoring requires TPU")
     from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        _candidate_scores,
-        union_metadata,
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_logits import (
+        sparse_mqa_logits,
+    )
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_metadata import (
+        grouped_union_metadata,
     )
 
     rng = np.random.default_rng(seed)
-    heads, width = max(4, head_stripe or 1), 128
+    heads, width = 4, 128
     start = min(start, requests - 1)
     native = jnp.asarray(rng.normal(size=(requests, width, 128)), jnp.bfloat16)
     expected_keys = jnp.concatenate((native[..., ::2], native[..., 1::2]), axis=-1)
     candidate_block_ids = rng.integers(
         -2, 18, size=(requests, queries, 12), dtype=np.int32
     )
-    meta = union_metadata(
+    meta = grouped_union_metadata(
         jnp.asarray(candidate_block_ids), logical_blocks=16, capacity_blocks=16
     )
     # A dense key cache whose slots correspond to the compact logical IDs.
@@ -222,19 +228,26 @@ def test_candidate_scores_match_independent_per_head_reference(
     weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
     lengths = jnp.asarray(rng.integers(0, width + 1, (requests, queries)), jnp.int32)
     lengths = lengths.at[-1, -1].set(0)
-    scores = _candidate_scores(
-        q,
-        weights,
-        score_keys,
-        meta.union_block_ids,
-        meta.membership,
-        lengths,
-        start_request=jnp.int32(start),
-        request_tile=requests - start,
+    row_ids = jnp.arange((requests - start) * queries, dtype=jnp.int32)
+    owners = row_ids // queries
+    rows = jnp.stack(
+        (
+            owners,
+            owners * 32 + row_ids % queries,
+            jnp.minimum(meta.union_block_count[start:][owners], 16) * 8,
+            lengths[start:].reshape(-1),
+        )
+    )
+    scores = sparse_mqa_logits(
+        q[start:].reshape(-1, heads, 128),
+        weights[start:].reshape(-1, heads),
+        score_keys[start:],
+        meta.union_block_ids[start:],
+        jnp.pad(meta.membership[start:], ((0, 1), (0, 0))),
+        rows,
         block_size=8,
         key_tile=64 if interpret else 128,
         compute_tile=32 if interpret else 128,
-        head_stripe=head_stripe,
         interpret=interpret,
     )
     logits = jnp.einsum(
@@ -269,8 +282,8 @@ def test_candidate_scores_match_independent_per_head_reference(
     ],
 )
 def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
-        union_metadata,
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_metadata import (
+        grouped_union_metadata,
     )
 
     if jax.default_backend() != "tpu":
@@ -281,7 +294,7 @@ def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
     values[1] = logical_blocks - 1
     values[2, :, ::2] = 0
     result = jax.jit(
-        lambda x: union_metadata(
+        lambda x: grouped_union_metadata(
             x, logical_blocks=logical_blocks, capacity_blocks=capacity
         )
     )(jnp.asarray(values))

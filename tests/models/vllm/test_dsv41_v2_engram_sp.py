@@ -543,6 +543,10 @@ def test_select_paged_indices_projects_index_q_on_local_query_shard(monkeypatch)
             index_cache,
             records,
             requests,
+            torch.nn.functional.pad(
+                requests.bincount(minlength=records.shape[0]).cumsum(0),
+                (1, 0),
+            ),
             weights,
             lengths,
             swa_slots,

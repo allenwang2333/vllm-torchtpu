@@ -113,7 +113,7 @@ The source publication and index-K write versions invalidate cached keys;
 entering a new stage resets all request-scoped entries. Any union overflow or
 noncanonical active request mapping falls back without dropping candidates.
 
-`prepare_candidate_cache(..., packed=True)` retains native int32 words instead
+`prepare_sparse_mqa_cache(..., packed=True)` retains native int32 words instead
 of allocating the separate BF16 unpack output. The scorer unpacks each key
 tile in VMEM. Both representations store two bytes per key element; packed
 mode reduces preparation temporaries rather than halving the persistent cache.
@@ -142,8 +142,8 @@ overflow still falls back correctly without truncation.
 Reproduce the candidate calibration separately from serving:
 
 ```bash
-python scripts/dsv41_bench/bench_candidate_reindex.py \
-  --out /tmp/candidate-tuning --seed 825 --repeats 41 --tiles 16 24 48
+python scripts/dsv41_bench/bench_sparse_mqa.py \
+  --out /tmp/candidate-tuning --seed 825 --repeats 41 --tiles 96 144 288
 ```
 
 Pass `--candidate-file rank-0.npz --width 98816 --capacity 49152` to replay
@@ -235,3 +235,46 @@ eight independent documents. Work was closed after functional validation:
 the matched 1M baseline and new 96K regression series were not completed, so
 these results establish neither 1M speedup nor a new 96K no-regression result.
 C32 serving was not tested.
+
+### Flat sparse MQA queries
+
+The current sparse MQA scorer consumes flat `Q[T,H,D]` rows and request
+boundaries from `query_start_loc`. It preserves input row order without a
+fixed queries-per-request tile or an output permutation. Each row uses its
+request's shared key cache and its own candidate membership and causal mask.
+Score/Top-K batches use `row_tile`; the benchmark's `--tiles` values count
+query rows and may cross request boundaries.
+
+The historical grouped-query performance measurements above do not validate
+the current row-wise scorer. Repeat the matched TPU profile and serving
+benchmark before claiming equivalent performance.
+
+### Experimental per-query score columns
+
+`sparse_mqa_indexer(..., candidate_block_ids=candidates)` selects per-query
+score columns. For `candidates[T,2048]` and block size 8, the scorer returns
+`float32[T,16384]`; omitting the argument retains the request-union layout
+(normally `float32[T,49152]`). Both return `int32[T,512]` logical positions,
+sorted ascending with `-1` padding. This switch changes the score layout;
+it keeps the existing FP32 scoring and output ordering.
+
+The per-query path sorts and deduplicates candidates, maps them into the
+shared request K cache, and gathers only those keys within each `row_tile`
+batch. It does not compute a full union score matrix and then slice it.
+The extra key gather and its temporary buffer are part of the experiment's
+cost and are included in the timed indexer calls.
+
+At the model boundary, construct `SparseMQAIndexer` with
+`per_query_candidates=True`; the default is `False`. Keep one mode fixed
+before compiling the model. To compare the benchmark at matched settings:
+
+```bash
+python scripts/dsv41_bench/bench_sparse_mqa.py \
+  --capacity 49152 --tiles 96 --seed 824 --out /tmp/mqa-union
+python scripts/dsv41_bench/bench_sparse_mqa.py \
+  --capacity 49152 --tiles 96 --seed 824 --per-query-candidates \
+  --out /tmp/mqa-query
+```
+
+Retain both modes until matched TPU correctness, profile and serving
+experiments select one; then remove the temporary selector and losing path.

@@ -43,7 +43,10 @@ def main() -> None:
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     native, _, _, _ = load_kernels(root)
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate, decode
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+        decode,
+        sparse_mqa_logits,
+    )
 
     relative = Path("src/vllm_torchtpu/kernels/deepseek_v41/index_selection")
     for name in ("scores.py", "streaming_topk.py", "union.py"):
@@ -164,6 +167,7 @@ def main() -> None:
         high = rng.integers(0, 65536, bits.shape, dtype=np.uint32)
         high = (high & 0x807F) | 0x3E00
         keys = jnp.asarray((bits | (high << 16)).view(np.int32))
+        packed_keys = keys
         if not packed:
             keys = jax.lax.bitcast_convert_type(keys, jnp.bfloat16).reshape(
                 requests, width, 128
@@ -181,7 +185,7 @@ def main() -> None:
                 q = jnp.zeros_like(q)
             calls = [
                 functools.partial(
-                    m.candidate_indexer,
+                    old_candidate.candidate_indexer,
                     q,
                     weights,
                     keys,
@@ -191,8 +195,20 @@ def main() -> None:
                     block_size=8,
                     key_tile=key_tile,
                     halfplane=packed,
-                )
-                for m in (old_candidate, candidate)
+                ),
+                functools.partial(
+                    sparse_mqa_logits.sparse_mqa_indexer,
+                    q.reshape(-1, 32, 128),
+                    weights.reshape(-1, 32),
+                    packed_keys,
+                    ids,
+                    jnp.pad(members, ((0, 1), (0, 0))),
+                    lengths.reshape(-1),
+                    query_start_loc=jnp.arange(requests + 1, dtype=jnp.int32) * queries,
+                    union_counts=(ids >= 0).sum(1).astype(jnp.int32),
+                    block_size=8,
+                    key_tile=key_tile,
+                ),
             ]
             check_bench(
                 f"candidate-r{requests}-q{queries}-w{width}"

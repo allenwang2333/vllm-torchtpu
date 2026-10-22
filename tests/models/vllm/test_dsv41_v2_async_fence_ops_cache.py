@@ -382,7 +382,7 @@ class TestCacheSizingAndConfig:
         assert res.raw_tensors[0].shape == (16 * 512,)
 
         # Case 3: layer_compact = True, word_rows = True, with FP8 views
-        fp8_view = torch.zeros(16, 1, 4, 128, dtype=torch.uint8)
+        fp8_view = torch.zeros(16, 1, 1, 512, dtype=torch.uint8)
         fp8_views = {"fp8_layer": fp8_view}
         monkeypatch.setattr(
             v2_cache, "allocate_upstream_kv_cache", lambda *a: fp8_views
@@ -423,7 +423,7 @@ class TestCacheSizingAndConfig:
         assert isinstance(res_split.rope_pools["fp8_layer"], tuple)
         assert len(res_split.rope_pools["fp8_layer"]) == 2
         assert len(res_split.raw_tensors) == 4
-        assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 4, 128)
+        assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 1, 512)
 
 
 # ==============================================================================

@@ -469,6 +469,10 @@ class TestIntegratedEvenQuerySplit:
                 index_cache_mock,
                 records,
                 requests,
+                torch.nn.functional.pad(
+                    requests.bincount(minlength=records.shape[0]).cumsum(0),
+                    (1, 0),
+                ),
                 weights,
                 lengths,
                 swa_slots,

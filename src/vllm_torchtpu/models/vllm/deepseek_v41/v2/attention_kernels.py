@@ -3413,9 +3413,6 @@ def update_and_select_2bank_jax(
 
 
 def initialize_indexer():
-    from .candidate_cache import initialize_candidate_cache
-
-    initialize_candidate_cache()
     global _indexer_op, _indexer_2bank_op
     if _indexer_op is not None:
         return
@@ -3536,9 +3533,29 @@ def paged_indexer(
     # explicitly: compiled JAX functions must not read environment state.
     if prefill_mode is None:
         prefill_mode = "streaming"
-    assert _indexer_op is not None
     if batch_max is None:
         batch_max = lengths.max()
+    from .packed_fp8_indexer import PackedFP8IndexCacheRows, paged_fp8_indexer
+
+    if isinstance(cache, PackedFP8IndexCacheRows):
+        return paged_fp8_indexer(
+            q,
+            cache,
+            records,
+            weights,
+            lengths,
+            candidates,
+            write_records,
+            keys,
+            requests,
+            topk=topk,
+            block_size=block_size,
+            candidate_write=candidate_write,
+            candidate_filter=candidate_filter,
+            unordered=unordered,
+            batch_max=batch_max,
+        )
+    assert _indexer_op is not None
     tail_args = (
         records.int(),
         weights,

@@ -50,6 +50,7 @@ import torch
 
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention as v2_attn
 import vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels as v2_kernels
+import vllm_torchtpu.models.vllm.deepseek_v41.v2.sparse_mqa_indexer as v2_indexer
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import (
     _index_page_records,
 )
@@ -68,6 +69,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     gather_cache_page_values,
     gather_cache_values,
 )
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import SparseMQACache
 
 
 class TestGatherCachePageValues:
@@ -653,7 +655,7 @@ class TestAttentionSelectPagedIndicesDecode:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        swa_valid = torch.ones(count, dtype=torch.bool)
 
         with v2_attn.stage_attention_cache_scope():
             selected = attn._select_paged_indices(
@@ -662,9 +664,13 @@ class TestAttentionSelectPagedIndicesDecode:
                 index_cache_mock,
                 records,
                 requests,
+                torch.nn.functional.pad(
+                    requests.bincount(minlength=records.shape[0]).cumsum(0),
+                    (1, 0),
+                ),
                 weights,
                 lengths,
-                swa_slots,
+                swa_valid,
                 None,
             )
 
@@ -715,7 +721,7 @@ class TestAttentionSelectPagedIndicesDecode:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        swa_valid = torch.ones(count, dtype=torch.bool)
 
         # Also supply pending_index_write to test pending_index_write is not None
         pending_write = (
@@ -729,9 +735,13 @@ class TestAttentionSelectPagedIndicesDecode:
             index_cache_mock,
             records,
             requests,
+            torch.nn.functional.pad(
+                requests.bincount(minlength=records.shape[0]).cumsum(0),
+                (1, 0),
+            ),
             weights,
             lengths,
-            swa_slots,
+            swa_valid,
             pending_write,
         )
 
@@ -787,7 +797,7 @@ class TestAttentionSelectPagedIndicesDecode:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        swa_valid = torch.ones(count, dtype=torch.bool)
 
         selected = attn._select_paged_indices(
             qr,
@@ -795,9 +805,13 @@ class TestAttentionSelectPagedIndicesDecode:
             index_cache_mock,
             records,
             requests,
+            torch.nn.functional.pad(
+                requests.bincount(minlength=records.shape[0]).cumsum(0),
+                (1, 0),
+            ),
             weights,
             lengths,
-            swa_slots,
+            swa_valid,
             None,
         )
 
@@ -846,7 +860,7 @@ class TestAttentionSelectPagedIndicesDecode:
         requests = torch.arange(count, dtype=torch.int32)
         weights = torch.zeros(count, 2)
         lengths = torch.full((count, 1), 50, dtype=torch.int32)
-        swa_slots = torch.zeros(count, 1, dtype=torch.int32)
+        swa_valid = torch.ones(count, dtype=torch.bool)
 
         with v2_attn.stage_attention_cache_scope():
             # Call 1: cache miss
@@ -856,9 +870,13 @@ class TestAttentionSelectPagedIndicesDecode:
                 index_cache_mock,
                 records,
                 requests,
+                torch.nn.functional.pad(
+                    requests.bincount(minlength=records.shape[0]).cumsum(0),
+                    (1, 0),
+                ),
                 weights,
                 lengths,
-                swa_slots,
+                swa_valid,
                 None,
             )
             assert sel1.shape == (count, 4)
@@ -871,9 +889,13 @@ class TestAttentionSelectPagedIndicesDecode:
                 index_cache_mock,
                 records,
                 requests,
+                torch.nn.functional.pad(
+                    requests.bincount(minlength=records.shape[0]).cumsum(0),
+                    (1, 0),
+                ),
                 weights,
                 lengths,
-                swa_slots,
+                swa_valid,
                 None,
             )
             assert sel2.shape == (count, 4)
@@ -899,9 +921,13 @@ class TestAttentionSelectPagedIndicesDecode:
                 index_cache_2b,
                 records,
                 requests,
+                torch.nn.functional.pad(
+                    requests.bincount(minlength=records.shape[0]).cumsum(0),
+                    (1, 0),
+                ),
                 weights,
                 lengths,
-                swa_slots,
+                swa_valid,
                 None,
             )
             assert sel3.shape == (count, 4)
@@ -911,7 +937,7 @@ class TestAttentionSelectPagedIndicesDecode:
 
 @pytest.mark.cpu_test
 def test_candidate_envelope_keeps_token_rows_dynamic():
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.sparse_mqa_logits import (
         cache_capacity,
     )
 
@@ -927,7 +953,7 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
 
 
 @pytest.mark.cpu_test
-def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch):
+def test_sparse_mqa_cache_reuses_only_within_stage_and_source_version(monkeypatch):
     """Four reindexes share keys; publication, source and new stage invalidate."""
     attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
         monkeypatch, ranks=1
@@ -938,7 +964,21 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
     attn.candidate_source_layer = 20
     attn.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
     attn.indexer.k_cache = SimpleNamespace(prefix="source-a")
-    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32))
+    attn.indexer.indexer_op = v2_indexer.SparseMQAIndexer(
+        attn.indexer.k_cache,
+        512,
+        attn.candidate_block_buffer,
+        8,
+        candidate_source_layer=20,
+    )
+    peer = v2_indexer.SparseMQAIndexer(
+        attn.indexer.k_cache,
+        512,
+        attn.candidate_block_buffer,
+        8,
+        candidate_source_layer=20,
+    )
+    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32), raw_hi=None)
     q = torch.zeros((12, 32, 128), dtype=torch.bfloat16)
     positions = torch.arange(12, dtype=torch.int32)
     records = torch.arange(2 * 98304, dtype=torch.int32).reshape(2, -1)
@@ -949,44 +989,51 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
     prepared = []
     used = []
 
-    def prepare(cache, records, candidates, requests, lengths, **kwargs):
-        result = object()
-        prepared.append((result, requests.clone()))
+    def prepare(cache, records, candidates, query_offsets, lengths, **kwargs):
+        result = SparseMQACache(
+            cache.raw.clone(), candidates, candidates, lengths, lengths, query_offsets
+        )
+        prepared.append((result, query_offsets.clone()))
         return result
 
     def select(
-        q,
-        cache,
-        records,
-        weights,
-        lengths,
-        candidates,
-        requests,
-        batch_max,
-        prepared,
-        **kwargs,
+        q, pool, records, weights, lengths, candidates, requests, maximum, keys, *args
     ):
-        used.append(prepared)
+        used.append(keys)
         return torch.zeros((12, 512), dtype=torch.int32)
 
     def old(q, cache, records, weights, lengths, candidates, *args, **kwargs):
         return cache.raw, torch.zeros((12, 512), dtype=torch.int32), candidates + 1
 
     monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: 128)
-    monkeypatch.setattr(v2_attn, "prepare_candidate_cache", prepare)
-    monkeypatch.setattr(v2_attn, "select_candidate_cache", select)
+    monkeypatch.setattr(v2_indexer, "prepare_sparse_mqa_cache", prepare)
+    monkeypatch.setattr(v2_indexer, "_select_op", select)
+    monkeypatch.setattr(v2_indexer, "_select_2bank_op", select)
     monkeypatch.setattr(v2_attn, "paged_indexer", old)
 
     def run(mapping):
         return attn._select_paged_indices(
-            q, positions, cache, records, mapping, weights, lengths, swa_valid, None
+            q,
+            positions,
+            cache,
+            records,
+            mapping,
+            torch.nn.functional.pad(
+                mapping.bincount(minlength=records.shape[0]).cumsum(0),
+                (1, 0),
+            ),
+            weights,
+            lengths,
+            swa_valid,
+            None,
         )
 
     with v2_attn.stage_attention_cache_scope():
         for _ in range(4):
             run(requests)
+            attn.indexer.indexer_op = peer
         assert len(prepared) == 1
-        assert all(x is prepared[0][0] for x in used)
+        assert all(x is prepared[0][0].keys for x in used)
         attn.indexer.indexer_op.candidate_write = True
         run(requests)
         attn.indexer.indexer_op.candidate_write = False
@@ -999,8 +1046,8 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
         run(requests)
         assert len(prepared) == 4
     with v2_attn.stage_attention_cache_scope():
-        reordered = requests.flip(0)
-        run(reordered)
+        uneven = torch.tensor([0] * 7 + [1] * 5, dtype=torch.int32)
+        run(uneven)
         assert len(prepared) == 5
-        torch.testing.assert_close(prepared[-1][1], reordered)
+        torch.testing.assert_close(prepared[-1][1], torch.tensor([0, 7, 12]))
     assert len(used) == 8

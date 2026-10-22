@@ -64,18 +64,18 @@ def test_decode_tuning_rejects_empty_batch():
         (7, 6, 49152),
     ],
 )
-def test_candidate_default_groups_bound_scores_without_splitting_requests(
-    requests, queries, capacity
-):
-    lookup = tuning.CandidateTuningKey("TPU7x", queries, 32, capacity, 8192, 512)
-    tile = tuning.get_candidate_block_sizes(lookup, requests).request_tile
-    assert tile <= requests
-    assert tile * queries * capacity <= tuning.CANDIDATE_SCORE_ELEMENTS
+def test_sparse_mqa_row_tiles_bound_scores(monkeypatch, requests, queries, capacity):
+    monkeypatch.setattr(tuning, "logger", Mock())
+    rows = requests * queries
+    lookup = tuning.SparseMQATuningKey("TPU7x", 32, capacity, 8192, 512)
+    tile = tuning.get_sparse_mqa_block_sizes(lookup, rows).row_tile
+    assert tile <= rows
+    assert tile * capacity <= tuning.SPARSE_MQA_SCORE_ELEMENTS
 
 
 @pytest.mark.cpu_test
-def test_candidate_exact_tuning_precedes_default(monkeypatch):
-    lookup = tuning.CandidateTuningKey("TPU7x", 6, 32, 49152, None, 512)
-    config = tuning.CandidateBlockSizes(4096, 12)
-    monkeypatch.setitem(tuning.CANDIDATE_BLOCK_SIZES, lookup, config)
-    assert tuning.get_candidate_block_sizes(lookup, 24) == config
+def test_sparse_mqa_exact_tuning_precedes_default(monkeypatch):
+    lookup = tuning.SparseMQATuningKey("TPU7x", 32, 49152, None, 512)
+    config = tuning.SparseMQABlockSizes(4096, 12)
+    monkeypatch.setitem(tuning.SPARSE_MQA_BLOCK_SIZES, lookup, config)
+    assert tuning.get_sparse_mqa_block_sizes(lookup, 24) == config

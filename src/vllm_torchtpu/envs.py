@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
+    TPU_DEEPSEEK_V41_INDEXER_BACKEND: str = "bf16"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
@@ -361,6 +362,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serving supports v2; v1 remains only as a standalone reference.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v2", ["v1", "v2"]
+    ),
+    # Comparison selector while the packed FP8 scorer undergoes model-quality
+    # validation. The backend owns cache allocation and cannot change mid-run.
+    "TPU_DEEPSEEK_V41_INDEXER_BACKEND": env_with_choices(
+        "TPU_DEEPSEEK_V41_INDEXER_BACKEND", "bf16", ["bf16", "packed_fp8"]
     ),
     # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
     # total) to Host DRAM so TPU HBM remains available for KV cache and decode.

@@ -35,7 +35,7 @@ from .attention import (
     _cache_slots,
     stage_attention_cache_scope,
 )
-from .attention_kernels import initialize_indexer, initialize_paged_attention
+from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
     coordinate_decoder_replay,
@@ -49,6 +49,7 @@ from .host_engram import (
     install_host_engram_inputs,
 )
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
+from .sparse_mqa_indexer import initialize_indexer
 
 logger = init_logger(__name__)
 

@@ -58,6 +58,7 @@ steps:
         tests/layers/adapter/test_fused_moe_ep.py
         tests/kernels/test_dsv41_decode_tuning.py
         tests/kernels/test_dsv41_decode_index_scores.py
+        tests/kernels/test_dsv41_sparse_mqa.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
         -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml
     artifact_paths:
