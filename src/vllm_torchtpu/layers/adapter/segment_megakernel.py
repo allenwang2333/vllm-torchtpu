@@ -912,6 +912,34 @@ def arm(model: torch.nn.Module, vllm_config: Any) -> int:
                     kv_rows=True,
                 )
             )
+        # TPU_GROUP_BATCHED_GATHER: a head that is also a group member (its
+        # group gather ops were built at load, before this arming) takes the
+        # rows its group head pre-gathered as well as the megakernel's rows.
+        if getattr(nattn, "sparse_mla_dcp_send_pre_op", None) is not None:
+            nattn.sparse_mla_dcp_send_kvrows_pre_op = (
+                nattn.impl._build_sparse_mla_dcp_op(
+                    nattn,
+                    st.dcp,
+                    st.interleave,
+                    q_rope=True,
+                    send_layout=True,
+                    kv_rows=True,
+                    group_pre=True,
+                )
+            )
+            if getattr(nattn, "sparse_mla_dcp_fused_pre_op", None) is not None:
+                nattn.sparse_mla_dcp_fused_kvrows_pre_op = (
+                    nattn.impl._build_sparse_mla_dcp_op(
+                        nattn,
+                        st.dcp,
+                        st.interleave,
+                        q_rope=True,
+                        send_layout=True,
+                        fused_exchange=True,
+                        kv_rows=True,
+                        group_pre=True,
+                    )
+                )
         _HEAD_ATTNS.append(nattn)
         setattr(
             layer,
