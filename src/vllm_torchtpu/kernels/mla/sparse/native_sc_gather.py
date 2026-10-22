@@ -1575,3 +1575,399 @@ def dsa_gather_native_sc_union(
         kv_lens.reshape(-1).astype(jnp.int32),
         group_num_live.astype(jnp.int32),
     )
+
+
+# ---------------------------------------------------------------------------
+# Group gather (TPU_GROUP_BATCHED_GATHER): one index-sharing layer group.
+# ---------------------------------------------------------------------------
+# GLM-5.2's skip_topk layers reuse their group head's top-k, so every layer of
+# a group gathers the same rows (the same fused-prep window indices) from its
+# own cache. `dsa_gather_native_sc_group` gathers several layers' caches in one
+# SparseCore call ("multi" mode) at the group head, before those layers have
+# written this step's KV rows; each such layer then runs the "patch" mode: its
+# own KV write (the TPU_MLA_KV_WRITE_IN_GATHER write phase) plus a re-gather of
+# only the 64-slot atoms whose indices name a row this step just wrote, into
+# the pre-gathered buffers in place. Rows of every other atom cannot have
+# changed since the head's read (only the layer itself writes its cache), so
+# the result is byte-identical to the incumbent's write-then-gather in every
+# row the incumbent writes.
+
+# Test-only faults of the patch mode (positive controls).
+GROUP_FAULTS = (
+    None,
+    # The write lands but no atom is re-gathered: stale rows survive.
+    "no_patch",
+)
+
+
+def _group_kernel(
+    *refs: Any,
+    num_layers: int,
+    patch: bool,
+    core_axis_name: str,
+    subcore_axis_name: str,
+    num_owners: int,
+    atoms_per_batch: int,
+    wait_mode: str,
+    serve_pipelined: bool,
+    live_vec_offset: int,
+    guard_tail: bool,
+    write_tokens: int,
+    fault: str | None,
+    sem_ref: Any,
+    live_vmem_ref: Any,
+    live_sem_ref: Any,
+    write_dst_vmem: Any = None,
+    write_dst_sem: Any = None,
+    write_sem: Any = None,
+    dirty_vmem: Any = None,
+    dirty_sem: Any = None,
+):
+    """`num_layers` gathers over one shared index operand (see the section
+    comment). Operand refs: (nope, rope) per layer, the flat indices, then in
+    patch mode the two pre-gathered buffers (written in place) and the
+    `pack_write_rows` operand; in multi mode the (nope, rope) outputs follow."""
+    caches = [(refs[2 * g], refs[2 * g + 1]) for g in range(num_layers)]
+    indices_hbm_ref = refs[2 * num_layers]
+    rest = refs[2 * num_layers + 1 :]
+    write_refs = None
+    if patch:
+        outs = [(rest[0], rest[1])]
+        write_refs = (rest[2],)
+    else:
+        outs = [(rest[2 * g], rest[2 * g + 1]) for g in range(num_layers)]
+
+    owner = lax.axis_index((core_axis_name, subcore_axis_name))
+    if patch:
+        _write_phase(
+            write_refs,
+            (write_dst_vmem, write_dst_sem, write_sem),
+            caches[0][0],
+            caches[0][1],
+            subcore=lax.axis_index(subcore_axis_name),
+            num_tokens=write_tokens,
+            fault=None,
+        )
+        # Every subcore tests its atoms against all of this step's rows:
+        # their `dst + 1` words (0 = skip) as one [Tp, 16] VMEM block.
+        cp = pltpu.make_async_copy(
+            write_refs[0]
+            .bitcast(jnp.int32)
+            .at[
+                pl.ds(WRITE_DST_PART * write_tokens, write_tokens), pl.ds(0, NUM_LANES)
+            ],
+            dirty_vmem,
+            dirty_sem.at[0],
+        )
+        cp.start()
+        cp.wait()
+
+    cp = pltpu.make_async_copy(
+        indices_hbm_ref.at[pl.ds(live_vec_offset, 2 * NUM_LANES)],
+        live_vmem_ref,
+        live_sem_ref.at[0],
+    )
+    cp.start()
+    cp.wait()
+    live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
+    owner_batches = live_vmem_ref[pl.ds(NUM_LANES, NUM_LANES)][0]
+
+    def serve_layer(nope_hbm_ref, rope_hbm_ref, nope_out_hbm_ref, rope_out_hbm_ref):
+        def serve_batch(indices_ref):
+            logical_batch = owner + pl.program_id(0) * num_owners
+            occurrence_base = logical_batch * atoms_per_batch * OCCURRENCES_PER_ATOM
+
+            def values(atom, stream):
+                return indices_ref[
+                    pl.ds(atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES, NUM_LANES)
+                ]
+
+            def destinations(atom, stream):
+                return pl.ds(
+                    occurrence_base + atom * OCCURRENCES_PER_ATOM + stream * NUM_LANES,
+                    NUM_LANES,
+                )
+
+            def body(*brefs):
+                atom = pl.program_id(0)
+                nope_inputs = brefs[:ROPE_PACKING]
+                rope_inputs = brefs[ROPE_PACKING : 2 * ROPE_PACKING]
+                rope_output = brefs[-1]
+                nope_copies = []
+                for stream in range(ROPE_PACKING):
+                    copy = pltpu.make_async_copy(
+                        nope_inputs[stream],
+                        nope_out_hbm_ref.at[destinations(atom, stream), :],
+                        sem_ref.at[stream],
+                    )
+                    copy.start()
+                    nope_copies.append(copy)
+                if wait_mode == "before_rope":
+                    for copy in nope_copies:
+                        copy.wait()
+                if patch:
+                    # No Mosaic-SC layout passes in patch mode (the dirty
+                    # test's lane reduction needs them off): (16,) vectors.
+                    _rope_group(rope_inputs, rope_output)
+                for row in range(0 if patch else QUADS_PER_ATOM):
+                    data = []
+                    for token_slot in range(ROPE_PACKING):
+                        logical_rank = row * ROPE_PACKING + token_slot
+                        data.append(
+                            rope_inputs[logical_rank // NUM_LANES][
+                                pl.ds(logical_rank % NUM_LANES, 1), pl.ds(0, 32)
+                            ]
+                        )
+                    low_16 = jnp.uint32(0x0000FFFF)
+                    low_byte_each_half = jnp.uint32(0x00FF00FF)
+                    data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
+                    data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
+                    data[0], data[1] = _delta_swap(
+                        data[0], data[1], 8, low_byte_each_half
+                    )
+                    data[2], data[3] = _delta_swap(
+                        data[2], data[3], 8, low_byte_each_half
+                    )
+                    for band in range(ROPE_PACKING):
+                        rope_output[pl.ds(row, 1), pl.ds(band * 32, 32)] = data[band]
+                if wait_mode == "overlap_rope":
+                    for copy in nope_copies:
+                        copy.wait()
+
+            nope_specs = tuple(
+                pl.BlockSpec(
+                    (pl.Indirect(NUM_LANES), 128),
+                    lambda atom, stream=stream: (values(atom, stream), 0),
+                )
+                for stream in range(ROPE_PACKING)
+            )
+            rope_specs = tuple(
+                pl.BlockSpec(
+                    (pl.Indirect(NUM_LANES), 32),
+                    lambda atom, stream=stream: (values(atom, stream), 0),
+                )
+                for stream in range(ROPE_PACKING)
+            )
+            rope_out_spec = pl.BlockSpec(
+                (QUADS_PER_ATOM, 128),
+                lambda atom: (logical_batch * atoms_per_batch + atom, 0),
+            )
+
+            def run_inner():
+                pltpu.emit_pipeline(
+                    body,
+                    grid=(atoms_per_batch,),
+                    in_specs=nope_specs + rope_specs,
+                    out_specs=(rope_out_spec,),
+                    no_pipelining=not serve_pipelined,
+                )(
+                    *([nope_hbm_ref] * ROPE_PACKING),
+                    *([rope_hbm_ref] * ROPE_PACKING),
+                    rope_out_hbm_ref,
+                )
+
+            run = logical_batch < live_batches if guard_tail else None
+            if patch:
+                # Re-gather this batch only if one of its indices is a row
+                # the write phase above just wrote (stored as dst + 1 > 0).
+                hit = None
+                for v in range(atoms_per_batch * ROPE_PACKING):
+                    vec = indices_ref[pl.ds(v * NUM_LANES, NUM_LANES)] + 1
+                    for t in range(write_tokens):
+                        d = dirty_vmem[t, :]
+                        m = jnp.logical_and(vec == d, d > 0)
+                        hit = m if hit is None else jnp.logical_or(hit, m)
+                dirty = plsc.all_reduce_population_count(hit)[0] > 0
+                if fault == "no_patch":
+                    dirty = jnp.logical_and(dirty, owner < 0)
+                run = dirty if run is None else jnp.logical_and(run, dirty)
+            if run is None:
+                run_inner()
+            else:
+                pl.when(run)(run_inner)
+
+        @pl.when(owner_batches > 0)
+        def _serve_live():
+            pltpu.emit_pipeline(
+                serve_batch,
+                grid=(owner_batches,),
+                in_specs=(
+                    pl.BlockSpec(
+                        (atoms_per_batch * OCCURRENCES_PER_ATOM,),
+                        lambda batch: (owner + batch * num_owners,),
+                    ),
+                ),
+            )(indices_hbm_ref)
+
+    for (nope_ref, rope_ref), (nope_out, rope_out) in zip(
+        caches if not patch else caches[:1], outs
+    ):
+        serve_layer(nope_ref, rope_ref, nope_out, rope_out)
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "out_size",
+        "atoms_per_batch",
+        "wait_mode",
+        "serve_pipelined",
+        "live_multiple",
+        "live_vec_offset",
+        "fault",
+    ),
+)
+def dsa_gather_native_sc_group(
+    caches: tuple[tuple[jax.Array, jax.Array], ...],
+    indices: jax.Array,
+    *,
+    out_size: int,
+    live_vec_offset: int,
+    atoms_per_batch: int = 1,
+    wait_mode: str = "overlap_rope",
+    serve_pipelined: bool = True,
+    live_multiple: int = 1,
+    gathered: tuple[jax.Array, jax.Array] | None = None,
+    kv_write: jax.Array | None = None,
+    fault: str | None = None,
+) -> tuple[jax.Array, ...]:
+    """The decode gather of `dsa_gather_native_sc(linear_indices=True,
+    live_vec_offset=...)` for an index-sharing layer group (section comment).
+
+    Multi mode (``gathered`` None): ``caches`` = ((nope, rope), ...) of G
+    layers; returns ``(nope_0, rope_0, ..., nope_{G-1}, rope_{G-1})``, each
+    what `dsa_gather_native_sc` returns for that layer alone (no write).
+
+    Patch mode: one layer's ``caches`` = ((nope, rope),), its multi-mode
+    ``gathered`` = (nope_rows, rope_rows) taken before this step's write, and
+    ``kv_write`` its `pack_write_rows` operand. Writes the rows into both caches
+    (fenced, as the incumbent's write phase), then re-gathers into
+    ``gathered`` in place every logical batch (atoms_per_batch 64-slot atoms)
+    whose indices name a written row. Returns ``(nope_rows, rope_rows,
+    nope_cache, rope_cache)``: byte-identical to `dsa_gather_native_sc(...,
+    kv_write=kv_write)` in every row it writes. ``fault``: test-only
+    (`GROUP_FAULTS`).
+    """
+    if wait_mode not in ("overlap_rope", "before_rope"):
+        raise ValueError(f"unknown {wait_mode=}")
+    if fault not in GROUP_FAULTS:
+        raise ValueError(f"unknown {fault=}")
+    patch = gathered is not None
+    if not caches or (patch and len(caches) != 1):
+        raise ValueError("multi mode takes >= 1 layer, patch mode exactly 1")
+    if patch != (kv_write is not None):
+        raise ValueError("patch mode needs both gathered and kv_write")
+    for nope_cache, rope_cache in caches:
+        if nope_cache.dtype != jnp.uint32 or nope_cache.shape[-1] != 128:
+            raise ValueError("native-SC NOPE must be explicit uint32[...,128]")
+        if rope_cache.dtype != jnp.uint32 or rope_cache.shape[-1] != 128:
+            raise ValueError("native-SC ROPE must be quarter-major uint32[...,128]")
+    if indices.dtype != jnp.int32 or indices.ndim != 2:
+        raise ValueError("indices must be int32[rows, cols]")
+    if live_vec_offset < out_size or indices.size < live_vec_offset + 2 * NUM_LANES:
+        raise ValueError(
+            f"live_vec_offset ({live_vec_offset}) must place the live vector "
+            f"past the {out_size} indices, inside {indices.size} values"
+        )
+    num_cores, num_subcores, atoms_per_batch, occurrences_per_batch, _ = (
+        live_vec_geometry(out_size, atoms_per_batch)
+    )
+    num_owners = num_cores * num_subcores
+    owner_batch_size = num_owners * occurrences_per_batch
+    out_shapes = (
+        jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
+        jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
+    )
+    scratch_types = {
+        "sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,)),
+        "live_vmem_ref": pltpu.VMEM((2 * NUM_LANES,), jnp.int32),
+        "live_sem_ref": pltpu.SemaphoreType.DMA((1,)),
+    }
+    operands: list[Any] = []
+    for nope_cache, rope_cache in caches:
+        nope_rows, rope_rows = nope_cache.reshape(-1, 128), rope_cache.reshape(-1, 32)
+        if patch:
+            nope_rows, rope_rows = jax.new_ref(nope_rows), jax.new_ref(rope_rows)
+        operands += [nope_rows, rope_rows]
+    operands.append(indices.reshape(-1))
+    write_tokens = 0
+    if patch:
+        assert gathered is not None and kv_write is not None
+        if gathered[0].shape != (out_size, 128) or gathered[1].shape != (
+            out_size // ROPE_PACKING,
+            128,
+        ):
+            raise ValueError(
+                f"gathered must be the multi-mode rows for out_size {out_size}, got "
+                f"{gathered[0].shape} / {gathered[1].shape}"
+            )
+        if num_subcores != NUM_SUBCORES:
+            raise ValueError(f"kv_write assumes {NUM_SUBCORES} subcores per core")
+        padded = kv_write.shape[0] // WRITE_PARTS
+        if (
+            kv_write.shape != (WRITE_PARTS * padded, 128)
+            or kv_write.dtype != jnp.uint32
+            or not 0 < padded <= 2 * NUM_SUBCORES
+            or padded % NUM_SUBCORES
+        ):
+            raise ValueError(
+                f"kv_write must be uint32[3 * Tp, 128], Tp in (16, 32); got "
+                f"{kv_write.shape} {kv_write.dtype}"
+            )
+        gathered_refs = (jax.new_ref(gathered[0]), jax.new_ref(gathered[1]))
+        operands += [*gathered_refs, kv_write]
+        rounds = write_slots(padded, None)
+        scratch_types["write_dst_vmem"] = pltpu.VMEM((rounds, NUM_LANES), jnp.int32)
+        scratch_types["write_dst_sem"] = pltpu.SemaphoreType.DMA((rounds,))
+        scratch_types["write_sem"] = pltpu.SemaphoreType.DMA((2 * rounds,))
+        scratch_types["dirty_vmem"] = pltpu.VMEM((padded, NUM_LANES), jnp.int32)
+        scratch_types["dirty_sem"] = pltpu.SemaphoreType.DMA((1,))
+        write_tokens = padded
+        out_type: tuple[Any, ...] = ()
+    else:
+        out_type = out_shapes * len(caches)
+    mesh = plsc.VectorSubcoreMesh(
+        num_cores=num_cores,
+        num_subcores=num_subcores,
+        core_axis_name="core",
+        subcore_axis_name="subcore",
+    )
+    body = functools.partial(
+        _group_kernel,
+        num_layers=len(caches),
+        patch=patch,
+        core_axis_name=mesh.core_axis_name,
+        subcore_axis_name=mesh.subcore_axis_name,
+        num_owners=num_owners,
+        atoms_per_batch=atoms_per_batch,
+        wait_mode=wait_mode,
+        serve_pipelined=serve_pipelined,
+        live_vec_offset=live_vec_offset,
+        guard_tail=live_multiple % owner_batch_size != 0,
+        write_tokens=write_tokens,
+        fault=fault,
+    )
+    outs = core_map_helper.kernel(
+        body,
+        out_type=out_type,
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=not patch,  # patch: lane reduction (see body)
+            disable_bounds_checks=True,
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        name=(
+            f"sc_native_sc_gather_group_a{atoms_per_batch}_"
+            + ("patch_kvw" if patch else f"g{len(caches)}")
+        ),
+    )(*operands)
+    if not patch:
+        return tuple(outs)
+    ((nope_cache, rope_cache),) = caches
+    return (
+        jax.freeze(gathered_refs[0]),
+        jax.freeze(gathered_refs[1]),
+        jax.freeze(operands[0]).reshape(nope_cache.shape),
+        jax.freeze(operands[1]).reshape(rope_cache.shape),
+    )

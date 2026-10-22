@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     TPU_MLA_ABSORB_TOKEN_MAJOR: str = "0"
     TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS: int = 64
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
+    TPU_GROUP_BATCHED_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
@@ -976,6 +977,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "TPU_MLA_ABSORB_TOKEN_MAJOR_MIN_TOKENS", 64
     ),
     # DCP sparse MLA, fused-prep decode buckets (TPU_DCP_MLA_FUSED_PREP): the
+    # GLM-5.2 index groups (an indexed layer + the skip_topk layers reusing its
+    # top-k), DCP decode buckets on the TPU_MLA_KV_WRITE_IN_GATHER path: the
+    # group head gathers all of its skip layers' rows in one SparseCore call
+    # (`native_sc_gather.dsa_gather_native_sc_group`), in the shadow of its own
+    # attention and MoE; each skip layer then only writes its KV rows and
+    # re-gathers the 64-slot atoms naming one of them (its own SC call), in
+    # place of its full gather. Bit-identical caches and attention outputs.
+    "TPU_GROUP_BATCHED_GATHER": env_bool("TPU_GROUP_BATCHED_GATHER", default=False),
     # SparseCore gather feeding the attention kernel writes the step's KV rows
     # into both caches itself (then fences), instead of a separate cache
     # writer kernel (tc_scatter / scatter_rows). Same bytes, same owner mask.
