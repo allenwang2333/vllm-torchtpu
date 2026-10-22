@@ -9,6 +9,7 @@ import pytest
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
     candidate_membership,
+    candidate_topk,
     compact_candidate_scores,
 )
 
@@ -29,16 +30,21 @@ def test_compact_scores_keep_logical_ties_and_remove_duplicates(block_size):
         jnp.asarray(scores), canonical, block_size=block_size
     )
     assert compact.shape == (rows, capacity * block_size)
-    values, selected = jax.lax.top_k(compact, 13)
+    values, selected = jax.lax.top_k(compact, 16)
     blocks = jnp.take_along_axis(canonical, selected // block_size, axis=1)
     actual = jnp.where(
         jnp.isfinite(values), blocks * block_size + selected % block_size, -1
     )
-    expected = np.full((rows, 13), -1, np.int32)
+    expected = np.full((rows, 16), -1, np.int32)
     for row in range(rows):
         logical = np.arange(width)
         valid = np.asarray(mask[row])[logical // block_size] != 0
         valid &= np.isfinite(scores[row])
-        chosen = sorted(np.flatnonzero(valid), key=lambda i: (-scores[row, i], i))[:13]
+        chosen = sorted(np.flatnonzero(valid), key=lambda i: (-scores[row, i], i))[:16]
         expected[row, : len(chosen)] = chosen
     np.testing.assert_array_equal(actual, expected)
+    result = candidate_topk(compact, canonical, k=16, block_size=block_size)
+    for row in range(rows):
+        valid = expected[row][expected[row] >= 0]
+        expected[row, : valid.size] = np.sort(valid)
+    np.testing.assert_array_equal(result, expected)

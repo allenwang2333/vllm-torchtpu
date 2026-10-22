@@ -11,6 +11,45 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+from .streaming_topk import TopKEpilogue, streaming_topk
+
+
+def candidate_topk(
+    scores: jax.Array, candidates: jax.Array, *, k: int, block_size: int
+) -> jax.Array:
+    """Select compact scores and return ascending logical token IDs."""
+    if jax.default_backend() != "tpu" or k % plsc.get_sparse_core_info().num_lanes:
+        values, indices = jax.lax.top_k(scores, k)
+        blocks = jnp.take_along_axis(candidates, indices // block_size, axis=1)
+        logical = blocks * block_size + indices % block_size
+        limit = jnp.iinfo(jnp.int32).max
+        logical = jnp.sort(jnp.where(jnp.isfinite(values), logical, limit), axis=1)
+        return jnp.where(logical < limit, logical, -1)
+
+    lanes = plsc.get_sparse_core_info().num_lanes
+
+    def remap(inputs, indices, metadata, sem, sort_selected):
+        del inputs, sem
+        sort_selected()
+
+        @plsc.parallel_loop(0, k, lanes)
+        def block(i):
+            slots = indices[pl.ds(i, lanes)]
+            safe = jnp.maximum(slots, 0).astype(jnp.uint32)
+            block_slots = (safe // block_size).astype(jnp.int32)
+            offsets = (safe % block_size).astype(jnp.int32)
+            selected = plsc.load_gather(metadata, [lanes + block_slots])
+            indices[pl.ds(i, lanes)] = jnp.where(
+                slots >= 0, selected * block_size + offsets, -1
+            )
+
+    return streaming_topk(
+        scores,
+        k=k,
+        exclude_neg_inf=True,
+        epilogue=TopKEpilogue((), candidates, 0, remap),
+    )
+
 
 def candidate_membership(
     candidates: jax.Array, blocks: int
@@ -56,13 +95,13 @@ def candidate_membership(
 
         @pl.loop(first, rows, step=mesh.num_cores * mesh.num_subcores)
         def row(row_id):
-            @plsc.parallel_loop(0, histogram_width, lanes)
+            @plsc.parallel_loop(0, histogram_width, lanes, unroll=alignment // lanes)
             def clear(i):
                 hist[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
             pltpu.async_copy(src.at[row_id], ids, sem).wait()
 
-            @plsc.parallel_loop(0, candidate_width, lanes)
+            @plsc.parallel_loop(0, candidate_width, lanes, unroll=alignment // lanes)
             def scatter(i):
                 keys = ids[pl.ds(i, lanes)]
                 valid = (keys >= 0) & (keys < blocks)
@@ -71,7 +110,7 @@ def candidate_membership(
                     hist, [jnp.clip(keys, 0, histogram_width - 1)], inc, mask=mask
                 )
 
-            @plsc.parallel_loop(0, candidate_width, lanes)
+            @plsc.parallel_loop(0, candidate_width, lanes, unroll=alignment // lanes)
             def clear_ids(i):
                 canonical[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
 
@@ -85,7 +124,13 @@ def candidate_membership(
 
             compact_loop = cast(
                 Callable[[Callable[[jax.Array, jax.Array], jax.Array]], jax.Array],
-                plsc.parallel_loop(0, histogram_width, lanes, carry=jnp.int32(0)),
+                plsc.parallel_loop(
+                    0,
+                    histogram_width,
+                    lanes,
+                    unroll=alignment // lanes,
+                    carry=jnp.int32(0),
+                ),
             )
             compact_loop(compact)
             pltpu.async_copy(hist, mask_out.at[row_id], sem).wait()
@@ -154,13 +199,16 @@ def compact_candidate_scores(
             pltpu.async_copy(ids_src.at[row_id], ids, sem.at[1]).wait()
             value_copy.wait()
 
-            @plsc.parallel_loop(0, out_width, lanes)
+            @plsc.parallel_loop(0, out_width, lanes, unroll=alignment // lanes)
             def gather(i):
                 slots = i + lane_ids
-                blocks = plsc.load_gather(ids, [slots // block_size])
-                logical = blocks * block_size + slots % block_size
+                unsigned_slots = slots.astype(jnp.uint32)
+                block_slots = (unsigned_slots // block_size).astype(jnp.int32)
+                offsets = (unsigned_slots % block_size).astype(jnp.int32)
+                blocks = plsc.load_gather(ids, [block_slots])
+                logical = blocks * block_size + offsets
                 valid = (slots < output_width) & (blocks >= 0) & (logical < width)
-                selected = plsc.load_gather(values, [jnp.clip(logical, 0, width - 1)])
+                selected = plsc.load_gather(values, [logical], mask=valid)
                 compact[pl.ds(i, lanes)] = jnp.where(valid, selected, -jnp.inf)
 
             pltpu.async_copy(compact, out.at[row_id], sem.at[0]).wait()

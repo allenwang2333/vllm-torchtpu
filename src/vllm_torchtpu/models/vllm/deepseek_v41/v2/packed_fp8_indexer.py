@@ -15,6 +15,7 @@ import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.index_quantization import quantize_index_rows
 from vllm_torchtpu.kernels.deepseek_v41.index_selection._packed_fp8_compact import (
+    candidate_topk,
     compact_candidate_scores,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.packed_fp8_cache import (
@@ -260,6 +261,7 @@ def _score_and_select(
                 pages[:, : (width + PAGE_RECORDS - 1) // PAGE_RECORDS],
                 block_size=block_size,
                 cache_pages=layout.pages,
+                query_start_loc=offsets,
             )
             scores = packed_fp8_mqa_logits(
                 quantized,
@@ -277,6 +279,19 @@ def _score_and_select(
                 tasks.candidates,
                 block_size=block_size,
             )
+            if unordered:
+                selected = candidate_topk(
+                    scores,
+                    tasks.candidates,
+                    k=min(topk, scores.shape[1]),
+                    block_size=block_size,
+                )
+                selected = jnp.pad(
+                    selected,
+                    ((0, 0), (0, min(topk, width) - selected.shape[1])),
+                    constant_values=-1,
+                )
+                return selected, row_candidates
             selected, _ = attention_kernels.select_indices_jax(
                 scores,
                 jnp.full_like(row_lengths, scores.shape[1]),
