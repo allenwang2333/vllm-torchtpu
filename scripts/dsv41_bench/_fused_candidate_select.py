@@ -7,7 +7,6 @@ prototype is benchmark-only until its full-path correctness and timing pass.
 """
 
 import functools
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +29,7 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
     lanes = info.num_lanes
     alignment = pltpu.get_tpu_info().num_lanes
     capacity = count * block_size + lanes
+    unroll = alignment // lanes if unroll_selection else 1
     resident = 4 * (capacity + count)
     scratch_peak = 4 * max(width, 4 * capacity + 2 * k + RADIX_BUCKETS)
     assert resident + scratch_peak <= info.vmem_capacity_bytes
@@ -76,7 +76,7 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
             pl.run_scoped(gather_row, pltpu.VMEM((width,), jnp.float32))
 
             def select_row(keys, ids, selected, selected_ids, hist):
-                @plsc.parallel_loop(0, count * block_size, lanes)
+                @plsc.parallel_loop(0, count * block_size, lanes, unroll=unroll)
                 def populate(i):
                     keys[pl.ds(i, lanes)] = compact[pl.ds(i, lanes)]
                     ids[pl.ds(i, lanes)] = i + lane_ids
@@ -93,9 +93,10 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
                     jnp.int32(count * block_size),
                     candidate_buffers=2,
                     id_digits=digits,
+                    unroll=unroll,
                 )
 
-                @plsc.parallel_loop(0, k, lanes)
+                @plsc.parallel_loop(0, k, lanes, unroll=unroll)
                 def remove_invalid(i):
                     ids[pl.ds(i, lanes)] = jnp.where(
                         keys[pl.ds(i, lanes)] > -jnp.inf,
@@ -103,9 +104,9 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
                         -1,
                     )
 
-                _sort_selected(ids, selected_ids, hist, id_digits=digits)
+                _sort_selected(ids, selected_ids, hist, id_digits=digits, unroll=unroll)
 
-                @plsc.parallel_loop(0, k, lanes)
+                @plsc.parallel_loop(0, k, lanes, unroll=unroll)
                 def remap(i):
                     slots = ids[pl.ds(i, lanes)]
                     safe = jnp.maximum(slots, 0).astype(jnp.uint32)
@@ -120,21 +121,14 @@ def fused_select(scores, candidates, *, k=512, block_size=8, unroll_selection=Fa
 
                 pltpu.async_copy(ids.at[:k], out.at[r], sem.at[0]).wait()
 
-            # Compile-time ablation of the existing selection helpers only.
-            # Restore the module before tracing any other kernel.
-            loop = functools.partial(
-                plsc.parallel_loop,
-                unroll=alignment // lanes if unroll_selection else 1,
+            pl.run_scoped(
+                select_row,
+                pltpu.VMEM((2 * capacity,), jnp.float32),
+                pltpu.VMEM((2 * capacity,), jnp.int32),
+                pltpu.VMEM((k,), jnp.float32),
+                pltpu.VMEM((k,), jnp.int32),
+                pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
             )
-            with mock.patch.object(plsc, "parallel_loop", loop):
-                pl.run_scoped(
-                    select_row,
-                    pltpu.VMEM((2 * capacity,), jnp.float32),
-                    pltpu.VMEM((2 * capacity,), jnp.int32),
-                    pltpu.VMEM((k,), jnp.float32),
-                    pltpu.VMEM((k,), jnp.int32),
-                    pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
-                )
 
     return kernel(scores, candidates)
 

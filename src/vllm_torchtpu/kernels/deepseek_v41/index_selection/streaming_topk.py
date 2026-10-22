@@ -71,16 +71,18 @@ def _store_candidates(candidates, candidate_ids, count, keys, ids, mask):
     plsc.store_compressed(candidate_ids.at[pl.ds(count, lanes)], ids, mask=mask)
 
 
-def _clear_histogram(histogram):
+def _clear_histogram(histogram, *, unroll: int = 1):
     lanes = plsc.get_sparse_core_info().num_lanes
     histogram_size = histogram.shape[0]
 
-    @plsc.parallel_loop(0, histogram_size, lanes)
+    @plsc.parallel_loop(0, histogram_size, lanes, unroll=unroll)
     def clear(i):
         histogram[pl.ds(i, lanes)] = jnp.zeros(lanes, jnp.int32)
 
 
-def _sort_selected(candidate_ids, selected_ids, histogram, *, id_digits: int):
+def _sort_selected(
+    candidate_ids, selected_ids, histogram, *, id_digits: int, unroll: int = 1
+):
     lanes = plsc.get_sparse_core_info().num_lanes
     k = selected_ids.shape[0]
     histogram_size = histogram.shape[0]
@@ -88,9 +90,9 @@ def _sort_selected(candidate_ids, selected_ids, histogram, *, id_digits: int):
     # valid IDs even when their low bytes coincide with the sentinel.
 
     def sort_digit(digit):
-        _clear_histogram(histogram)
+        _clear_histogram(histogram, unroll=unroll)
 
-        @plsc.parallel_loop(0, k, lanes)
+        @plsc.parallel_loop(0, k, lanes, unroll=unroll)
         def count_keys(i):
             bits = candidate_ids[pl.ds(i, lanes)].astype(jnp.uint32)
             digits = (bits >> digit * RADIX_BITS & jnp.uint32(RADIX_MASK)).astype(
@@ -99,7 +101,9 @@ def _sort_selected(candidate_ids, selected_ids, histogram, *, id_digits: int):
             counts, last = plsc.scan_count(digits)
             plsc.addupdate_scatter(histogram, [digits], counts, mask=last)
 
-        @plsc.parallel_loop(0, histogram_size, lanes, carry=jnp.asarray(0, jnp.int32))
+        @plsc.parallel_loop(
+            0, histogram_size, lanes, unroll=unroll, carry=jnp.asarray(0, jnp.int32)
+        )
         def prefix(i, total):
             counts = histogram[pl.ds(i, lanes)]
             cumulative = jnp.cumsum(counts)
@@ -120,7 +124,7 @@ def _sort_selected(candidate_ids, selected_ids, histogram, *, id_digits: int):
 
         jax.lax.fori_loop(0, k // lanes, scatter, ())
 
-        @plsc.parallel_loop(0, k, lanes)
+        @plsc.parallel_loop(0, k, lanes, unroll=unroll)
         def copy_sorted(i):
             candidate_ids[pl.ds(i, lanes)] = selected_ids[pl.ds(i, lanes)]
 
@@ -138,6 +142,7 @@ def _compact(
     *,
     candidate_buffers: int,
     id_digits: int,
+    unroll: int = 1,
 ):
     """Radix-select exact (score, -column index) winners into the first bank."""
     lanes = plsc.get_sparse_core_info().num_lanes
@@ -149,7 +154,7 @@ def _compact(
     candidates = candidate_banks.at[pl.ds(0, capacity)]
     candidate_ids = id_banks.at[pl.ds(0, id_capacity)]
 
-    @plsc.parallel_loop(0, k, lanes)
+    @plsc.parallel_loop(0, k, lanes, unroll=unroll)
     def clear_selected(i):
         selected[pl.ds(i, lanes)] = jnp.full(lanes, -jnp.inf, jnp.float32)
         selected_ids[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
@@ -168,14 +173,14 @@ def _compact(
         destination_keys = candidate_banks.at[pl.ds(next_bank * capacity, capacity)]
         destination_ids = id_banks.at[pl.ds(next_bank * id_capacity, id_capacity)]
 
-        _clear_histogram(histogram)
+        _clear_histogram(histogram, unroll=unroll)
 
         def digits_for(bits):
             return bits >> (digit * RADIX_BITS).astype(jnp.uint32) & jnp.uint32(
                 RADIX_MASK
             )
 
-        @plsc.parallel_loop(0, limit, lanes)
+        @plsc.parallel_loop(0, limit, lanes, unroll=unroll)
         def fill_histogram(i):
             bits = (
                 ~source_ids[pl.ds(i, lanes)].astype(jnp.uint32)
@@ -190,7 +195,7 @@ def _compact(
         below = remaining - (k - found)
         init = (jnp.zeros(lanes, jnp.int32), jnp.zeros(lanes, jnp.int32))
 
-        @plsc.parallel_loop(0, histogram_size, lanes, carry=init)
+        @plsc.parallel_loop(0, histogram_size, lanes, unroll=unroll, carry=init)
         def find_pivot(i, carry):
             pivot, prefix = carry
             cumulative = jnp.cumsum(histogram[pl.ds(i, lanes)])
@@ -225,9 +230,9 @@ def _compact(
 
         initial = (jnp.asarray(0, jnp.int32), found)
         if candidate_buffers == 2:
-            survivors, outputs = plsc.parallel_loop(0, limit, lanes, carry=initial)(
-                filter_candidates
-            )
+            survivors, outputs = plsc.parallel_loop(
+                0, limit, lanes, unroll=unroll, carry=initial
+            )(filter_candidates)
         else:
             survivors, outputs = jax.lax.fori_loop(
                 0,
@@ -255,7 +260,7 @@ def _compact(
     )
     needed = jnp.minimum(remaining, k - found)
 
-    @plsc.parallel_loop(0, pl.cdiv(needed, lanes) * lanes, lanes)
+    @plsc.parallel_loop(0, pl.cdiv(needed, lanes) * lanes, lanes, unroll=unroll)
     def postfill(i):
         mask = i + lane_ids < needed
         plsc.store_compressed(
@@ -275,7 +280,7 @@ def _compact(
         jnp.zeros(lanes, jnp.int32),
     )
 
-    @plsc.parallel_loop(0, k, lanes, carry=initial)
+    @plsc.parallel_loop(0, k, lanes, unroll=unroll, carry=initial)
     def retain_topk(i, carry):
         minimum, last_id, multiplicity = carry
         keys = selected[pl.ds(i, lanes)]
