@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_SEGMENT_MEGAKERNEL: bool = False
+    TPU_SEGMK_EXPERT_PREFETCH: int = 0
     TPU_MOE_TP_DECODE_FAST: bool = False
     TPU_MOE_TP_DECODE_SPLIT_META: bool = False
     TPU_MOE_TP_DECODE_SHARED_META: bool = False
@@ -1210,6 +1211,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and the fp8 sites it reproduces; any other setup, bucket or layer keeps
     # the usual path. Remove once the path is the default or replaced.
     "TPU_SEGMENT_MEGAKERNEL": env_bool("TPU_SEGMENT_MEGAKERNEL"),
+    # With TPU_SEGMENT_MEGAKERNEL: speculative expert prefetch with a pool of up
+    # to this many expert slots (clamped per token bucket to what fits VMEM).
+    # Each segment call predicts the next layer's routed experts (router_{N+1}
+    # on its residual exit, the production routing rule, ranked by mass) and the
+    # next call stages them into the pool while its attention tail runs; the
+    # result is bit-identical (only data movement changes). 0 = off.
+    "TPU_SEGMK_EXPERT_PREFETCH": env_int("TPU_SEGMK_EXPERT_PREFETCH", 0),
     # With USE_MOE_TP_DECODE_KERNEL: the kernel's fast schedule (same arithmetic,
     # bit-identical output): top-k without the per-pick index reduction (exact
     # fallback on ties), the expert compaction on the vector units, ring primes

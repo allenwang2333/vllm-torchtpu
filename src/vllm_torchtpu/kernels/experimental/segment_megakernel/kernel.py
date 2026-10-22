@@ -102,10 +102,36 @@ class SegCfg:
     o_tile: int = 1536
     o_slots: int = 2
     qkv_chunks: int = 4
+    # Speculative expert prefetch (TPU_SEGMK_EXPERT_PREFETCH): `e_pre` pool
+    # slots beside the `nb` ring slots of one expert buffer. 0 = the kernel
+    # without it (every code path below gated on `prefetch`).
+    e_pre: int = 0
+    # False: the removal arm -- the pool DMAs are issued and waited, every
+    # routed expert still streams through the ring (timing only; exact).
+    pf_use: bool = True
+    # Test-only positive control: "stale_slot" fills pool slot p with the
+    # expert predicted for slot p + 1 (the map still says p).
+    pf_fault: str = ""
 
     @property
     def m(self) -> int:  # moe_tp_decode row bucket of this token bucket
         return 16 if self.T <= 16 else 32
+
+    @property
+    def prefetch(self) -> bool:
+        return self.e_pre > 0
+
+    @property
+    def slots(self) -> int:  # expert buffer slots: ring + pool
+        return self.nb + self.e_pre
+
+    @property
+    def qkv_blk(self) -> int:  # q_a/kv_a column block = one expert slot's w13
+        return 2 * self.moe_i
+
+    @property
+    def qkv_nblk(self) -> int:
+        return -(-self.qkv_pad // self.qkv_blk)
 
     @property
     def e_pad(self) -> int:
@@ -137,6 +163,8 @@ class SegCfg:
             ("ss2", self.hidden),
             ("qkv_s", self.qkv_pad),
         )
+        if self.prefetch:  # the predictor's: layer N+1's norm and bias
+            widths += (("g_post_nx", self.hidden), ("bias_nx", self.e_pad))
         out, off = [], 0
         for name, w in widths:
             out.append((name, off, w))
@@ -179,8 +207,33 @@ def supported(cfg: SegCfg) -> str | None:
         return "expert intermediate size does not tile"
     if not MAR.supported(cfg.tp, cfg.m, cfg.hidden, pltpu.get_tpu_info()):
         return "the in-kernel all-reduce does not support this geometry"
-    if vmem_need_bytes(cfg)["limit"] > 64 * MIB:
-        return "VMEM plan above 64 MiB"
+    if cfg.prefetch:
+        if cfg.e_pre > PRED_LANES:
+            return f"prefetch pool above {PRED_LANES} slots"
+        if cfg.nb < 2:
+            return "prefetch needs at least 2 ring slots"
+        if cfg.slots < cfg.qkv_nblk:
+            return "q_a/kv_a blocks do not fit the expert buffer's slots"
+        if cfg.pf_fault not in ("", "stale_slot", "no_dma"):
+            return f"unknown prefetch fault {cfg.pf_fault}"
+    if vmem_need_bytes(cfg)["limit"] > VMEM_CAP:
+        return f"VMEM plan above {VMEM_CAP // MIB} MiB (prefetch pool overflow?)"
+    return None
+
+
+VMEM_CAP = 64 * MIB
+PRED_LANES = 16  # lanes of the prediction row that carry expert ids
+
+
+def prefetch_fit(cfg: SegCfg, e_pre: int, min_nb: int = 4) -> SegCfg | None:
+    """`cfg` with the largest pool <= e_pre slots that fits VMEM, the ring
+    kept at nb (shrunk to min_nb only when that buys pool slots); None when
+    not even one slot fits."""
+    for p in range(min(e_pre, PRED_LANES), 0, -1):
+        for nb in range(cfg.nb, min_nb - 1, -1):
+            c = dataclasses.replace(cfg, e_pre=p, nb=nb)
+            if supported(c) is None:
+                return c
     return None
 
 
@@ -413,6 +466,152 @@ def _compact_mxu(cfg, r):
     return r["cnt_s"][0, 0]
 
 
+# =====================================================================================
+# speculative expert prefetch (cfg.prefetch)
+# =====================================================================================
+def _pref_valid(cfg, e):
+    return (e >= 0) & (e < cfg.experts)
+
+
+def _pool_src(cfg, r, p):
+    """The expert id pool slot p is filled with: pref[p] (the positive
+    control "stale_slot": pref[p + 1] when that is a valid id, so the slot
+    holds another expert's weights than the map says)."""
+    e = r["pref_s"][0, p]
+    if cfg.pf_fault == "stale_slot":
+        e2 = r["pref_s"][0, (p + 1) % cfg.e_pre]
+        e = jnp.where(_pref_valid(cfg, e2), e2, e)
+    return e
+
+
+def _pool_started(cfg, r, p):
+    """Whether pool slot p's DMAs were issued (pref[p] a valid expert id;
+    never under the positive control "no_dma", which leaves the slot holding
+    whatever an earlier call left there while the map still says hit)."""
+    if cfg.pf_fault == "no_dma":
+        return jnp.bool_(False)
+    return _pref_valid(cfg, r["pref_s"][0, p])
+
+
+def _pool_copies(cfg, r, p, slot_k, e=None):
+    """Pool slot p's four DMAs (buffer slot nb + p), as the ring's. `e`: the
+    source expert (only the semaphore and the destination matter to a wait)."""
+    if e is None:
+        e = _pool_src(cfg, r, p)
+    e = jnp.clip(e, 0, cfg.experts - 1)
+    slot = cfg.nb + p
+    sem = r["pool_sem"]
+    return [
+        pltpu.make_async_copy(r["w13"].at[e], r["w1_r"].at[slot], sem.at[p, 0]),
+        pltpu.make_async_copy(r["w2"].at[e], r["w2_r"].at[slot], sem.at[p, 1]),
+        pltpu.make_async_copy(
+            r["s13s"].at[slot_k, e], r["s1_r"].at[slot], sem.at[p, 2]
+        ),
+        pltpu.make_async_copy(r["s2"].at[e, 0], r["s2_r"].at[slot], sem.at[p, 3]),
+    ]
+
+
+def _gate_nx_copy(r):
+    return pltpu.make_async_copy(r["gate_nx"], r["gate_v"], r["pf_sem"].at[1])
+
+
+def _compact_pool(cfg, r):
+    """`_compact_mxu` with the pool: the same ascending ids of the hit experts
+    (row 0), and per step j its buffer slot (row 1: nb + p for an expert the
+    pool holds in slot p, else ring slot (miss ordinal % nb)), pool flag (row
+    2), miss ordinal (row 3); row 4 the misses' ids in ascending order (the
+    ring's stream); row 5 lane p: whether a step uses pool slot p. Every
+    operand of the 0/1 matmuls is an integer <= 256: exact in bf16 with f32
+    accumulation. Returns (hit count, miss count)."""
+    E, nb, P = cfg.e_pad, cfg.nb, cfg.e_pre
+    lane = lax.broadcasted_iota(I32, (1, E), 1)
+    hit = r["hits_v"][...] != 0  # [1, E]
+    # pool map: pm[e] = the pool slot holding expert e (last slot wins on a
+    # duplicate id), -1 if none; the removal arm (pf_use False) maps nothing.
+    pm = jnp.full((1, E), -1, I32)
+    if cfg.pf_use:
+        for p in range(P):
+            e = r["pref_s"][0, p]
+            pm = jnp.where((lane == e) & _pref_valid(cfg, e), p, pm)
+    in_pool = hit & (pm >= 0)
+    miss = hit & jnp.logical_not(in_pool)
+    row8 = lax.broadcasted_iota(I32, (8, E), 0)
+    lhs = jnp.where(row8 == 0, jnp.where(hit, 1.0, 0.0), 0.0)
+    lhs = jnp.where(row8 == 1, jnp.where(miss, 1.0, 0.0), lhs).astype(BF16)
+    U = _sel(E, E, lambda i, j: i <= j)
+    incl = lax.dot_general(lhs, U, _NN, preferred_element_type=F32).astype(I32)
+    incl_hit, incl_miss = incl[0:1], incl[1:2]  # inclusive ranks [1, E]
+    jj = lax.broadcasted_iota(I32, (E, E), 0)
+    P_hit = jnp.where((jj == incl_hit - 1) & hit, 1.0, 0.0).astype(BF16)
+    P_miss = jnp.where((jj == incl_miss - 1) & miss, 1.0, 0.0).astype(BF16)
+    ordm = jnp.where(miss, incl_miss - 1, 0)
+    bslot = jnp.where(in_pool, nb + pm, lax.rem(ordm, nb))
+    vals = (lane, bslot, jnp.where(in_pool, 1, 0), ordm)
+    lhs2 = jnp.zeros((8, E), I32)
+    for i, v in enumerate(vals):
+        lhs2 = jnp.where(row8 == i, v, lhs2)
+    lhs2 = lhs2.astype(F32).astype(BF16)
+    steps = lax.dot_general(lhs2, P_hit, _NT, preferred_element_type=F32)  # [8, E]
+    erow = jnp.where(row8 == 0, lane, 0).astype(F32).astype(BF16)
+    mids = lax.dot_general(erow, P_miss, _NT, preferred_element_type=F32)  # row 0
+    used = jnp.zeros((1, E), I32)
+    for p in range(P):
+        u = jnp.max(jnp.where(in_pool & (pm == p), 1, 0), axis=1, keepdims=True)
+        used = jnp.where(lane == p, u, used)
+    out = jnp.where(row8 < 4, steps.astype(I32), 0)
+    out = jnp.where(row8 == 4, jnp.broadcast_to(mids[0:1].astype(I32), (8, E)), out)
+    out = jnp.where(row8 == 5, jnp.broadcast_to(used, (8, E)), out)
+    r["ids_v"][...] = out
+    n_hit = jnp.sum(jnp.where(hit, 1, 0), axis=1, keepdims=True)  # [1, 1]
+    n_miss = jnp.sum(jnp.where(miss, 1, 0), axis=1, keepdims=True)
+    cl = lax.broadcasted_iota(I32, (8, LANES), 1)
+    r["cnt_v"][...] = jnp.where(cl == 0, n_hit, jnp.where(cl == 1, n_miss, 0))
+    a = pltpu.make_async_copy(r["ids_v"], r["ids_s"], r["hit_sem"].at[0])
+    b = pltpu.make_async_copy(r["cnt_v"], r["cnt_s"], r["hit_sem"].at[1])
+    a.start()
+    b.start()
+    a.wait()
+    b.wait()
+    return r["cnt_s"][0, 0], r["cnt_s"][0, 1]
+
+
+def predict_mass(scores, bias, n_valid, *, topk):
+    """The predictor's per-expert mass [1, E]: the production routing rule
+    (biased top-k selection, unbiased weights renormalized, bf16) applied to
+    the predicted scores, summed over the valid rows."""
+    w = _route_argmax(scores, bias, n_valid, topk=topk)
+    return jnp.sum(w, axis=0, keepdims=True)
+
+
+def rank_experts(mass, n):
+    """[8, 128] int32: row 0 lanes 0..n-1 = the n experts of largest mass
+    (ties to the lower id; -1 once the mass is 0), every other entry -1."""
+    E = mass.shape[1]
+    lane = lax.broadcasted_iota(I32, (8, E), 1)
+    m8 = jnp.broadcast_to(mass, (8, E))
+    orow = lax.broadcasted_iota(I32, (8, LANES), 0)
+    olane = lax.broadcasted_iota(I32, (8, LANES), 1)
+    out = jnp.full((8, LANES), -1, I32)
+    for p in range(n):
+        mx = jnp.max(m8, axis=1, keepdims=True)  # [8, 1]
+        idx = jnp.argmax(m8, axis=1, keepdims=True).astype(I32)
+        idv = jnp.where(mx > 0, idx, -1)
+        out = jnp.where((orow == 0) & (olane == p), idv, out)
+        m8 = jnp.where(lane == idx, -1.0, m8)
+    return out
+
+
+def _predict(cfg, r, n_valid, eps):
+    """Rule (b) of probe P15 on the residual this call exits with (layer
+    N+1's input): post_attention_layernorm_{N+1} -> GateLinear_{N+1} (bf16
+    logits, f32 sigmoid) -> + e_score_correction_bias_{N+1}, top-k per row
+    -> experts ranked by routed mass over the valid rows."""
+    hp, _ = rms_add(r["res_m"][...].astype(F32), None, r["g_post_nx_v"][...], eps)
+    scores = router_scores(hp, r["gate_v"][...])
+    mass = predict_mass(scores, r["bias_nx_v"][...], n_valid, topk=cfg.topk)
+    return rank_experts(mass, cfg.e_pre)
+
+
 def _sel(rows, cols, fn):
     """0/1 bf16 selection matrix S[i, j] = fn(i, j) (an exact row permutation
     on the MXU)."""
@@ -462,20 +661,44 @@ VEC_FIELDS = (
     "qkv_s",
 )
 OUTS = ("res_out", "qc_out", "kvp_out")
+# The prefetch variant's extra operands: `pref` int32 [8, 128], row 0 lanes
+# 0..e_pre-1 = the expert ids to stage into the pool (-1 / out of range = none;
+# the previous boundary's `pred_out`), and layer N+1's router gate (the
+# predictor's). Its extra output `pred_out` is this call's prediction for
+# layer N+1's routed experts, in the same layout.
+PF_HBM_IN = ("pref", "gate_nx")
+PF_VEC_FIELDS = ("g_post_nx", "bias_nx")
+PF_OUTS = ("pred_out",)
+META_PREDICT = 3  # meta[3] = 1: run the predictor (layer N+1's MoE is armed)
+
+
+def hbm_in(cfg: SegCfg) -> tuple[str, ...]:
+    return HBM_IN + (PF_HBM_IN if cfg.prefetch else ())
+
+
+def vec_fields(cfg: SegCfg) -> tuple[str, ...]:
+    return VEC_FIELDS + (PF_VEC_FIELDS if cfg.prefetch else ())
+
+
+def outs(cfg: SegCfg) -> tuple[str, ...]:
+    return OUTS + (PF_OUTS if cfg.prefetch else ())
 
 
 def scratch_table(cfg: SegCfg):
     """[(name, shape-object)] in kernel order, and the all-reduce spec."""
     H, m, T = cfg.hidden, cfg.m, cfg.T
-    nb, ic = cfg.nb, cfg.moe_i
+    nb, ic = cfg.slots, cfg.moe_i  # ring (+ pool) slots
     spec = MAR.make_spec(cfg.tp, m, H)
+    # Prefetch: no q_a/kv_a buffer -- its column blocks stream into the
+    # expert slots after the routed experts are done.
+    qkv = [] if cfg.prefetch else [("qkv_v", pltpu.VMEM((H, cfg.qkv_pad), F8))]
     sc = [
         ("wuv_v", pltpu.VMEM((cfg.heads_rank, cfg.kv_lora, cfg.v_head), BF16)),
         ("o_tiles", pltpu.VMEM((cfg.o_slots, cfg.o_in, cfg.o_tile), F8)),
         ("gate_v", pltpu.VMEM((cfg.e_pad, H), BF16)),
         ("sw13_v", pltpu.VMEM((H, 2 * cfg.shared_i), F8)),
         ("sw2_v", pltpu.VMEM((cfg.shared_i, H), F8)),
-        ("qkv_v", pltpu.VMEM((H, cfg.qkv_pad), F8)),
+        *qkv,
         ("w1_r", pltpu.VMEM((nb, H, 2 * ic), F8)),
         ("w2_r", pltpu.VMEM((nb, ic, H), F8)),
         ("s1_r", pltpu.VMEM((nb, 1, 2 * ic), F32)),
@@ -503,17 +726,25 @@ def scratch_table(cfg: SegCfg):
         ("qc_x", pltpu.VMEM((T, cfg.q_lora), BF16)),
         ("kvp_x", pltpu.VMEM((3 * cfg.tok_rows, LANES), U32)),
         ("in_sem", pltpu.SemaphoreType.DMA((len(STAGED_IN) + 1,))),  # + W_UV
-        ("vec_sem", pltpu.SemaphoreType.DMA((len(VEC_FIELDS),))),
+        ("vec_sem", pltpu.SemaphoreType.DMA((len(vec_fields(cfg)),))),
         ("o_sem", pltpu.SemaphoreType.DMA((cfg.o_slots,))),
         ("w_sem", pltpu.SemaphoreType.DMA((1 + cfg.qkv_chunks,))),  # gate, qkv
         ("shared_sem", pltpu.SemaphoreType.DMA((2,))),
-        ("ring_sem", pltpu.SemaphoreType.DMA((nb, 4))),
+        ("ring_sem", pltpu.SemaphoreType.DMA((cfg.nb, 4))),
         ("hit_sem", pltpu.SemaphoreType.DMA((2,))),
-        ("out_sem", pltpu.SemaphoreType.DMA((3,))),
+        ("out_sem", pltpu.SemaphoreType.DMA((len(outs(cfg)),))),
     ]
+    if cfg.prefetch:
+        sc += [
+            ("pref_s", pltpu.SMEM((8, LANES), I32)),
+            ("pred_v", pltpu.VMEM((8, LANES), I32)),
+            ("pool_sem", pltpu.SemaphoreType.DMA((cfg.e_pre, 4))),
+            ("qkvb_sem", pltpu.SemaphoreType.DMA((cfg.qkv_nblk,))),
+            ("pf_sem", pltpu.SemaphoreType.DMA((2,))),  # pref, gate_nx
+        ]
     shapes = operand_shapes(cfg)
     sc += [(n, pltpu.VMEM(*shapes[n])) for n in STAGED_IN]
-    sc += [(f"{n}_v", pltpu.VMEM((1, cfg.field(n)[1]), F32)) for n in VEC_FIELDS]
+    sc += [(f"{n}_v", pltpu.VMEM((1, cfg.field(n)[1]), F32)) for n in vec_fields(cfg)]
     sc += [(f"ar1_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     sc += [(f"ar2_{i}", s) for i, s in enumerate(MAR.scratch_shapes(spec))]
     return sc, spec
@@ -546,7 +777,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     names = (
         list(SMEM_IN)
         + [f"in_{n}" for n in STAGED_IN]
-        + list(HBM_IN + OUTS)
+        + list(hbm_in(cfg) + outs(cfg))
         + [n for n, _ in sc_t]
     )
     assert len(names) == len(refs), (len(names), len(refs))
@@ -556,6 +787,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     ar2 = [r[f"ar2_{i}"] for i in range(n_ar)]
 
     H, T, m, nb = cfg.hidden, cfg.T, cfg.m, cfg.nb
+    pf = cfg.prefetch
     meta = r["meta"]
     n_valid = meta[0]
     rank = meta[1]
@@ -573,6 +805,9 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         r["wuv"], r["wuv_v"], r["in_sem"].at[len(STAGED_IN)]
     )
     wuv_copy.start()
+    if pf:  # the pool's expert ids, needed when the pool DMAs are issued
+        pref_copy = pltpu.make_async_copy(r["pref"], r["pref_s"], r["pf_sem"].at[0])
+        pref_copy.start()
 
     # ---- 2. o_proj weight stream: tiles 0..o_slots-1 + its scale
     n_ot = H // cfg.o_tile
@@ -588,7 +823,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
         o_copy(j).start()
     w_sem = r["w_sem"]
     vec = {}
-    for i, n in enumerate(VEC_FIELDS):
+    for i, n in enumerate(vec_fields(cfg)):
         vec[n] = pltpu.make_async_copy(frow(n), r[f"{n}_v"], r["vec_sem"].at[i])
         vec[n].start()
 
@@ -605,7 +840,16 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
             c.start()
             shared.append(c)
         qkv = []
-        for c in range(cfg.qkv_chunks):
+        if pf:  # the pool instead; q_a/kv_a streams into the slots later
+            pref_copy.wait()
+            for p_ in range(cfg.e_pre):
+
+                @pl.when(_pool_started(cfg, r, p_))
+                def _(p_=p_):
+                    for c in _pool_copies(cfg, r, p_, slot_k):
+                        c.start()
+
+        for c in range(0 if pf else cfg.qkv_chunks):
             cp = pltpu.make_async_copy(
                 r["qkv_w"].at[pl.ds(c * qc_rows, qc_rows)],
                 r["qkv_v"].at[pl.ds(c * qc_rows, qc_rows)],
@@ -671,12 +915,20 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     hit = jnp.any(r["wtab"][...] != 0, axis=0, keepdims=True)
     r["hits_v"][...] = jnp.where(hit, 1, 0).astype(I32)
     ring_sem = r["ring_sem"]
-    # ---- 8b. compaction (two exact 0/1 matmuls) + ring prime
-    items = _compact_mxu(cfg, r)
+    # ---- 8b. compaction (two exact 0/1 matmuls) + ring prime. Prefetch:
+    #          the ring streams the misses only (in ascending id order, a
+    #          subsequence of the steps); ids rows 1-3 give each step its
+    #          buffer slot, pool flag and miss ordinal, row 4 the miss ids.
+    if pf:
+        items, n_ring = _compact_pool(cfg, r)
+        ring_row = 4
+    else:
+        items = _compact_mxu(cfg, r)
+        n_ring, ring_row = items, 0
     ids = r["ids_s"]
 
-    def transfers(step):
-        e = ids[0, step]
+    def transfers(step):  # the step-th expert the ring streams
+        e = ids[ring_row, step]
         slot = step % nb
         return [
             pltpu.make_async_copy(
@@ -697,7 +949,7 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
 
     for s_ in range(nb):
 
-        @pl.when(jnp.int32(s_) < items)
+        @pl.when(jnp.int32(s_) < n_ring)
         def _(s_=s_):
             for c in transfers(jnp.int32(s_)):
                 c.start()
@@ -752,30 +1004,92 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
                 acc2 * r["s2_r"][slot, :, n : n + MK._N_CHUNK] * ms
             )
 
-    @pl.when(items > 0)
-    def _run_experts():
-        for c in transfers(jnp.int32(0)):
-            c.wait()
+    if not pf:
 
-        def expert_body(step, acc1):
-            nxt = step + 1
+        @pl.when(items > 0)
+        def _run_experts():
+            for c in transfers(jnp.int32(0)):
+                c.wait()
 
-            @pl.when(nxt < items)
+            def expert_body(step, acc1):
+                nxt = step + 1
+
+                @pl.when(nxt < items)
+                def _():
+                    for c in transfers(nxt):
+                        c.wait()
+
+                acc1_next = gate_up(nxt % nb)
+                finish(step, step % nb, acc1)
+
+                @pl.when(step + nb < items)
+                def _():
+                    for c in transfers(step + nb):
+                        c.start()
+
+                return acc1_next
+
+            lax.fori_loop(0, items, expert_body, gate_up(0))
+
+    else:
+        # The same steps in the same (ascending id) order as above -- so the
+        # same arithmetic in the same order: only where a step's weights
+        # come from differs (pool slot nb + p, or ring slot ordinal % nb).
+        def wait_step(step):
+            @pl.when((ids[2, step] != 0) & _pool_started(cfg, r, ids[1, step] - nb))
             def _():
-                for c in transfers(nxt):
+                p_ = ids[1, step] - nb
+                for c in _pool_copies(cfg, r, p_, slot_k, e=ids[0, step]):
                     c.wait()
 
-            acc1_next = gate_up(nxt % nb)
-            finish(step, step % nb, acc1)
-
-            @pl.when(step + nb < items)
+            @pl.when(ids[2, step] == 0)
             def _():
-                for c in transfers(step + nb):
-                    c.start()
+                for c in transfers(ids[3, step]):
+                    c.wait()
 
-            return acc1_next
+        @pl.when(items > 0)
+        def _run_experts_pf():
+            wait_step(jnp.int32(0))
+            last = jnp.int32(cfg.e_pad - 1)
 
-        lax.fori_loop(0, items, expert_body, gate_up(0))
+            def expert_body(step, acc1):
+                nxt = step + 1
+
+                @pl.when(nxt < items)
+                def _():
+                    wait_step(nxt)
+
+                acc1_next = gate_up(ids[1, jnp.minimum(nxt, last)])
+                finish(step, ids[1, step], acc1)
+                k = ids[3, step]
+
+                @pl.when((ids[2, step] == 0) & (k + nb < n_ring))
+                def _():
+                    for c in transfers(k + nb):
+                        c.start()
+
+                return acc1_next
+
+            lax.fori_loop(0, items, expert_body, gate_up(ids[1, 0]))
+
+        # Pool slots no step used (mispredicted, duplicate, removal arm).
+        for p_ in range(cfg.e_pre):
+
+            @pl.when(_pool_started(cfg, r, p_) & (ids[5, p_] == 0))
+            def _(p_=p_):
+                for c in _pool_copies(cfg, r, p_, slot_k):
+                    c.wait()
+
+        # Every slot is free: q_a/kv_a's column blocks stream into slots
+        # 0..qkv_nblk-1 under AR2; the predictor's gate into gate_v.
+        for j in range(cfg.qkv_nblk):
+            pltpu.make_async_copy(
+                r["qkv_w"].at[j], r["w1_r"].at[j], r["qkvb_sem"].at[j]
+            ).start()
+
+        @pl.when(meta[META_PREDICT] != 0)
+        def _():
+            _gate_nx_copy(r).start()
 
     combined = MK._combine(r["owner"][...], r["shared"][...], cfg.routed_scale)
 
@@ -796,16 +1110,35 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     # ---- 11. fused q_a/kv_a (xla_quantized_matmul numerics), K-chunked
     xq2, xs2 = quant_rows_block(h2)
     vec["qkv_s"].wait()
-    acc = None
-    for c in range(cfg.qkv_chunks):
-        pre["qkv"][c].wait()
-        part = lax.dot_general(
-            xq2[:, c * qc_rows : (c + 1) * qc_rows],
-            r["qkv_v"][pl.ds(c * qc_rows, qc_rows), :],
-            _NN,
-            preferred_element_type=F32,
-        )
-        acc = part if acc is None else acc + part
+    if not pf:
+        acc = None
+        for c in range(cfg.qkv_chunks):
+            pre["qkv"][c].wait()
+            part = lax.dot_general(
+                xq2[:, c * qc_rows : (c + 1) * qc_rows],
+                r["qkv_v"][pl.ds(c * qc_rows, qc_rows), :],
+                _NN,
+                preferred_element_type=F32,
+            )
+            acc = part if acc is None else acc + part
+    else:
+        # Per column block, the same K chunks summed in the same order.
+        blocks = []
+        for j in range(cfg.qkv_nblk):
+            pltpu.make_async_copy(
+                r["qkv_w"].at[j], r["w1_r"].at[j], r["qkvb_sem"].at[j]
+            ).wait()
+            acc_j = None
+            for c in range(cfg.qkv_chunks):
+                part = lax.dot_general(
+                    xq2[:, c * qc_rows : (c + 1) * qc_rows],
+                    r["w1_r"][j, pl.ds(c * qc_rows, qc_rows), :],
+                    _NN,
+                    preferred_element_type=F32,
+                )
+                acc_j = part if acc_j is None else acc_j + part
+            blocks.append(acc_j)
+        acc = jnp.concatenate(blocks, axis=1)[:, : cfg.qkv_pad]
     qkv = ((acc * xs2) * r["qkv_s_v"][...]).astype(BF16)  # [m, qkv_pad]
     q_pre = qkv[:, : cfg.q_lora]
     kv_c = qkv[:, cfg.q_lora : cfg.q_lora + cfg.kv_lora]
@@ -825,7 +1158,27 @@ def _segment_kernel(*refs, cfg: SegCfg, spec):
     _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps)
     kvp_copy = pltpu.make_async_copy(r["kvp_x"], r["kvp_out"], out_sem.at[2])
     kvp_copy.start()
-    for c in (res_copy, qc_copy, kvp_copy):
+    copies = [res_copy, qc_copy, kvp_copy]
+    if pf:
+        # ---- 13. predictor for layer N+1's routed experts (P15 rule (b)):
+        #          router_{N+1}(post_attention_layernorm_{N+1}(residual exit))
+        @pl.when(meta[META_PREDICT] != 0)
+        def _():
+            _gate_nx_copy(r).wait()
+            vec["g_post_nx"].wait()
+            vec["bias_nx"].wait()
+            r["pred_v"][...] = _predict(cfg, r, n_valid, eps)
+
+        @pl.when(meta[META_PREDICT] == 0)
+        def _():
+            vec["g_post_nx"].wait()
+            vec["bias_nx"].wait()
+            r["pred_v"][...] = jnp.full((8, LANES), -1, I32)
+
+        pred_copy = pltpu.make_async_copy(r["pred_v"], r["pred_out"], out_sem.at[3])
+        pred_copy.start()
+        copies.append(pred_copy)
+    for c in copies:
         c.wait()
 
 
@@ -838,9 +1191,9 @@ def _entry_wuv(cfg: SegCfg, r):
     for hh in range(cfg.heads_rank):
         lat = r["lat"][:, pl.ds(hh * kv, kv)]  # [T, kv_lora] bf16
         heads.append(
-            lax.dot_general(lat, r["wuv_v"][hh], _NN, preferred_element_type=F32).astype(
-                BF16
-            )
+            lax.dot_general(
+                lat, r["wuv_v"][hh], _NN, preferred_element_type=F32
+            ).astype(BF16)
         )
     return jnp.concatenate(heads, axis=1)  # [T, o_in]
 
@@ -886,12 +1239,15 @@ def _skip_exit(cfg, r, kv_c, pe_blk, cfull, sfull, eps):
 # wrapper
 # =====================================================================================
 def kernel_name(cfg: SegCfg) -> str:
-    return f"segment_megakernel_skip-T_{cfg.T}-m_{cfg.m}-nb_{cfg.nb}-e_{cfg.experts}"
+    name = f"segment_megakernel_skip-T_{cfg.T}-m_{cfg.m}-nb_{cfg.nb}-e_{cfg.experts}"
+    if cfg.prefetch:
+        name += f"-pf_{cfg.e_pre}" + ("" if cfg.pf_use else "-issueonly")
+    return name
 
 
 def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
     """One boundary on one device. `ops`: name -> array for every name of
-    SMEM_IN + STAGED_IN + HBM_IN, shapes as `operand_shapes(cfg)`. Returns
+    SMEM_IN + STAGED_IN + hbm_in(cfg), shapes as `operand_shapes(cfg)`. Returns
     {res_out bf16 [T, H], qc_out bf16 [T, q_lora], kvp_out u32 [3 Tp, 128]}."""
     reason = supported(cfg)
     if reason is not None:
@@ -904,14 +1260,14 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         jax.ShapeDtypeStruct((T, H), BF16),
         jax.ShapeDtypeStruct((T, cfg.q_lora), BF16),
         jax.ShapeDtypeStruct((3 * cfg.tok_rows, LANES), U32),
-    )
+    ) + ((jax.ShapeDtypeStruct((8, LANES), I32),) if cfg.prefetch else ())
     limit = vmem_need_bytes(cfg)["limit"]
     call = pl.pallas_call(
         functools.partial(_segment_kernel, cfg=cfg, spec=spec),
         out_shape=out_shapes,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(SMEM_IN),
-            in_specs=[anyspace] * len(STAGED_IN) + [hbm] * len(HBM_IN),
+            in_specs=[anyspace] * len(STAGED_IN) + [hbm] * len(hbm_in(cfg)),
             out_specs=tuple([anyspace] * len(out_shapes)),
             scratch_shapes=[s for _, s in sc_t],
         ),
@@ -921,8 +1277,8 @@ def segment_call(cfg: SegCfg, ops: dict, *, interpret=None) -> dict:
         name=kernel_name(cfg),
         **({} if interpret is None else {"interpret": interpret}),
     )
-    outs = call(*[ops[n] for n in SMEM_IN + STAGED_IN + HBM_IN])
-    return dict(zip(OUTS, outs, strict=True))
+    res = call(*[ops[n] for n in SMEM_IN + STAGED_IN + hbm_in(cfg)])
+    return dict(zip(outs(cfg), res, strict=True))
 
 
 def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
@@ -944,7 +1300,26 @@ def operand_shapes(cfg: SegCfg, boundaries: int = 1) -> dict:
         "s13s": ((boundaries, cfg.experts, 1, 2 * cfg.moe_i), F32),
         "sw13s": ((boundaries, H, 2 * cfg.shared_i), F8),
         "sw2s": ((boundaries, cfg.shared_i, H), F8),
+        **(
+            {
+                # column blocks of the padded q_a/kv_a weight (block_qkv)
+                "qkv_w": ((cfg.qkv_nblk, H, cfg.qkv_blk), F8),
+                "pref": ((8, LANES), I32),
+                "gate_nx": ((cfg.e_pad, H), BF16),
+            }
+            if cfg.prefetch
+            else {}
+        ),
     }
+
+
+def block_qkv(qkv_w, blk: int):
+    """[H, qkv_pad] -> [nblk, H, blk]: the prefetch variant's q_a/kv_a layout
+    (column blocks the shape of one expert slot's w13, zero-padded)."""
+    H, n = qkv_w.shape
+    nblk = -(-n // blk)
+    w = jnp.pad(qkv_w, ((0, 0), (0, nblk * blk - n)))
+    return jnp.transpose(w.reshape(H, nblk, blk), (1, 0, 2))
 
 
 def pack_act(res, cfull, sfull):
@@ -955,11 +1330,13 @@ def pack_act(res, cfull, sfull):
     return jnp.concatenate([res, pad(cfull), pad(sfull)], axis=0)
 
 
-def pack_meta(n_valid, rank, slot, dst_rows):
-    """The SMEM `meta` operand."""
-    head = jnp.stack([jnp.asarray(x, I32).reshape(()) for x in (n_valid, rank, slot)])
+def pack_meta(n_valid, rank, slot, dst_rows, predict=0):
+    """The SMEM `meta` operand (`predict`: meta[META_PREDICT], prefetch only)."""
+    head = jnp.stack(
+        [jnp.asarray(x, I32).reshape(()) for x in (n_valid, rank, slot, predict)]
+    )
     return jnp.concatenate(
-        [head, jnp.zeros((META_DST - 3,), I32), dst_rows.astype(I32)]
+        [head, jnp.zeros((META_DST - 4,), I32), dst_rows.astype(I32)]
     )
 
 

@@ -232,8 +232,22 @@ def _shared_inputs(d: Dims, T: int, n_valid: int, seed: int):
 # =====================================================================================
 # The three computations, per device
 # =====================================================================================
-def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=None):
-    cfg = d.cfg(T)
+def _kernel_device(
+    d,
+    T,
+    n_valid,
+    sh,
+    pr,
+    rank,
+    dst_rows,
+    fault=None,
+    interpret=None,
+    pf=None,
+    ops_only=False,
+):
+    """pf (speculative expert prefetch): dict(cfg=<prefetch SegCfg>, pref=int32
+    [8, 128], predict=0/1, g_post_nx, bias_nx, gate_nx); returns pred_out too."""
+    cfg = d.cfg(T) if pf is None else pf["cfg"]
     g_post, g_in = sh["g_post"], sh["g_in"]
     oproj_s = pr["oproj_s"]
     qkv_w, qkv_s = sh["qkv_w"], sh["qkv_s"]
@@ -262,10 +276,14 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
     )
     # Two boundaries in the stacks, this one in row 1 (row 0 a decoy: wrong
     # row indexing shows up as garbage constants).
+    if pf is not None:
+        consts.update(g_post_nx=pf["g_post_nx"], bias_nx=pf["bias_nx"])
     row = seg.fstack_row(cfg, consts)
     decoy = jnp.flip(row) + 1.0
     ops = dict(
-        meta=seg.pack_meta(n_valid, rank[0], 1, dst_rows),
+        meta=seg.pack_meta(
+            n_valid, rank[0], 1, dst_rows, 0 if pf is None else pf["predict"]
+        ),
         lat=pr["lat"].reshape(T, -1),
         act=seg.pack_act(sh["res"], cfull, sfull),
         wuv=wuv,
@@ -280,7 +298,17 @@ def _kernel_device(d, T, n_valid, sh, pr, rank, dst_rows, fault=None, interpret=
         sw13s=jnp.stack([jnp.flip(pr["sw13"], 0), pr["sw13"]]),
         sw2s=jnp.stack([jnp.flip(pr["sw2"], 0), pr["sw2"]]),
     )
+    if pf is not None:
+        ops.update(
+            qkv_w=seg.block_qkv(qkv_w, cfg.qkv_blk),
+            pref=pf["pref"],
+            gate_nx=pf["gate_nx"],
+        )
+    if ops_only:
+        return cfg, ops, (cfull, sfull)
     out = seg.segment_call(cfg, ops, interpret=interpret)
+    if pf is not None:
+        return out["res_out"], out["qc_out"], out["kvp_out"], out["pred_out"]
     return out["res_out"], out["qc_out"], out["kvp_out"]
 
 
@@ -735,6 +763,351 @@ def _run_case(mesh, d, T, n_valid, seed, *, interpret=None, faults=(), incumbent
     return results
 
 
+# =====================================================================================
+# Speculative expert prefetch (TPU_SEGMK_EXPERT_PREFETCH): only data movement
+# changes, so the oracle is bit-identity with the prefetch-off kernel
+# =====================================================================================
+PF_KINDS = ("hit", "mixed", "wrong", "garbage", "none")
+PF_FAULTS = ("stale_slot", "no_dma")
+
+
+def _prefs(d: Dims, planted, n_valid, P, seed):
+    """Host-side pool id lists [8, 128] int32 per kind, from the planted
+    routing of the valid rows: hit = the P most-picked planted experts; mixed =
+    half of those + experts no row picks; wrong = only experts no row picks;
+    garbage = duplicates, -1, out-of-range ids among planted ones; none = -1."""
+    rng = np.random.default_rng(seed + 77)
+    pk = planted[:n_valid].ravel()
+    ids, cnt = np.unique(pk, return_counts=True)
+    order = ids[np.lexsort((ids, -cnt))]
+    unpicked = np.setdiff1d(np.arange(d.experts), ids)
+    rng.shuffle(unpicked)
+    lists = {
+        "hit": list(order[:P]),
+        "mixed": list(order[: (P + 1) // 2]) + list(unpicked[: P // 2]),
+        "wrong": list(unpicked[:P]),
+        "garbage": [order[0], order[0], -1, d.experts + 44, -7]
+        + list(order[1:P])
+        + list(unpicked[:P]),
+        "none": [],
+    }
+    out = {}
+    for k, v in lists.items():
+        a = np.full((8, 128), -1, np.int32)
+        v = np.asarray(v[:P], np.int32)
+        a[0, : len(v)] = v
+        out[k] = a
+    picked = set(ids.tolist())
+    hits = {
+        k: len({int(e) for e in a[0, :P] if 0 <= e < d.experts} & picked)
+        for k, a in out.items()
+    }
+    return out, hits, len(picked)
+
+
+def _nx_inputs(d: Dims, seed):
+    """Layer N+1's router (the predictor's), host-side."""
+    rng = np.random.default_rng(seed + 2000)
+    gate = rng.standard_normal((d.experts, d.hidden)).astype(np.float32)
+    gate /= np.linalg.norm(gate, axis=1, keepdims=True)
+    return dict(
+        gate_nx=_host(gate, BF16),
+        g_post_nx=_host(1 + 0.3 * rng.standard_normal(d.hidden), BF16),
+        bias_nx=_host(rng.standard_normal(d.experts) * 0.01, F32),
+    )
+
+
+def _pred_reference(d, cfg, res_out, nx, n_valid):
+    """P15 rule (b) in XLA on the kernel's residual exit: production router
+    (GateLinear bf16 logits, sigmoid) on post_attention_layernorm_{N+1}, the
+    production routing rule, ranked by routed mass. -> (ids [P], mass [E])."""
+    from vllm_torchtpu.kernels.experimental.segment_megakernel import kernel as sk
+
+    m = cfg.m
+    x = jnp.pad(jnp.asarray(res_out, BF16), ((0, m - res_out.shape[0]), (0, 0)))
+    hp, _ = sk.rms_add(
+        x.astype(F32), None, jnp.asarray(nx["g_post_nx"])[None], jnp.float32(d.eps)
+    )
+    scores = _production_scores(hp, jnp.asarray(nx["gate_nx"]))
+    mass = sk.predict_mass(
+        scores, jnp.asarray(nx["bias_nx"])[None], n_valid, topk=d.topk
+    )
+    return np.asarray(sk.rank_experts(mass, cfg.e_pre))[0, : cfg.e_pre], np.asarray(
+        mass
+    )[0]
+
+
+PRED_TIE_TOL = 2e-3  # mass units: a routed weight is O(1/topk)
+
+
+def _pred_ok(got, ref_ids, mass, tol=PRED_TIE_TOL):
+    """The kernel's ids are a top-P set of the reference mass up to near-ties
+    (the two sum the bf16 routing weights in different orders): distinct,
+    valid, every chosen expert's mass >= every unchosen one's - tol, and the
+    order non-increasing in mass up to tol."""
+    pos = [int(e) for e in got if e >= 0]
+    n_pos = int((mass > 0).sum())
+    if len(set(pos)) != len(pos) or len(pos) != min(len(got), n_pos):
+        return False
+    if not pos:
+        return True
+    chosen = mass[pos]
+    rest = np.delete(mass, pos)
+    if rest.size and chosen.min() < rest.max() - tol:
+        return False
+    return bool(np.all(np.diff(chosen) <= tol))
+
+
+def _pf_cfg(d: Dims, T: int, e_pre: int, **kw):
+    cfg = seg.prefetch_fit(d.cfg(T), e_pre)
+    assert cfg is not None, (T, e_pre)
+    return dataclasses.replace(cfg, **kw)
+
+
+def _run_prefetch_case(mesh, d, T, n_valid, seed, e_pre, *, interpret=None, timing=()):
+    """Bit-identity of the prefetch kernel with the prefetch-off kernel on
+    every device, for every pool id list kind, the removal arm and the
+    faults; the predictor against its XLA reference. timing: M values for a
+    chained per-call clock of the arms (TPU only)."""
+    rank_ids = jax.device_put(
+        np.arange(N_RANKS, dtype=np.int32).reshape(N_RANKS, 1),
+        NamedSharding(mesh, P(AXIS)),
+    )
+    shared = _shared_inputs(d, T, n_valid, seed)
+    sh = {k: v for k, v in shared.items() if k not in ("dst", "planted")}
+    sh_dev = {k: jax.device_put(v, NamedSharding(mesh, P())) for k, v in sh.items()}
+    dst_all = shared["dst"][np.arange(N_RANKS) % DCP]
+    dst_sh = jax.device_put(dst_all, NamedSharding(mesh, P(AXIS)))
+    sh_specs = {k: P() for k in sh}
+    nx = _nx_inputs(d, seed)
+    nx_dev = {k: jax.device_put(v, NamedSharding(mesh, P())) for k, v in nx.items()}
+    base_cfg = _pf_cfg(d, T, e_pre)
+    Pn = base_cfg.e_pre
+    prefs, hits, n_routed = _prefs(d, shared["planted"], n_valid, Pn, seed)
+    local = [
+        i
+        for i, dv in enumerate(mesh.devices)
+        if dv.process_index == jax.process_index()
+    ]
+
+    def build(arm):
+        """arm: (cfg | None, predict). Returns a jitted fn(rank, dst, sh, nx,
+        pref) -> outputs (each [16, ...])."""
+        cfg, predict = arm
+
+        def body(rank, dst, sh_, nx_, pref):
+            pr = _per_rank_inputs(d, T, n_valid, seed, rank[0])
+            pf = None
+            if cfg is not None:
+                pf = dict(cfg=cfg, pref=pref[0], predict=predict, **nx_)
+            outs = _kernel_device(
+                d, T, n_valid, sh_, pr, rank[0], dst[0], interpret=interpret, pf=pf
+            )
+            return tuple(x[None] for x in outs)
+
+        n_out = 3 if cfg is None else 4
+        return jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P(AXIS), P(AXIS), sh_specs, {k: P() for k in nx}, P(AXIS)),
+                out_specs=tuple(P(AXIS) for _ in range(n_out)),
+                check_vma=False,
+            )
+        )
+
+    def pref_dev(kind):
+        a = np.broadcast_to(prefs[kind][None], (N_RANKS, 8, 128))
+        return jax.device_put(np.ascontiguousarray(a), NamedSharding(mesh, P(AXIS)))
+
+    def shards(out):
+        res = []
+        for i in local:
+            res.append(
+                tuple(
+                    np.asarray(
+                        [
+                            s
+                            for s in x.addressable_shards
+                            if s.device == mesh.devices[i]
+                        ][0].data[0]
+                    )
+                    for x in out
+                )
+            )
+        return res
+
+    def same(a, b):  # bit identity of res / q_c / kv rows on every local device
+        return all(
+            all(
+                np.array_equal(
+                    np.asarray(x).view(np.uint8), np.asarray(y).view(np.uint8)
+                )
+                for x, y in zip(da[:3], db[:3])
+            )
+            for da, db in zip(a, b)
+        )
+
+    base = shards(build((None, 0))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("none")))
+    out = dict(
+        e_pre=Pn,
+        nb=base_cfg.nb,
+        vmem_limit_mib=round(seg.kernel.vmem_need_bytes(base_cfg)["limit"] / 2**20, 2),
+        routed_experts=n_routed,
+        planned_hits=hits,
+        exact={},
+        caught={},
+    )
+    fn_pf = build((base_cfg, 1))
+    pred_ok, pred_detail = True, {}
+    for kind in PF_KINDS:
+        o = shards(fn_pf(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev(kind)))
+        out["exact"][kind] = same(o, base)
+        if kind == "hit":  # predictor vs its XLA reference, per device
+            for j, dev_out in enumerate(o):
+                ref_ids, mass = _pred_reference(d, base_cfg, dev_out[0], nx, n_valid)
+                got = dev_out[3][0, :Pn]
+                ok = _pred_ok(got, ref_ids, mass) and (dev_out[3][1:] == -1).all()
+                if not ok:
+                    pred_detail[str(local[j])] = dict(
+                        got=got.tolist(), ref=ref_ids.tolist()
+                    )
+                pred_ok = pred_ok and ok
+            out["pred_n_positive"] = int((mass > 0).sum())
+            out["pred_ids_dev0"] = o[0][3][0, :Pn].tolist()
+            # identical on every rank (the residual exit is identical)
+            out["pred_same_all_ranks"] = all(np.array_equal(x[3], o[0][3]) for x in o)
+    out["pred_matches_reference"] = pred_ok
+    out["pred_mismatch"] = pred_detail
+    o = shards(build((base_cfg, 0))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
+    out["exact"]["predict_off"] = same(o, base)
+    out["predict_off_all_minus1"] = all((x[3] == -1).all() for x in o)
+    io_cfg = dataclasses.replace(base_cfg, pf_use=False)
+    o = shards(build((io_cfg, 1))(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
+    out["exact"]["issue_only"] = same(o, base)
+    for f in PF_FAULTS:
+        fn = build((dataclasses.replace(base_cfg, pf_fault=f), 1))
+        # VMEM holds another call's experts first (what "no_dma" leaves).
+        fn_pf(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("wrong"))
+        o = shards(fn(rank_ids, dst_sh, sh_dev, nx_dev, pref_dev("hit")))
+        out["caught"][f] = not same(o, base)
+    if timing:
+        if jax.process_index() == 0:
+            print(
+                f"[segmk-pf] T={T} nv={n_valid} correctness {json.dumps(out)}",
+                flush=True,
+            )
+        out["timing_us"] = _pf_timing(
+            mesh,
+            d,
+            T,
+            n_valid,
+            seed,
+            base_cfg,
+            io_cfg,
+            timing,
+            (rank_ids, dst_sh, sh_dev, nx_dev),
+            pref_dev,
+            sh_specs,
+            nx,
+        )
+    return out
+
+
+def _pf_timing(
+    mesh, d, T, n_valid, seed, pf_cfg, io_cfg, Ms, args, pref_dev, sh_specs, nx
+):
+    """Per-call device time of each arm: M chained calls in one program (each
+    call's residual input depends on the previous call's output through an
+    optimization barrier), slope of the median wall time over M (M2)."""
+    arms = {
+        "A0_off": (None, "none"),
+        "A1_pf_hit": (pf_cfg, "hit"),
+        "R1_issue_only": (io_cfg, "hit"),
+        "R2_pf_empty": (pf_cfg, "none"),
+        "W_pf_wrong": (pf_cfg, "wrong"),
+    }
+    # The per-rank weights once, outside the timed programs.
+    pr_keys = tuple(
+        jax.eval_shape(
+            lambda: _per_rank_inputs(d, T, n_valid, seed, jnp.zeros((1,), I32))
+        ).keys()
+    )
+    pr_all = jax.jit(
+        jax.shard_map(
+            lambda rank: {
+                k: v[None]
+                for k, v in _per_rank_inputs(d, T, n_valid, seed, rank[0]).items()
+            },
+            mesh=mesh,
+            in_specs=(P(AXIS),),
+            out_specs={k: P(AXIS) for k in pr_keys},
+            check_vma=False,
+        )
+    )(args[0])
+    res = {}
+    for name, (cfg, kind) in arms.items():
+        times = {}
+        for M in Ms:
+
+            def body(rank, dst, sh_, nx_, pref, prs, cfg=cfg, M=M):
+                pr = {k: v[0] for k, v in prs.items()}
+                pf = None
+                if cfg is not None:
+                    pf = dict(cfg=cfg, pref=pref[0], predict=1, **nx_)
+                # Every operand built once, outside the loop (block_qkv is an
+                # fp8 relayout; nothing but the kernel may sit in the loop).
+                kcfg, ops, (cfull, sfull) = _kernel_device(
+                    d, T, n_valid, sh_, pr, rank[0], dst[0], pf=pf, ops_only=True
+                )
+
+                def step(i, carry):
+                    res_in, _ = lax.optimization_barrier((sh_["res"], carry))
+                    o = seg.segment_call(
+                        kcfg, dict(ops, act=seg.pack_act(res_in, cfull, sfull))
+                    )
+                    return o["res_out"]
+
+                last = lax.fori_loop(0, M, step, sh_["res"])
+                return last[None]
+
+            fn = jax.jit(
+                jax.shard_map(
+                    body,
+                    mesh=mesh,
+                    in_specs=(
+                        P(AXIS),
+                        P(AXIS),
+                        sh_specs,
+                        {k: P() for k in nx},
+                        P(AXIS),
+                        {k: P(AXIS) for k in pr_keys},
+                    ),
+                    out_specs=P(AXIS),
+                    check_vma=False,
+                )
+            )
+            a = (*args, pref_dev(kind), pr_all)
+            n_cc = fn.lower(*a).as_text().count("tpu_custom_call")
+            jax.block_until_ready(fn(*a))  # compile + warm
+            ts = []
+            for _ in range(7):
+                t0 = time.perf_counter()
+                jax.block_until_ready(fn(*a))
+                ts.append(time.perf_counter() - t0)
+            times[M] = (float(np.median(ts[1:])), n_cc)
+        xs = np.asarray(list(times), np.float64)
+        ys = np.asarray([times[M][0] for M in times]) * 1e6
+        slope, icpt = np.polyfit(xs, ys, 1)
+        res[name] = dict(
+            per_call_us=round(float(slope), 2),
+            intercept_us=round(float(icpt), 1),
+            med_us={str(M): round(times[M][0] * 1e6, 1) for M in times},
+            custom_calls={str(M): times[M][1] for M in times},
+        )
+    return res
+
+
 def _worst(rows):
     m = {k: max(r[0][k] for r in rows) for k in METRICS}
     flags = {k: all(r[1][k] for r in rows) for k in rows[0][1]}
@@ -900,6 +1273,144 @@ def _tpu_main():
     return 0 if ok else 1
 
 
+def pool_overflow_checks(d: Dims):
+    """Host-side: a pool beyond VMEM or the prediction row is refused, and
+    prefetch_fit clamps a request to what fits."""
+    out = {}
+    for T in seg.TOKEN_BUCKETS:
+        c = d.cfg(T)
+        big = dataclasses.replace(c, e_pre=16)
+        fit = seg.prefetch_fit(c, 64)
+        out[f"T{T}"] = dict(
+            e_pre16_nb6_refused=seg.supported(big) is not None,
+            e_pre17_refused=seg.supported(dataclasses.replace(c, e_pre=17, nb=2))
+            is not None,
+            fit_for_64=(fit.e_pre, fit.nb) if fit else None,
+            fit_ok=fit is not None and seg.supported(fit) is None,
+        )
+    return out
+
+
+def _lowered_custom_call(path, cfg, d):
+    """The tpu_custom_call payload of kernel module `path` for cfg (E_pre=0):
+    proves the prefetch-off kernel is the incumbent's (M4)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("segk_" + str(abs(hash(path))), path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    shapes = mod.operand_shapes(cfg, boundaries=2)
+    args = {n: jax.ShapeDtypeStruct(*shapes[n]) for n in shapes}
+    names = mod.SMEM_IN + mod.STAGED_IN + mod.HBM_IN
+    fn = jax.jit(lambda *a: mod.segment_call(cfg, dict(zip(names, a))))
+    import re
+
+    txt = fn.lower(*[args[n] for n in names]).as_text()
+    m = re.findall(r'backend_config = "([^"]*)"', txt) or re.findall(
+        r"backend_config=([^,}]*)", txt
+    )
+    import hashlib
+
+    return hashlib.md5("".join(m).encode()).hexdigest(), len(txt)
+
+
+def _tpu_prefetch_main():
+    pid = int(os.environ.get("JOBSET_JOB_INDEX", os.environ.get("TPU_WORKER_ID", "0")))
+    nproc = int(os.environ.get("NPROC", "1"))
+    if nproc > 1:
+        jax.distributed.initialize(os.environ["COORD"], nproc, pid)
+    devices = sorted(jax.devices(), key=lambda dv: (dv.process_index, dv.id))
+    assert len(devices) == N_RANKS, f"need {N_RANKS} devices, have {len(devices)}"
+    mesh = _mesh(devices)
+    e_pre = int(os.environ.get("SEGMK_PF_EPRE", "12"))
+    timing_T = {
+        int(t) for t in os.environ.get("SEGMK_PF_TIMING_T", "4,16,32").split(",") if t
+    }
+    Ms = tuple(int(x) for x in os.environ.get("SEGMK_PF_MS", "4,24").split(","))
+    summary, ok = {"overflow": pool_overflow_checks(GLM52)}, True
+    ok = ok and all(
+        v["e_pre16_nb6_refused"] and v["e_pre17_refused"] and v["fit_ok"]
+        for v in summary["overflow"].values()
+    )
+    old = os.environ.get("SEGMK_OLD_KERNEL")
+    if old and jax.process_index() == 0:
+        new = seg.kernel.__file__
+        same = {}
+        for T in seg.TOKEN_BUCKETS:
+            a = _lowered_custom_call(old, GLM52.cfg(T), GLM52)
+            b = _lowered_custom_call(new, GLM52.cfg(T), GLM52)
+            same[f"T{T}"] = dict(old=a, new=b, identical=a[0] == b[0])
+        summary["e_pre0_lowering_identical_to_incumbent"] = same
+        print(f"[segmk-pf] lowering identity {same}", flush=True)
+    for T, nv in TPU_CASES:
+        t0 = time.time()
+        r = _run_prefetch_case(
+            mesh,
+            GLM52,
+            T,
+            nv,
+            seed=T * 100 + nv,
+            e_pre=e_pre,
+            timing=Ms if (T in timing_T and nv == T) else (),
+        )
+        mine = np.asarray(
+            [r["exact"][k] for k in sorted(r["exact"])]
+            + [r["caught"][k] for k in sorted(r["caught"])]
+            + [r["pred_matches_reference"], r["predict_off_all_minus1"]]
+        )
+        allv = multihost_utils_allgather(mine)
+        names = (
+            [f"exact.{k}" for k in sorted(r["exact"])]
+            + [f"caught.{k}" for k in sorted(r["caught"])]
+            + ["pred_matches_reference", "predict_off_all_minus1"]
+        )
+        agg = dict(zip(names, np.all(allv, axis=0).tolist()))
+        r["all_hosts"] = agg
+        case_ok = all(v for k, v in agg.items() if not k.startswith("caught.no_dma"))
+        r["pass"] = case_ok
+        ok = ok and case_ok
+        r["seconds"] = round(time.time() - t0, 1)
+        summary[f"T{T}_nv{nv}"] = r
+        if jax.process_index() == 0:
+            print(
+                f"[segmk-pf] T={T} nv={nv} pass={case_ok} {json.dumps(r)}", flush=True
+            )
+    if jax.process_index() == 0:
+        print(
+            "SEGMK_PF_RESULT " + json.dumps({"pass": ok, "cases": summary}), flush=True
+        )
+    return 0 if ok else 1
+
+
+def multihost_utils_allgather(x):
+    from jax.experimental import multihost_utils
+
+    return np.asarray(multihost_utils.process_allgather(np.asarray(x), tiled=False))
+
+
+def _cpu_prefetch_worker():
+    """Interpret mode, 16 host devices: the prefetch kernel's DMA / semaphore
+    protocol (race detector) and bit identity at reduced dims."""
+    from jax._src.pallas.mosaic.interpret import interpret_pallas_call
+
+    pltpu.get_tpu_info = _tpu7x
+    from jax._src.pallas.mosaic import tpu_info
+
+    tpu_info.get_tpu_info = _tpu7x
+    mesh = _mesh(sorted(jax.devices("cpu"), key=lambda dv: dv.id)[:N_RANKS])
+    tiny = os.environ.get("SEGMK_TEST_TINY") == "1"
+    dims = TINY if tiny else SMALL
+    out = {}
+    for T, nv in ((4, 4),) if tiny else ((4, 4), (16, 12)):
+        t0 = time.time()
+        pltpu.reset_tpu_interpret_mode_state()
+        r = _run_prefetch_case(mesh, dims, T, nv, seed=T * 100 + nv, e_pre=6)
+        r["races"] = bool(interpret_pallas_call.races.races_found)
+        r["seconds"] = round(time.time() - t0, 1)
+        out[f"T{T}_nv{nv}"] = r
+    print("PFRESULT " + json.dumps(out, default=str), flush=True)
+
+
 if __name__ == "__main__":
     if "--routing-worker" in sys.argv:
         print(
@@ -907,6 +1418,14 @@ if __name__ == "__main__":
             + json.dumps(routing_vs_production(GLM52, interpret=True, calls=8)),
             flush=True,
         )
+    elif "--cpu-prefetch-worker" in sys.argv:
+        with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
+            _cpu_prefetch_worker()
+    elif "--tpu-prefetch" in sys.argv:
+        os.environ["XLA_FLAGS"] = (
+            os.environ.get("XLA_FLAGS", "") + " --xla_allow_excess_precision=false"
+        )
+        sys.exit(_tpu_prefetch_main())
     elif "--cpu-worker" in sys.argv:
         # Around everything: pallas_call reads the mode when it is built.
         with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
