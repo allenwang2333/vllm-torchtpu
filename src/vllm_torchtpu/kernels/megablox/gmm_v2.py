@@ -899,22 +899,30 @@ class DecodeRefs:
     weight: Any  # [DECODE_SLOTS, size_k, size_n]
     scale: Any  # [DECODE_SLOTS, 1, 1, size_n]
     lhs_sem: Any  # DMA[1]
-    weight_sems: Any  # DMA[DECODE_SLOTS]
+    weight_sems: Any  # DMA[DECODE_SLOTS, panels]: one per weight column panel
     scale_sems: Any  # DMA[DECODE_SLOTS]
 
 
-def decode_weight_copy(rhs_hbm_ref: WeightsRef, dec: DecodeRefs, group_id, slot):
-    """Whole-expert weight and scale DMAs of `group_id` into decode slot `slot`."""
-    return (
+def decode_weight_copies(rhs_hbm_ref: WeightsRef, dec: DecodeRefs, group_id, slot):
+    """`(weight DMA per column panel, scale DMA)` of `group_id` into decode slot `slot`.
+
+    A fused gate/up expert has a gate and an up panel, each its own DMA, so
+    the gate columns can be multiplied while the up columns still land.
+    """
+    num_panels = dec.weight_sems.shape[-1]
+    panel_n = dec.weight.shape[-1] // num_panels
+    weights = tuple(
         pltpu.make_async_copy(
-            rhs_hbm_ref.weight.at[group_id],
-            dec.weight.at[slot],
-            dec.weight_sems.at[slot],
-        ),
-        pltpu.make_async_copy(
-            rhs_hbm_ref.scale.at[group_id], dec.scale.at[slot], dec.scale_sems.at[slot]
-        ),
+            rhs_hbm_ref.weight.at[group_id, :, pl.ds(p * panel_n, panel_n)],
+            dec.weight.at[slot, :, pl.ds(p * panel_n, panel_n)],
+            dec.weight_sems.at[slot, p],
+        )
+        for p in range(num_panels)
     )
+    scale = pltpu.make_async_copy(
+        rhs_hbm_ref.scale.at[group_id], dec.scale.at[slot], dec.scale_sems.at[slot]
+    )
+    return weights, scale
 
 
 def start_first_decode_fetch(
@@ -953,7 +961,8 @@ def start_first_decode_fetch(
 
     @pl.when(first_group < size_group)
     def _():
-        for copy in decode_weight_copy(rhs_hbm_ref, dec, first_group, 0):
+        weights, scale = decode_weight_copies(rhs_hbm_ref, dec, first_group, 0)
+        for copy in (*weights, scale):
             copy.start()
 
     return first_group
@@ -1020,21 +1029,22 @@ def decode_kernel(
         lhs_group_sizes_ref, group_offset_ref, metadata_ref, cfgs=cfgs
     )
 
+    num_panels = dec.weight_sems.shape[-1]
+
     def copies(gm):
         group_id = metadata_ref.gm_id_to_group_id[gm]
-        return decode_weight_copy(rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS)
+        return decode_weight_copies(rhs_hbm_ref, dec, group_id, gm % DECODE_SLOTS)
 
-    def weight_copy(gm):
-        return copies(gm)[0]
+    def start_fetch(gm, panels=range(num_panels)):
+        """Starts tile gm's weight panels `panels`; panel 0 brings the scale."""
 
-    def scale_copy(gm):
-        return copies(gm)[1]
-
-    def start_fetch(gm):
         @pl.when(gm < num_gm)
         def _():
-            weight_copy(gm).start()
-            scale_copy(gm).start()
+            weights, scale = copies(gm)
+            for p in panels:
+                weights[p].start()
+                if p == 0:
+                    scale.start()
 
     lhs_copy = pltpu.make_async_copy(
         lhs_hbm_ref, dec.lhs.at[pl.ds(0, lhs_hbm_ref.shape[0])], dec.lhs_sem.at[0]
@@ -1052,7 +1062,8 @@ def decode_kernel(
 
     @pl.when(first_started & jnp.logical_not(first_is_tile0))
     def _():
-        for copy in decode_weight_copy(rhs_hbm_ref, dec, first_group, 0):
+        weights, scale = decode_weight_copies(rhs_hbm_ref, dec, first_group, 0)
+        for copy in (*weights, scale):
             copy.wait()
 
     @pl.when(jnp.logical_not(first_is_tile0))
@@ -1087,8 +1098,7 @@ def decode_kernel(
         ).astype(lhs_q_dtype)
         dec.lhs_scale[b_id] = block_scale
 
-    panel_n = cfgs.out_size_n
-    num_panels = dims.size_n // panel_n
+    panel_n = dims.size_n // num_panels
 
     def matmul_panel(slot, panel):
         """acc_dtype[rows, panel_n] of weight columns [panel * panel_n, +panel_n)."""
@@ -1123,14 +1133,19 @@ def decode_kernel(
         return jnp.concatenate(acc_list, axis=1)
 
     def gm_body(gm, carry):
-        start_fetch(gm + lookahead)
-        weight_copy(gm).wait()
-        scale_copy(gm).wait()
-
         slot = gm % DECODE_SLOTS
+        weights, scale = copies(gm)
         # Fused gate and up are multiplied as separate contiguous column panels
         # and paired at the end; each column sees the same ops as interleaved.
-        panels = [matmul_panel(slot, p) for p in range(num_panels)]
+        # A panel of the tile `lookahead` ahead is started as each panel here
+        # begins, so its gate DMA is queued ahead of its up DMA.
+        panels = []
+        for p in range(num_panels):
+            start_fetch(gm + lookahead, panels=(p,))
+            weights[p].wait()
+            if p == 0:
+                scale.wait()
+            panels.append(matmul_panel(slot, p))
         if cfgs.fuse_act is None:
             (acc,) = panels
         else:
@@ -1779,7 +1794,9 @@ def gmm_v2(
                 weight=pltpu.VMEM((DECODE_SLOTS, dims.size_k, dims.size_n), rhs.dtype),
                 scale=pltpu.VMEM((DECODE_SLOTS, 1, 1, dims.size_n), jnp.float32),
                 lhs_sem=pltpu.SemaphoreType.DMA((1,)),
-                weight_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
+                weight_sems=pltpu.SemaphoreType.DMA(
+                    (DECODE_SLOTS, dims.size_n // cfgs.out_size_n)
+                ),
                 scale_sems=pltpu.SemaphoreType.DMA((DECODE_SLOTS,)),
             )
         )
