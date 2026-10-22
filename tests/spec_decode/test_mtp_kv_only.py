@@ -51,6 +51,7 @@ def _gating_proposer(monkeypatch, *, min_tokens=8, lockstep=False, target_md=Tru
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", min_tokens)
     proposer = _make_proposer()
     proposer._mtp_kv_only_model = object()
+    proposer._mtp_kv_only_min_tokens = min_tokens
     proposer._dp_lockstep_sharded = lambda: lockstep
     proposer._target_draft_attn_metadata = lambda chunk: (
         {DRAFT_LAYER: object()} if target_md else None
@@ -86,9 +87,27 @@ def _build_proposer(monkeypatch, *, min_tokens=1024, method="mtp"):
     proposer = _make_proposer(method)
     proposer.draft_model = object()
     proposer.draft_vllm_config = object()
-    proposer.runner = SimpleNamespace(_pcp_enabled=False, mesh=object())
+    proposer.runner = SimpleNamespace(
+        _pcp_enabled=False,
+        mesh=object(),
+        _dp_lockstep_enabled=lambda: False,
+        # Loop buckets up to 32 (max_num_reqs 32).
+        num_tokens_paddings=[16, 32, 64, 128, 1024, 4096],
+        max_num_reqs=32,
+    )
     proposer._draft_attn_layer_names = {"mtp.attn", "mtp.indexer.k_cache"}
     return proposer
+
+
+def _record_logs(monkeypatch):
+    logs = []
+    for level in ("info", "warning"):
+        monkeypatch.setattr(
+            e3.logger,
+            level,
+            lambda msg, *args, _level=level, **kw: logs.append((_level, msg % args)),
+        )
+    return logs
 
 
 def _patch_builder(monkeypatch, reason=None, raises=False):
@@ -126,8 +145,13 @@ def test_build_kv_only_model_off_by_default(monkeypatch):
 def test_build_kv_only_model_builds_with_draft_config_and_own_prefix(monkeypatch):
     proposer = _build_proposer(monkeypatch)
     built = _patch_builder(monkeypatch)
+    logs = _record_logs(monkeypatch)
     proposer._build_mtp_kv_only_model()
     assert proposer._mtp_kv_only_model is not None
+    # Above every loop bucket: the gate is the flag, as set.
+    assert proposer._mtp_kv_only_min_tokens == 1024
+    assert [lvl for lvl, _ in logs] == ["info"]
+    assert ">= 1024 tokens" in logs[0][1]
     (kwargs,) = built
     assert kwargs["vllm_config"] is proposer.draft_vllm_config
     assert kwargs["mtp"] is proposer.draft_model
@@ -135,9 +159,38 @@ def test_build_kv_only_model_builds_with_draft_config_and_own_prefix(monkeypatch
     assert kwargs["prefix"] == "mtp_prefill_kv_only"
 
 
+@pytest.mark.parametrize("min_tokens", [1, 16, 32])
+def test_build_kv_only_model_raises_the_gate_above_the_loop_buckets(
+    monkeypatch, min_tokens
+):
+    """A step 0 no larger than the largest loop bucket keeps the single pass:
+    the warmup's single-request specs at those sizes warm the draft at p = T."""
+    proposer = _build_proposer(monkeypatch, min_tokens=min_tokens)
+    _patch_builder(monkeypatch)
+    logs = _record_logs(monkeypatch)
+    proposer._build_mtp_kv_only_model()
+    assert proposer._mtp_kv_only_model is not None
+    assert proposer._mtp_kv_only_min_tokens == 33
+    ((lvl, msg), (lvl2, msg2)) = logs
+    assert lvl == "warning" and "largest draft loop bucket (32)" in msg
+    assert lvl2 == "info" and ">= 33 tokens" in msg2
+    proposer._dp_lockstep_sharded = lambda: False
+    proposer._target_draft_attn_metadata = lambda chunk: {DRAFT_LAYER: object()}
+    assert proposer._use_kv_only_two_pass(object(), 32, 1) is False
+    assert proposer._use_kv_only_two_pass(object(), 64, 1) is True
+
+
 @pytest.mark.parametrize(
     "setup",
-    ["eagle3", "kv_shared", "pcp", "unsupported", "build_fails", "not_draft_layers"],
+    [
+        "eagle3",
+        "kv_shared",
+        "pcp",
+        "lockstep",
+        "unsupported",
+        "build_fails",
+        "not_draft_layers",
+    ],
 )
 def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
     proposer = _build_proposer(
@@ -152,14 +205,23 @@ def test_build_kv_only_model_refusals_keep_the_single_pass(monkeypatch, setup):
         proposer._draft_kv_shared = True
     if setup == "pcp":
         proposer.runner._pcp_enabled = True
+    if setup == "lockstep":
+        proposer._dp_lockstep_sharded = lambda: True
+    logs = _record_logs(monkeypatch)
     if setup == "not_draft_layers":
         # The indexer cache is not among the draft's attention layers, so the
         # step-0 metadata pass 1 reads would not carry it.
         proposer._draft_attn_layer_names = {"mtp.attn"}
     proposer._build_mtp_kv_only_model()
     assert proposer._mtp_kv_only_model is None
+    assert proposer._mtp_kv_only_min_tokens == 0
     if setup != "not_draft_layers":
         assert built == []
+    # The log says why, and never claims the two-pass step 0 is active.
+    assert logs[-1][0] == "warning" and "keeps the single full pass" in logs[-1][1]
+    assert not any(lvl == "info" for lvl, _ in logs)
+    if setup == "lockstep":
+        assert "EP-DP lockstep" in logs[-1][1]
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +610,7 @@ def _run(monkeypatch, *, two_pass: bool, mode: str, num_chunks: int = 1):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", GATE)
     kv_only = _ToyKvOnly(world)
     proposer._mtp_kv_only_model = kv_only if two_pass else None
+    proposer._mtp_kv_only_min_tokens = GATE if two_pass else 0
 
     @contextlib.contextmanager
     def fake_forward_context(attn_metadata, *_a, **_k):
@@ -593,6 +656,7 @@ def test_two_pass_step0_is_not_taken_below_the_gate(monkeypatch):
     monkeypatch.setattr(envs, "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 32)
     proposer = _make_proposer()
     proposer._mtp_kv_only_model = object()
+    proposer._mtp_kv_only_min_tokens = 32
     proposer._dp_lockstep_sharded = lambda: False
     proposer._target_draft_attn_metadata = lambda chunk: {DRAFT_LAYER: object()}
     assert proposer._use_kv_only_two_pass(object(), 16, 4) is False

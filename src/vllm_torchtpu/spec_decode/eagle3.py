@@ -241,6 +241,9 @@ class Eagle3Proposer:
         # layer's KV and indexer-K caches. Built in load_model; None keeps the
         # single full step-0 pass.
         self._mtp_kv_only_model: torch.nn.Module | None = None
+        # The gate it runs under: the flag, raised above the largest loop
+        # bucket (see _build_mtp_kv_only_model). 0 while not built.
+        self._mtp_kv_only_min_tokens = 0
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -856,6 +859,7 @@ class Eagle3Proposer:
         single full pass.
         """
         self._mtp_kv_only_model = None
+        self._mtp_kv_only_min_tokens = 0
         if envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS <= 0:
             return
         reason = None
@@ -865,6 +869,11 @@ class Eagle3Proposer:
             reason = "the draft reads the target's KV cache"
         elif self.runner._pcp_enabled:
             reason = "prefill context parallelism is on"
+        elif self._dp_lockstep_sharded():
+            # Same rule as _use_kv_only_two_pass: the idle ranks' replay of a
+            # peer's draft trace (run_dp_dummy_draft) knows only the single
+            # pass, so the program would never run.
+            reason = "EP-DP lockstep replays the draft as the single pass"
         else:
             from vllm_torchtpu.spec_decode.mtp_kv_only import (
                 kv_only_unsupported_reason,
@@ -909,11 +918,35 @@ class Eagle3Proposer:
                 reason,
             )
             return
+        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
+        max_loop_bucket = self._max_loop_bucket()
+        if min_tokens <= max_loop_bucket:
+            # A step 0 of at most `max_loop_bucket` tokens is also a loop-step
+            # shape: the warmup's single-request specs at those sizes are what
+            # warm the draft at p = T, and two-pass would run it at a smaller
+            # p instead. It would save nearly nothing there anyway (pass 2
+            # runs at p ~ T), so keep those sizes on the single pass.
+            logger.warning(
+                "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS=%d is not above the largest "
+                "draft loop bucket (%d); the two-pass step 0 starts at %d tokens.",
+                min_tokens,
+                max_loop_bucket,
+                max_loop_bucket + 1,
+            )
+            min_tokens = max_loop_bucket + 1
+        self._mtp_kv_only_min_tokens = min_tokens
         logger.info(
             "MTP draft step 0 of chunks with >= %d tokens runs a KV-only pass "
             "over every row, then the full layer on one row per request.",
-            envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS,
+            min_tokens,
         )
+
+    def _max_loop_bucket(self) -> int:
+        """The largest loop bucket p `_loop_bucket` can return."""
+        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
+
+        runner = self.runner
+        return _get_padded_token_len(runner.num_tokens_paddings, runner.max_num_reqs)
 
     def _use_kv_only_two_pass(
         self, chunk: DraftChunkInputs, num_tokens: int, num_rows: int
@@ -926,7 +959,7 @@ class Eagle3Proposer:
         """
         if self._mtp_kv_only_model is None:
             return False
-        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
+        min_tokens = self._mtp_kv_only_min_tokens
         if min_tokens <= 0 or num_tokens < min_tokens or num_tokens <= num_rows:
             return False
         # EP-DP lockstep replays a peer's draft trace on idle ranks
@@ -2711,13 +2744,9 @@ class Eagle3Proposer:
         can take: T a token bucket at or above the gate, p a loop bucket."""
         if self._mtp_kv_only_model is None:
             return
-        from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
-
         runner = self.runner
-        min_tokens = envs.TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS
-        max_loop_bucket = _get_padded_token_len(
-            runner.num_tokens_paddings, runner.max_num_reqs
-        )
+        min_tokens = self._mtp_kv_only_min_tokens
+        max_loop_bucket = self._max_loop_bucket()
         # p is always `_loop_bucket(num_reqs)`, a token padding.
         idx_sizes = [t for t in runner.num_tokens_paddings if t <= max_loop_bucket]
         hidden_size = self._draft_hidden_size()
