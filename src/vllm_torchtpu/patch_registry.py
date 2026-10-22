@@ -156,6 +156,11 @@ PATCHES = (
         "maybe_patch_deepseek_v2_segment",
         ("platform_activation", "model_load"),
     ),
+    # P15 expert-prediction probe (throwaway; TPU_P15_PROBE=1).
+    Patch(
+        "vllm_torchtpu.models.vllm.p15_expert_probe:maybe_install",
+        ("platform_activation", "model_load"),
+    ),
 )
 
 _applied: set[str] = set()
