@@ -489,7 +489,9 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        available = budget.available - kv_connector_hbm_reserve
+        available = self._agree_across_ep_engines(
+            budget.available - kv_connector_hbm_reserve
+        )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -519,6 +521,25 @@ class TPUWorker(WorkerBase):
                 f"{gpu_memory_utilization} to a larger value."
             )
         return available
+
+    def _agree_across_ep_engines(self, available: int) -> int:
+        """The smallest KV budget of any DP engine sharing this EP world.
+
+        Each engine sizes its pool from its own free HBM, and the pool's block
+        count is part of every compiled program. EP engines run their expert
+        collectives inside those programs, so engines that land one block
+        apart compile different programs and hang in the first forward.
+        """
+        pc = self.parallel_config
+        if not pc.enable_expert_parallel or pc.data_parallel_size <= 1:
+            return available
+        from vllm.distributed.parallel_state import get_dp_group
+
+        t = torch.tensor([int(available)], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+        )
+        return int(t.item())
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
