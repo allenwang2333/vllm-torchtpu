@@ -296,10 +296,7 @@ class DeepseekV4Model(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
-        num_hash_layers = getattr(config, "num_hash_layers", None)
-        if num_hash_layers is None:
-            num_hash_layers = config.mlp_layer_types.count("hash_moe")
-        self.num_hash_layers: int = num_hash_layers
+        self.num_hash_layers: int = config.mlp_layer_types.count("hash_moe")
 
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,

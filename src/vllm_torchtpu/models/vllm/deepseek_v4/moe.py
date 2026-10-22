@@ -60,10 +60,9 @@ class DeepseekV4MoE(nn.Module):
 
         self.gate.e_score_correction_bias = None
         self.gate.tid2eid = None
-        num_hash_layers = getattr(config, "num_hash_layers", None)
-        if num_hash_layers is None:
-            num_hash_layers = config.mlp_layer_types.count("hash_moe")
-        is_hash_moe = extract_layer_index(prefix) < num_hash_layers
+        is_hash_moe = extract_layer_index(prefix) < config.mlp_layer_types.count(
+            "hash_moe"
+        )
         self.hash_indices_dtype = torch.int32
         if is_hash_moe:
             self.gate.tid2eid = nn.Parameter(

@@ -159,7 +159,7 @@ def _tiny_hf_config():
         hc_eps=1e-5,
         rms_norm_eps=1e-6,
         num_hidden_layers=N_LAYERS,
-        num_hash_layers=1,
+        mlp_layer_types=["hash_moe"] + ["moe"] * (N_LAYERS - 1),
         index_topk=4,
         vocab_size=VOCAB,
     )
