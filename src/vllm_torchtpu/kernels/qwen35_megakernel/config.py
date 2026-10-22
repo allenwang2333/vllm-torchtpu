@@ -567,6 +567,13 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = default_tiles(c.microbatch())
         if c.dp > 1:  # virtual ranks share a core: no group split, no TP8 all-reduce stages
             t = dataclasses.replace(t, split=False, hier=0, rsag=False)
+            # the chip's rows of all 4 chips in the MoE buffers: a shallower expert ring from
+            # a 48-row chip grid (v7x-8: 64-row grid nbe 18, 48-row microbatch nbe 16 fit the
+            # scoped VMEM limit; 20 overflows both by ~0.5 MB)
+            grid = c.n_mb * c.mb_rows
+            nbe = 16 if c.mb_rows >= 48 else (18 if grid >= 48 else 20)
+            t = dataclasses.replace(t, nbd=min(t.nbd, WIDE_NBD), nbe=nbe)
+            return t
         # 1.67 EP experts (20 of 12-tile experts) in the expert ring: the wide expert loop has no
         # software pipeline, so a one-expert ring serializes each expert's DMA behind its compute;
         # 2 experts (24) overflows the scoped VMEM limit at 192+ rows
