@@ -1570,6 +1570,38 @@ def get_default_block_sizes(
     )
 
     match tpu_version:
+        case 4:
+            # TPU v4 has 16 MiB VMEM. Start from the v5/v6 heuristics and
+            # halve the blocks until they fit in half of VMEM. The other half
+            # is headroom, because the estimate excludes register spills.
+            if case == RpaCase.DECODE:
+                bq_sz = 1
+                bkv_sz = min(min_bkv_sz_to_peak, max_kv)
+                bq_csz = 1
+                bkv_csz = min(min_bkv_sz_to_peak, max_kv)
+            else:
+                bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
+                bkv_sz = min(1024, max_kv)
+                bq_csz = min(512 // num_q_heads_per_kv_head, max_q)
+                bkv_csz = min(512, align_to(max_kv // 2, page_size))
+            vmem_budget = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+
+            def _vmem_bytes(bq, bkv):
+                return get_vmem_estimate_bytes(
+                    actual_num_kv_heads,
+                    actual_num_q_heads // actual_num_kv_heads,
+                    head_dim,
+                    bq,
+                    align_to(bkv, page_size),
+                    q_dtype,
+                    kv_dtype,
+                )
+
+            while _vmem_bytes(bq_sz, bkv_sz) > vmem_budget and bkv_sz > page_size:
+                bkv_sz //= 2
+            while _vmem_bytes(bq_sz, bkv_sz) > vmem_budget and bq_sz > 1:
+                bq_sz //= 2
+            bkv_csz = min(bkv_csz, bkv_sz)
         case 5 | 6:
             if case == RpaCase.DECODE:
                 bq_sz = 1
