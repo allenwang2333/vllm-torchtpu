@@ -1363,8 +1363,8 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         else:
             # Load-time quantization has its own fixed per-channel contract.
             self._linear_quant_config = (
-                "float8_e4m3fn",
-                torch.float8_e4m3fn,
+                envs.REQUANTIZE_WEIGHT_DTYPE,
+                _MOE_REQUANT_WEIGHT_DTYPES[envs.REQUANTIZE_WEIGHT_DTYPE],
                 None,
                 False,
             )
