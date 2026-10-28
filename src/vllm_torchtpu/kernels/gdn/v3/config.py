@@ -266,6 +266,8 @@ class GDNConfig:
         fraction = (
             self.WINDOWED_VMEM_FRACTION
             if self.window_size > 1
+            # TPU v4 has 16 MiB VMEM. Prefill tiles need 11.3 MiB.
+            or tpu_info.vmem_capacity_bytes <= 16 * 1024 * 1024
             else self.DEFAULT_VMEM_FRACTION
         )
         return int(fraction * tpu_info.vmem_capacity_bytes)
