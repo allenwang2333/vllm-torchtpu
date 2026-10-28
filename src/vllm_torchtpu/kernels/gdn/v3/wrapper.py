@@ -263,6 +263,7 @@ def outer_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     *,
     cfg: config.GDNConfig,
+    num_cores: int = 1,
 ):
     """Setup memory allocations and emit pipeline for running inner_kernel."""
     del conv_state_out_ref, recurrent_state_out_ref
@@ -285,7 +286,8 @@ def outer_kernel(
         )
     )
 
-    num_tiles = metadata_ref.num_tiles[...]
+    num_tiles_ref = metadata_ref.num_tiles
+    num_tiles = num_tiles_ref[0] if num_tiles_ref.ndim else num_tiles_ref[...]
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(
@@ -293,6 +295,8 @@ def outer_kernel(
             cfg=cfg,
         ),
         grid=(num_tiles,),
+        core_axis=0 if num_cores > 1 else None,
+        dimension_semantics=(pltpu.PARALLEL,) if num_cores > 1 else None,
         in_specs=(
             qkv_alloc.spec,
             b_alloc.spec,
@@ -703,8 +707,25 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
+        # PER_SEQ tiles carry state to the next tile of the same sequence, so
+        # they stay on one core.
+        num_cores = 1
+        tpu_info = pltpu.get_tpu_info()
+        if (
+            tpu_info.generation == 4
+            and mode == config.GDNMode.BATCHED
+            and cfg.attention_mode == config.AttentionMode.GDN
+        ):
+            num_cores = tpu_info.num_cores
+        core_grid = {}
+        if num_cores > 1:
+            core_grid = {"grid": (num_cores,)}
+            metadata_obj = jax.tree.map(
+                lambda x: x.reshape(1) if x.ndim == 0 else x, metadata_obj
+            )
         return pl.pallas_call(
-            functools.partial(outer_kernel, cfg=cfg),
+            functools.partial(outer_kernel, cfg=cfg, num_cores=num_cores),
+            **core_grid,
             out_shape=(out_shape, in_conv_state, in_recurrent_state),
             in_specs=(
                 metadata_spec,
@@ -722,6 +743,7 @@ def fused_conv1d_gdn(
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=cfg.get_vmem_limit_bytes(),
+                dimension_semantics=("parallel",) if num_cores > 1 else None,
             ),
             name=cfg.get_kernel_name(),
             metadata=cfg.get_metadata(),
